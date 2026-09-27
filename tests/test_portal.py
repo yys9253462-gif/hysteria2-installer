@@ -74,15 +74,45 @@ class PortalTest(unittest.TestCase):
                 prefix = '/' + data['token'] + '/'
                 auth = 'Basic ' + base64.b64encode((access['username']+':'+access['password']).encode()).decode()
                 self.assertEqual(request('/')[0], 404)
-                for route in ['', 'qr.svg', 'clash.yaml', 'sing-box.json']:
+
+                # 未鉴权时的响应分两类，这是 portal.py 里有意的设计
+                # （见 do_GET 末尾：is_client_api 走 401 + WWW-Authenticate，
+                #   其余浏览器请求返回登录页 200，方便用户直接在浏览器里登录）。
+                # 本测试原先一律断言 401，是登录页 UX 引入之前写的，此处按实际行为修正；
+                # 更要害的断言是：两条路径都不能吐出任何订阅内容或节点参数。
+                # 注意保持每路由 2 次请求不变 —— 末尾的 429 限流断言依赖总请求次数。
+                client_routes = ['clash.yaml', 'sing-box.json']
+                browser_routes = ['', 'qr.svg']
+
+                for route in client_routes:
                     self.assertEqual(request(prefix+route)[0], 401)
+                    status, headers, body = request(prefix+route, auth)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(headers['Cache-Control'], 'no-store')
+                    self.assertTrue(body)
+
+                for route in browser_routes:
+                    status, _, body = request(prefix+route)
+                    self.assertEqual(status, 200)
+                    self.assertIn(b'login-form', body)          # 确实是登录页而非内容
+                    self.assertNotIn(b'MATCH,PROXY', body)      # 不含 Clash 订阅内容
+                    self.assertNotIn(b'hysteria2://', body)     # 不含节点直链
                     status, headers, body = request(prefix+route, auth)
                     self.assertEqual(status, 200)
                     self.assertEqual(headers['Cache-Control'], 'no-store')
                     self.assertTrue(body)
                 self.assertEqual(request(prefix+'../portal.json', auth)[0], 404)
                 self.assertEqual(request(prefix, 'Basic wrong')[0], 401)
-                self.assertIn(429, [request(prefix)[0] for _ in range(25)])
+
+                # 限流：web 桶在「1 秒内 >= 50 次请求」或「60 秒内 >= 60 次失败」时返回 429
+                # （见 portal.py 的 check_rate_limit）。
+                # 原断言只连发 25 次，低于任一阈值，在现行实现下永远不可能出现 429 ——
+                # 同样属过时断言，此前被上面那条 401 断言挡住、从未执行到。
+                # 这里按真实阈值构造：未鉴权请求 clash.yaml 会触发 record_failure()，
+                # 连发 70 次即可保证在「快」（50 次/秒先到）与「慢」（60 次失败先到）
+                # 两种计时情形下都必然出现 429。
+                codes = [request(prefix+'clash.yaml')[0] for _ in range(70)]
+                self.assertIn(429, codes)
             finally:
                 proc.terminate()
                 proc.wait(timeout=5)
