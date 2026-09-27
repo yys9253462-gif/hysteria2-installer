@@ -25,6 +25,21 @@ HY2_CERT_DIR="${HY2_DIR}/cert"
 HY2_META_FILE="${HY2_DIR}/client_meta.json"
 HY2_SUB_PORT="8443"
 
+# ---- AmneziaWG (AWG) ----
+# 引擎逻辑全部在 awgctl.sh 里，本脚本只做交互封装。
+AWG_REPO="yys9253462-gif/hysteria2-installer"
+AWG_RELEASE_TAG="awg-binaries"
+AWG_CTL_BIN="/usr/local/bin/hy2-awgctl"
+AWG_DIR="/etc/amnezia/amneziawg"
+AWG_LINK="awg0"
+AWG_CONFIG="${AWG_DIR}/${AWG_LINK}.conf"
+AWG_META_FILE="${AWG_DIR}/awg_meta.json"
+AWG_PEERS_FILE="${AWG_DIR}/awg_peers.json"
+AWG_SERVICE="/etc/systemd/system/amneziawg-server.service"
+# 规避 Hysteria2 端口跳跃区间(20000-40000) 与 WireGuard 默认端口(51820)
+AWG_PORT_MIN=50000
+AWG_PORT_MAX=59000
+
 log_info() { echo -e "${GREEN}[INFO]${PLAIN} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${PLAIN} $1"; }
 log_err()  { echo -e "${RED}[ERROR]${PLAIN} $1"; }
@@ -1034,6 +1049,29 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .toast-item.success { background: #087f74; }
 .toast-item.error { background: #cf3c3c; }
 @keyframes toastIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
+
+/* ===== AmneziaWG 抗 DPI 协议卡片 ===== */
+.awg-card { background: #ffffff; border: 1px solid var(--line); border-radius: 16px; padding: 22px; box-shadow: 0 4px 16px rgba(18, 43, 49, 0.03); }
+.awg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; flex-wrap: wrap; gap: 10px; }
+.awg-title-box { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.awg-title { font-size: 15px; font-weight: 800; color: var(--ink); margin: 0; }
+.awg-desc { font-size: 12.5px; color: var(--muted); line-height: 1.7; margin: 0 0 14px; }
+.awg-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 16px; }
+.awg-meta span { background: #f3f7f6; border: 1px solid #d4e5e1; border-radius: 12px; padding: 4px 11px; font-weight: 650; }
+.awg-install-box { background: #f8fbfa; border: 1px solid #d9ebe6; border-radius: 14px; padding: 16px 18px; margin-bottom: 18px; }
+.awg-label { display: block; font-size: 12px; font-weight: 700; color: var(--muted); margin: 12px 0 5px; }
+.awg-label:first-child { margin-top: 0; }
+.awg-input, .awg-select { width: 100%; height: 40px; padding: 0 12px; border: 1.5px solid var(--line); border-radius: 10px; font-size: 13px; color: var(--ink); background: #fdfefe; outline: none; box-sizing: border-box; }
+.awg-input:focus, .awg-select:focus { border-color: var(--accent); background: #fff; box-shadow: 0 0 0 3px rgba(8, 127, 116, 0.12); }
+.awg-warn { font-size: 11.5px; color: #993c1d; background: #faece7; border: 1px solid #f5c4b3; border-radius: 10px; padding: 9px 12px; line-height: 1.6; margin: 12px 0 0; }
+.awg-add-form { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
+.awg-add-form .awg-input { flex: 1; min-width: 150px; width: auto; }
+.awg-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.awg-table th { text-align: left; font-size: 11.5px; color: var(--muted); font-weight: 700; padding: 8px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.awg-table td { padding: 10px; border-bottom: 1px solid #f0f4f3; color: var(--ink); vertical-align: middle; }
+.awg-foot { display: flex; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+.awg-hint { font-size: 11.5px; color: var(--muted); margin: 10px 0 0; line-height: 1.6; }
+@media(max-width: 600px) { .awg-add-form { flex-direction: column; } .awg-add-form .awg-input { width: 100%; } }
 
 
 
@@ -2090,6 +2128,199 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
     }
   });
 });
+
+/* ==================== AmneziaWG 抗 DPI 协议管理 ==================== */
+const awgBadge = document.getElementById('awg-badge');
+const awgInstallBox = document.getElementById('awg-install-box');
+const btnInstallAwg = document.getElementById('btn-install-awg');
+const btnDoInstallAwg = document.getElementById('btn-do-install-awg');
+const awgLineSelect = document.getElementById('awg-line-select');
+const awgEndpointInput = document.getElementById('awg-endpoint-input');
+const awgMetaBox = document.getElementById('awg-meta');
+const awgMetaLine = document.getElementById('awg-meta-line');
+const awgMetaPort = document.getElementById('awg-meta-port');
+const awgMetaPeers = document.getElementById('awg-meta-peers');
+const awgMetaChip = document.getElementById('awg-meta-chip');
+const awgPanel = document.getElementById('awg-panel');
+const awgPeerTbody = document.getElementById('awg-peer-tbody');
+const awgPeerName = document.getElementById('awg-peer-name');
+const awgPeerEndpoint = document.getElementById('awg-peer-endpoint');
+const btnAddAwgPeer = document.getElementById('btn-add-awg-peer');
+const btnSwitchAwgLine = document.getElementById('btn-switch-awg-line');
+const btnUpdateAwg = document.getElementById('btn-update-awg');
+let awgCurrentEndpoint = '';
+let awgCurrentLine = '3';
+
+function awgPost(endpoint, params) {
+  return fetch(location.pathname + endpoint, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params).toString()
+  }).then(r => r.json()).catch(e => ({ ok: false, error: '请求异常: ' + e.message }));
+}
+
+function setAwgBadge(text, bg, color) {
+  if (!awgBadge) return;
+  awgBadge.textContent = text;
+  awgBadge.style.background = bg;
+  awgBadge.style.color = color;
+}
+
+async function loadAwgState() {
+  if (!awgBadge) return;
+  try {
+    const res = await fetch(location.pathname + 'awg-state', { credentials: 'same-origin' });
+    if (!res.ok) return;
+    const json = await res.json();
+    if (!json.ok) return;
+
+    awgCurrentEndpoint = json.endpoint || '';
+    awgCurrentLine = json.line || '3';
+    if (awgEndpointInput && !awgEndpointInput.value) awgEndpointInput.value = awgCurrentEndpoint;
+    if (awgPeerEndpoint && !awgPeerEndpoint.value) awgPeerEndpoint.value = awgCurrentEndpoint;
+    if (awgMetaChip) awgMetaChip.textContent = json.installed ? ('AWG ' + awgCurrentLine + '.x') : '未安装';
+
+    if (!json.installed) {
+      setAwgBadge('● 未安装 AmneziaWG', '#fff1f0', '#cf3c3c');
+      if (awgMetaBox) awgMetaBox.style.display = 'none';
+      if (awgPanel) awgPanel.style.display = 'none';
+      if (awgInstallBox) awgInstallBox.style.display = 'none';
+      if (btnInstallAwg) { btnInstallAwg.style.display = 'inline-flex'; btnInstallAwg.textContent = '⚡ 一键安装 AmneziaWG'; }
+      return;
+    }
+
+    if (awgLineSelect && awgCurrentLine) awgLineSelect.value = awgCurrentLine;
+
+    if (json.active) {
+      setAwgBadge('● AmneziaWG 运行中', '#eaf3de', '#27500a');
+    } else {
+      setAwgBadge('● AmneziaWG 已安装未运行', '#f1efe8', '#5f5e5a');
+    }
+    if (btnInstallAwg) btnInstallAwg.style.display = 'none';
+    if (awgInstallBox) awgInstallBox.style.display = 'none';
+    if (awgMetaBox) awgMetaBox.style.display = 'flex';
+    if (awgMetaLine) awgMetaLine.textContent = '协议线 AWG ' + awgCurrentLine + '.x';
+    if (awgMetaPort) awgMetaPort.textContent = 'UDP ' + (json.port || '未知');
+    if (awgMetaPeers) awgMetaPeers.textContent = '客户端 ' + (json.peer_count || 0) + ' 个';
+    if (awgPanel) awgPanel.style.display = 'block';
+
+    renderAwgPeers(json.peers || []);
+  } catch (e) { /* 静默失败，不打扰主界面 */ }
+}
+
+function renderAwgPeers(peers) {
+  if (!awgPeerTbody) return;
+  if (!peers.length) {
+    awgPeerTbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">暂无客户端，用上方表单新增</td></tr>';
+    return;
+  }
+  awgPeerTbody.innerHTML = peers.map(p => {
+    const enc = encodeURIComponent(p.name);
+    const bs = 'padding:3px 10px;font-size:11px';
+    return '<tr>'
+      + '<td><strong>' + p.name + '</strong></td>'
+      + '<td>' + p.address + '</td>'
+      + '<td style="color:var(--muted);font-size:11.5px">' + (p.created_at || '-') + '</td>'
+      + '<td style="white-space:nowrap">'
+      + '<button class="button" type="button" data-awg-conf="' + enc + '" style="' + bs + '">下载配置</button> '
+      + '<button class="button" type="button" data-awg-qr="' + enc + '" style="' + bs + '">二维码</button> '
+      + '<button class="button" type="button" data-awg-del="' + enc + '" style="' + bs + ';color:#cf3c3c">删除</button>'
+      + '</td></tr>';
+  }).join('');
+
+  awgPeerTbody.querySelectorAll('[data-awg-conf]').forEach(b => {
+    b.addEventListener('click', () => {
+      window.open(location.pathname + 'awg-conf?name=' + b.getAttribute('data-awg-conf'), '_blank');
+    });
+  });
+  awgPeerTbody.querySelectorAll('[data-awg-qr]').forEach(b => {
+    b.addEventListener('click', () => {
+      window.open(location.pathname + 'awg-qr.svg?name=' + b.getAttribute('data-awg-qr'), '_blank');
+    });
+  });
+  awgPeerTbody.querySelectorAll('[data-awg-del]').forEach(b => {
+    b.addEventListener('click', async () => {
+      const n = decodeURIComponent(b.getAttribute('data-awg-del'));
+      if (!confirm('确认删除客户端「' + n + '」？该客户端会立即断开连接。')) return;
+      const json = await awgPost('manage-amneziawg', { action: 'peer_del', name: n });
+      if (json.ok) { showToast('已删除客户端 ' + n, 'success'); loadAwgState(); }
+      else { alert(json.error || '删除失败'); }
+    });
+  });
+}
+
+if (btnInstallAwg) {
+  btnInstallAwg.addEventListener('click', () => {
+    if (!awgInstallBox) return;
+    awgInstallBox.style.display = (awgInstallBox.style.display === 'none') ? 'block' : 'none';
+  });
+}
+
+if (btnDoInstallAwg) {
+  btnDoInstallAwg.addEventListener('click', async () => {
+    const line = awgLineSelect ? awgLineSelect.value : '3';
+    const endpoint = awgEndpointInput ? awgEndpointInput.value.trim() : '';
+    if (!endpoint) { alert('请填写客户端连接地址（域名或公网 IP）'); return; }
+    if (!confirm('确认安装 AmneziaWG（协议线 AWG ' + line + '.x）？\n\n会下载自建静态二进制并启动独立服务，不影响现有的 Hysteria 2。')) return;
+    btnDoInstallAwg.disabled = true;
+    const orig = btnDoInstallAwg.textContent;
+    btnDoInstallAwg.textContent = '⏳ 安装中，请稍候...';
+    try {
+      const json = await awgPost('install-amneziawg', { line: line, endpoint: endpoint });
+      if (json.ok) { showToast(json.message || '安装完成', 'success'); loadAwgState(); }
+      else { alert(json.error || '安装失败'); }
+    } finally {
+      btnDoInstallAwg.disabled = false;
+      btnDoInstallAwg.textContent = orig;
+    }
+  });
+}
+
+if (btnAddAwgPeer) {
+  btnAddAwgPeer.addEventListener('click', async () => {
+    const name = awgPeerName ? awgPeerName.value.trim() : '';
+    const endpoint = (awgPeerEndpoint && awgPeerEndpoint.value.trim()) || awgCurrentEndpoint;
+    if (!name) { alert('请填写客户端名称'); return; }
+    if (!/^[A-Za-z0-9_.-]{1,32}$/.test(name)) { alert('名称只允许字母、数字、点、下划线、连字符，且不超过 32 字符'); return; }
+    if (!endpoint) { alert('请填写连接地址'); return; }
+    btnAddAwgPeer.disabled = true;
+    try {
+      const json = await awgPost('manage-amneziawg', { action: 'peer_add', name: name, endpoint: endpoint });
+      if (json.ok) {
+        if (awgPeerName) awgPeerName.value = '';
+        showToast('已新增客户端 ' + name + '，正在打开配置', 'success');
+        window.open(location.pathname + 'awg-conf?name=' + encodeURIComponent(name), '_blank');
+        loadAwgState();
+      } else { alert(json.error || '新增失败'); }
+    } finally {
+      btnAddAwgPeer.disabled = false;
+    }
+  });
+}
+
+if (btnSwitchAwgLine) {
+  btnSwitchAwgLine.addEventListener('click', async () => {
+    const target = prompt('切换 AmneziaWG 协议线\n\n2 = AWG 2.x（参数体系稳定）\n3 = AWG 3.x（含头部保护与抗行为分析）\n\n⚠️ 切换会重新生成全部混淆参数，已发放的客户端配置会立即失效，必须重新导出。\n\n请输入目标协议线：', awgCurrentLine === '3' ? '2' : '3');
+    if (target !== '2' && target !== '3') return;
+    if (target === awgCurrentLine) { alert('已经是 AWG ' + awgCurrentLine + '.x，无需切换。'); return; }
+    if (!confirm('确认切换到 AWG ' + target + '.x？所有已发放的客户端配置都会失效。')) return;
+    const json = await awgPost('manage-amneziawg', { action: 'set_line', line: target });
+    if (json.ok) { showToast(json.message || '已切换协议线', 'success'); loadAwgState(); }
+    else { alert(json.error || '切换失败'); }
+  });
+}
+
+if (btnUpdateAwg) {
+  btnUpdateAwg.addEventListener('click', async () => {
+    if (!confirm('确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。')) return;
+    const json = await awgPost('manage-amneziawg', { action: 'update' });
+    if (json.ok) { showToast(json.message || '更新完成', 'success'); loadAwgState(); }
+    else { alert(json.error || '更新失败'); }
+  });
+}
+
+loadAwgState();
 """
 
 LOGIN_SCRIPT = """
@@ -2462,6 +2693,69 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       <div class="warp-tags-wrap" id="warp-tags-cloud">
         <span style="font-size:12px;color:var(--muted)">正在拉取规则...</span>
       </div>
+    </div>
+  </section>
+
+  <!-- 区块 3: AmneziaWG 抗 DPI 协议 (用户态 WireGuard 分支) -->
+  <section class="card awg-card" style="margin-top:22px">
+    <div class="awg-head">
+      <div class="awg-title-box">
+        <h2 class="awg-title">🛡️ AmneziaWG (抗 DPI 的 WireGuard 分支)</h2>
+        <span class="status-pill" id="awg-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
+        <span class="status-pill" id="awg-meta-chip" style="background:#f3f7f6;color:#2e554d">—</span>
+      </div>
+      <button class="button primary" id="btn-install-awg" type="button" style="padding:6px 14px;font-size:12px;display:none">⚡ 一键安装 AmneziaWG</button>
+    </div>
+
+    <p class="awg-desc">
+      WireGuard 的抗审查分支：密码学内核（Curve25519 / ChaCha20-Poly1305 / Noise_IK）完全不变，只把数据包的头部、长度与时序特征随机化，让 DPI 无法按固定指纹识别。
+      本项目采用<strong>用户态 amneziawg-go</strong>部署，不需要编译内核模块，也不引入 Docker，与其他服务互不干扰。
+    </p>
+
+    <div class="awg-meta" id="awg-meta" style="display:none">
+      <span id="awg-meta-line">协议线 —</span>
+      <span id="awg-meta-port">UDP —</span>
+      <span id="awg-meta-peers">客户端 —</span>
+    </div>
+
+    <!-- 安装表单（未安装或需要重装时展开） -->
+    <div class="awg-install-box" id="awg-install-box" style="display:none">
+      <label class="awg-label" for="awg-line-select">协议线</label>
+      <select class="awg-select" id="awg-line-select">
+        <option value="3">AWG 3.x — 最新，含头部保护与抗连接行为分析</option>
+        <option value="2">AWG 2.x — 参数体系成熟，生态验证更充分</option>
+      </select>
+
+      <label class="awg-label" for="awg-endpoint-input">客户端连接地址（域名或公网 IP）</label>
+      <input class="awg-input" id="awg-endpoint-input" type="text" placeholder="例如 vpn.example.com" autocomplete="off" spellcheck="false">
+
+      <p class="awg-hint">监听端口自动从 50000-59000 中选取空闲端口，以避开 Hysteria 2 的端口跳跃区间 20000-40000。</p>
+
+      <button class="button primary" id="btn-do-install-awg" type="button" style="margin-top:14px;padding:9px 20px;font-size:13px">开始安装</button>
+    </div>
+
+    <!-- 已安装后的客户端管理面板 -->
+    <div id="awg-panel" style="display:none">
+      <div class="awg-add-form">
+        <input class="awg-input" id="awg-peer-name" type="text" placeholder="新客户端名称（字母/数字/._-）" autocomplete="off" spellcheck="false">
+        <input class="awg-input" id="awg-peer-endpoint" type="text" placeholder="连接地址（默认沿用已保存的地址）" autocomplete="off" spellcheck="false">
+        <button class="button primary" id="btn-add-awg-peer" type="button" style="white-space:nowrap">＋ 新增客户端</button>
+      </div>
+
+      <table class="awg-table">
+        <thead><tr><th>名称</th><th>隧道地址</th><th>创建时间</th><th>操作</th></tr></thead>
+        <tbody id="awg-peer-tbody"><tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">正在加载客户端...</td></tr></tbody>
+      </table>
+
+      <div class="awg-foot">
+        <button class="button" id="btn-switch-awg-line" type="button" style="padding:6px 14px;font-size:12px">切换协议线</button>
+        <button class="button" id="btn-update-awg" type="button" style="padding:6px 14px;font-size:12px">更新二进制</button>
+      </div>
+
+      <p class="awg-hint">
+        「下载配置」按钮会生成标准 .conf 文件，可直接导入 AmneziaWG 官方客户端或 WG Tunnel；「二维码」用于手机端扫码导入。
+        提醒：服务端与客户端的 S1-S4 / H1-H4 混淆参数必须逐字节一致，请勿手工修改 .conf 中的这些字段。
+      </p>
     </div>
   </section>
 </div>
@@ -3121,6 +3415,8 @@ def serve(path):
     ip_tracker = {}
     IP_TIMEOUT_SECONDS = 180
     VALID_USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
+    # AmneziaWG 客户端名称：与 awgctl.sh 中的校验保持一致
+    VALID_AWG_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,32}$')
 
     # 实时速率计算滑动窗口数据结构: {uid: [(timestamp, total_bytes_tx, total_bytes_rx)]}
     speed_tracker = {}
@@ -3216,6 +3512,98 @@ def serve(path):
             return out == 'active'
         except Exception:
             return False
+
+    # ------------------------------------------------------------------
+    # AmneziaWG (AWG) 支持
+    #
+    # 设计取舍：门户不重新实现 AWG 的配置生成逻辑，而是调用 shell 侧的
+    # /usr/local/bin/hy2-awgctl（由 install.sh 安装）。这样命令行菜单与 Web
+    # 门户共用同一套实现，不会出现两份逻辑漂移 —— 考虑到 S1-S4/H1-H4 必须
+    # 两端逐字节一致，重复实现的风险太高。
+    # ------------------------------------------------------------------
+    AWG_CTL = '/usr/local/bin/hy2-awgctl'
+    AWG_REPO = 'yys9253462-gif/hysteria2-installer'
+    AWG_DIR_PATH = Path('/etc/amnezia/amneziawg')
+    AWG_META_PATH = AWG_DIR_PATH / 'awg_meta.json'
+    AWG_PEERS_PATH = AWG_DIR_PATH / 'awg_peers.json'
+    AWG_CONF_PATH = AWG_DIR_PATH / 'awg0.conf'
+    AWG_GO_PATH = Path('/usr/local/bin/amneziawg-go')
+    AWG_SVC_NAME = 'amneziawg-server'
+
+    def awg_read_json(path, default):
+        try:
+            if path.exists():
+                return json.loads(path.read_text())
+        except Exception:
+            pass
+        return default
+
+    def awg_installed():
+        return AWG_CONF_PATH.exists() and AWG_GO_PATH.exists()
+
+    def awg_active():
+        try:
+            out = subprocess.run(['systemctl', 'is-active', AWG_SVC_NAME],
+                                 capture_output=True, text=True, timeout=3).stdout.strip()
+            return out == 'active'
+        except Exception:
+            return False
+
+    def ensure_awgctl():
+        """确保 hy2-awgctl 可用；缺失时从主仓库拉取（与 install.sh 的策略一致）。"""
+        if Path(AWG_CTL).exists():
+            return True
+        try:
+            import os
+            import shutil
+            import tempfile
+            import urllib.request
+            url = 'https://raw.githubusercontent.com/' + AWG_REPO + '/main/awgctl.sh'
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content = resp.read()
+            # 太小说明拿到的是错误页而不是脚本
+            if len(content) < 2048 or b'hy2-awgctl' not in content:
+                return False
+            fd, tmp_name = tempfile.mkstemp(prefix='hy2-awgctl-', suffix='.sh')
+            os.close(fd)
+            with open(tmp_name, 'wb') as fh:
+                fh.write(content)
+            os.chmod(tmp_name, 0o755)
+            shutil.move(tmp_name, AWG_CTL)
+            os.chmod(AWG_CTL, 0o755)
+            return True
+        except Exception:
+            return False
+
+    def awg_run(args, timeout=420):
+        """调用 hy2-awgctl。返回 (returncode, stdout, stderr)。"""
+        proc = subprocess.run([AWG_CTL] + args, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def awg_err_tail(rc, out, err, limit=700):
+        text = (err or '').strip() or (out or '').strip()
+        return text[-limit:] if text else '退出码 ' + str(rc)
+
+    def awg_state():
+        meta = awg_read_json(AWG_META_PATH, {})
+        peers_raw = awg_read_json(AWG_PEERS_PATH, {}).get('peers', []) or []
+        line = str(meta.get('line', '3') or '3')
+        if line not in ('2', '3'):
+            line = '3'
+        return {
+            'ok': True,
+            'installed': awg_installed(),
+            'active': awg_active(),
+            'line': line,
+            'port': str(meta.get('port', '') or ''),
+            'endpoint': str(meta.get('endpoint', '') or ''),
+            'peer_count': len(peers_raw),
+            'ctl': Path(AWG_CTL).exists(),
+            # 注意：只回传非敏感字段，私钥与预共享密钥绝不下发到前端
+            'peers': [{'name': p.get('name', ''), 'address': p.get('address', ''),
+                       'created_at': p.get('created_at', '')} for p in peers_raw],
+        }
 
     def regenerate_page():
         m = json.loads(meta_path.read_text()) if meta_path.exists() else {}
@@ -3895,6 +4283,119 @@ WantedBy=multi-user.target
                     subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=10)
 
                     return self.reply_json(200, {'ok': True, 'message': f'GOST {tag} 官方核心安装成功，服务已自动配置并启动！'})
+                except Exception as e:
+                    return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
+
+            # ---------------- AmneziaWG (AWG) ----------------
+            if self.path == prefix + 'install-amneziawg':
+                if not self.is_authenticated():
+                    return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                    body = self.rfile.read(length).decode('utf-8')
+                    form = parse_qs(body)
+                    # 先去空白再取默认值：写成 (value or '3').strip() 的话，
+                    # 纯空格能通过 or 判定、再被 strip 成空串，导致误判为非法协议线。
+                    line = (form.get('line', [''])[0] or '').strip() or '3'
+                    endpoint = (form.get('endpoint', [''])[0] or '').strip()
+                    port = (form.get('port', [''])[0] or '').strip()
+
+                    if line not in ('2', '3'):
+                        return self.reply_json(400, {'ok': False, 'error': '协议线只能是 2 或 3'})
+                    if not endpoint:
+                        return self.reply_json(400, {'ok': False, 'error': '必须提供客户端连接地址（域名或公网 IP）'})
+                    # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃冲突的取值
+                    if port:
+                        if not port.isdigit() or not (1 <= int(port) <= 65535):
+                            return self.reply_json(400, {'ok': False, 'error': '端口必须是 1-65535 的数字'})
+                        if 20000 <= int(port) <= 40000:
+                            return self.reply_json(400, {'ok': False, 'error': '该端口落在 Hysteria2 的端口跳跃区间 20000-40000 内，会导致 AWG 收不到握手包，请改用 50000-59000'})
+                    if not ensure_awgctl():
+                        return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
+
+                    args = ['install', '--line', line, '--endpoint', endpoint]
+                    if port:
+                        args += ['--port', port]
+                    rc, out, err = awg_run(args, timeout=420)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '安装失败：' + awg_err_tail(rc, out, err)})
+                    return self.reply_json(200, {'ok': True, 'message': f'AmneziaWG（协议线 AWG {line}.x）安装成功，服务已启动。'})
+                except subprocess.TimeoutExpired:
+                    return self.reply_json(500, {'ok': False, 'error': '安装超时（超过 420 秒），请查看服务器上的 journalctl -u amneziawg-server'})
+                except Exception as e:
+                    return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
+
+            if self.path == prefix + 'manage-amneziawg':
+                if not self.is_authenticated():
+                    return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                    body = self.rfile.read(length).decode('utf-8')
+                    form = parse_qs(body)
+                    action = (form.get('action', [''])[0] or '').strip()
+
+                    if action == 'state':
+                        return self.reply_json(200, awg_state())
+
+                    # 先校验动作名再检查安装状态 —— 否则未知动作会拿到
+                    # "尚未安装" 这种误导性的报错，排障时容易被带偏。
+                    known_actions = ('peer_add', 'peer_del', 'set_line', 'update',
+                                     'start', 'stop', 'restart')
+                    if action not in known_actions:
+                        return self.reply_json(400, {'ok': False, 'error': '未知操作: ' + (action or '(空)')})
+
+                    if not awg_installed():
+                        return self.reply_json(400, {'ok': False, 'error': 'AmneziaWG 尚未安装'})
+                    if not ensure_awgctl():
+                        return self.reply_json(500, {'ok': False, 'error': 'hy2-awgctl 不可用'})
+
+                    if action == 'peer_add':
+                        name = (form.get('name', [''])[0] or '').strip()
+                        endpoint = (form.get('endpoint', [''])[0] or '').strip()
+                        if not VALID_AWG_NAME_RE.match(name):
+                            return self.reply_json(400, {'ok': False, 'error': '客户端名称只允许字母、数字、点、下划线、连字符，长度 1-32'})
+                        if not endpoint:
+                            return self.reply_json(400, {'ok': False, 'error': '必须提供连接地址'})
+                        rc, out, err = awg_run(['peer-add', name, '--endpoint', endpoint], timeout=90)
+                        if rc != 0:
+                            return self.reply_json(500, {'ok': False, 'error': '创建失败：' + awg_err_tail(rc, out, err, 400)})
+                        return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已创建'})
+
+                    if action == 'peer_del':
+                        name = (form.get('name', [''])[0] or '').strip()
+                        if not VALID_AWG_NAME_RE.match(name):
+                            return self.reply_json(400, {'ok': False, 'error': '客户端名称非法'})
+                        rc, out, err = awg_run(['peer-del', name], timeout=90)
+                        if rc != 0:
+                            return self.reply_json(500, {'ok': False, 'error': '删除失败：' + awg_err_tail(rc, out, err, 400)})
+                        return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已删除'})
+
+                    if action == 'set_line':
+                        target = (form.get('line', [''])[0] or '').strip()
+                        if target not in ('2', '3'):
+                            return self.reply_json(400, {'ok': False, 'error': '协议线只能是 2 或 3'})
+                        if target == awg_state()['line']:
+                            return self.reply_json(200, {'ok': True, 'message': f'已经是 AWG {target}.x，无需切换。'})
+                        rc, out, err = awg_run(['update', '--line', target], timeout=420)
+                        if rc != 0:
+                            return self.reply_json(500, {'ok': False, 'error': '切换失败：' + awg_err_tail(rc, out, err)})
+                        return self.reply_json(200, {'ok': True, 'message': f'已切换到 AWG {target}.x。⚠️ 所有客户端必须重新导入配置。'})
+
+                    if action == 'update':
+                        rc, out, err = awg_run(['update'], timeout=420)
+                        if rc != 0:
+                            return self.reply_json(500, {'ok': False, 'error': '更新失败：' + awg_err_tail(rc, out, err)})
+                        return self.reply_json(200, {'ok': True, 'message': '二进制已更新，协议线与参数保持不变，客户端无需重新导入。'})
+
+                    if action in ('start', 'stop', 'restart'):
+                        label = {'start': '启动', 'stop': '停止', 'restart': '重启'}.get(action, action)
+                        proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
+                                              capture_output=True, text=True, timeout=30)
+                        if proc.returncode != 0:
+                            return self.reply_json(500, {'ok': False, 'error': '服务' + label + '失败：' + (proc.stderr or '').strip()[-400:]})
+                        return self.reply_json(200, {'ok': True, 'message': '服务已' + label})
+                except subprocess.TimeoutExpired:
+                    return self.reply_json(500, {'ok': False, 'error': '操作超时，请查看服务器日志'})
                 except Exception as e:
                     return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
 
@@ -4786,6 +5287,70 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'ip_limit': u_copy.get('ip_limit', 0),
                 })
 
+            # ---------------- AmneziaWG (AWG) ----------------
+            if subpath == 'awg-state':
+                if not self.is_authenticated():
+                    return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+                return self.reply_json(200, awg_state())
+
+            # 注意：这里的 subpath 是含查询串的（门户上游就是这么切分的），
+            # 所以必须先剥掉 ?query 再比对，否则带 ?name= 的路由永远匹配不上。
+            awg_route = subpath.split('?', 1)[0]
+            if awg_route in ('awg-conf', 'awg-qr.svg'):
+                if not self.is_authenticated():
+                    return self.reply(401, b'Authentication required', www_auth=True)
+                query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
+                name = (query.get('name', [''])[0] or '').strip()
+                if not VALID_AWG_NAME_RE.match(name):
+                    return self.reply(400, b'Invalid client name')
+                if not awg_installed():
+                    return self.reply(404, b'AmneziaWG is not installed')
+                if not ensure_awgctl():
+                    return self.reply(500, b'hy2-awgctl unavailable')
+
+                # 连接地址优先用查询参数，其次用安装时记录的 endpoint
+                endpoint = (query.get('endpoint', [''])[0] or '').strip() or awg_state()['endpoint']
+                if not endpoint:
+                    return self.reply(400, b'Endpoint not configured; re-run install with an endpoint')
+
+                try:
+                    rc, out, err = awg_run(['client-conf', name, '--endpoint', endpoint], timeout=60)
+                except Exception as exc:
+                    return self.reply(500, ('error: ' + str(exc)).encode('utf-8'))
+                if rc != 0 or not out.strip():
+                    return self.reply(500, awg_err_tail(rc, out, err, 400).encode('utf-8'))
+
+                if awg_route == 'awg-conf':
+                    body = out.encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                    self.send_header('Content-Disposition', 'attachment; filename="' + name + '.conf"')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.send_header('Cache-Control', 'no-store')
+                    self.send_header('X-Content-Type-Options', 'nosniff')
+                    self.send_header('X-Robots-Tag', 'noindex, nofollow, noarchive')
+                    self.send_header('Connection', 'close')
+                    self.end_headers()
+                    self.wfile.write(body)
+                    try:
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                    try:
+                        self.connection.shutdown(socket.SHUT_WR)
+                    except Exception:
+                        pass
+                    return
+
+                # 二维码走与门户其它二维码相同的实现（qrencode 直接输出 SVG）
+                try:
+                    qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
+                                              input=out.encode('utf-8'),
+                                              capture_output=True, check=True, timeout=20).stdout
+                except Exception:
+                    return self.reply(500, b'qrencode is not available on this server')
+                return self.reply(200, qr_bytes, 'image/svg+xml')
+
             if not self.is_authenticated():
                 if is_client_api:
                     self.record_failure()
@@ -4849,8 +5414,6 @@ if __name__ == '__main__':
         refresh(sys.argv[2])
     else:
         serve(sys.argv[2])
-
-
 PYPORTAL
 }
 
@@ -5199,6 +5762,444 @@ EOF
     fi
 }
 
+# ==============================================================================
+# AmneziaWG (AWG) —— 抗 DPI 的 WireGuard 分支
+# ------------------------------------------------------------------------------
+# 本项目坚持"下载静态二进制 + systemd"的部署模型，因此 AmneziaWG 走【用户态】路线：
+# 不编译内核模块、不引入 Docker。数据面用上游 amneziawg-go，工具用 amneziawg-tools，
+# 二者由本仓库的 GitHub Actions 交叉编译后发布到 Release（见
+# .github/workflows/build-awg.yml），amd64 / arm64 / armv7 全架构静态链接。
+#
+# 为什么不用内核模块：
+#   1. 官方 PPA 只发布 Ubuntu 包，Debian 上要强塞 Ubuntu 源，脏且易碎；
+#   2. 手工编译模块要求 5.6+ 内核提供【完整内核源码树】（不是 headers）；
+#   3. 内核模块在宿主内核升级后需要 DKMS 重建，失败会影响系统启动。
+#
+# ⚠️ 端口必须避开 Hysteria2 的端口跳跃区间 20000-40000 —— 那段 UDP 已被
+#    iptables REDIRECT 到 Hysteria 主端口，落在里面的 AWG 端口收不到握手包。
+#    同时避开 51820（WireGuard 默认端口本身就是个弱指纹）。
+#
+# 具体逻辑全部收敛在 awgctl.sh（安装为 /usr/local/bin/hy2-awgctl），
+# 这样命令行菜单与 Web 门户共用同一套实现，不会出现两份配置生成逻辑漂移。
+# ==============================================================================
+
+# 确保 hy2-awgctl 就位。优先用与 install.sh 同目录的 awgctl.sh（本地克隆场景），
+# 否则从仓库拉取。注意本脚本常以 `bash <(curl ...)` 方式运行，此时 BASH_SOURCE
+# 指向 /dev/fd/NN，不是真实文件，所以必须做存在性判断。
+awg_ensure_ctl() {
+    if [[ -x "$AWG_CTL_BIN" ]]; then
+        return 0
+    fi
+
+    local src="" dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || dir=""
+        if [[ -n "$dir" && -f "${dir}/awgctl.sh" ]]; then
+            src="${dir}/awgctl.sh"
+        fi
+    fi
+
+    local tmp=""
+    if [[ -z "$src" ]]; then
+        tmp="$(mktemp)"
+        if curl -fsSL --max-time 30 \
+             "https://raw.githubusercontent.com/${AWG_REPO}/main/awgctl.sh" -o "$tmp" 2>/dev/null; then
+            src="$tmp"
+        else
+            rm -f "$tmp"
+            log_err "无法获取 awgctl.sh（本地不存在，且从仓库下载失败）"
+            return 1
+        fi
+    fi
+
+    if ! install -m 0755 "$src" "$AWG_CTL_BIN"; then
+        if [[ -n "$tmp" ]]; then
+            rm -f "$tmp"
+        fi
+        log_err "安装 ${AWG_CTL_BIN} 失败"
+        return 1
+    fi
+    if [[ -n "$tmp" ]]; then
+        rm -f "$tmp"
+    fi
+    log_info "已安装 AmneziaWG 控制工具: ${AWG_CTL_BIN}"
+    return 0
+}
+
+# 推断客户端连接地址。
+# 自签证书模式下的 server_name 是伪装用的 SNI（如 www.bing.com），
+# 绝不能拿来当连接地址，必须回退到公网 IP。
+awg_suggest_endpoint() {
+    local sn="" ip="" insecure=""
+    if [[ -f "$HY2_META_FILE" ]]; then
+        sn="$(jq -r '.server_name // empty'  "$HY2_META_FILE" 2>/dev/null || true)"
+        ip="$(jq -r '.public_ip // empty'    "$HY2_META_FILE" 2>/dev/null || true)"
+        insecure="$(jq -r '.is_insecure // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -z "$ip" ]]; then
+        ip="${PUBLIC_IP:-}"
+    fi
+    if [[ "$insecure" == "true" ]]; then
+        echo "$ip"
+        return 0
+    fi
+    if [[ -n "$sn" && "$sn" != "$ip" && "$sn" != "www.bing.com" ]]; then
+        echo "$sn"
+    else
+        echo "$ip"
+    fi
+}
+
+# 读取当前已安装的协议线
+awg_current_line() {
+    local v="3"
+    if [[ -f "$AWG_META_FILE" ]]; then
+        v="$(jq -r '.line // "3"' "$AWG_META_FILE" 2>/dev/null || echo 3)"
+    fi
+    if [[ "$v" != "2" && "$v" != "3" ]]; then
+        v="3"
+    fi
+    echo "$v"
+}
+
+awg_is_installed() {
+    [[ -f "$AWG_CONFIG" && -x /usr/local/bin/amneziawg-go ]]
+}
+
+# ------------------------------------------------ 交互式安装
+install_amneziawg() {
+    check_root
+    check_arch
+    echo -e "\n${CYAN}------------------------------------------------------------${PLAIN}"
+    echo -e "${GREEN}AmneziaWG (AWG) 安装配置：${PLAIN}"
+    echo -e "${CYAN}------------------------------------------------------------${PLAIN}"
+    echo -e "AmneziaWG 是 WireGuard 的抗 DPI 分支：密码学内核不变，"
+    echo -e "只把数据包的头部、长度、时序特征随机化，让审查设备无法指纹识别。"
+    echo ""
+
+    if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        install_dependencies
+    fi
+    if ! awg_ensure_ctl; then
+        return 1
+    fi
+
+    local already="no"
+    if awg_is_installed; then
+        already="yes"
+        local cur
+        cur="$(awg_current_line)"
+        log_warn "检测到本机已安装 AmneziaWG（当前协议线 AWG ${cur}.x）。"
+        log_warn "重装会保留现有密钥与客户端列表；但如果更换协议线，"
+        log_warn "所有已发放的客户端配置都会失效，必须重新导出。"
+        echo ""
+    fi
+
+    # --- 协议线 ---
+    local def_line cur_line line_choice line
+    cur_line="$(awg_current_line)"
+    if [[ "$already" == "yes" ]]; then
+        def_line="$cur_line"
+    else
+        def_line="3"
+    fi
+    echo -e "请选择 AmneziaWG 协议线："
+    echo -e "  ${GREEN}1.${PLAIN} AWG 3.x  (最新：头部保护 + 时序随机化，抗连接行为分析)"
+    echo -e "  ${GREEN}2.${PLAIN} AWG 2.x  (生态验证更充分，参数体系稳定)"
+    if [[ "$def_line" == "2" ]]; then
+        read -rp "请输入选项 [1-2, 默认 2]: " line_choice
+        line_choice="${line_choice:-2}"
+    else
+        read -rp "请输入选项 [1-2, 默认 1]: " line_choice
+        line_choice="${line_choice:-1}"
+    fi
+    case "$line_choice" in
+        1|3) line="3" ;;
+        2)   line="2" ;;
+        *)   log_err "无效选项，已中止。"; return 1 ;;
+    esac
+
+    # --- 端口 ---
+    local port=""
+    echo ""
+    echo -e "${YELLOW}端口说明：${PLAIN}必须避开 Hysteria2 的端口跳跃区间 20000-40000，"
+    echo -e "          否则入站 UDP 会被 REDIRECT 到 Hysteria，AWG 收不到握手包。"
+    read -rp "请输入监听 UDP 端口 [回车自动选择 ${AWG_PORT_MIN}-${AWG_PORT_MAX} 内的空闲端口]: " port
+    port="${port// /}"
+    if [[ -n "$port" ]]; then
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
+            log_err "端口必须是 1-65535 的数字。"
+            return 1
+        fi
+        if [[ "$port" -ge 20000 && "$port" -le 40000 ]]; then
+            log_err "端口 ${port} 落在 Hysteria2 端口跳跃区间 20000-40000 内，会导致 AWG 无法收到握手包。"
+            log_err "请改用区间外的端口，推荐 ${AWG_PORT_MIN}-${AWG_PORT_MAX}。"
+            return 1
+        fi
+    fi
+
+    # --- 连接地址 ---
+    local endpoint suggestion
+    suggestion="$(awg_suggest_endpoint)"
+    if [[ -z "$suggestion" ]]; then
+        get_public_ip
+        suggestion="${PUBLIC_IP:-}"
+    fi
+    echo ""
+    echo -e "${YELLOW}连接地址用于生成客户端的 Endpoint，填域名或公网 IP 均可。${PLAIN}"
+    if [[ -n "$suggestion" ]]; then
+        read -rp "请输入客户端连接地址 [默认: ${suggestion}]: " endpoint
+        endpoint="${endpoint:-$suggestion}"
+    else
+        read -rp "请输入客户端连接地址（域名或公网 IP）: " endpoint
+    fi
+    if [[ -z "$endpoint" ]]; then
+        log_warn "未提供连接地址，将跳过首个客户端创建，之后可手动补。"
+    fi
+
+    # --- 首个客户端 ---
+    local client="client1"
+    if [[ -n "$endpoint" ]]; then
+        local has_peers="0"
+        if [[ -f "$AWG_PEERS_FILE" ]]; then
+            has_peers="$(jq -r '[.peers[]?]|length' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
+        fi
+        if [[ "$has_peers" == "0" ]]; then
+            echo ""
+            read -rp "请为首个客户端命名 [默认: client1]: " client
+            client="${client:-client1}"
+        fi
+    fi
+
+    # --- 执行 ---
+    echo ""
+    local args=(install --line "$line")
+    if [[ -n "$port" ]]; then
+        args+=(--port "$port")
+    fi
+    if [[ -n "$endpoint" ]]; then
+        args+=(--endpoint "$endpoint")
+    fi
+
+    # 已有客户端时不重复创建，避免报"客户端已存在"
+    local peer_count="0"
+    if [[ -f "$AWG_PEERS_FILE" ]]; then
+        peer_count="$(jq -r '[.peers[]?]|length' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
+    fi
+    if [[ "$peer_count" == "0" ]]; then
+        args+=(--client "$client")
+    fi
+
+    if ! "$AWG_CTL_BIN" "${args[@]}"; then
+        log_err "AmneziaWG 安装失败，请查看上方日志。"
+        return 1
+    fi
+
+    echo ""
+    log_info "云厂商安全组记得放行对应的 UDP 端口。"
+    log_info "客户端配置请用 'AmneziaWG 管理' 菜单导出（含二维码）。"
+    return 0
+}
+
+awg_menu_add_peer() {
+    check_root
+    if ! awg_ensure_ctl; then return 1; fi
+
+    local name endpoint suggestion
+    read -rp "请输入新客户端名称（字母/数字/._-）: " name
+    name="${name// /}"
+    if [[ -z "$name" ]]; then
+        log_err "名称不能为空。"
+        return 1
+    fi
+    if ! [[ "$name" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
+        log_err "名称只允许字母、数字、点、下划线、连字符，且不超过 32 字符。"
+        return 1
+    fi
+
+    suggestion="$(awg_suggest_endpoint)"
+    read -rp "客户端连接地址 [默认: ${suggestion:-需手动输入}]: " endpoint
+    endpoint="${endpoint:-$suggestion}"
+    if [[ -z "$endpoint" ]]; then
+        log_err "必须提供连接地址才能生成客户端配置。"
+        return 1
+    fi
+
+    echo ""
+    if ! "$AWG_CTL_BIN" peer-add "$name" --endpoint "$endpoint"; then
+        return 1
+    fi
+
+    echo ""
+    log_info "以下二维码可直接用 AmneziaWG 官方客户端扫描导入："
+    if command -v qrencode >/dev/null 2>&1; then
+        "$AWG_CTL_BIN" client-conf "$name" --endpoint "$endpoint" 2>/dev/null | qrencode -t ANSIUTF8 || true
+    else
+        log_warn "未安装 qrencode，跳过二维码。安装后可执行:"
+        log_warn "  hy2-awgctl qr ${name} --endpoint ${endpoint}"
+    fi
+    return 0
+}
+
+awg_menu_del_peer() {
+    check_root
+    if ! awg_ensure_ctl; then return 1; fi
+
+    echo ""
+    "$AWG_CTL_BIN" peer-list || true
+    echo ""
+    local name
+    read -rp "请输入要删除的客户端名称: " name
+    if [[ -z "$name" ]]; then
+        log_err "名称不能为空。"
+        return 1
+    fi
+
+    local confirm
+    read -rp "确认删除客户端 '${name}'？该客户端将立即断线 [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "已取消。"
+        return 0
+    fi
+    "$AWG_CTL_BIN" peer-del "$name"
+}
+
+awg_menu_switch_line() {
+    check_root
+    if ! awg_ensure_ctl; then return 1; fi
+    if ! awg_is_installed; then
+        log_err "AmneziaWG 尚未安装。"
+        return 1
+    fi
+
+    local cur target
+    cur="$(awg_current_line)"
+    if [[ "$cur" == "3" ]]; then
+        target="2"
+    else
+        target="3"
+    fi
+
+    echo ""
+    log_warn "当前协议线: AWG ${cur}.x  →  目标协议线: AWG ${target}.x"
+    log_warn "两个协议线的参数体系不同，切换会重新生成混淆参数，"
+    log_warn "所有已发放的客户端配置都会立刻失效，必须全部重新导出！"
+    echo ""
+    local confirm
+    read -rp "确认切换协议线？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "已取消。"
+        return 0
+    fi
+
+    if ! "$AWG_CTL_BIN" update --line "$target"; then
+        return 1
+    fi
+    echo ""
+    log_warn "请立即为所有客户端重新导出配置："
+    "$AWG_CTL_BIN" peer-list || true
+}
+
+uninstall_amneziawg() {
+    check_root
+    if ! awg_ensure_ctl; then return 1; fi
+
+    echo ""
+    log_warn "即将彻底卸载 AmneziaWG：停止服务、删除网卡与 NAT 规则、"
+    log_warn "删除全部密钥与客户端配置（不可恢复）。"
+    local confirm
+    read -rp "确认卸载？[y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        log_info "已取消。"
+        return 0
+    fi
+
+    "$AWG_CTL_BIN" uninstall || true
+    rm -f "$AWG_CTL_BIN"
+    log_info "AmneziaWG 已卸载，控制工具也已移除。"
+    return 0
+}
+
+status_amneziawg() {
+    if ! awg_ensure_ctl; then
+        return 1
+    fi
+    "$AWG_CTL_BIN" status
+}
+
+update_amneziawg() {
+    check_root
+    check_arch
+    if ! awg_ensure_ctl; then return 1; fi
+    "$AWG_CTL_BIN" update
+}
+
+# ------------------------------------------------ AmneziaWG 子菜单
+menu_amneziawg() {
+    check_root
+    if ! awg_ensure_ctl; then
+        log_err "AmneziaWG 控制工具不可用，请检查网络后重试。"
+        return 1
+    fi
+
+    local sub
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}================================================================${PLAIN}"
+        echo -e "${GREEN}                    AmneziaWG 管理控制台                          ${PLAIN}"
+        echo -e "${BLUE}       GitHub: https://github.com/${AWG_REPO}    ${PLAIN}"
+        echo -e "${CYAN}================================================================${PLAIN}"
+        "$AWG_CTL_BIN" status 2>/dev/null | sed 's/^/  /' || true
+        echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
+        echo -e "  ${GREEN}1.${PLAIN} 安装 / 重装 AmneziaWG"
+        echo -e "  ${GREEN}2.${PLAIN} 新增客户端并导出配置"
+        echo -e "  ${GREEN}3.${PLAIN} 查看所有客户端"
+        echo -e "  ${GREEN}4.${PLAIN} 删除客户端"
+        echo -e "  ${GREEN}5.${PLAIN} 更新二进制到最新版"
+        echo -e "  ${GREEN}6.${PLAIN} 切换协议线 (AWG 2.x <-> 3.x)"
+        echo -e "  ${GREEN}7.${PLAIN} 重新同步配置并重启服务"
+        echo -e "  ${GREEN}8.${PLAIN} 卸载 AmneziaWG"
+        echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
+        echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
+        echo -e "${CYAN}================================================================${PLAIN}"
+        read -rp "请输入选项 [0-8]: " sub
+
+        case "$sub" in
+            1) install_amneziawg || true ;;
+            2) awg_menu_add_peer || true ;;
+            3) echo ""; "$AWG_CTL_BIN" peer-list || true ;;
+            4) awg_menu_del_peer || true ;;
+            5)
+                if awg_is_installed; then
+                    update_amneziawg || true
+                else
+                    log_err "AmneziaWG 尚未安装。"
+                fi
+                ;;
+            6) awg_menu_switch_line || true ;;
+            7)
+                if awg_is_installed; then
+                    "$AWG_CTL_BIN" resync || true
+                else
+                    log_err "AmneziaWG 尚未安装。"
+                fi
+                ;;
+            8)
+                if awg_is_installed; then
+                    uninstall_amneziawg || true
+                else
+                    log_err "AmneziaWG 尚未安装。"
+                fi
+                ;;
+            0) return 0 ;;
+            *) log_err "无效选项，请重新选择！" ;;
+        esac
+
+        echo ""
+        read -rp "按回车返回 AmneziaWG 菜单..." _
+    done
+}
+
 status_service() {
     if [[ ! -f "$HY2_BIN" ]]; then
         log_err "Hysteria 2 未安装！"
@@ -5232,6 +6233,15 @@ view_logs() {
 }
 
 uninstall_all() {
+    # AmneziaWG 是独立协议，单独询问再删 —— 避免"卸载 Hysteria 2"顺带删掉
+    # 用户并不想删的客户端配置。
+    local awg_confirm="N"
+    if [[ -f "$AWG_SERVICE" || -f "$AWG_CONFIG" ]]; then
+        echo ""
+        log_warn "检测到本机还安装了 AmneziaWG。"
+        read -rp "是否也要一并卸载 AmneziaWG（含全部客户端配置）？[y/N]: " awg_confirm
+    fi
+
     read -rp "确定要彻底卸载 Hysteria 2 服务及所有配置文件吗？[y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         log_step "正在停止并删除系统服务..."
@@ -5261,6 +6271,25 @@ uninstall_all() {
         rm -rf "$HY2_DIR"
         rm -rf /etc/wireguard
 
+        # AmneziaWG 清理（按上面的确认结果决定）
+        if [[ "$awg_confirm" =~ ^[Yy]$ ]]; then
+            log_step "正在卸载 AmneziaWG..."
+            awg_ensure_ctl 2>/dev/null || true
+            if [[ -x "$AWG_CTL_BIN" ]]; then
+                "$AWG_CTL_BIN" uninstall >/dev/null 2>&1 || true
+                rm -f "$AWG_CTL_BIN"
+            else
+                # 控制工具不可用时的兜底清理，保证不留下半截状态
+                systemctl disable --now amneziawg-server 2>/dev/null || true
+                rm -f "$AWG_SERVICE"
+                rm -rf "$AWG_DIR"
+                systemctl daemon-reload 2>/dev/null || true
+            fi
+            log_info "AmneziaWG 已卸载。"
+        elif [[ -f "$AWG_CONFIG" ]]; then
+            log_info "已保留 AmneziaWG（如需卸载：主菜单选 8，或执行 hy2-awgctl uninstall）。"
+        fi
+
         log_info "Hysteria 2 已彻底卸载完成！"
     else
         log_info "已取消卸载。"
@@ -5282,6 +6311,16 @@ menu() {
     else
         echo -e "核心状态: ${YELLOW}未安装 (Not Installed)${PLAIN}"
     fi
+    # AmneziaWG 状态：仅在本机装了 AWG 时显示，避免干扰原有主流程
+    if [[ -f "$AWG_CONFIG" ]]; then
+        local _awg_port
+        _awg_port="$(jq -r '.port // "?"' "$AWG_META_FILE" 2>/dev/null || echo '?')"
+        if systemctl is-active --quiet amneziawg-server 2>/dev/null; then
+            echo -e "AWG 状态 : ${GREEN}运行中${PLAIN} | 协议线: AWG $(awg_current_line).x | UDP ${_awg_port}"
+        else
+            echo -e "AWG 状态 : ${YELLOW}已安装但未运行${PLAIN} | 协议线: AWG $(awg_current_line).x"
+        fi
+    fi
     echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
     echo -e "  ${GREEN}1.${PLAIN} 全新安装 Hysteria 2"
     echo -e "  ${GREEN}2.${PLAIN} 更新 Hysteria 2 核心至最新版"
@@ -5290,14 +6329,17 @@ menu() {
     echo -e "  ${GREEN}5.${PLAIN} 一键安装并配置 Cloudflare WARP 出口 (AI解锁)"
     echo -e "  ${GREEN}6.${PLAIN} 一键安装 gost 入站代理引擎 (SOCKS5/HTTP/HTTPS)"
     echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
-    echo -e "  ${GREEN}7.${PLAIN} 启动服务"
-    echo -e "  ${GREEN}8.${PLAIN} 停止服务"
-    echo -e "  ${GREEN}9.${PLAIN} 重启服务"
-    echo -e "  ${GREEN}10.${PLAIN} 查看实时运行日志"
-    echo -e "  ${GREEN}11.${PLAIN} 彻底卸载 Hysteria 2"
+    echo -e "  ${GREEN}7.${PLAIN} 一键安装 AmneziaWG (抗 DPI · 用户态 WireGuard)"
+    echo -e "  ${GREEN}8.${PLAIN} AmneziaWG 管理 (客户端 / 版本切换 / 更新 / 卸载)"
+    echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
+    echo -e "  ${GREEN}9.${PLAIN} 启动服务"
+    echo -e "  ${GREEN}10.${PLAIN} 停止服务"
+    echo -e "  ${GREEN}11.${PLAIN} 重启服务"
+    echo -e "  ${GREEN}12.${PLAIN} 查看实时运行日志"
+    echo -e "  ${GREEN}13.${PLAIN} 彻底卸载 Hysteria 2"
     echo -e "  ${GREEN}0.${PLAIN} 退出脚本"
     echo -e "${CYAN}================================================================${PLAIN}"
-    read -rp "请输入选项 [0-11]: " choice
+    read -rp "请输入选项 [0-13]: " choice
 
     case "$choice" in
         1)
@@ -5342,18 +6384,28 @@ menu() {
             install_gost
             ;;
         7)
-            start_service
+            # AmneziaWG 安装入口。用 || true 兜住失败，避免 set -e 把整个菜单打断，
+            # 让用户能看到报错后返回菜单重试。
+            install_amneziawg || true
+            echo ""
+            read -rp "按回车返回主菜单..." _
             ;;
         8)
-            stop_service
+            menu_amneziawg || true
             ;;
         9)
-            restart_service
+            start_service
             ;;
         10)
-            view_logs
+            stop_service
             ;;
         11)
+            restart_service
+            ;;
+        12)
+            view_logs
+            ;;
+        13)
             check_root
             uninstall_all
             ;;
@@ -5403,6 +6455,37 @@ if [[ $# -gt 0 ]]; then
             ;;
         uninstall)
             uninstall_all
+            ;;
+        # ---- AmneziaWG (AWG) ----
+        # 带参数时直接透传给底层工具，可完全非交互：
+        #   ./install.sh awg-install --line 3 --endpoint vpn.example.com --client phone
+        awg-install)
+            check_root
+            check_arch
+            awg_ensure_ctl || exit 1
+            shift
+            if [[ $# -gt 0 ]]; then
+                exec "$AWG_CTL_BIN" install "$@"
+            fi
+            install_amneziawg
+            ;;
+        awg-menu)
+            menu_amneziawg
+            ;;
+        awg-status)
+            status_amneziawg
+            ;;
+        awg-update)
+            update_amneziawg
+            ;;
+        awg-uninstall)
+            uninstall_amneziawg
+            ;;
+        awg)
+            # 任意底层命令透传，例如: ./install.sh awg peer-list --json
+            awg_ensure_ctl || exit 1
+            shift
+            exec "$AWG_CTL_BIN" "$@"
             ;;
         *)
             menu
