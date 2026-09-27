@@ -1,0 +1,270 @@
+name: Build AmneziaWG binaries
+
+# 为 hysteria2-installer 自建 AmneziaWG 二进制。
+#
+# 为什么自建而不是用官方产物：
+#   1. amneziawg-go 官方只发布 Docker 镜像（amneziavpn/amneziawg-go），没有独立二进制；
+#   2. amneziawg-tools 官方只发布 ubuntu-22.04 / alpine-3.19 两个包，没有通用 Linux 包；
+#   3. 本项目坚持"下载静态二进制 + systemd"的部署模型，不引入 Docker、不在服务器上编译。
+#
+# 产物：Release `awg-binaries` 下的
+#   amneziawg-linux-<arch>-awg<2|3>.tar.gz
+# 内含：amneziawg-go（数据面）、awg（CLI）、awg-quick（启动脚本）、VERSION
+
+on:
+  workflow_dispatch:
+    inputs:
+      go_tag_2:
+        description: 'AWG 2.x 对应的 amneziawg-go tag'
+        required: false
+        default: 'v0.2.19'
+      go_tag_3:
+        description: 'AWG 3.x 对应的 amneziawg-go tag'
+        required: false
+        default: 'v3.1.20260828'
+      tools_tag:
+        description: 'amneziawg-tools tag'
+        required: false
+        default: 'v3.1.20260812'
+      publish:
+        description: '构建完成后发布到 Release'
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'awg-v*'
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: awg-binaries
+  # 默认值；workflow_dispatch 时由 inputs 覆盖
+  AWG_GO_TAG_2: ${{ github.event.inputs.go_tag_2 || 'v0.2.19' }}
+  AWG_GO_TAG_3: ${{ github.event.inputs.go_tag_3 || 'v3.1.20260828' }}
+  AWG_TOOLS_TAG: ${{ github.event.inputs.tools_tag || 'v3.1.20260812' }}
+
+jobs:
+  # ---------------------------------------------------------------- 数据面（Go）
+  go:
+    name: amneziawg-go · awg${{ matrix.line }} · ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        line: ['2', '3']
+        arch: [amd64, arm64, armv7]
+    steps:
+      - name: 解析目标 tag 与 GOARCH
+        id: meta
+        run: |
+          set -euo pipefail
+          case "${{ matrix.line }}" in
+            2) TAG="${{ env.AWG_GO_TAG_2 }}" ;;
+            3) TAG="${{ env.AWG_GO_TAG_3 }}" ;;
+            *) echo "未知协议版本线: ${{ matrix.line }}"; exit 1 ;;
+          esac
+          case "${{ matrix.arch }}" in
+            amd64) GOARCH=amd64; GOARM="" ;;
+            arm64) GOARCH=arm64; GOARM="" ;;
+            armv7) GOARCH=arm;   GOARM="7" ;;
+            *) echo "未知架构: ${{ matrix.arch }}"; exit 1 ;;
+          esac
+          echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
+          echo "goarch=$GOARCH" >> "$GITHUB_OUTPUT"
+          echo "goarm=$GOARM"   >> "$GITHUB_OUTPUT"
+          echo "目标: amneziawg-go $TAG → $GOARCH${GOARM:+ GOARM=$GOARM}"
+
+      - name: 检出 amneziawg-go
+        uses: actions/checkout@v4
+        with:
+          repository: amnezia-vpn/amneziawg-go
+          ref: ${{ steps.meta.outputs.tag }}
+          path: src
+          fetch-depth: 1
+
+      - name: 安装 Go（版本取自 go.mod）
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
+
+      - name: 写入版本号
+        working-directory: src
+        run: |
+          set -euo pipefail
+          # 上游 Makefile 用 git describe 生成 version.go，这里显式写入以避免 CI 中
+          # fetch-depth=1 导致 describe 取不到 tag 而把版本号写成占位值。
+          printf 'package main\n\nconst Version = "%s"\n' \
+            "${{ steps.meta.outputs.tag }}" > version.go
+          cat version.go
+
+      - name: 编译（静态链接，CGO 关闭）
+        working-directory: src
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ steps.meta.outputs.goarch }}
+          GOARM: ${{ steps.meta.outputs.goarm }}
+        run: |
+          set -euo pipefail
+          # 注意：version.go 里 Version 是 const，不能再用 -X 覆盖，
+          # 所以上一步直接改写 version.go 才是唯一的版本注入点。
+          go build -trimpath -ldflags "-s -w" -o amneziawg-go .
+          file amneziawg-go
+          # 确认是静态链接（无动态解释器）——这是跨发行版可用的前提
+          if readelf -l amneziawg-go 2>/dev/null | grep -q 'INTERP'; then
+            echo "::warning::amneziawg-go 不是静态链接，可能存在 glibc 版本依赖"
+          fi
+          ./amneziawg-go --version 2>&1 | head -3 || true
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-${{ matrix.line }}-${{ matrix.arch }}
+          path: src/amneziawg-go
+          if-no-files-found: error
+          retention-days: 7
+
+  # ------------------------------------------------------------ 工具链（C）
+  tools:
+    name: amneziawg-tools · ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64, armv7]
+    steps:
+      - name: 检出 amneziawg-tools
+        uses: actions/checkout@v4
+        with:
+          repository: amnezia-vpn/amneziawg-tools
+          ref: ${{ env.AWG_TOOLS_TAG }}
+          path: src
+          fetch-depth: 1
+
+      - name: 安装交叉编译工具链
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential
+          case "${{ matrix.arch }}" in
+            amd64) echo "使用本机 gcc" ;;
+            arm64) sudo apt-get install -y -qq gcc-aarch64-linux-gnu ;;
+            armv7) sudo apt-get install -y -qq gcc-arm-linux-gnueabihf ;;
+          esac
+
+      - name: 编译 awg
+        working-directory: src/src
+        run: |
+          set -euo pipefail
+          case "${{ matrix.arch }}" in
+            amd64) CC=gcc ;;
+            arm64) CC=aarch64-linux-gnu-gcc ;;
+            armv7) CC=arm-linux-gnueabihf-gcc ;;
+          esac
+          # -static 是为了消除 glibc 版本依赖：CI 跑在较新的 Ubuntu 上，
+          # 动态链接产物在 Debian 12（glibc 2.36）上会因版本不足无法运行。
+          # 万一 -static 链接失败则回退为动态链接，避免整条流水线中断。
+          if make -j"$(nproc)" CC="$CC" LDFLAGS=-static; then
+            echo "静态链接成功"
+          else
+            echo "::warning::静态链接失败，回退为动态链接（将依赖目标机 glibc 版本）"
+            make clean >/dev/null 2>&1 || true
+            make -j"$(nproc)" CC="$CC"
+          fi
+          ls -la wg
+          file wg
+
+      - name: 整理产物（awg + awg-quick）
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          install -m 0755 src/wg out/awg
+          install -m 0755 src/wg-quick/linux.bash out/awg-quick
+          # 校验两个可执行文件确实可用
+          out/awg --version || true
+          bash -n out/awg-quick
+          ls -la out/
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: tools-${{ matrix.arch }}
+          path: src/out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ------------------------------------------------------------------ 打包发布
+  release:
+    name: 打包并发布
+    needs: [go, tools]
+    runs-on: ubuntu-latest
+    # push 触发必定发布；手动触发时遵循 publish 开关（默认 true）
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+    steps:
+      - name: 检出本仓库（取 CHANGELOG 说明用）
+        uses: actions/checkout@v4
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 组装 per-架构 tarball
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64 armv7; do
+            for line in 2 3; do
+              stage="build/${arch}-awg${line}"
+              mkdir -p "$stage"
+              install -m 0755 "artifacts/go-${line}-${arch}/amneziawg-go" "$stage/amneziawg-go"
+              install -m 0755 "artifacts/tools-${arch}/awg"             "$stage/awg"
+              install -m 0755 "artifacts/tools-${arch}/awg-quick"       "$stage/awg-quick"
+              {
+                echo "protocol_line=awg${line}"
+                echo "arch=${arch}"
+                if [[ "$line" == "2" ]]; then echo "amneziawg-go=${{ env.AWG_GO_TAG_2 }}"; else echo "amneziawg-go=${{ env.AWG_GO_TAG_3 }}"; fi
+                echo "amneziawg-tools=${{ env.AWG_TOOLS_TAG }}"
+                echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                echo "commit=${{ github.sha }}"
+              } > "$stage/VERSION"
+              tar -czf "dist/amneziawg-linux-${arch}-awg${line}.tar.gz" -C "$stage" .
+            done
+          done
+          cd dist && sha256sum ./*.tar.gz | tee SHA256SUMS
+          echo "--- 产物清单 ---"; ls -la
+
+      - name: 发布到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES_FILE="$(mktemp)"
+          cat > "$NOTES_FILE" <<'EOF'
+          hysteria2-installer 自建的 AmneziaWG 静态二进制。
+
+          | 文件 | 协议版本 | 数据面 tag |
+          |---|---|---|
+          | `amneziawg-linux-<arch>-awg2.tar.gz` | AmneziaWG 2.x | 见包内 VERSION |
+          | `amneziawg-linux-<arch>-awg3.tar.gz` | AmneziaWG 3.x | 见包内 VERSION |
+
+          架构：`amd64` / `arm64` / `armv7`。每个包内含 `amneziawg-go`、`awg`、`awg-quick`。
+          全部为静态链接，无 glibc 版本依赖。
+
+          由 `.github/workflows/build-awg.yml` 自动构建，请勿手动修改本 Release 的标签。
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG 已存在，覆盖资产"
+            gh release upload "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              --title "AmneziaWG prebuilt binaries" \
+              --notes-file "$NOTES_FILE" \
+              dist/*.tar.gz dist/SHA256SUMS
+          fi
+          rm -f "$NOTES_FILE"
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name'
