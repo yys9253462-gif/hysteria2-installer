@@ -2,6 +2,32 @@
 
 ## 未发布
 
+### 新增：AmneziaWG (AWG) 抗 DPI 协议支持
+- **一键部署 WireGuard 的抗审查分支**。密钥与加密内核完全沿用 WireGuard（Curve25519 / ChaCha20-Poly1305 / BLAKE2s / Noise_IK），只把数据包的头部、长度与时序特征随机化，使 DPI 无法按固定签名识别。
+- **走用户态部署，不碰内核、不引入 Docker、不在服务器上编译**：
+  - 上游 `amneziawg-go` 官方**只发布 Docker 镜像**（无独立二进制），`amneziawg-tools` 官方只发布 `ubuntu-22.04` / `alpine-3.19` 两个包（无通用 Linux 包）；
+  - 因此新增 `.github/workflows/build-awg.yml`，用 GitHub Actions 交叉编译 **amd64 / arm64 / armv7** 三个架构、并以 **`-static` 全静态链接**（消除 glibc 版本依赖，CI 跑在较新 Ubuntu 上、动态链接产物在 Debian 12 上会因 glibc 版本不足无法运行），产物发布到 Release 标签 `awg-binaries`；
+  - `install.sh` 侧只做"下载静态二进制 + systemd"，与本项目既有扩展（WARP / gost）完全同构。
+- **新增 `awgctl.sh`（安装为 `/usr/local/bin/hy2-awgctl`）**：把 AWG 的安装、配置生成、客户端管理全部收敛到一个文件，命令行菜单与 Web 门户都只做调用，**杜绝两份配置生成逻辑漂移**（考虑到 `S1`-`S4`/`H1`-`H4` 必须两端逐字节一致，重复实现的风险不可接受）。
+- **双协议线可切换**：AWG 3.x（`amneziawg-go` `v3.1.20260828`，含 `HeaderProtectionKey` / 时序随机化 / 随机包尾）与 AWG 2.x（`v0.2.19`）。切换会重新生成混淆参数并明确提示"所有客户端配置将失效"。
+- **端口安全**：Hysteria 2 的端口跳跃会装上 `udp --dport 20000:40000 -j REDIRECT`，落在该区间的 AWG 端口**收不到任何握手包**。因此默认从 **50000-59000** 选空闲端口，并在命令行与 Web 两处都硬拦截 20000-40000；同时避开 `51820`（WireGuard 默认端口本身是弱指纹）。
+- **参数生成遵循上游全部硬约束**：`Jc` 4~12、`Jmin`/`Jmax` = 8/80、`S1`/`S2`/`S3` 15~150 且 `S1+56 ≠ S2`、`S4` 3.x 时 ≥12（头部保护要求）、`H1`~`H4` 用**四分带取值**天然满足"范围不得重叠"。
+- **`MTU` 自动扣减 `S4`**（`1420 - S4`）：`S4` 是每个 Data 包的随机填充，不扣掉外层会分片。
+- **Web 控制台接入**："入站代理与 WARP 扩展服务"页面新增 AmneziaWG 卡片 —— 状态徽章、协议线选择、一键安装、客户端增删、`.conf` 下载、二维码、切换协议线、更新二进制。
+- **客户端私钥绝不下发前端**：`awg-state` 只回传 `name` / `address` / `created_at`。
+- **卸载不牵连**：`uninstall_all()` 对 AmneziaWG 单独询问，避免"卸载 Hysteria 2"顺带删掉用户还想保留的客户端配置。
+
+### 修复（由本次新增的测试发现）
+- **门户 `awg-conf` / `awg-qr.svg` 路由完全失效**：门户里 `subpath` 是**含查询串**的（上游就是这样切分的），原先用 `subpath in ('awg-conf', 'awg-qr.svg')` 比对，带 `?name=` 的请求永远匹配不上、会静默落到 404。改为先剥掉 `?query` 再比对。
+- **协议线空值误判**：原先写成 `(value or '3').strip()`，纯空格能通过 `or` 判定、再被 `strip()` 成空串，导致误报"协议线非法"。改为先去空白再取默认。
+- **`manage-amneziawg` 未知动作报错误导**：原先先检查安装状态再校验动作名，未安装时会返回"尚未安装"而不是"未知操作"，排障容易被带偏。已调整为先校验动作名。
+
+### 测试
+- 新增 `.github/workflows/tests.yml`：在 push / PR 时校验三份 shell 脚本语法、**强制校验 `install.sh` 内嵌的 `portal.py` 副本与 `portal.py` 逐字节一致**（这条不变量极易悄悄退化，本次开发中就差一点把门户改动丢掉），并跑完整测试套件。
+- 新增 `tests/test_awgctl.sh`（纯逻辑，无需 root，可跨平台运行）：覆盖混淆参数的**全部上游硬约束**、端口跳跃区间避让、**服务端与客户端配置的 11 个参数逐字节一致性**、peer 生命周期与地址回收、meta 读写、随机数边界、命令行参数解析。做了反向验证（故意注入 `H2=H1` 与"客户端 S1 不一致"两个缺陷，确认测试能抓到）。
+- 新增 `tests/test_portal_awg.py`：页面渲染（含 **f-string 无残留占位符** 回归检查）、**CSP `sha256` 白名单跟随 `SCRIPT` 变化**、端点鉴权、路径穿越与非法名称拦截、端口区间拦截、**私钥不泄露**、`awg-conf` 路由可达性。
+- 迭代轮数可用 `AWG_TEST_ROUNDS` 调整（CI/Linux 默认 1500；Windows 上每次 `awg_rand` 都要起 `od` 子进程，建议调低）。
+
 ### WARP 实现统一 (wgcf + wireproxy)
 - **统一出口实现为 `wgcf` + `wireproxy`（socks5 `127.0.0.1:19898`）**，彻底废弃官方 `cloudflare-warp` / `warp-cli` / `warp-svc`（`127.0.0.1:40000`）那套 —— 原方案在 Debian 12 / bookworm 上因 apt keyring 解析缺陷永远装不上。此前「命令行主菜单装一套新版、Web 控制台却装另一套旧版」的分裂已全部对齐：
   - `install.sh`：config 模板默认 outbound、主菜单第 5 项 `install_warp_local_proxy()`、`toggle_warp.sh` 的出口探活；
