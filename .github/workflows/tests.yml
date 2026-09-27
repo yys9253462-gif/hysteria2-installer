@@ -1,0 +1,62 @@
+name: Tests
+
+# 守住几条容易悄悄退化的不变量：
+#   1. install.sh 里内嵌的 portal.py 副本必须与 portal.py 逐字节一致
+#      （tests/test_portal.py 已有断言；不一致会导致"终端重配时覆盖降级"）
+#   2. AmneziaWG 混淆参数必须始终满足上游硬约束，且服务端/客户端配置逐字节一致
+#   3. portal.py 改过 SCRIPT 之后 CSP 的 sha256 白名单必须自动跟上
+#   4. 三份 shell 脚本的语法
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-and-portal:
+    name: 语法 / AWG 逻辑 / 门户
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 确保 shell 可执行位
+        run: chmod +x install.sh awgctl.sh tests/test_awgctl.sh
+
+      - name: 安装依赖（jq / qrencode 是测试与门户的硬依赖）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq qrencode
+
+      - name: Shell 语法校验
+        run: |
+          bash -n install.sh
+          bash -n awgctl.sh
+          bash -n tests/test_awgctl.sh
+          bash -n fix_cert_chain.sh
+
+      - name: 校验 install.sh 内嵌的 portal.py 副本已同步
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          script = Path('install.sh').read_text(encoding='utf-8')
+          if "<<'PYPORTAL'\n" not in script:
+              sys.exit('install.sh 中找不到 PYPORTAL heredoc')
+          embedded = script.split("<<'PYPORTAL'\n", 1)[1].split('\nPYPORTAL', 1)[0]
+          live = Path('portal.py').read_text(encoding='utf-8')
+          if embedded.strip() != live.strip():
+              sys.exit('install.sh 内嵌的 portal.py 副本与 portal.py 不一致！\n'
+                       '请把 portal.py 的完整内容同步进 install.sh 的 PYPORTAL heredoc。')
+          print('内嵌副本一致，长度', len(live.strip()))
+          PY
+
+      - name: AmneziaWG 纯逻辑测试
+        run: bash tests/test_awgctl.sh
+
+      - name: Python 测试套件
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
