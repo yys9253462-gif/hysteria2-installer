@@ -1180,46 +1180,38 @@ def get_cert_pin_sha256(root_path):
         return ''
 
 
+_REALITY_DATA = None
+
 def reality_uuid_for_user(user_id):
-    """为某个 Hy2 用户派生**稳定**的 VLESS UUID。
-
-    为什么用派生而不是随机（2026-10-03）：
-    随机 UUID 的话，「开户 → 销户 → 再开户」每次都要改 xray.json，
-    而且**同一用户每次拉订阅拿到的 Reality 链接都会变** ——
-    客户端会当成新节点，旧的配置失效。
-
-    派生（uuid5）让「同一个 user_id 永远得到同一个 UUID」，
-    于是：
-      * 订阅可以重复拉取，链接稳定；
-      * 销户时只要从 clients 里删掉对应 id 即可；
-      * 再开户同 user_id 时链接与之前一致（幂等）。
-
-    命名空间固定为 URL —— 换 namespace 会让已发出去的链接全部失效。
-    """
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'hy2-portal-reality:' + str(user_id)))
+    """Read a persisted credential. Never derive credentials from a public ID."""
+    if _REALITY_DATA is None:
+        raise RuntimeError('Reality registry not initialized')
+    reg = reality_registry(_REALITY_DATA)
+    value = reg.get(str(user_id))
+    if not value:
+        raise ValueError('Unknown Reality user')
+    return value
 
 
 def reality_registry(data):
-    """从 portal.json 的 data 里取出「user_id → UUID」的 Reality 账号表。
-
-    存在 data['reality_users'] 里；首次调用时按现有 users 回填
-    （保证升级后老用户也有 UUID，不需要重新开户）。
-    """
+    """One-time compatible migration; new users receive persistent random UUIDs."""
+    global _REALITY_DATA
     reg = data.get('reality_users')
     if not isinstance(reg, dict):
         reg = {}
-    changed = False
-    for uid in list(data.get('users', {}).keys()):
+    legacy = data.get('reality_uuid_version') != 2
+    users = data.get('users', {}) or {}
+    for uid in users:
         if uid not in reg:
-            reg[uid] = reality_uuid_for_user(uid)
-            changed = True
-    # 清理已不存在用户的条目 —— 避免 xray clients 无限增长
-    for uid in list(reg.keys()):
-        if uid not in data.get('users', {}):
+            # Existing issued identities must survive the upgrade unchanged.
+            reg[uid] = (str(uuid.uuid5(uuid.NAMESPACE_URL, 'hy2-portal-reality:' + str(uid)))
+                        if legacy else str(uuid.uuid4()))
+    for uid in list(reg):
+        if uid not in users:
             del reg[uid]
-            changed = True
-    if changed:
-        data['reality_users'] = reg
+    data['reality_users'] = reg
+    data['reality_uuid_version'] = 2
+    _REALITY_DATA = data
     return reg
 
 
@@ -1233,7 +1225,8 @@ def reality_clients(data):
     """
     reg = reality_registry(data)
     clients = [{'id': uid_uuid, 'flow': 'xtls-rprx-vision', 'email': uid}
-               for uid, uid_uuid in sorted(reg.items())]
+               for uid, uid_uuid in sorted(reg.items())
+               if (data.get('users', {}).get(uid) or {}).get('status', 'active') == 'active']
     if not clients:
         clients = [{'id': str(uuid.uuid4()), 'flow': 'xtls-rprx-vision',
                     'email': 'placeholder'}]
@@ -1437,7 +1430,7 @@ def prepare(meta_path, port, node_api_key=None):
 
     data = dict(port=int(port), token=token, auth_hash=hashlib.sha256(auth).hexdigest(),
                 session_secret=session_secret, api_key=api_key, users=users,
-                proxy_services=[], page=page, qr=qr.decode(), clash=clash, sing=sing)
+                proxy_services=[], page=page, qr=qr.decode(), clash=clash, sing=sing, reality_uuid_version=2)
     for filename, value in [('portal.json', data), ('portal-access.json', portal_access_payload(base, user, password, api_key))]:
         path = root / filename
         path.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
@@ -1524,6 +1517,10 @@ def serve(path):
                                          encoding='utf-8')
                     disk_temp.chmod(0o600)
                     disk_temp.replace(disk_path)
+
+    # Persist legacy identities before serving requests; new users are random.
+    reality_registry(data)
+    save_data()
 
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
