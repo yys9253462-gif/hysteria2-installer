@@ -1180,39 +1180,123 @@ def get_cert_pin_sha256(root_path):
         return ''
 
 
-_REALITY_DATA = None
+# 当前运行实例的 portal.json 字典。仅在 serve() 启动时登记，
+# 供省略 data 参数的旧调用形式使用（见 reality_uuid_for_user）。
+_active_reality_data = None
 
-def reality_uuid_for_user(user_id):
-    """Read a persisted credential. Never derive credentials from a public ID."""
-    if _REALITY_DATA is None:
+
+REALITY_UUID_VERSION = 2
+
+# 「已注销」的凭据保留时限（秒）。
+#
+# 为什么不立刻删：销户后如果马上清掉条目，同一个 user_id 再开户就会拿到
+# **另一个** UUID —— 客户端手里的旧配置失效，且订阅重新拉取会多出一个节点。
+# 旧实现靠 uuid5 派生天然幂等；改成随机 UUID 后必须显式保留一段时间才能等价。
+#
+# 保留窗口内该身份**已经不在 xray 的 clients 里**（reality_clients 只输出
+# data['users'] 中现存且 active 的用户），所以「钱退了货还在」不成立 ——
+# 这里留的只是凭据本身，不是访问权。
+REALITY_RETIRED_TTL_SECONDS = 30 * 86400
+
+
+def reality_uuid_for_user(user_id, data=None):
+    """取某个用户的 VLESS-Reality 凭据（UUID）。
+
+    凭据**只从持久化的注册表读取**，绝不从 user_id 派生 ——
+    user_id 是公开的（出现在订阅链接、客服记录、订单号里），
+    由它派生等于「知道 user_id 就能算出别人的凭据」。
+
+    凭据不存在时**当场生成并写回 data**（而不是抛错）——
+    调用方有 serve() 里带锁的、也有测试/工具里直接调函数的，
+    让本函数自身自足，就不会再出现「忘了先初始化某个全局」的耦合。
+
+    data 省略时回退到 _active_reality_data —— 那是 serve() 里登记的
+    **当前运行实例**的 portal.json 字典，仅为兼容旧的调用形式；
+    显式传 data 永远是首选。
+    """
+    owner = data if data is not None else _active_reality_data
+    if owner is None:
         raise RuntimeError('Reality registry not initialized')
-    reg = reality_registry(_REALITY_DATA)
-    value = reg.get(str(user_id))
+    reg = reality_registry(owner)
+    key = str(user_id)
+    value = reg.get(key)
     if not value:
-        raise ValueError('Unknown Reality user')
+        value = str(uuid.uuid4())
+        reg[key] = value
+        owner['reality_users'] = reg
+        # ⚠️ 本函数**不负责落盘** —— save_data() 是 serve() 里的闭包，
+        #    模块级函数够不到它。所有可能新增凭据的调用点
+        #    （users/create、_generate_and_apply_reality、serve 启动）
+        #    都必须自己调 save_data()，否则重启后随机凭据丢失、
+        #    客户手里的 Reality 链接会失效。
     return value
 
 
 def reality_registry(data):
-    """One-time compatible migration; new users receive persistent random UUIDs."""
-    global _REALITY_DATA
+    """维护 data['reality_users']：user_id → UUID 的凭据注册表。
+
+    两条路径必须分清，混在一起就是 bug：
+
+      * **升级迁移**（reality_uuid_version < 2，只跑一次）：
+        老节点的用户从来没有注册表，凭据一直是 uuid5 派生的 ——
+        必须**原样补回派生值**，否则所有已发出的链接在升级瞬间全部失效。
+      * **新增用户**（版本已是 2）：发一个**随机** UUIDv4 并持久化，
+        此后永远读注册表，不再派生。
+
+    已注销用户的条目**保留** REALITY_RETIRED_TTL_SECONDS，
+    这样销户→重开户能拿回同一个 UUID（幂等），超期才真正回收。
+    """
+    global _active_reality_data
     reg = data.get('reality_users')
     if not isinstance(reg, dict):
         reg = {}
-    legacy = data.get('reality_uuid_version') != 2
     users = data.get('users', {}) or {}
+
+    # —— 一次性的老数据迁移 ——
+    # 判据是版本号，且迁移后立即升版本；因此这里最多执行一次。
+    # ⚠️ 不能拿 legacy 去决定「新用户是否随机」—— 那样第二次调用
+    #    legacy 已为假，销户重建就会误走随机分支（这正是要修的 bug）。
+    migrating = data.get('reality_uuid_version') != REALITY_UUID_VERSION
+    now = time.time()
+    retired = data.get('reality_retired_users')
+    if not isinstance(retired, dict):
+        retired = {}
+
     for uid in users:
         if uid not in reg:
-            # Existing issued identities must survive the upgrade unchanged.
-            reg[uid] = (str(uuid.uuid5(uuid.NAMESPACE_URL, 'hy2-portal-reality:' + str(uid)))
-                        if legacy else str(uuid.uuid4()))
+            if migrating:
+                # 老用户：必须还原升级前的派生值，链接才不变。
+                reg[uid] = _legacy_reality_uuid(uid)
+            else:
+                reg[uid] = str(uuid.uuid4())
+
+    # —— 销户回收 ——
+    # 刚注销的用户先进 retired 表（带时间戳），保留窗口内不真删。
     for uid in list(reg):
         if uid not in users:
-            del reg[uid]
+            retired.setdefault(uid, now)
+    for uid in list(retired):
+        if uid in users:
+            del retired[uid]                       # 又开回来了
+        elif now - retired[uid] > REALITY_RETIRED_TTL_SECONDS:
+            retired.pop(uid, None)
+            reg.pop(uid, None)                     # 超期才回收凭据
+
     data['reality_users'] = reg
-    data['reality_uuid_version'] = 2
-    _REALITY_DATA = data
+    data['reality_retired_users'] = retired
+    data['reality_uuid_version'] = REALITY_UUID_VERSION
+    _active_reality_data = data
     return reg
+
+
+def _legacy_reality_uuid(user_id):
+    """升级前的派生规则（uuid5 + 固定命名空间）。
+
+    ⚠️ 命名空间与算法**不可更改** —— 它决定了老用户凭据的还原结果，
+    换掉等于让所有已发出去的 Reality 链接失效。
+    仅用于一次性迁移，新凭据一律 uuid4。
+    """
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'hy2-portal-reality:' + str(user_id)))
 
 
 def reality_clients(data):
@@ -1224,21 +1308,29 @@ def reality_clients(data):
     所以宁可给一个随机占位 UUID，也不要让 clients 空着。
     """
     reg = reality_registry(data)
+    users = data.get('users', {}) or {}
     clients = [{'id': uid_uuid, 'flow': 'xtls-rprx-vision', 'email': uid}
                for uid, uid_uuid in sorted(reg.items())
-               if (data.get('users', {}).get(uid) or {}).get('status', 'active') == 'active']
+               # 只输出「现存的、且 active 的」用户。
+               # 已注销但仍在保留窗口内的凭据**不进 clients** ——
+               # 保留只是为了重开户时 UUID 不变，不是保留访问权。
+               if uid in users
+               and (users.get(uid) or {}).get('status', 'active') == 'active']
     if not clients:
         clients = [{'id': str(uuid.uuid4()), 'flow': 'xtls-rprx-vision',
                     'email': 'placeholder'}]
     return clients
 
 
-def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
+def reality_uri_for_user(rcfg, user_id, public_ip, label=None, data=None):
     """给某个用户拼他自己的 VLESS-Reality 直链。
 
-    rcfg 是 data['reality_config']（含 uuid/short_id/dest_sni/port/public_key）。
+    rcfg 是 data['reality_config']（含 short_id/dest_sni/port/public_key）。
     单用户的 rcfg 里存的是**旧版单账号**的 uuid —— 这里忽略它，
-    改用该 user_id 派生出的 UUID（reality_uuid_for_user）。
+    改从凭据注册表取该用户自己的 UUID（reality_uuid_for_user）。
+
+    data 需要显式传入，凭据才有处可读写（缺失时会回退到当前运行实例，
+    见 reality_uuid_for_user）。
     """
     if not rcfg:
         return ''
@@ -1248,7 +1340,7 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     pub_key = rcfg.get('public_key', '')
     if not (short_id and dest_sni and pub_key):
         return ''
-    uid_uuid = reality_uuid_for_user(user_id)
+    uid_uuid = reality_uuid_for_user(user_id, data)
     tag = label or ('VLESS-Reality-' + str(user_id))
     return (f"vless://{uid_uuid}@{public_ip}:{port}"
             f"?security=reality&encryption=none&pbk={pub_key}"
@@ -1256,12 +1348,16 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
             f"&sni={dest_sni}&sid={short_id}#{quote(tag)}")
 
 
-def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None):
+def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
+              data=None):
     """生成 hy2:// 直链 + Clash / Sing-box 配置。
 
     reality（可选）—— 传 rcfg 时会**额外产出一条 VLESS-Reality 节点**，
     并把 Clash 的 PROXY 组改成 url-test（Hy2 与 Reality 自动择优），
     这样「UDP 被 QoS 的网络」会自己切到 TCP 通道（2026-10-03）。
+
+    data（可选）—— 凭据注册表所在的数据字典。带 reality + user_id 时
+    必须给，否则取不到（也不该凭空生成）该用户的 Reality UUID。
     """
     is_insecure = m.get('is_insecure', False)
     server_name = m.get('server_name') or m.get('public_ip', 'localhost')
@@ -1314,8 +1410,8 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     reality_sing = None
     if reality and user_id:
         ruri = reality_uri_for_user(reality, user_id, public_ip,
-                                    label=(name + '-Reality'))
-        r_uuid = reality_uuid_for_user(user_id)
+                                    label=(name + '-Reality'), data=data)
+        r_uuid = reality_uuid_for_user(user_id, data)
         r_port = reality.get('port', 443)
         r_sni = reality.get('dest_sni', 'www.apple.com')
         r_pbk = reality.get('public_key', '')
@@ -1518,7 +1614,9 @@ def serve(path):
                     disk_temp.chmod(0o600)
                     disk_temp.replace(disk_path)
 
-    # Persist legacy identities before serving requests; new users are random.
+    # 启动时先把凭据注册表补齐并落盘，再开始服务：
+    #   * 老库（version<2）在这里一次性迁移成派生值 —— 存量链接不变；
+    #   * 新库只是把注册表与版本号写正（幂等，无副作用）。
     reality_registry(data)
     save_data()
 
@@ -2222,10 +2320,11 @@ if __name__ == '__main__':
                 }
                 # 单用户视角的 uri 仍然给（Web 面板二维码要用），
                 # 取机主自己的 UUID —— 保证刷新后链接不变。
-                data['reality_config']['uuid'] = reality_uuid_for_user(MASTER_USER_ID)
+                data['reality_config']['uuid'] = reality_uuid_for_user(
+                    MASTER_USER_ID, data)
                 data['reality_config']['uri'] = reality_uri_for_user(
                     data['reality_config'], MASTER_USER_ID, public_ip,
-                    label='Teyir-VLESS-Reality')
+                    label='Teyir-VLESS-Reality', data=data)
                 clients = reality_clients(data)
             save_data()
 
@@ -2442,7 +2541,15 @@ if __name__ == '__main__':
                         }
                         # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
                         # 对应一个 VLESS UUID，开户即生效。
+                        #
+                        # ⚠️ 必须**当场落盘**（2026-10-05 修）：新凭据是随机的
+                        # 并存在 data['reality_users'] 里，不写盘就只活在内存。
+                        # 面板重启（部署/换版/崩溃）后会从盘上重新加载，
+                        # 于是同一个 user_id 会**再生成一个不同的 UUID** ——
+                        # 客户手里的 Reality 链接直接失效，且只有 Reality 通道
+                        # 挂掉、Hy2 正常，极难定位。
                         reality_registry(data)
+                        save_data()
                         rcfg = dict(data.get('reality_config', {}) or {})
                     regenerate_page()
 
@@ -2454,10 +2561,11 @@ if __name__ == '__main__':
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
                     uri, clash_yaml, sing_json = artifacts(
                         m, auth_override=pwd, name_override=f"Teyir-Hy2-{user_id}",
-                        reality=rcfg, user_id=user_id)
+                        reality=rcfg, user_id=user_id, data=data)
                     public_ip = m.get('public_ip', '127.0.0.1')
                     reality_uri = reality_uri_for_user(
-                        rcfg, user_id, public_ip, label=f"Teyir-Reality-{user_id}")
+                        rcfg, user_id, public_ip,
+                        label=f"Teyir-Reality-{user_id}", data=data)
                     return self.reply_json(200, {
                         'ok': True,
                         'user_id': user_id,
@@ -2467,7 +2575,7 @@ if __name__ == '__main__':
                         'expires_at': expires,
                         'uri': uri,
                         'reality_uri': reality_uri,
-                        'reality_uuid': reality_uuid_for_user(user_id),
+                        'reality_uuid': reality_uuid_for_user(user_id, data),
                         'clash': clash_yaml,
                         'sing_box': sing_json
                     })
@@ -2507,7 +2615,13 @@ if __name__ == '__main__':
                             # 2026-10-03：同步删掉该用户的 Reality 身份。
                             # 不删的话 —— xray 里那个 UUID 还在，买家退了款
                             # 照样能用 Reality 连上，属于「钱退了货还在」。
+                            #
+                            # 2026-10-05：这里也会把凭据移进 retired（保留
+                            # 窗口内不真删，重开户才能拿回同一个 UUID），
+                            # 所以同样必须落盘 —— 否则重启后 retired 丢失，
+                            # 重开户会拿到新 UUID。
                             reality_registry(data)
+                            save_data()
                             deleted = True
                         else:
                             deleted = False
@@ -2540,7 +2654,17 @@ if __name__ == '__main__':
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                         before = u.get('status', 'active')
                         u['status'] = want
+                        # 状态本身也要落盘 —— 否则重启后停用被「忘掉」，
+                        # 已停用的账号会自己恢复成可用。
+                        save_data()
                     regenerate_page()
+                    # ⚠️ 必须把 status 变更同步进 xray —— 与开户/销户同等对待。
+                    # reality_clients() 只输出 active 用户，但那份列表**只在
+                    # 重载 xray 时才写进 xray.json**；不在这里调一次的话，
+                    # 停用后那条 client 仍留在 xray 里，买家照旧能用 Reality
+                    # 连上（Hy2 侧因为鉴权回调查 status 会立刻被拒，
+                    # 于是一个人被停用后「UDP 断了、TCP 还通」，最难排查）。
+                    self._sync_reality_clients()
                     return self.reply_json(200, {
                         'ok': True,
                         'user_id': user_id,
