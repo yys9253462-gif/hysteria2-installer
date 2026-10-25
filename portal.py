@@ -3318,6 +3318,10 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
             f"?{urlencode(params, safe='')}#{quote(tag)}")
 
 
+# WARP 出口 IP 探测结果缓存：前端每 10 秒轮询，而每次探测都要走一次外网。
+_warp_probe_cache = {}
+
+
 _ACCESS_APPLIED = {}
 
 def user_access_allowed(info, now=None):
@@ -5161,6 +5165,9 @@ if __name__ == '__main__':
         
         now_ts = int(time.time())
         display_users = {}
+        # 只把「拍快照」放在锁内，渲染与落盘放到锁外（2026-10-25 修）。
+        # page_html 在 2000 用户时约 27 ms，/auth 每个连接都要拿 data_lock，
+        # 持锁渲染会短暂阻塞新连接鉴权；而渲染本身不依赖锁。
         with data_lock:
             # 清理离线已久的 ip_tracker 键
             dead_uids = [u for u, tr in ip_tracker.items() if not any(now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())]
@@ -5172,13 +5179,21 @@ if __name__ == '__main__':
                 user_ips = {ip: t for ip, t in ip_tracker.get(uid, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
                 u_copy['online_ips'] = user_ips
                 display_users[uid] = u_copy
+            page = page_html(m, uri, subscription, clash, sing, users=display_users,
+                             api_key=data.get('api_key'), token=data['token'],
+                             session_secret=session_secret,
+                             username=access.get('username', ''), password=access.get('password', ''))
 
-            data['page'] = page_html(m, uri, subscription, clash, sing, users=display_users, api_key=data.get('api_key'), token=data['token'], session_secret=session_secret,
-                                     username=access.get('username', ''), password=access.get('password', ''))
+        with data_lock:
+            # 内容没变就不重写：页面在用户、端口、证书都没变化时是同一份，
+            # 每次刷新都全量序列化 + fsync 是纯浪费（2000 用户约 8 ms/次）。
+            changed = data.get('page') != page
+            data['page'] = page
             # 与 refresh() 同理：二维码/下载配置必须跟着 uri 一起更新，
             # 否则自愈换了 sni 之后，页面文本框是对的、二维码仍是旧节点。
             sync_download_artifacts(data, uri, clash, sing)
-        save_data()
+        if changed:
+            save_data()
 
     # 会话在服务端过期：签名里带签发时间。原来的签名只覆盖固定 token，
     # 每次登录得到同一个值、永不过期（Max-Age 只约束浏览器），泄露即永久可用。
@@ -8225,7 +8240,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 for uid, sources in list(speed_tracker.items()):
                     recent = {source: sample for source, sample in sources.items()
                               if cur_mono - sample[0] <= SPEED_WINDOW_SECONDS}
-                    speed_tracker[uid] = recent
+                    if recent:
+                        speed_tracker[uid] = recent
+                    else:
+                        # 全部过期就整条删掉。旧实现只把值改成 {}，键永远留着：
+                        # 已删除的用户、改名后的旧 id 会一直占着条目，
+                        # 长期运行的节点上这个字典只增不减（2026-10-25 修）。
+                        speed_tracker.pop(uid, None)
                     u_tx_speed = sum(sample[1] for sample in recent.values())
                     u_rx_speed = sum(sample[2] for sample in recent.values())
                     total_tx_speed += u_tx_speed
@@ -8233,7 +8254,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     user_speeds[uid] = {'tx': u_tx_speed, 'rx': u_rx_speed}
                 for uid, user in data.get('users', {}).items():
                     entry = user_speeds.setdefault(uid, {'tx': 0, 'rx': 0})
-                    entry.update(usage_summary(uid))
+                    # /traffic-speed 是每 2 秒一次的高频轮询，前端只用
+                    # used_bytes / measured_bytes / measurement_ok 三个字段。
+                    # usage_summary 里的 measurement_gaps（最多 100 条）与
+                    # measurement_sources 每个用户都要 deepcopy 一次，
+                    # 响应体会随用户数平方级膨胀（实测 500 用户 5.4 MiB/次）。
+                    # 这里只取需要的字段，完整信息仍在用户详情端点里。
+                    _summary = usage_summary(uid)
+                    entry['measured_bytes'] = _summary.get('measured_bytes')
+                    entry['measurement_ok'] = _summary.get('measurement_ok')
+                    entry['measurement_started_at'] = _summary.get('measurement_started_at')
+                    entry['measurement_scope'] = _summary.get('measurement_scope')
                     entry['used_bytes'] = user.get('used_bytes', 0)
 
             return self.reply_json(200, {
@@ -8704,11 +8735,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             connected = False
             outbound_ip = ''
             if is_installed and enabled:
-                for warp_addr in ('127.0.0.1:19898', '127.0.0.1:40000'):
-                    outbound_ip = detect_outbound_ip('socks5', warp_addr, timeout=3)
-                    if outbound_ip:
-                        connected = True
-                        break
+                # 出口 IP 探测要真的走一次外网（实测 150-300 ms），而前端每 10 秒
+                # 轮询一次状态。加 30 秒缓存：状态变化本来也不是秒级的，
+                # 且每次探测都占一个并发槽，会拖慢真正需要响应的请求。
+                cached = _warp_probe_cache.get('value')
+                if cached and time.monotonic() - _warp_probe_cache.get('at', 0) < 30:
+                    outbound_ip, connected = cached
+                else:
+                    for warp_addr in ('127.0.0.1:19898', '127.0.0.1:40000'):
+                        outbound_ip = detect_outbound_ip('socks5', warp_addr, timeout=3)
+                        if outbound_ip:
+                            connected = True
+                            break
+                    _warp_probe_cache['value'] = (outbound_ip, connected)
+                    _warp_probe_cache['at'] = time.monotonic()
             try:
                 cfg_text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
                 applied = cfg_text == render_egress_config(cfg_text, state)

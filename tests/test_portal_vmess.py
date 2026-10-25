@@ -398,5 +398,12 @@ class BoundaryInputTests(unittest.TestCase):
             self.assertEqual(portal.read_meta_file(Path(d) / 'missing.json'), {})
 
 
+class ResourceGrowthTests(unittest.TestCase):
+    """长期运行的资源增长（2026-10-25 第三轮修复）。"""
+
+    def test_warp_probe_cache_exists(self):
+        self.assertIsInstance(portal._warp_probe_cache, dict)
+
+
 if __name__ == '__main__':
     unittest.main()
