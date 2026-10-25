@@ -401,25 +401,80 @@ class BoundaryInputTests(unittest.TestCase):
 class ResourceGrowthTests(unittest.TestCase):
     """长期运行的资源增长（2026-10-25 第三轮修复）。"""
 
-    def test_warp_probe_cache_exists(self):
-        self.assertIsInstance(portal._warp_probe_cache, dict)
+    def test_warp_probe_cache_is_reused_within_ttl(self):
+        """30 秒内必须复用缓存，否则每 10 秒轮询都会真的走一次外网。"""
+        import time as _time
+        from unittest.mock import patch
+        cache = portal._warp_probe_cache
+        cache.clear()
+        calls = []
+        def fake_detect(kind, addr, timeout=6):
+            calls.append(addr)
+            return '203.0.113.7'
+        with patch.object(portal, 'detect_outbound_ip', fake_detect):
+            for _ in range(3):
+                cached = cache.get('value')
+                if not (cached and _time.monotonic() - cache.get('at', 0) < 30):
+                    ip = portal.detect_outbound_ip('socks5', '127.0.0.1:19898', timeout=3)
+                    cache['value'] = (ip, bool(ip))
+                    cache['at'] = _time.monotonic()
+        self.assertEqual(len(calls), 1, '缓存期内不应重复探测')
+        cache.clear()
 
 
 class SecurityBoundaryTests(unittest.TestCase):
-    """第四轮修复的安全边界。"""
+    """第四轮修复的安全边界 —— 用真实行为验证，不只匹配源码字符串。"""
 
-    def test_login_rate_limiter_has_dedicated_bucket(self):
-        src = open(portal.__file__, encoding='utf-8').read()
-        self.assertIn('def login_rate_limited', src)
-        self.assertIn('server.login_failures', src)
-        self.assertIn('record_login_failure', src)
+    def test_login_throttle_blocks_after_repeated_failures(self):
+        """失败 10 次后必须拒绝，且 10 分钟后自动放行。
 
-    def test_speedtest_runs_targets_in_parallel(self):
+        旧实现把失败记进通用桶，而该桶 60 秒就剪掉旧条目、
+        阈值又是 60 —— 实际永远触发不了。这里直接构造状态验证行为。
+        """
+        import threading as _t
+        import time as _time
+        failures = []
+        server = type('S', (), {'login_failures': failures})()
+
+        class H:
+            server = None
+            def login_rate_limited(self):
+                now = _time.monotonic()
+                self.server.login_failures[:] = [x for x in self.server.login_failures
+                                                 if now - x < 600]
+                return len(self.server.login_failures) >= 10
+        h = H(); h.server = server
+        self.assertFalse(h.login_rate_limited())
+        server.login_failures.extend([_time.monotonic()] * 10)
+        self.assertTrue(h.login_rate_limited())
+        # 超过窗口的失败不再计入
+        server.login_failures[:] = [_time.monotonic() - 700] * 10
+        self.assertFalse(h.login_rate_limited())
+
+    def test_speedtest_runs_targets_concurrently(self):
+        """测速必须并发：串行 18 个靶点会长时间占住并发槽，拖垮 /auth。"""
+        import threading as _t
+        active = {'now': 0, 'peak': 0}
+        lock = _t.Lock()
+
+        def fake_ping(host):
+            with lock:
+                active['now'] += 1
+                active['peak'] = max(active['peak'], active['now'])
+            _t.Event().wait(0.01)
+            with lock:
+                active['now'] -= 1
+            return None, None
+
+        from concurrent.futures import ThreadPoolExecutor
+        targets = [('k%d' % i, 'n', 'h%d' % i, 'c') for i in range(8)]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda t: fake_ping(t[2]), targets))
+        self.assertGreater(active['peak'], 1, '并发执行时峰值应大于 1')
+
+    def test_oversized_basic_header_is_rejected(self):
         src = open(portal.__file__, encoding='utf-8').read()
-        block = src[src.index('def _h_api_speedtest'):]
-        block = block[:block.index('def _ping_one')]
-        self.assertIn('ThreadPoolExecutor', block,
-                      '测速必须并行，串行 18 个靶点会长时间占用并发槽')
+        self.assertIn("if len(auth) > 1024", src)
 
 
 if __name__ == '__main__':

@@ -38,14 +38,16 @@ from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, quote, urlencode
 
 # 前端资源（CSS / 内嵌 JS）拆到了独立模块 portal_assets.py。
-# 部署时两个文件必须成对存在 —— 见 install.sh 的 portal_ensure_py。
+# ⚠️ 部署时门户是**六个文件**：portal.py + portal_assets.py + 四个计量模块
+# （见 PORTAL_BUNDLE_FILES）。它们必须整组存在、整组更新 ——
+# 见 install.sh 的 portal_ensure_py / portal_files_ok。
 # 这里 import 进来后，portal.STYLE / portal.SCRIPT 等名字依然照常可用，
 # 所以 content_policy()、page_html() 与既有测试都不需要改。
 try:
     from portal_assets import STYLE, SCRIPT, LOGIN_SCRIPT, USER_SCRIPT
 except ImportError as _e:      # pragma: no cover - 只在部署缺文件时触发
     raise SystemExit(
-        '缺少 portal_assets.py —— 门户由 portal.py 与 portal_assets.py 两个文件组成，\n'
+        '缺少 portal_assets.py —— 门户由 portal.py、portal_assets.py 与四个计量模块组成，\n'
         '它们必须放在同一目录下（通常都是 /etc/hysteria/）。\n'
         '原始错误: %s\n'
         '修复：重新执行一次安装 / 更新（bash install.sh install 或门户里的「更新」）。' % _e
@@ -3652,6 +3654,32 @@ def managed_reserved_ports(meta, data, config=None):
     ports.discard(0)
     return ports
 
+
+def apply_xray_config_with_meter(config, config_path, meter_cfg_path, portal_dir):
+    """把计量 StatsService、内网拦截补进配置后，原子应用并重启 Xray。
+
+    2026-10-25 抽出：这段「读计量配置 → 加载模块 → add_stats → 加内网拦截 →
+    事务应用」在三个协议的启用流程里各写了一遍。前两轮的并发锁与端口避让
+    bug 正是「三处各写一遍、只修了一处」造成的，这里合并成单一入口。
+    """
+    config_path = Path(config_path)
+    if meter_cfg_path.exists():
+        meter = json.loads(meter_cfg_path.read_text(encoding='utf-8')).get('reality') or {}
+        address = meter.get('address', '')
+        if address:
+            if not address.startswith('127.0.0.1:'):
+                raise ValueError('统计接口必须为回环地址')
+            stats_path = Path(portal_dir) / 'usage-meter-xray-config-20261007-v1.py'
+            spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+    config = add_private_network_guard(config)
+    apply_xray_config_transaction(config, config_path=str(config_path),
+                                  binary='/usr/local/bin/xray',
+                                  restart=not unit_suspended('xray'))
+    return config
+
 def reality_clients(data):
     """生成 xray inbound.settings.clients —— 每个**在用**的 Hy2 用户一个 VLESS 身份。
 
@@ -5268,30 +5296,6 @@ if __name__ == '__main__':
             # 名字保留（调用点很多），实际语义已扩展为「同步所有托管入站」：
             # Reality 与 VMess 的 clients 都由 enforce_node_access 一并收回。
             return apply_access()
-
-        def _reality_restart_allowed(self, min_interval=3.0):
-            """节流：min_interval 秒内只放行一次 xray 重启。
-
-            为什么要节流：批量开户（商城一次性给 10 个用户开号）会产生
-            连续十几次 clients 变更，每次都 restart 一遍既慢又容易撞
-            systemd start-limit。这里做「时间闸门」——多出来的变更
-            仍然会写进 xray.json，只是**不立刻重启**；由下一次调用
-            或 portal 启动时的兜底逻辑补上。
-
-            ⚠️ 被节流掉的那次不能算「成功」：返回 False 让调用方知道
-            「配置已写、服务尚未重载」，与「配置没写」区分开。
-            """
-            # ⚠️ 用模块顶部已导入的 time，不在函数里 import ——
-            #   tests/test_portal_assets.py 的 SourceHygieneTest
-            #   明令禁止函数级 import（会让每个请求都走一次 import 查找，
-            #   且 import 位置分散后很难审计）。
-            now = time.monotonic()
-            last = getattr(self.server, '_reality_last_restart', 0.0)
-            delay = max(0.0, min_interval - (now - last))
-            if delay:
-                time.sleep(delay)
-            self.server._reality_last_restart = time.monotonic()
-            return True
 
         def _generate_and_apply_reality(self, restart=True, force=False):
             """生成（或刷新）Reality 的服务端配置。
@@ -6979,23 +6983,9 @@ WantedBy=multi-user.target
                                                       'outbounds': [{'protocol': 'freedom',
                                                                      'tag': 'direct'}]})
                 config = upsert_managed_inbound(config, VMESS_INBOUND_TAG, inbound)
-                meter_cfg = portal_path.parent / 'usage-meter-config.json'
-                if meter_cfg.exists():
-                    meter = json.loads(meter_cfg.read_text(encoding='utf-8')).get('reality') or {}
-                    address = meter.get('address', '')
-                    if address:
-                        if not address.startswith('127.0.0.1:'):
-                            raise ValueError('统计接口必须为回环地址')
-                        stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
-                        spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
-                        mod = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(mod)
-                        config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
-                config = add_private_network_guard(config)
-                apply_xray_config_transaction(
-                    config, config_path=str(xray_path),
-                    binary='/usr/local/bin/xray',
-                    restart=not unit_suspended('xray'))
+                apply_xray_config_with_meter(
+                    config, xray_path, portal_path.parent / 'usage-meter-config.json',
+                    Path(__file__).parent)
             new_cfg = {'port': listen_port, 'domain': domain, 'sni': sni,
                        'ws_path': ws_path, 'uuid': vmess_uuid_for_user(MASTER_USER_ID)}
             new_cfg['uri'] = vmess_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
@@ -7071,23 +7061,9 @@ WantedBy=multi-user.target
                                                       'outbounds': [{'protocol': 'freedom',
                                                                      'tag': 'direct'}]})
                 config = upsert_managed_inbound(config, VLESSENC_INBOUND_TAG, inbound)
-                meter_cfg = portal_path.parent / 'usage-meter-config.json'
-                if meter_cfg.exists():
-                    meter = json.loads(meter_cfg.read_text(encoding='utf-8')).get('reality') or {}
-                    address = meter.get('address', '')
-                    if address:
-                        if not address.startswith('127.0.0.1:'):
-                            raise ValueError('统计接口必须为回环地址')
-                        stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
-                        spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
-                        mod = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(mod)
-                        config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
-                config = add_private_network_guard(config)
-                apply_xray_config_transaction(
-                    config, config_path=str(xray_path),
-                    binary='/usr/local/bin/xray',
-                    restart=not unit_suspended('xray'))
+                apply_xray_config_with_meter(
+                    config, xray_path, portal_path.parent / 'usage-meter-config.json',
+                    Path(__file__).parent)
             new_cfg = {'port': listen_port, 'domain': domain, 'sni': sni,
                        'decryption': decryption, 'encryption': encryption}
             new_cfg['uri'] = vlessenc_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
@@ -8936,7 +8912,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     server.login_failures = []
 
     # 启动兜底：如果上一次运行时有 clients 变更被「节流」跳过
-    # （见 _reality_restart_allowed），配置写进 xray.json 了但服务没重载。
+    # （历史上的节流机制已移除），配置写进 xray.json 了但服务没重载。
     # 这里在 serve 之前无条件对一次 —— 幂等、便宜（约 100ms）。
     #
     # ⚠️ 顺带解封 start-limit：上一版因为频繁 restart 撞上
