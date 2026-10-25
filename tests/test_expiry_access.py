@@ -29,12 +29,35 @@ class ExpiryTests(unittest.TestCase):
   source=pathlib.Path(portal.__file__).read_text(encoding='utf-8');tree=ast.parse(source)
   branch=next(n for n in ast.walk(tree) if isinstance(n,ast.If) and isinstance(n.test,ast.Compare) and any(isinstance(v,ast.Constant) and v.value=='users/delete' for v in n.test.comparators))
   f=ast.parse('def delete(self,params):\n pass').body[0];f.body=branch.body
-  state={'users':{'probe':{'status':'active'}}};env={'data':state,'data_lock':threading.RLock(),'regenerate_page':lambda:None,'reality_registry':portal.reality_registry,'VALID_USER_ID_RE':re.compile('^[a-z]+$'),'MASTER_USER_ID':'admin_master','ip_tracker':{},'apply_access':lambda ids:False}
+  state={'users':{'probe':{'status':'active'}}};env={'data':state,'data_lock':threading.RLock(),'regenerate_page':lambda:None,'reality_registry':portal.reality_registry,'VALID_USER_ID_RE':re.compile('^[a-z]+$'),'MASTER_USER_ID':'admin_master','ip_tracker':{},'speed_tracker':{},'apply_access':lambda ids:False}
   exec(compile(ast.fix_missing_locations(ast.Module(body=[f],type_ignores=[])),'branch','exec'),env)
   class Fake:
    def reply_json(self,status,body):return status,body
   self.assertEqual(env['delete'](Fake(),{'user_id':'probe'})[0],503)
   self.assertEqual(state['_pending_revocations'],['probe'])
+class ShareAvailabilityConsistencyTests(unittest.TestCase):
+ """分享页可用性与节点准入必须同源（2026-10-25 修复）。"""
+
+ def test_zero_expiry_blocks_both(self):
+  u={'status':'active','expires_at':0,'limit_bytes':0,'used_bytes':0}
+  self.assertEqual(portal.user_access_allowed(u), portal.user_share_available(u))
+  self.assertFalse(portal.user_access_allowed(u))
+
+ def test_missing_expiry_allows_both(self):
+  u={'status':'active','limit_bytes':0,'used_bytes':0}
+  self.assertTrue(portal.user_access_allowed(u))
+  self.assertTrue(portal.user_share_available(u))
+
+ def test_quota_exhausted_blocks_both(self):
+  u={'status':'active','expires_at':2085974400,'limit_bytes':10,'used_bytes':10}
+  self.assertFalse(portal.user_access_allowed(u))
+  self.assertFalse(portal.user_share_available(u))
+
+
+class FormatBytesEdgeTests(unittest.TestCase):
+ def test_negative_is_clamped(self):
+  self.assertEqual(portal.format_bytes(-1), '0 B')
+
 if __name__=='__main__':unittest.main()
 
 

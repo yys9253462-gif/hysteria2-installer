@@ -50,7 +50,7 @@ class WebWorkflowTests(unittest.TestCase):
         self.reload = Mock(return_value=True)
         self.ns = dict(portal.__dict__, Path=fake_path, data=self.data, data_lock=threading.RLock(),
                        save_data=self.save, regenerate_page=self.save, meta_path=self.meta,
-                       portal_path=self.hdir / 'portal.json', ip_tracker={}, MASTER_USER_ID='admin_master',
+                       portal_path=self.hdir / 'portal.json', ip_tracker={}, speed_tracker={}, MASTER_USER_ID='admin_master',
                        VALID_USER_ID_RE=portal.re.compile(r'^[a-zA-Z0-9_.-]{1,64}$'),
                        reload_gost=self.reload, gost_status=Mock(return_value=True),
                        gost_operation_lock=threading.RLock(), reality_apply_lock=threading.Lock(),

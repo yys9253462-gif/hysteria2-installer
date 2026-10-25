@@ -1114,15 +1114,32 @@ def rotate_user_view_key_on_change(previous, current):
 
 
 def user_share_available(user, now=None):
+    """分享页是否可用 —— 判据必须与 user_access_allowed 完全同源。
+
+    ⚠️ 2026-10-25 修：旧实现用 `not expires` 把 0 当「永久」，
+    而 user_access_allowed 用 `expires_at is None` 才当永久。
+    于是 expires_at=0 的用户出现「分享页能打开、节点却连不上」的矛盾状态，
+    与 users/list 显示的 active 也不一致。现在两者共用同一个函数。
+    """
+    # 判据与 user_access_allowed 逐字一致（含 expires_at=0 视为已过期）。
+    # 这里内联而不是调用它：本函数在若干测试里是被单独摘出来执行的，
+    # 跨函数引用会 NameError；两处必须同步修改，改动时请对照。
     now = int(time.time()) if now is None else now
-    expires = int(user.get('expires_at', 0) or 0)
-    limit = int(user.get('limit_bytes', 0) or 0)
-    return (user.get('status', 'active') == 'active' and
-            (not expires or expires > now) and
-            (not limit or int(user.get('used_bytes', 0) or 0) < limit))
+    expires_at = user.get('expires_at')
+    try:
+        return (user.get('status', 'active') == 'active' and
+                (expires_at is None or float(expires_at) > now) and
+                (int(user.get('limit_bytes', 0)) <= 0 or
+                 int(user.get('used_bytes', 0)) < int(user.get('limit_bytes', 0))))
+    except (ValueError, TypeError):
+        return False
 
 
 def format_bytes(b):
+    # 负数只可能来自计数器回退或手工改坏的数据；直接展示 "-1 B" 会让人
+    # 以为用量是负的。归零并保留原语义（调用方另有 used_bytes 原始值）。
+    if b < 0:
+        b = 0
     if b < 1024:
         return f"{b} B"
     elif b < 1024**2:
@@ -1148,9 +1165,14 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
         if stripped.startswith('listenHTTPS:'):
             raw = stripped.split(':', 1)[1].strip()
             # 形如 ":11690" / "0.0.0.0:11690" / "11690"
-            raw = raw.rsplit(':', 1)[-1].strip()
+            # 去掉可能的引号（`: "8443"` 这种写法 YAML 完全合法）。
+            raw = raw.rsplit(':', 1)[-1].strip().strip('"').strip("'")
             if raw.isdigit():
-                return int(raw)
+                port = int(raw)
+                # 端口 0 或越界不能当作有效值返回：调用方会把它拼进订阅链接，
+                # 生成一个永远连不上的地址（2026-10-25 修）。
+                if 1 <= port <= 65535:
+                    return port
     return None
 
 
@@ -5857,6 +5879,9 @@ if __name__ == '__main__':
                             (data.get('usage_meter') or {}).get('totals', {}).pop(user_id, None)
                             if user_id in ip_tracker:
                                 del ip_tracker[user_id]
+                            # 速率样本同理：不删的话，同名用户重建后第一轮
+                            # 速率会沿用旧样本算出尖峰（2026-10-25 修）。
+                            speed_tracker.pop(user_id, None)
                             # 2026-10-03：同步删掉该用户的 Reality 身份。
                             # 不删的话 —— xray 里那个 UUID 还在，买家退了款
                             # 照样能用 Reality 连上，属于「钱退了货还在」。
@@ -7277,7 +7302,9 @@ WantedBy=multi-user.target
                             used_gb = round(int(existing.get('used_bytes', 0)) / (1024 ** 3), 2)
                             return self.reply(409, (
                                 f'用户 {user_id} 已存在（当前密码尾号 {tail}，已用 {used_gb} GB）。'
-                                '如需改参数请用「修改」，或先删除该用户再重建。'
+                                # Web 端没有「修改」入口（只有 REST API 的 users/update），
+                                # 旧文案会把管理员指向不存在的功能（2026-10-25 修）。
+                                '如需改参数请调用 REST API 的 users/update，或先删除该用户再重建。'
                             ).encode('utf-8'))
                         if password_taken(data.get('users', {}), pwd, user_id):
                             return self.reply(409, '该密码已被其他用户使用，请换一个（留空则自动生成）。'.encode('utf-8'))
@@ -7312,6 +7339,9 @@ WantedBy=multi-user.target
                             (data.get('usage_meter') or {}).get('totals', {}).pop(user_id, None)
                             if user_id in ip_tracker:
                                 del ip_tracker[user_id]
+                            # 速率样本同理：不删的话，同名用户重建后第一轮
+                            # 速率会沿用旧样本算出尖峰（2026-10-25 修）。
+                            speed_tracker.pop(user_id, None)
 
                 regenerate_page()
                 if not self._sync_reality_clients():
