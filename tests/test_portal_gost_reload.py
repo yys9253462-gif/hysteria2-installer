@@ -153,7 +153,11 @@ class ReloadGostChecksReturncode(unittest.TestCase):
                'gost_operation_lock': threading.RLock(), 'ensure_gost_unit': Mock(),
                'write_gost_config': Mock(), 'gost_status': lambda: True,
                'gost_ports_ready': lambda: True, 'subprocess': SimpleNamespace(run=run),
-               'time': SimpleNamespace(sleep=lambda seconds: None), 'unit_suspended': lambda unit: False}
+               'time': SimpleNamespace(sleep=lambda seconds: None),
+               # reload_gost 是模块级函数，只能看到模块级的 _unit_suspended；
+               # 两个名字都给上，避免桩与实现命名漂移造成假红。
+               'unit_suspended': lambda unit: False,
+               '_unit_suspended': lambda unit: False}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[self.fn], type_ignores=[])),
                      'gost-reload-behavior', 'exec'), env)
         self.assertTrue(env['reload_gost']())
@@ -165,7 +169,11 @@ class ReloadGostChecksReturncode(unittest.TestCase):
                'gost_operation_lock': threading.RLock(), 'ensure_gost_unit': Mock(),
                'write_gost_config': Mock(), 'gost_status': lambda: True,
                'gost_ports_ready': lambda: False, 'subprocess': SimpleNamespace(run=run),
-               'time': SimpleNamespace(sleep=lambda seconds: None), 'unit_suspended': lambda unit: False}
+               'time': SimpleNamespace(sleep=lambda seconds: None),
+               # reload_gost 是模块级函数，只能看到模块级的 _unit_suspended；
+               # 两个名字都给上，避免桩与实现命名漂移造成假红。
+               'unit_suspended': lambda unit: False,
+               '_unit_suspended': lambda unit: False}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[self.fn], type_ignores=[])),
                      'gost-listener-readiness', 'exec'), env)
         self.assertFalse(env['reload_gost']())

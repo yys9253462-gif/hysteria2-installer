@@ -3687,9 +3687,22 @@ def apply_xray_config_with_meter(config, config_path, meter_cfg_path, portal_dir
             spec.loader.exec_module(mod)
             config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
     config = add_private_network_guard(config)
+    # ⚠️ 必须用模块级 `_unit_suspended`，不能直接调 `unit_suspended`。
+    #
+    # 2026-10-26 生产实测：12 台节点升级后点「启用 VLESS Encryption」报
+    #   name 'unit_suspended' is not defined
+    #
+    # 根因：`unit_suspended` 是 main() 内部的嵌套函数，只有 main() 的作用域
+    # 看得见；本函数是模块级的，运行时找不到这个名字。
+    # 模块级本来就有 `_unit_suspended = lambda unit: False` 兜底，且 main()
+    # 会用 `global _unit_suspended` 把它替换成真实现 —— 模块级代码一律走它。
+    #
+    # 为什么以前没炸：这条路径只在「需要重新生成 Xray 配置」时才走到；
+    # 存量节点升级前配置已生成，不会重新进入。启用新协议必然要写配置，
+    # 于是必然触发。
     apply_xray_config_transaction(config, config_path=str(config_path),
                                   binary='/usr/local/bin/xray',
-                                  restart=not unit_suspended('xray'))
+                                  restart=not _unit_suspended('xray'))
     return config
 
 def reality_clients(data):
@@ -4657,7 +4670,8 @@ def serve(path):
                 binary, address = rcfg.get('binary', ''), rcfg.get('address', '')
                 if not (binary and address and xray_path.exists() and Path(binary).is_file()):
                     time.sleep(30); continue
-                if unit_suspended('xray') or _systemd_state('xray') != 'active':
+                # 模块级代码看不到 main() 内的嵌套函数，必须用 _unit_suspended。
+                if _unit_suspended('xray') or _systemd_state('xray') != 'active':
                     time.sleep(10); continue
                 if not ready:
                     # 开启路由接口要重启一次 Xray；失败后 10 分钟内不再尝试，免得反复重启。
@@ -4770,7 +4784,8 @@ def serve(path):
             try:
                 ensure_gost_unit()
                 write_gost_config()
-                if unit_suspended('gost'):
+                # 模块级代码看不到 main() 内的嵌套函数，必须用 _unit_suspended。
+                if _unit_suspended('gost'):
                     # 停用期间只更新配置；控制台恢复节点时 gost 会带着它启动。
                     return True
                 if gost_status():
