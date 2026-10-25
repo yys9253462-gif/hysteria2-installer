@@ -32,6 +32,7 @@ import uuid
 import zipfile
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, quote, urlencode
@@ -5494,6 +5495,11 @@ if __name__ == '__main__':
 
         def is_authenticated(self):
             auth = self.headers.get('Authorization', '')
+            # 头部没有体积上限，而这里要对它做 sha256。超长 Basic 头
+            # （几 MB 的 base64）会让每个请求都白算一次哈希，属于廉价放大。
+            # 正常凭据远小于 1 KiB，直接拒绝更长的（2026-10-25）。
+            if len(auth) > 1024:
+                return False
             if auth.startswith('Basic '):
                 digest = hashlib.sha256(auth.removeprefix('Basic ').encode()).hexdigest()
                 if hmac.compare_digest(digest, data['auth_hash']):
@@ -5557,6 +5563,26 @@ if __name__ == '__main__':
                         return False
                     self.server.requests.append(now)
                     return True
+
+        def login_rate_limited(self):
+            """Web 登录的暴力破解防护。
+
+            🔴 2026-10-25 修：原来登录失败记在通用的 `failures` 桶里，而该桶
+            每次 check_rate_limit 都会把 60 秒以外的条目剪掉，并在 `>= 60`
+            时拒绝 —— 60 秒内既要有 60 次请求、又要达到 60 次失败，
+            实际上永远触发不了。攻击者每秒试一次密码可以无限进行。
+            这里改成独立的 10 分钟滑窗失败桶：10 次失败后进入冷却。
+            """
+            now = time.monotonic()
+            with data_lock:
+                self.server.login_failures[:] = [
+                    t for t in self.server.login_failures if now - t < 600]
+                return len(self.server.login_failures) >= 10
+
+        def record_login_failure(self):
+            now = time.monotonic()
+            with data_lock:
+                self.server.login_failures.append(now)
 
         def record_failure(self):
             now = time.monotonic()
@@ -7449,11 +7475,17 @@ WantedBy=multi-user.target
             except Exception:
                 return self.reply(400, b'Bad request')
 
+            if self.login_rate_limited():
+                # 与密码错误用同一页面形态，不给爆破者「已被限流」的区分信号。
+                page = login_html(data['token'],
+                                  error_msg='尝试次数过多，请 10 分钟后再试')
+                return self.reply(429, page.encode('utf-8'), 'text/html; charset=utf-8')
+
             submitted_auth = base64.b64encode(f'{user}:{pwd}'.encode())
             submitted_digest = hashlib.sha256(submitted_auth).hexdigest()
 
             if not hmac.compare_digest(submitted_digest, data['auth_hash']):
-                self.record_failure()
+                self.record_login_failure()
                 page = login_html(data['token'], error_msg='用户名或密码不正确，请重新输入')
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
@@ -8162,7 +8194,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     body = out.encode('utf-8')
                     self.send_response(200)
                     self.send_header('Content-Type', 'text/plain; charset=utf-8')
-                    self.send_header('Content-Disposition', 'attachment; filename="' + name + '.conf"')
+                    # 名称虽已过 VALID_AWG_NAME_RE，仍是全文件唯一一处把变量
+                    # 直接拼进响应头的位置。统一再白名单过滤一遍，杜绝 CRLF。
+                    safe_name = re.sub(r'[^A-Za-z0-9_.\-]', '_', str(name))[:64] or 'client'
+                    self.send_header('Content-Disposition',
+                                     'attachment; filename="' + safe_name + '.conf"')
                     self.send_header('Content-Length', str(len(body)))
                     self.send_header('Cache-Control', 'no-store')
                     self.send_header('X-Content-Type-Options', 'nosniff')
@@ -8471,9 +8507,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'results': [],
                 })
 
+            # 并行探测（2026-10-25 修）。旧实现串行 ping 18 个靶点，
+            # 每个最坏 10 秒 → 单请求可达 180 秒；而门户只有 8 个并发槽、
+            # 连接期限 30 秒，期限只关 socket 不终止线程，槽位仍被占住。
+            # 8 个这样的请求就能让 /auth 也拿不到槽位，所有用户掉线重连失败。
+            # 并行后整体耗时约等于最慢的单个靶点。
             results = []
-            for key, name, host, carrier in SPEEDTEST_TARGETS:
-                avg, loss = self._ping_one(host)
+            with ThreadPoolExecutor(max_workers=min(8, len(SPEEDTEST_TARGETS))) as pool:
+                measured_pairs = list(pool.map(lambda t: self._ping_one(t[2]),
+                                               SPEEDTEST_TARGETS))
+            for (key, name, host, carrier), (avg, loss) in zip(SPEEDTEST_TARGETS, measured_pairs):
                 results.append({
                     'target_key': key,
                     'target_name': name,
@@ -8889,6 +8932,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # /auth 专用限流桶（2026-10-09）：见 auth_rate_limited() 的说明 ——
     # /auth 经 masquerade 对公网可达，必须有独立的速率+失败计数。
     server.auth_requests, server.auth_failures = [], []
+    # Web 登录专用失败桶（2026-10-25）：见 login_rate_limited() 的说明。
+    server.login_failures = []
 
     # 启动兜底：如果上一次运行时有 clients 变更被「节流」跳过
     # （见 _reality_restart_allowed），配置写进 xray.json 了但服务没重载。

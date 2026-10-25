@@ -405,5 +405,22 @@ class ResourceGrowthTests(unittest.TestCase):
         self.assertIsInstance(portal._warp_probe_cache, dict)
 
 
+class SecurityBoundaryTests(unittest.TestCase):
+    """第四轮修复的安全边界。"""
+
+    def test_login_rate_limiter_has_dedicated_bucket(self):
+        src = open(portal.__file__, encoding='utf-8').read()
+        self.assertIn('def login_rate_limited', src)
+        self.assertIn('server.login_failures', src)
+        self.assertIn('record_login_failure', src)
+
+    def test_speedtest_runs_targets_in_parallel(self):
+        src = open(portal.__file__, encoding='utf-8').read()
+        block = src[src.index('def _h_api_speedtest'):]
+        block = block[:block.index('def _ping_one')]
+        self.assertIn('ThreadPoolExecutor', block,
+                      '测速必须并行，串行 18 个靶点会长时间占用并发槽')
+
+
 if __name__ == '__main__':
     unittest.main()
