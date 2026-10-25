@@ -316,6 +316,22 @@ class PortSelectionSafetyTests(unittest.TestCase):
         """没冲突时仍沿用原端口，不给已有节点无谓换端口。"""
         self.assertEqual(portal._pick_reality_port(preferred=2087)[0], 2087)
 
+    def test_own_port_is_not_treated_as_conflict(self):
+        """协议自己的端口不算冲突：重新启用必须沿用它。
+
+        真实故障（2026-10-25）：把自身端口也列进避让清单后，一次无关的
+        启停就把 Reality 从 443 换到 2053，所有已发链接失效。
+        """
+        meta = {'listen_port': 38076, 'subscription_port': 8443}
+        data = {'reality_config': {'port': 443}, 'vmess_config': {'port': 2087},
+                'vlessenc_config': {'port': 2088}}
+        reserved = portal.managed_reserved_ports(meta, data, None,
+                                                 exclude_key='reality_config')
+        self.assertNotIn(443, reserved)
+        self.assertIn(2087, reserved)
+        port, _ = portal._pick_reality_port(preferred=443, extra_blocked=reserved)
+        self.assertEqual(port, 443)
+
     def test_reserved_ports_helper_collects_every_protocol(self):
         meta = {'listen_port': 19984, 'subscription_port': 29421}
         data = {'reality_config': {'port': 443}, 'vmess_config': {'port': 2087},

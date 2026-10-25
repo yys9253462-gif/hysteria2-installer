@@ -3628,7 +3628,7 @@ def enforce_node_access(root, snapshot, force_ids=()):
 
 
 
-def managed_reserved_ports(meta, data, config=None):
+def managed_reserved_ports(meta, data, config=None, exclude_key=None):
     """汇总「本机其它协议正在用 / 配置里已占」的端口，供 _pick_reality_port 避让。
 
     2026-10-24 修：三个启用流程各自只避开 hy2 与订阅端口，彼此之间不避让 ——
@@ -3642,11 +3642,23 @@ def managed_reserved_ports(meta, data, config=None):
         except (TypeError, ValueError):
             pass
     for key in ('reality_config', 'vmess_config', 'vlessenc_config'):
+        if key == exclude_key:
+            # 协议**自己**的端口不是冲突：重新启用时应当沿用它。
+            # 不排除的话，重新生成配置会把自己的端口也当成「被占用」，
+            # 于是一次无关的启停就把 Reality 从 443 换到 2053
+            # （2026-10-25 实测踩到）。
+            continue
         try:
             ports.add(int((data or {}).get(key, {}).get('port')))
         except (TypeError, ValueError, AttributeError):
             pass
+    own_tags = {REALITY_INBOUND_TAG: 'reality_config',
+                VMESS_INBOUND_TAG: 'vmess_config',
+                VLESSENC_INBOUND_TAG: 'vlessenc_config'}
     for inbound in ((config or {}).get('inbounds') or []):
+        # 同理：自己那一条入站的端口不算冲突。
+        if exclude_key and own_tags.get((inbound or {}).get('tag')) == exclude_key:
+            continue
         try:
             ports.add(int(inbound.get('port')))
         except (TypeError, ValueError, AttributeError):
@@ -5370,7 +5382,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            _avoid |= managed_reserved_ports(m, _data_now, _cfg_now)
+            _avoid |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='reality_config')
             listen_port, port_reason = _pick_reality_port(
                 preferred=rcfg_old.get('port'), extra_blocked=_avoid)
             if not listen_port:
@@ -6944,7 +6956,7 @@ WantedBy=multi-user.target
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            blocked = managed_reserved_ports(m, _data_now, _cfg_now)
+            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config')
             blocked.add(reality_port)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port') or 2087,
@@ -7023,7 +7035,7 @@ WantedBy=multi-user.target
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now)
+            blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config')
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port') or 2088, extra_blocked=blocked_ports)
             if not listen_port:
