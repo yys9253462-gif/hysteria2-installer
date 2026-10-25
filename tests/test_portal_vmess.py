@@ -332,13 +332,28 @@ class ManagedInboundRobustnessTests(unittest.TestCase):
         portal.upsert_managed_inbound(config, 'x', {'protocol': 'vmess'})
         self.assertEqual(config['inbounds'][0]['tag'], 'x')
 
-    def test_untagged_reality_not_taken_when_tagged_ones_exist(self):
-        """已有带 tag 的托管入站时，无 tag 的 Reality 只可能是用户手工加的。"""
+    def test_untagged_reality_is_adopted_even_when_other_protocols_are_tagged(self):
+        """其它协议带 tag 不影响 Reality 的兜底认领。
+
+        ⚠️ 这条测试曾经断言相反的行为，是错的：节点先启用 VMess（带 tag）后，
+        旧版留下的无 tag Reality 入站就再也不被认领 —— 卡片显示未启用、
+        撤销覆盖不到它。兜底判据必须按协议各自独立。
+        """
         config = {'inbounds': [
             {'tag': portal.VMESS_INBOUND_TAG, 'protocol': 'vmess'},
             {'protocol': 'vless', 'streamSettings': {'security': 'reality'}},
         ]}
-        self.assertFalse(portal.has_managed_inbound(config, portal.REALITY_INBOUND_TAG))
+        self.assertTrue(portal.has_managed_inbound(config, portal.REALITY_INBOUND_TAG))
+
+    def test_untagged_reality_ignored_once_reality_itself_is_tagged(self):
+        """Reality 自己已有带 tag 的入站时，多余的无 tag Reality 不再被认领。"""
+        config = {'inbounds': [
+            {'tag': portal.REALITY_INBOUND_TAG, 'protocol': 'vless',
+             'streamSettings': {'security': 'reality'}},
+            {'protocol': 'vless', 'streamSettings': {'security': 'reality'}},
+        ]}
+        idx, _ = portal.managed_inbound_index(config, portal.REALITY_INBOUND_TAG)
+        self.assertEqual(idx, 0, '必须命中带 tag 的那一条，而不是后面无 tag 的')
 
     def test_untagged_reality_still_adopted_for_legacy_config(self):
         """纯旧版配置（完全没有 tag）仍要被接管，否则升级后 Reality 失联。"""

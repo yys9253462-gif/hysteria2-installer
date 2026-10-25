@@ -3133,12 +3133,12 @@ def managed_inbound_index(config, tag):
     for i, item in enumerate(inbounds):
         if isinstance(item, dict) and item.get('tag') == tag:
             return i, item
-    # 兜底匹配只在「配置里还没有任何带 tag 的托管入站」时启用：
-    # 一旦存在带 tag 的，说明这是新版写的配置，此时仍有无 tag 的
-    # vless+reality 入站就只可能是**用户手工加的**，不能当成托管入站
-    # 去删除或改 clients（2026-10-24 修）。
-    if any(isinstance(i, dict) and i.get('tag') in MANAGED_INBOUND_TAGS for i in inbounds):
-        return -1, None
+    # 兜底匹配只在「**该协议自己**还没有带 tag 的入站」时启用。
+    #
+    # ⚠️ 2026-10-25 修：上一版写的是「配置里存在任意带 tag 的托管入站就
+    # 不兜底」。结果是节点上只要先启用了 VMess（带 tag），旧版留下的
+    # 无 tag Reality 入站就再也认不领 —— Reality 卡片显示未启用、
+    # 撤销也覆盖不到它。判据必须按协议各自独立。
     if tag == REALITY_INBOUND_TAG:
         for i, item in enumerate(inbounds):
             if (isinstance(item, dict) and item.get('protocol') == 'vless'
