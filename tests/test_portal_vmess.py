@@ -375,5 +375,28 @@ class ReservedUserNameTests(unittest.TestCase):
         self.assertIn(portal.MASTER_USER_ID, portal.RESERVED_USER_IDS)
 
 
+class BoundaryInputTests(unittest.TestCase):
+    """边界与异常输入（2026-10-25 第二轮修复）。"""
+
+    def test_missing_port_never_emits_invalid_link(self):
+        uri = portal.artifacts({'listen_port': None, 'server_name': 'x',
+                                'public_ip': '1.2.3.4', 'auth_password': 'p'})[0]
+        self.assertNotIn(':None', uri)
+        self.assertIn(':19984', uri)
+
+    def test_bool_and_fractional_ports_are_rejected(self):
+        self.assertNotEqual(portal._pick_reality_port(preferred=True)[0], 1)
+        self.assertNotEqual(portal._pick_reality_port(preferred=2087.5)[0], 2087)
+
+    def test_corrupt_meta_returns_empty_dict(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            bad = Path(d) / 'client_meta.json'
+            bad.write_text('{"truncated": ', encoding='utf-8')
+            self.assertEqual(portal.read_meta_file(bad), {})
+            self.assertEqual(portal.read_meta_file(Path(d) / 'missing.json'), {})
+
+
 if __name__ == '__main__':
     unittest.main()

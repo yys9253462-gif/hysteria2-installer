@@ -1176,6 +1176,24 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
     return None
 
 
+
+def read_meta_file(meta_path):
+    """读取 client_meta.json；文件损坏时返回空 dict 而不是抛异常。
+
+    🔴 2026-10-25 修：此前有 14 处直接 `json.loads(meta_path.read_text())`，
+    文件被截断或手工改坏时抛 JSONDecodeError。regenerate_page 几乎在每次
+    用户变更后都会调用，于是「一个坏文件」会让开户/删除/启停全部失败，
+    且报错是不可理解的解码异常。
+
+    放在模块级而不是闭包里：do_POST 在部分测试里是被单独摘出来执行的，
+    闭包里的名字不在作用域内。
+    """
+    try:
+        return json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        print('[portal] client_meta.json unreadable: ' + type(exc).__name__, file=sys.stderr)
+        return {}
+
 def resolve_subscription_port(m, config_path='/etc/hysteria/config.yaml'):
     """解析订阅链接该用的端口。按优先级取值，**绝不返回伪造的 8443**。
 
@@ -2593,11 +2611,11 @@ def _parse_cert_subject(cert_file):
         # `-subject -ext subjectAltName -issuer` 的输出里 SAN 块夹在
         # subject 与 issuer 之间，按 issuer 切会把 SAN 块并进 CN。
         p_subj = subprocess.run(['openssl', 'x509', '-in', str(cert_file),
-                                 '-noout', '-subject'], capture_output=True, text=True)
+                                 '-noout', '-subject'], capture_output=True, timeout=5, text=True)
         p_iss = subprocess.run(['openssl', 'x509', '-in', str(cert_file),
-                                '-noout', '-issuer'], capture_output=True, text=True)
+                                '-noout', '-issuer'], capture_output=True, timeout=5, text=True)
         p_san = subprocess.run(['openssl', 'x509', '-in', str(cert_file),
-                                '-noout', '-ext', 'subjectAltName'],
+                                '-noout', '-ext', 'subjectAltName'], timeout=5,
                                capture_output=True, text=True)
         if p_subj.returncode != 0:
             return '', [], False
@@ -3810,6 +3828,12 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
         根本猜不到是「配置里存了个坏端口值」。
         这里降级为「忽略这个偏好值」，继续正常选端口。
         """
+        # bool 是 int 的子类（True == 1），配置里出现 true 会被当成端口 1；
+        # 小数会被 int() 静默截断（65535.9 -> 65535）。两者都拒绝（2026-10-25）。
+        if isinstance(v, bool):
+            return 0
+        if isinstance(v, float) and not v.is_integer():
+            return 0
         try:
             iv = int(v)
         except (TypeError, ValueError):
@@ -3906,7 +3930,15 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     host = public_ip if is_insecure else server_name
     name = name_override or ('Hy2-' + host)
     password = auth_override or m.get('auth_password', '')
-    listen_port = m.get('listen_port', 19984)
+    # 端口必须落成合法整数（2026-10-25 修）：meta 被改坏时 listen_port 可能是
+    # None / 字符串，旧代码会原样拼出 `hysteria2://...:None` 这种所有客户端
+    # 都会拒绝的链接，而且没有任何报错提示。这里退回默认端口。
+    try:
+        listen_port = int(m.get('listen_port') or 19984)
+    except (TypeError, ValueError):
+        listen_port = 19984
+    if not 1 <= listen_port <= 65535:
+        listen_port = 19984
     obfs_password = m.get('obfs_password', '')
     hop_port_range = m.get('hop_port_range', '')
     # 证书信任策略（已逐条对照 v2rayNG 源码 / Xray 内核行为对齐）：
@@ -5119,7 +5151,7 @@ if __name__ == '__main__':
         return ecfg or None
 
     def regenerate_page():
-        m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+        m = read_meta_file(meta_path)
         uri, clash, sing = artifacts(m)
         root = portal_path.parent
         access_file = root / 'portal-access.json'
@@ -5299,7 +5331,7 @@ if __name__ == '__main__':
             #
             # 注意：这里**只读**监听表，不做 bind 探测 ——
             # 本文件 gost 段记着血泪：「不再用 socket bind 做端口探测(在某些环境会卡住)」。
-            m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+            m = read_meta_file(meta_path)
             _avoid = set()
             try:
                 _avoid.add(int(m.get('listen_port') or 0))
@@ -5572,7 +5604,7 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': False, 'msg': 'Auth service busy'})
                 try:
                     length = int(self.headers.get('Content-Length', 0))
-                    body = self.rfile.read(length).decode('utf-8')
+                    body = self.rfile.read(length).decode('utf-8', errors='replace')
                     req_data = json.loads(body)
                     client_auth = req_data.get('auth', '').strip()
                     client_addr = req_data.get('addr', '')
@@ -5652,7 +5684,7 @@ if __name__ == '__main__':
 
                 try:
                     length = int(self.headers.get('Content-Length', 0))
-                    body = self.rfile.read(length).decode('utf-8') if length > 0 else '{}'
+                    body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '{}'
                     params = json.loads(body)
                 except Exception:
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid JSON body'})
@@ -5689,13 +5721,31 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
 
                     pwd = params.get('password') or secrets.token_hex(16)
-                    days = int(params.get('duration_days', 30))
-                    ip_limit = int(params.get('ip_limit', 0))
-                    if ip_limit > 1000:  # 与 users/update 的取值范围一致
+                    # 🔴 2026-10-25 修：这些值直接来自请求体，`int('abc')` 会抛
+                    # ValueError。该分支不在任何 try 里，异常会穿透 do_POST →
+                    # 连接被掐断，客户端只看到 "Remote end closed connection"，
+                    # 完全看不出是参数问题。这里统一解析并给出 400。
+                    try:
+                        days = int(params.get('duration_days', 30))
+                        ip_limit = int(params.get('ip_limit', 0))
+                        traffic_gb = float(params.get('traffic_gb', 0))
+                        expires = int(params.get('expires_at', now_ts + days * 86400))
+                    except (ValueError, TypeError, OverflowError):
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: duration_days / ip_limit / traffic_gb / expires_at must be numeric'})
+                    if not math.isfinite(traffic_gb):
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid user parameter: traffic_gb must be finite'})
+                    if not 1 <= days <= 36500:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: duration_days must be 1..36500'})
+                    if not 0 <= ip_limit <= 1000:  # 与 users/update 的取值范围一致
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user parameter'})
-                    traffic_gb = float(params.get('traffic_gb', 0))
+                    # 上限与 users/renew 一致（1e6 GB）。没有上限时 1e308 能通过
+                    # isfinite 检查，却在 int() 转换处抛 OverflowError 掐断连接。
+                    if not 0 <= traffic_gb <= 1000000:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: traffic_gb must be 0..1000000'})
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
-                    expires = int(params.get('expires_at', now_ts + days * 86400))
                     note = str(params.get('note', '')).strip()[:200]
 
                     with data_lock:
@@ -5751,7 +5801,7 @@ if __name__ == '__main__':
                         if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
 
-                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                    m = read_meta_file(meta_path)
                     # artifacts 传入 reality + user_id ⇒ 输出「Hy2 + Reality」双节点
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
                     uri, clash_yaml, sing_json = artifacts(
@@ -5985,7 +6035,7 @@ if __name__ == '__main__':
                 elif sub == 'proxy-services/list':
                     with data_lock:
                         items = list(data.get('proxy_services', []))
-                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                    m = read_meta_file(meta_path)
                     host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
                     # 不脱敏 password, 调用方是受信 API key
                     return self.reply_json(200, {
@@ -6099,7 +6149,7 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8')
+                body = self.rfile.read(length).decode('utf-8', errors='replace')
                 form = parse_qs(body)
                 target = form.get('target', [''])[0]
                 if target not in ('core', 'portal', 'awg', 'reality-online'):
@@ -6315,7 +6365,7 @@ if __name__ == '__main__':
                     return 200, {'ok': True, 'applied': True, 'message': 'Proxy service deleted'}
                 # 开着 ufw / firewalld 的系统上不放行的话，本机探测一切正常、外网却连不上。
                 firewall_port(port, 'tcp', open_=True)
-                m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                m = read_meta_file(meta_path)
                 host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
                 host_part = '[' + host + ']' if ':' in host and not host.startswith('[') else host
                 uri = '%s://%s:%s@%s:%s' % (ptype, quote(username, safe=''), quote(password, safe=''), host_part, port)
@@ -6335,7 +6385,7 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                form = parse_qs(self.rfile.read(length).decode('utf-8'))
+                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
                 params = {key: values[0] for key, values in form.items()}
                 status, payload = self._manage_proxy_operation(params.pop('action', ''), params)
                 return self.reply_json(status, payload)
@@ -6449,7 +6499,7 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8')
+                body = self.rfile.read(length).decode('utf-8', errors='replace')
                 form = parse_qs(body)
                 # 先去空白再取默认值：写成 (value or '3').strip() 的话，
                 # 纯空格能通过 or 判定、再被 strip 成空串，导致误判为非法协议线。
@@ -6488,7 +6538,7 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8')
+                body = self.rfile.read(length).decode('utf-8', errors='replace')
                 form = parse_qs(body)
                 action = (form.get('action', [''])[0] or '').strip()
 
@@ -6602,7 +6652,7 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
                 if action not in ('toggle', 'enable', 'disable', 'apply',
@@ -6720,7 +6770,7 @@ WantedBy=multi-user.target
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
 
@@ -6831,7 +6881,7 @@ WantedBy=multi-user.target
             顺序刻意如此：**配置先落地、数据后写入**。反过来一旦事务失败，
             data 里就留下一个「显示已启用、实际没有」的状态。
             """
-            m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+            m = read_meta_file(meta_path)
             public_ip = m.get('public_ip', '127.0.0.1')
             domain = (m.get('server_name') or '').strip()
             if not domain or not _is_dns_name(domain):
@@ -6922,7 +6972,7 @@ WantedBy=multi-user.target
             密钥对只在**首次**生成：换掉 decryption 会让所有已下发的
             encryption 立刻失效，等于把在用的用户全部踢下线。
             """
-            m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+            m = read_meta_file(meta_path)
             public_ip = m.get('public_ip', '127.0.0.1')
             domain = (m.get('server_name') or '').strip()
             if not domain or not _is_dns_name(domain):
@@ -7019,7 +7069,7 @@ WantedBy=multi-user.target
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
                 xray_path = Path('/etc/hysteria/xray.json')
@@ -7111,7 +7161,7 @@ WantedBy=multi-user.target
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
                 xray_path = Path('/etc/hysteria/xray.json')
@@ -7199,7 +7249,7 @@ WantedBy=multi-user.target
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                form = parse_qs(self.rfile.read(length).decode('utf-8'))
+                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
                 ver = form.get('version', ['v1'])[0].lower()
                 if ver not in ('v1', 'v2', 'v3'):
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid BBR version'})
@@ -7267,7 +7317,7 @@ WantedBy=multi-user.target
                 return self.reply(401, b'Unauthorized')
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8')
+                body = self.rfile.read(length).decode('utf-8', errors='replace')
                 form = parse_qs(body)
                 action = form.get('action', [''])[0]
                 user_id = form.get('user_id', [''])[0].strip()
@@ -7283,10 +7333,16 @@ WantedBy=multi-user.target
 
                 if action == 'create' and user_id:
                     pwd = form.get('password', [''])[0].strip() or secrets.token_hex(16)
-                    days = int(form.get('duration_days', ['30'])[0] or 30)
-                    ip_limit = int(form.get('ip_limit', ['0'])[0] or 0)
-                    traffic_gb = float(form.get('traffic_gb', ['0'])[0] or 0)
-                    if days <= 0 or not 0 <= ip_limit <= 1000 or not math.isfinite(traffic_gb) or traffic_gb < 0:
+                    # 同 REST 通道：非数字输入必须回 400，而不是让异常掐断连接。
+                    try:
+                        days = int(form.get('duration_days', ['30'])[0] or 30)
+                        ip_limit = int(form.get('ip_limit', ['0'])[0] or 0)
+                        traffic_gb = float(form.get('traffic_gb', ['0'])[0] or 0)
+                    except (ValueError, TypeError, OverflowError):
+                        return self.reply(400, b'Invalid duration, IP limit or traffic quota')
+                    # 上限 1e6 GB：没有上限时超大值会在 int() 处抛 OverflowError。
+                    if (days <= 0 or not 0 <= ip_limit <= 1000 or not math.isfinite(traffic_gb)
+                            or not 0 <= traffic_gb <= 1000000):
                         return self.reply(400, b'Invalid duration, IP limit or traffic quota')
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
                     note = form.get('note', [''])[0].strip()[:200]
@@ -7661,7 +7717,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     #   * 收窄到**白名单**（见 _reality_public_params）：只挑
                     #     明确要用的几个键，不做整字典透传 —— 这样以后
                     #     reality_config 里新增任何字段都不会自动泄漏出去。
-                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                    m = read_meta_file(meta_path)
                     with data_lock:
                         d_snap = {
                             'reality': dict(data.get('reality_config') or {}),
@@ -7838,7 +7894,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     counters.update({'ok': True, 'suspended': suspended, 'time': int(time.time())})
                     return self.reply_json(200, counters)
                 if sub == 'node/meta':
-                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                    m = read_meta_file(meta_path)
                     with data_lock:
                         users_count = len(data.get('users', {}))
                     # 🔴 白名单，2026-10-09 修（真实泄漏）：
@@ -7882,7 +7938,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         items = list(data.get('proxy_services', []))
                     # 面板只看这条 API: 补齐 host 与 gost 运行状态,
                     # 否则列表显示不出主机名, 也无法区分"服务真的可用"和"条目存在".
-                    m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                    m = read_meta_file(meta_path)
                     host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
                     return self.reply_json(200, {
                         'ok': True,
@@ -7930,7 +7986,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not user_share_available(u_copy):
                     return self.reply(403, b'User subscription unavailable')
 
-                m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                m = read_meta_file(meta_path)
                 pwd = u_copy.get('password', '')
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
@@ -8023,7 +8079,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                     u_copy = dict(u)
 
-                m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                m = read_meta_file(meta_path)
                 pwd = u_copy.get('password', '')
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
@@ -8194,7 +8250,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
                 services = list(data.get('proxy_services', []))
-            m = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+            m = read_meta_file(meta_path)
             host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
             return self.reply_json(200, {
                 'ok': True,
@@ -8535,7 +8591,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8') if length > 0 else ''
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
             except Exception:
                 return self.reply_json(400, {'ok': False, 'error': 'Bad request'})
@@ -8685,7 +8741,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                meta = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+                meta = read_meta_file(meta_path)
             except Exception:
                 meta = {}
             root = meta_path.parent
