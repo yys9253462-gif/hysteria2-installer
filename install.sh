@@ -219,6 +219,32 @@ HY2_ACME_REPO="acmesh-official/acme.sh"
 HY2_ACME_FILES="acme.sh dnsapi/dns_cf.sh dnsapi/dns_ali.sh dnsapi/dns_dp.sh"
 # 已有安装核验通过后记录实际比对的 commit（仅用于日志/后续提示，不参与校验）。
 HY2_ACME_VERIFIED_COMMIT=""
+# 本机记录"这份 acme.sh 是按哪个 commit 校验安装的"，位于 acme.sh home 内。
+# 自动升级已关闭，所以安装后文件不会再变；以后核验必须对比**这个** commit，
+# 而不是当时的上游 master —— master 一前进，旧安装就永远对不上了。
+HY2_ACME_PIN_NAME=".hy2-pinned-commit"
+
+# 把校验所用 commit 写进 $1/.hy2-pinned-commit（原子替换，600）。
+hy2_acme_record_pin() {
+    local home="${1:-}" commit="${2:-}" tmp
+    [[ -n "$home" && -d "$home" ]] || return 1
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    tmp="$(mktemp "${home}/${HY2_ACME_PIN_NAME}.XXXXXX")" || return 1
+    printf '%s
+' "$commit" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "${home}/${HY2_ACME_PIN_NAME}" || {
+        rm -f "$tmp"; return 1; }
+}
+
+# 读 $1/.hy2-pinned-commit；文件不存在返回 2（旧安装），内容非法返回 1。
+hy2_acme_read_pin() {
+    local f="${1:-}/${HY2_ACME_PIN_NAME}" commit
+    [[ -e "$f" ]] || return 2
+    [[ -f "$f" && ! -L "$f" ]] || return 1
+    commit="$(head -n1 "$f" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    printf '%s
+' "$commit"
+}
 
 # 路径必须是仓库内相对路径：拒绝绝对路径、`..`/`.` 组件、反斜杠、空段、以 `-` 开头。
 hy2_acme_path_safe() {
@@ -399,6 +425,10 @@ hy2_acme_install_verified() {
         log_err "无法关闭 acme.sh 的自动升级（account.conf 写入失败），已放弃使用。"
         return 1
     fi
+    if ! hy2_acme_record_pin "$home" "$commit"; then
+        log_err "无法记录 acme.sh 的固定 commit（${home}/${HY2_ACME_PIN_NAME}），以后将无法核验这份安装，已放弃使用。"
+        return 1
+    fi
     log_info "acme.sh 已固定到 commit ${commit} 并通过逐文件 blob 校验；自动升级已关闭，续期 cron 保留。"
     return 0
 }
@@ -451,9 +481,20 @@ hy2_acme_verify_existing() {
         return 1
     fi
     work="$(mktemp -d)" || { log_err "无法创建临时目录，无法校验已有 acme.sh。"; return 1; }
-    if ! commit="$(hy2_acme_pin_commit)"; then
-        log_err "无法从 GitHub 官方 API 解析 ${HY2_ACME_REPO} 的 commit（网络/限流）。"
+    # 优先对比本机记录的固定 commit（本项目装的 / 已核验过的安装）。
+    # 记录存在时**绝不**回退到上游 master：对不上就是被改过，必须阻断。
+    # 没有记录的旧安装（get.acme.sh 装的）只能对比当前 master，核验通过后再补记录。
+    local pin_rc=0
+    commit="$(hy2_acme_read_pin "$home")" || pin_rc=$?
+    if [[ $pin_rc -eq 1 ]]; then
+        log_err "${home}/${HY2_ACME_PIN_NAME} 内容非法（不是 40 位 commit），无法确认这份安装的来源。"
         rm -rf "$work"; return 1
+    elif [[ $pin_rc -eq 2 ]]; then
+        if ! commit="$(hy2_acme_pin_commit)"; then
+            log_err "无法从 GitHub 官方 API 解析 ${HY2_ACME_REPO} 的 commit（网络/限流）。"
+            rm -rf "$work"; return 1
+        fi
+        log_warn "这份 acme.sh 没有固定 commit 记录（旧安装），改为对比上游当前 master ${commit:0:7}。"
     fi
     if ! tree_json="$(hy2_acme_tree_json "$commit")"; then
         log_err "取不到 ${HY2_ACME_REPO}@${commit} 的官方文件树（或返回被截断）。"
@@ -509,6 +550,10 @@ hy2_acme_check_existing() {
     log_info "现有 acme.sh 与官方 ${HY2_ACME_VERIFIED_COMMIT} 逐文件一致（除 shebang），来源可确认。"
     if hy2_acme_disable_auto_upgrade "${home}/account.conf"; then
         log_info "已关闭现有 acme.sh 的在线自动升级（AUTO_UPGRADE=0），续期 cron 保留。"
+        # 自动升级关掉后文件不会再变，这时才补记录：以后都对比这个 commit。
+        # 记录失败不影响本次使用，只是下次仍按"旧安装"对比 master。
+        hy2_acme_record_pin "$home" "$HY2_ACME_VERIFIED_COMMIT" ||
+            log_warn "未能写入 ${home}/${HY2_ACME_PIN_NAME}，下次仍会对比上游 master。"
     else
         log_warn "未能关闭现有 acme.sh 的自动升级，请手工在 ${home}/account.conf 设 AUTO_UPGRADE='0'。"
     fi

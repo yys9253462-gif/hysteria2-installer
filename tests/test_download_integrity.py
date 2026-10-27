@@ -808,7 +808,8 @@ class AcmeInstallTests(unittest.TestCase):
                     'hy2_acme_fetch_verified', 'hy2_acme_disable_auto_upgrade',
                     'hy2_acme_shebang_safe', 'hy2_acme_same_except_shebang',
                     'hy2_acme_verify_existing', 'hy2_acme_check_existing',
-                    'hy2_acme_install_verified')
+                    'hy2_acme_install_verified', 'hy2_acme_record_pin',
+                    'hy2_acme_read_pin')
 
     # 假的上游安装器：把自身（改掉 shebang）装到 --home，并写一份带
     # AUTO_UPGRADE="1" 的 account.conf —— 与上游 install() 的关键行为一致。
@@ -840,8 +841,9 @@ exit 0
         src = INSTALL.read_text(encoding='utf-8')
         repo = re.search(r'^HY2_ACME_REPO="([^"]+)"', src, re.M).group(1)
         files = re.search(r'^HY2_ACME_FILES="([^"]+)"', src, re.M).group(1)
+        pin = re.search(r'^HY2_ACME_PIN_NAME="([^"]+)"', src, re.M).group(1)
         helpers = '\n'.join(extract_install_fn(n) for n in self.ACME_HELPERS)
-        return (f'HY2_ACME_REPO="{repo}"\nHY2_ACME_FILES="{files}"\n'
+        return (f'HY2_ACME_REPO="{repo}"\nHY2_ACME_FILES="{files}"\nHY2_ACME_PIN_NAME="{pin}"\n'
                 'log_info() { echo "INF: $*"; }; log_warn() { echo "WRN: $*"; }\n'
                 'log_err() { echo "ERR: $*"; }; log_step() { :; }\n' + helpers + '\n')
 
@@ -902,6 +904,7 @@ curl() {{
       *) shift;;
     esac
   done
+  printf '%s\n' "$url" >> "$ROOT/urls.log"
   case "$url" in
     *api.github.com*commits/master*)
         if [[ -n "$dest" ]]; then cat "$ROOT/commit.json" > "$dest"; else cat "$ROOT/commit.json"; fi
@@ -910,7 +913,7 @@ curl() {{
         if [[ -n "$dest" ]]; then cat "$ROOT/tree.json" > "$dest"; else cat "$ROOT/tree.json"; fi
         return 0;;
     *raw.githubusercontent.com*)
-        local p="${{url#*$COMMIT/}}"
+        local p="${{url#*raw.githubusercontent.com/*/*/*/}}"
         for f in $FETCH_FAIL; do [[ "$p" == "$f" ]] && return 22; done
         [[ -n "${{MAP[$p]:-}}" ]] || return 22
         cp "$ROOT/${{MAP[$p]}}" "$dest"; return 0;;
@@ -1091,8 +1094,11 @@ done
             self.assertEqual((home / 'acme.sh').read_bytes(), installed['acme.sh'])
 
     def _existing_case(self, td, mutate_main=None, mutate_plugin=None, commit_json=None,
-                       fetch_fail=None):
-        """构造"已有安装 + 官方元数据"的完整场景，返回 (out, home, files)。"""
+                       fetch_fail=None, pin=None):
+        """构造"已有安装 + 官方元数据"的完整场景，返回 (out, home, files)。
+
+        pin: 预先写进 home/.hy2-pinned-commit 的内容（None = 旧安装，无记录）。
+        """
         files = self.ok_files()
         installed = {'acme.sh': self.MOCK_INSTALLER.replace(
             '#!/usr/bin/env sh', '#!/bin/bash', 1).encode(),
@@ -1109,6 +1115,8 @@ done
         (home / 'hy2.test.com_ecc').mkdir()
         (home / 'hy2.test.com_ecc' / 'fullchain.cer').write_text('CERT', encoding='utf-8')
         (home / 'hy2.test.com_ecc' / 'hy2.test.com.key').write_text('KEY', encoding='utf-8')
+        if pin is not None:
+            (home / '.hy2-pinned-commit').write_text(pin, encoding='utf-8')
         out, _, mark, _ = self.run_install(td, files, self.ok_tree(files),
                                           commit_json=commit_json, fetch_fail=fetch_fail,
                                           home=home, call='existing', existing_files=installed)
@@ -1122,6 +1130,7 @@ done
                          'AUTO_UPGRADE="1"\nCF_Token="x"\n', '核验失败时不得写其配置')
         self.assertFalse((home / 'account.conf.hy2-bak').exists(),
                          '核验失败时不得改动/备份其配置')
+        self.assertFalse((home / '.hy2-pinned-commit').exists(), '核验失败时不得写固定 commit 记录')
         # 不执行、不删除、不覆盖任何已有文件
         for p, data in installed.items():
             self.assertEqual((home / p).read_bytes(), data, f'核验失败时 {p} 必须原样保留')
@@ -1192,6 +1201,61 @@ done
             out, _, _, _ = self.run_install(td, files, json.dumps(tree), home=home,
                                            call='existing', existing_files=installed)
             self.assertIn('ERR:', out, out)
+
+    # ── 固定 commit 记录（2026-10-27）：核验对比本机记录的 commit，而不是浮动 master ──
+
+    def test_install_records_pinned_commit(self):
+        with tempfile.TemporaryDirectory() as td:
+            files = self.ok_files()
+            out, home, _, _ = self.run_install(td, files, self.ok_tree(files))
+            self.assertNotIn('ERR:', out, out)
+            pin = home / '.hy2-pinned-commit'
+            self.assertEqual(pin.read_text(encoding='utf-8').strip(), 'a' * 40, out)
+            self.assertEqual(pin.stat().st_mode & 0o777, 0o600)
+
+    def test_pinned_install_survives_upstream_master_moving(self):
+        """上游 master 前进后，按记录的 commit 核验仍通过，且根本不去问 master。"""
+        pinned = 'c' * 40
+        with tempfile.TemporaryDirectory() as td:
+            out, home, installed = self._existing_case(
+                td, pin=pinned + '\n', commit_json=json.dumps({'sha': 'd' * 40}))
+            self.assertNotIn('ERR:', out, out)
+            self.assertIn('来源可确认', out, out)
+            urls = (Path(td) / 'urls.log').read_text(encoding='utf-8')
+            self.assertNotIn('commits/master', urls, '有记录时不得再解析浮动 master')
+            self.assertIn(f'git/trees/{pinned}', urls)
+            self.assertIn(f'/{pinned}/acme.sh', urls)
+            self.assertEqual((home / '.hy2-pinned-commit').read_text(encoding='utf-8').strip(), pinned)
+
+    def test_pinned_install_tampered_is_blocked_without_master_fallback(self):
+        """有记录但内容对不上：必须阻断，不能退回去对比 master 碰运气。"""
+        with tempfile.TemporaryDirectory() as td:
+            out, home, installed = self._existing_case(
+                td, mutate_plugin=b'# dns_cf TAMPERED\n', pin='c' * 40 + '\n')
+            self.assertIn('已阻止', out, out)
+            for p, data in installed.items():
+                self.assertEqual((home / p).read_bytes(), data)
+            self.assertEqual((home / 'account.conf').read_text(encoding='utf-8'),
+                             'AUTO_UPGRADE="1"\nCF_Token="x"\n')
+            urls = (Path(td) / 'urls.log').read_text(encoding='utf-8')
+            self.assertNotIn('commits/master', urls)
+
+    def test_invalid_pin_record_blocks(self):
+        for bad in ('not-a-commit\n', '', 'A' * 40 + '\n', 'c' * 39 + '\n'):
+            with tempfile.TemporaryDirectory() as td:
+                out, home, installed = self._existing_case(td, pin=bad)
+                self.assertIn('已阻止', out, out)
+                self.assertIn('内容非法', out, out)
+                self.assertEqual((home / '.hy2-pinned-commit').read_text(encoding='utf-8'), bad,
+                                 '非法记录不得被自动改写')
+
+    def test_legacy_install_gets_pinned_after_master_check(self):
+        """没有记录的旧安装：对比 master 通过、关掉自动升级后补写记录。"""
+        with tempfile.TemporaryDirectory() as td:
+            out, home, installed = self._existing_case(td)
+            self.assertNotIn('ERR:', out, out)
+            self.assertIn('旧安装', out, out)
+            self.assertEqual((home / '.hy2-pinned-commit').read_text(encoding='utf-8').strip(), 'a' * 40)
 
     def test_install_binary_fallback_keeps_app_tag_prefix(self):
         """API 不可用、只能从下载站解析版本时，必须拼回 `app/` 前缀。
