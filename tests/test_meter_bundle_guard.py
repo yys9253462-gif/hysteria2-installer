@@ -53,7 +53,17 @@ class MeterBundleGuardTests(unittest.TestCase):
                     p = fixture / 'usage-meter-runtime-20261007-v1.py'
                     p.write_text(p.read_text(encoding='utf-8').replace('2026-10-12-real-usage-v2', 'old'), encoding='utf-8')
                 # 不触网，不调用 systemctl；只测试实际下载+落地代码段。
+                # 目录列表 JSON：文件名 -> fixture 内容的 git blob 身份。
+                # 门户取文件现在除了 marker/语法，还要比对 blob 身份（2026-10-27）。
+                import hashlib as _h
+                entries = []
+                for name in FILES:
+                    data = (fixture / name).read_bytes()
+                    blob = _h.sha1(b'blob ' + str(len(data)).encode() + b'\x00' + data).hexdigest()
+                    entries.append('{"name":"%s","sha":"%s"}' % (name, blob))
+                listing = '[' + ','.join(entries) + ']'
                 stub = '''HY2_DIR="$PWD/target"
+LISTING=''' + '\'' + listing + '\'' + '''
 curl() {
   local url='' dest=''
   while [[ $# -gt 0 ]]; do
@@ -66,6 +76,16 @@ curl() {
   done
   if [[ "$url" == */commits/main ]]; then
     printf '{"sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+    return
+  fi
+  # 目录列表（contents/?ref=<sha>）与单文件 JSON（contents/<name>?ref=<sha>）都要答
+  if [[ "$url" == */contents/\?ref=* ]]; then
+    printf '%s' "$LISTING" > "$dest"
+    return
+  fi
+  if [[ "$url" == */contents/*\?ref=* ]]; then
+    local n="${url#*/contents/}"; n="${n%%\?*}"
+    printf '%s' "$LISTING" | python3 -c 'import json,sys; n=sys.argv[1]; print(json.dumps({"sha": next((i["sha"] for i in json.load(sys.stdin) if i["name"]==n), "")}))' "$n"
     return
   fi
   [[ "$url" == *aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa* ]] || return 9
@@ -93,6 +113,8 @@ portal_fetch_files() {
   printf '%s' "$PORTAL_FETCH_REF" > "$1/pinned"
 }
 portal_files_ok() { return 0; }
+portal_remote_blob_shas() { [[ "$1" == aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ]] || return 1; echo "x aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; }
+portal_verify_blobs() { return 0; }
 '''.replace('PAYLOAD', '{"sha":"' + 'a' * 40 + '"}' if resolve else '{}')
                 result = self.run_shell(script + 'portal_fetch_py() {' + body +
                                         '\n}\nportal_fetch_py "$PWD"\n', root)

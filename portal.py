@@ -943,6 +943,163 @@ def resolve_update_ref(ref):
     return value
 
 
+# ==============================================================================
+# 下载完整性校验（2026-10-27）
+# ------------------------------------------------------------------------------
+# 与 install.sh 里的同名逻辑保持一致：先解析确定版本，再从**官方**发布取校验
+# 清单，按精确资产名解析出唯一 SHA256，下载到私有临时目录校验通过才替换。
+#
+# fail-closed 的情形：清单取不到 / 为空 / 没有该资产 / 同一资产多条匹配 /
+# 摘要不是 64 位十六进制 / 内容与摘要不一致。
+# 第三方镜像不能提供可信摘要：只有先从官方拿到预期摘要，才允许把镜像当传输
+# 候选，且内容必须与官方摘要逐字节一致。
+# 同源摘要只证明与官方发布一致，不构成独立签名。
+# ==============================================================================
+
+_SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def parse_checksum_manifest(text, asset):
+    """从 `<sha256>  <name>` 清单里取唯一匹配资产的摘要。
+
+    无匹配 / 多条匹配 / 摘要畸形一律返回 None（调用方必须 fail-closed）。
+    兼容 CRLF、`*name`、`./name`，并允许按 basename 匹配（hysteria 的清单里
+    路径形如 `build/hysteria-linux-amd64`）。
+    """
+    if not isinstance(text, str) or not asset:
+        return None
+    found = None
+    count = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        digest = parts[0].lower()
+        name = parts[-1].lstrip('*')
+        while name.startswith('./'):
+            name = name[2:]
+        if name != asset and name.rsplit('/', 1)[-1] != asset:
+            continue
+        if not _SHA256_RE.match(digest):
+            return None
+        count += 1
+        found = digest
+    return found if count == 1 else None
+
+
+def parse_xray_dgst(text):
+    """从 Xray 的 `.dgst` 里取 SHA2-256（`SHA2-256= <hex>`）。
+
+    只认 SHA2-256 —— 绝不把 MD5 / SHA1 当作校验依据。缺失或重复返回 None。
+    """
+    if not isinstance(text, str):
+        return None
+    found = None
+    count = 0
+    for raw in text.splitlines():
+        line = raw.strip()
+        if '=' not in line:
+            continue
+        key, value = line.split('=', 1)
+        key = key.strip().upper().replace('_', '-')
+        if key != 'SHA2-256':
+            continue
+        digest = value.strip().lower()
+        if not _SHA256_RE.match(digest):
+            return None
+        count += 1
+        found = digest
+    return found if count == 1 else None
+
+
+def fetch_text(url, timeout=30, headers=None):
+    req = urllib.request.Request(url, headers=headers or {'User-Agent': 'hysteria2-installer'})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode('utf-8', errors='replace')
+
+
+def fetch_expected_sha256(manifest_url, asset, parser=None):
+    """取官方清单并解析唯一摘要；任何异常/缺失都返回 None（fail-closed）。"""
+    try:
+        text = fetch_text(manifest_url)
+    except Exception:
+        return None
+    return parser(text) if parser is not None else parse_checksum_manifest(text, asset)
+
+
+def verify_sha256(path, expected):
+    """摘要格式非法或内容不匹配都返回 False。"""
+    if not isinstance(expected, str) or not _SHA256_RE.match(expected):
+        return False
+    try:
+        return sha256_file(path) == expected
+    except OSError:
+        return False
+
+
+def git_blob_sha(data):
+    """git blob 身份：sha1("blob <len>\\0" + content)。
+
+    ⚠️ 它**不等于**文件的 sha1，少写 blob 头永远对不上 GitHub contents API 的 sha。
+    """
+    return hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\x00' + data).hexdigest()
+
+
+def safe_tar_members(names, wanted):
+    """校验 tar 成员名，并返回与 wanted 同名的**包内实际成员名**。
+
+    拒绝绝对路径与含 `..` 的成员（防以 root 写出临时目录），
+    且只接受一个精确同名的常规文件（不做"第一个可执行文件"兜底）。
+    """
+    hits = []
+    for name in names:
+        clean = name[2:] if name.startswith('./') else name
+        if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
+            raise ValueError('tar 包内含不安全路径成员: %s' % name)
+        if clean == wanted or clean.rsplit('/', 1)[-1] == wanted:
+            hits.append(name)
+    if len(hits) != 1:
+        raise ValueError('tar 包内 %s 成员缺失或不唯一（%d 个）' % (wanted, len(hits)))
+    return hits[0]
+
+
+def safe_zip_members(names, wanted):
+    """校验 zip 成员名并返回唯一精确匹配的成员名。"""
+    hits = []
+    for name in names:
+        clean = name[2:] if name.startswith('./') else name
+        if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
+            raise ValueError('zip 包内含不安全路径成员: %s' % name)
+        if clean == wanted or clean.rsplit('/', 1)[-1] == wanted:
+            hits.append(name)
+    if len(hits) != 1:
+        raise ValueError('zip 包内 %s 成员缺失或不唯一（%d 个）' % (wanted, len(hits)))
+    return hits[0]
+
+
+# 上游 Hysteria 没有 hysteria-linux-armv7 资产（实测 404），armv7 机器要用
+# hysteria-linux-arm。旧的 armv7 映射是已证实的缺陷。
+HYSTERIA_ARCH_ASSET = {'amd64': 'amd64', 'arm64': 'arm64', 'armv7': 'arm'}
+
+
+def hysteria_asset_arch(machine=None):
+    machine = (machine or platform.machine()).lower()
+    arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64',
+            'arm64': 'arm64', 'armv7l': 'armv7', 'armv7': 'armv7'}.get(machine)
+    return HYSTERIA_ARCH_ASSET.get(arch) if arch else None
+
+
 def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
     binary = Path(binary)
     current = subprocess.run([str(binary), 'version'], capture_output=True, text=True, timeout=5).stdout
@@ -953,16 +1110,55 @@ def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hyste
     arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64', 'armv7l': 'armv7'}.get(machine)
     if not arch:
         raise RuntimeError('Unsupported core architecture')
+    asset_arch = HYSTERIA_ARCH_ASSET.get(arch)
+    if not asset_arch:
+        raise RuntimeError('Unsupported core architecture')
+    asset = 'hysteria-linux-' + asset_arch
     fd, name = tempfile.mkstemp(prefix='.hysteria-update-', dir=str(binary.parent))
     os.close(fd)
     candidate = Path(name)
     backup = None
     replaced = False
     try:
-        url = 'https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-' + arch
+        # 先解析确定版本，再取该版本的官方 hashes.txt。绝不用浮动 latest 的字节。
+        tag = ''
+        try:
+            tag = str(json.loads(fetch_text(
+                'https://api.github.com/repos/apernet/hysteria/releases/latest',
+                timeout=10)).get('tag_name') or '')
+        except Exception:
+            tag = ''
+        if not tag:
+            # 官方下载站的 latest 会 302 到 /app/<version>/<asset>，据此解析版本。
+            # 任何解析失败（网络、HTML 错误页、重定向缺失）都只意味着"版本无法确定"，
+            # 必须继续走下面的 fail-closed 分支，而不是把底层异常类型抛给调用方。
+            try:
+                req = urllib.request.Request(
+                    'https://download.hysteria.network/app/latest/' + asset,
+                    headers={'User-Agent': 'hysteria2-installer'})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    final = resp.geturl() or ''
+                m = re.search(r'/app/(v[0-9][^/]*)/' + re.escape(asset) + r'$', final)
+                # 下载站只给裸版本号，而 GitHub 的 release tag 是 `app/vX.Y.Z`；
+                # 不补前缀拼出的 hashes.txt / 资产 URL 实测 404，回退路径会永远失败。
+                tag = ('app/' + m.group(1)) if m else ''
+            except Exception:
+                tag = ''
+        if not tag:
+            raise RuntimeError('无法确定 Hysteria 版本，已放弃更新（不做无校验下载）')
+        expected = fetch_expected_sha256(
+            'https://github.com/apernet/hysteria/releases/download/' + tag + '/hashes.txt',
+            asset)
+        if not expected:
+            raise RuntimeError(
+                '取不到 Hysteria %s 的官方 hashes.txt（或其中没有 %s），已放弃更新' % (tag, asset))
+        url = ('https://github.com/apernet/hysteria/releases/download/'
+               + tag + '/' + asset)
         req = urllib.request.Request(url, headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=90) as source, open(candidate, 'wb') as dest:
             shutil.copyfileobj(source, dest)
+        if not verify_sha256(candidate, expected):
+            raise RuntimeError('候选核心的 SHA256 与官方 hashes.txt 不一致，原核心未更改')
         with candidate.open('rb') as stream:
             if stream.read(4) != b'\x7fELF':
                 raise RuntimeError('下载内容不是 Linux 核心二进制，原核心未更改')
@@ -5047,7 +5243,7 @@ if __name__ == '__main__':
         except Exception:
             return False
 
-    def _fetch_repo_file(filename, marker=None, min_size=1024, ref="main"):
+    def _fetch_repo_file(filename, marker=None, min_size=1024, ref="main", expect_blob=None):
         """从多个源依次尝试获取仓库里的某个文件，返回内容字节；全失败返回 None。
 
         ⚠️ 不能只用 raw.githubusercontent.com：实测 push 后数分钟仍返回旧内容，
@@ -5055,9 +5251,15 @@ if __name__ == '__main__':
         实测同一时刻：api.github.com（Accept: vnd.github.raw）与 jsDelivr 都是最新，
         raw 滞后。顺序：API（权威）→ jsDelivr（无限速）→ raw（兜底）。
         与 install.sh 中 awg_fetch_ctl 的策略保持一致。
+
+        expect_blob 不为 None 时，每个源取回的内容都必须与它（git blob sha）一致：
+        jsDelivr / raw 可能返回与所 pin commit 不符的内容（缓存污染或 CDN 侧篡改），
+        只比对 marker 挡不住 —— 只要内容里含 marker 且语法合法就会被写盘。
         """
         if ref != "main" and not re.fullmatch(r"[0-9a-f]{40}", ref):
             raise ValueError("invalid immutable ref")
+        if expect_blob is not None and not re.fullmatch(r"[0-9a-f]{40}", expect_blob):
+            raise ValueError("invalid expected blob sha")
         sources = [
             ('https://api.github.com/repos/' + AWG_REPO + '/contents/' + filename + '?ref=' + ref,
              {'User-Agent': 'Mozilla/5.0', 'Accept': 'application/vnd.github.raw'}),
@@ -5073,6 +5275,8 @@ if __name__ == '__main__':
                     content = resp.read()
                 # 体积 + 关键字双重校验，挡住错误页
                 if len(content) > min_size and (marker is None or marker in content):
+                    if expect_blob is not None and _git_blob_sha(content) != expect_blob:
+                        continue          # 与所 pin commit 的内容不符，换下一个源
                     return content
             except Exception:
                 continue
@@ -5092,35 +5296,49 @@ if __name__ == '__main__':
         except Exception:
             return None
 
-    def _remote_blob_sha(filename, marker=None):
-        """取远端文件的 git blob sha。优先走 contents API 的 JSON（便宜），
-        拿不到时退回「下载内容后自己算」。"""
+    def _remote_blob_sha(filename, marker=None, ref="main"):
+        """取远端文件的 git blob sha（**只**走 contents API 的 JSON）。
+
+        🔴 2026-10-27：旧实现在 API 失败时会退回「下载内容后自己算 blob sha」——
+        那样"预期身份"就来自待校验的内容本身，比对恒成立，等于没有身份校验。
+        现在 API 拿不到就返回 None，调用方必须 fail-closed（放弃更新）。
+        marker 参数仅为兼容既有调用点保留，此处不再用于下载内容。
+        """
         try:
-            url = 'https://api.github.com/repos/' + AWG_REPO + '/contents/' + filename + '?ref=main'
+            url = ('https://api.github.com/repos/' + AWG_REPO + '/contents/'
+                   + filename + '?ref=' + ref)
             req = urllib.request.Request(url, headers={
                 'User-Agent': 'Mozilla/5.0',
                 'Accept': 'application/vnd.github+json',
             })
             with urllib.request.urlopen(req, timeout=8) as resp:
                 info = json.loads(resp.read().decode('utf-8'))
-            sha = info.get('sha', '')
-            if len(sha) == 40:
+            sha = info.get('sha', '') if isinstance(info, dict) else ''
+            if isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha):
                 return sha
         except Exception as exc:
             _log_ignored('awg_remote_sha', exc)
-        content = _fetch_repo_file(filename, marker)
-        return _git_blob_sha(content) if content else None
+        return None
 
     def ensure_awgctl(force=False):
         """确保 hy2-awgctl 可用；缺失时从主仓库拉取（与 install.sh 的策略一致）。
 
         force=True 时即使已存在也重新获取，且仅在内容变化时才替换 —— 否则已经装过
         AWG 的机器会把引擎永久冻结在首次安装的版本上。
+
+        🔴 2026-10-27：先把 main 固定成 40 位 commit，再用该 commit 的 blob 身份
+        比对取回内容。旧实现直接取 `?ref=main` 且只 grep 一个字符串标记，
+        main 被推入恶意提交就会把 hy2-awgctl 刷成攻击者版本并以 root 执行。
         """
         if not force and Path(AWG_CTL).exists():
             return True
         try:
-            content = _fetch_repo_file('awgctl.sh', marker=b'hy2-awgctl', min_size=2048)
+            ref = resolve_update_ref('main')
+            expected = _remote_blob_sha('awgctl.sh', marker=b'hy2-awgctl', ref=ref)
+            if not expected:
+                return False
+            content = _fetch_repo_file('awgctl.sh', marker=b'hy2-awgctl', min_size=2048,
+                                       ref=ref, expect_blob=expected)
             if content is None:
                 return False
             # 内容一致就直接返回，避免无谓改写
@@ -6260,16 +6478,28 @@ if __name__ == '__main__':
                     # 于是三个源全被判成"内容不对"，自更新永远失败。
                     # 现在 portal_assets.py 用 b'SCRIPT = r'：既确实存在，
                     # 又顺带校验了「JS 常量仍是原始字符串」这个关键属性。
+                    #
+                    # 🔴 除 marker + 语法外，每个文件还必须与**所 pin commit 的 git blob
+                    #    身份**一致。jsDelivr / raw 可能与所 pin 的 commit 不符（缓存污染
+                    #    或 CDN 侧篡改），只校验 marker 挡不住：内容含 marker 且语法合法
+                    #    就会被写成 root 运行的面板代码。
                     for fname, marker, minsize in (('portal.py', b'hysteria2-installer', 20000),
                                                    ('portal_assets.py', b'SCRIPT = r', 10000),
                                                    ('usage-meter-core-20261007-v1.py', b'ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"', 1024),
                                                    ('usage-meter-readers-20261007-v1.py', b'def read_hysteria', 1024),
                                                    ('usage-meter-runtime-20261007-v1.py', b'ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"', 1024),
                                                    ('usage-meter-xray-config-20261007-v1.py', b'def add_stats', 1024)):
-                        content = _fetch_repo_file(fname, marker=marker, min_size=minsize, ref=ref)
+                        expected = _remote_blob_sha(fname, marker=marker, ref=ref)
+                        if not expected:
+                            return self.reply_json(500, {'ok': False, 'error':
+                                '取不到 %s@%s 的预期 blob 身份 —— 已放弃更新，面板保持原样'
+                                % (fname, ref[:7])})
+                        content = _fetch_repo_file(fname, marker=marker, min_size=minsize,
+                                                   ref=ref, expect_blob=expected)
                         if content is None:
                             return self.reply_json(500, {'ok': False, 'error':
-                                '取不到 %s（三个源均失败）—— 已放弃更新，面板保持原样' % fname})
+                                '取不到 %s（三个源均失败或内容与 %s 不符）—— 已放弃更新，面板保持原样'
+                                % (fname, ref[:7])})
                         try:
                             ast.parse(content.decode('utf-8'))
                         except Exception as e:
@@ -6499,6 +6729,17 @@ if __name__ == '__main__':
                 ver = tag.lstrip('v')
                 pkg_name = f"gost_{ver}_{arch}.tar.gz"
 
+                # 先从该版本的**官方** checksums.txt 取预期摘要；取不到就不装。
+                # 第三方镜像（ghfast / moeyy）只能作传输候选，不能提供可信摘要：
+                # 它们必须与官方摘要逐字节一致才会被接受。
+                expected = fetch_expected_sha256(
+                    f"https://github.com/go-gost/gost/releases/download/{tag}/checksums.txt",
+                    pkg_name)
+                if not expected:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        '取不到 gost %s 的官方校验清单（checksums.txt）或其中没有 %s —— '
+                        '无法验证下载内容，已放弃安装' % (tag, pkg_name)})
+
                 download_urls = [
                     f"https://github.com/go-gost/gost/releases/download/{tag}/{pkg_name}",
                     f"https://ghfast.top/https://github.com/go-gost/gost/releases/download/{tag}/{pkg_name}",
@@ -6516,24 +6757,29 @@ if __name__ == '__main__':
                             # 超时给足：包有 ~17MB，30 秒在慢线路上不够
                             with urllib.request.urlopen(req, timeout=180) as resp, open(archive_path, 'wb') as out_f:
                                 shutil.copyfileobj(resp, out_f)
-                            size = archive_path.stat().st_size
-                            if size > 1024 * 1024 and tarfile.is_tarfile(str(archive_path)):
-                                src_bin = Path(tmpdir) / 'gost'
-                                with tarfile.open(str(archive_path), 'r:gz') as tar:
-                                    member = next((m for m in tar.getmembers()
-                                        if m.name.lstrip('./') == 'gost' and m.isfile()), None)
-                                    if member is None:
-                                        raise ValueError('Package contains no regular gost binary')
-                                    with tar.extractfile(member) as source, open(src_bin, 'wb') as dest:
-                                        shutil.copyfileobj(source, dest)
-                                if src_bin.exists():
-                                    shutil.move(str(src_bin), '/usr/local/bin/gost')
-                                    os.chmod('/usr/local/bin/gost', 0o755)
-                                    installed = True
-                                    break
-                                errors.append('%s: 包内没有 gost 可执行文件' % host)
-                            else:
-                                errors.append('%s: 内容异常（%d 字节，非有效 tar.gz）' % (host, size))
+                            if not verify_sha256(archive_path, expected):
+                                errors.append('%s: SHA256 与官方 checksums.txt 不一致' % host)
+                                continue
+                            if not tarfile.is_tarfile(str(archive_path)):
+                                errors.append('%s: 内容不是有效 tar.gz' % host)
+                                continue
+                            src_bin = Path(tmpdir) / 'gost'
+                            with tarfile.open(str(archive_path), 'r:gz') as tar:
+                                # 拒绝绝对路径 / `..`，且只接受唯一精确同名的常规成员
+                                member_name = safe_tar_members(
+                                    [m.name for m in tar.getmembers()], 'gost')
+                                member = next(m for m in tar.getmembers()
+                                              if m.name == member_name and m.isfile())
+                                with tar.extractfile(member) as source, open(src_bin, 'wb') as dest:
+                                    shutil.copyfileobj(source, dest)
+                            if src_bin.exists():
+                                staged = Path('/usr/local/bin/gost.new')
+                                shutil.copyfile(str(src_bin), str(staged))
+                                os.chmod(str(staged), 0o755)
+                                os.replace(str(staged), '/usr/local/bin/gost')
+                                installed = True
+                                break
+                            errors.append('%s: 包内没有 gost 可执行文件' % host)
                         except Exception as e:
                             errors.append('%s: %s: %s' % (host, type(e).__name__, e))
 
@@ -6770,34 +7016,65 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 machine = platform.machine().lower()
-                xarch = 'arm64-v8a' if ('aarch64' in machine or 'arm64' in machine) else '64'
+                # 架构映射必须覆盖 armv7：旧实现把除 aarch64 外的一切都当成 amd64，
+                # 于是 armv7 机器会被静默装上 Xray-linux-64.zip 并当作 xray 运行。
+                if 'aarch64' in machine or 'arm64' in machine:
+                    xarch = 'arm64-v8a'
+                elif 'armv7' in machine or 'armhf' in machine:
+                    xarch = 'arm32-v7a'
+                elif 'x86_64' in machine or 'amd64' in machine:
+                    xarch = '64'
+                else:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        '不支持的 CPU 架构，无法选择 Xray 资产: %s' % machine})
+                xasset = f"Xray-linux-{xarch}.zip"
+                xbase = 'https://github.com/XTLS/Xray-core/releases/download/v26.3.27/'
+                # 先取官方 `.dgst` 并只认 SHA2-256；取不到就不装。
+                expected = fetch_expected_sha256(xbase + xasset + '.dgst', None,
+                                                 parser=parse_xray_dgst)
+                if not expected:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        '取不到 %s 的官方 SHA2-256 摘要（.dgst 缺失、畸形或重复）—— '
+                        '无法验证下载内容，已放弃安装' % xasset})
                 dl_urls = [
-                    f"https://ghfast.top/https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-{xarch}.zip",
-                    f"https://github.moeyy.xyz/https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-{xarch}.zip",
-                    f"https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-{xarch}.zip"
+                    xbase + xasset,
+                    f"https://ghfast.top/{xbase}{xasset}",
+                    f"https://github.moeyy.xyz/{xbase}{xasset}",
                 ]
                 installed = False
+                errors = []
                 with tempfile.TemporaryDirectory() as tmpdir:
                     zpath = Path(tmpdir) / 'xray.zip'
                     for u in dl_urls:
+                        host = u.split('/')[2] if '//' in u else u
                         try:
                             req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
                             with urllib.request.urlopen(req, timeout=45) as resp, open(zpath, 'wb') as out_f:
                                 shutil.copyfileobj(resp, out_f)
-                            if zpath.stat().st_size > 5 * 1024 * 1024 and zipfile.is_zipfile(str(zpath)):
-                                with zipfile.ZipFile(zpath, 'r') as zf:
-                                    zf.extract('xray', path=tmpdir)
-                                bin_path = Path(tmpdir) / 'xray'
-                                if bin_path.exists():
-                                    shutil.move(str(bin_path), '/usr/local/bin/xray')
-                                    os.chmod('/usr/local/bin/xray', 0o755)
-                                    installed = True
-                                    break
+                            if not verify_sha256(zpath, expected):
+                                errors.append('%s: SHA256 与官方 .dgst 不一致' % host)
+                                continue
+                            if not zipfile.is_zipfile(str(zpath)):
+                                errors.append('%s: 内容不是有效 zip' % host)
+                                continue
+                            with zipfile.ZipFile(zpath, 'r') as zf:
+                                member = safe_zip_members(zf.namelist(), 'xray')
+                                zf.extract(member, path=tmpdir)
+                            bin_path = Path(tmpdir) / 'xray'
+                            if bin_path.exists():
+                                staged = Path('/usr/local/bin/xray.new')
+                                shutil.copyfile(str(bin_path), str(staged))
+                                os.chmod(str(staged), 0o755)
+                                os.replace(str(staged), '/usr/local/bin/xray')
+                                installed = True
+                                break
+                            errors.append('%s: 包内没有 xray' % host)
                         except Exception as exc:
-                            _log_ignored('xray_install', exc)
+                            errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
 
                 if not installed:
-                    return self.reply_json(500, {'ok': False, 'error': '下载或解压 Xray 核心失败'})
+                    return self.reply_json(500, {'ok': False,
+                        'error': '下载或解压 Xray 核心失败 —— ' + ' ｜ '.join(errors)})
 
                 service_content = '''[Unit]
 Description=Xray Service (VLESS-Reality / VMess / VLESS Encryption)
@@ -7507,7 +7784,7 @@ WantedBy=multi-user.target
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                install_warp_sh = '''
+                install_warp_sh = r'''
 set -eo pipefail
 export DEBIAN_FRONTEND=noninteractive
 WARP_SOCKS_ADDR="127.0.0.1:19898"
@@ -7539,6 +7816,27 @@ case "$ARCH" in
     *) echo "不支持的 CPU 架构: $ARCH" >&2; exit 1 ;;
 esac
 
+# ---- 完整性校验辅助（与 install.sh / portal.py 主流程同一套规则）----
+# 从 `<sha256>  <name>` 清单里取唯一匹配摘要；无匹配/多条/畸形 => 失败。
+manifest_sha256() {
+    awk -v f="$2" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); b=n; sub(/.*\//,"",b);
+                    if (n==f || b==f) print $1}' "$1" | tr 'A-F' 'a-f' | sort -u |
+    awk 'NR==1{d=$0} END{if (NR==1 && d ~ /^[0-9a-f]{64}$/) print d; else exit 1}'
+}
+verify_sha() {
+    [[ "$2" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$(sha256sum "$1" | awk '{print $1}')" == "$2" ]]
+}
+tar_member() {
+    local m n=0 hit=""
+    while IFS= read -r m; do
+        case "$m" in /*|..|../*|*/../*|*/..) return 2 ;; esac
+        if [[ "${m#./}" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
+    done < <(tar -tzf "$2" 2>/dev/null)
+    [[ $n -eq 1 ]] || return 3
+    echo "$hit"
+}
+
 if [ ! -x "$WGCF_BIN" ]; then
     log "下载 wgcf 二进制..."
     RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
@@ -7549,13 +7847,27 @@ if [ ! -x "$WGCF_BIN" ]; then
     fi
     VER="${TAG#v}"
     case "$VER" in ""|null) VER="2.3.0" ;; esac
-    if ! curl -fsSL --max-time 90 -o "${WGCF_BIN}.tmp" "https://github.com/ViRb3/wgcf/releases/download/v${VER}/wgcf_${VER}_linux_${WG_A}"; then
-        rm -f "${WGCF_BIN}.tmp"
-        echo "wgcf 下载失败 (v${VER}/${WG_A})" >&2
-        exit 1
+    WG_DL="wgcf_${VER}_linux_${WG_A}"
+    TD=$(mktemp -d)
+    trap 'rm -rf "$TD"' EXIT
+    # 先取该版本官方 checksums.txt，取不到就放弃（不做无校验下载）。
+    if ! curl -fsSL --max-time 30 --retry 2 -o "${TD}/checksums.txt" \
+            "https://github.com/ViRb3/wgcf/releases/download/v${VER}/checksums.txt" 2>/dev/null; then
+        rm -rf "$TD"; echo "取不到 wgcf v${VER} 的官方 checksums.txt，已放弃安装" >&2; exit 1
     fi
-    install -m 755 "${WGCF_BIN}.tmp" "$WGCF_BIN"
-    rm -f "${WGCF_BIN}.tmp"
+    WANT=$(manifest_sha256 "${TD}/checksums.txt" "$WG_DL") || WANT=""
+    if [ -z "$WANT" ]; then
+        rm -rf "$TD"; echo "checksums.txt 中 ${WG_DL} 的摘要缺失或不唯一，已放弃安装" >&2; exit 1
+    fi
+    if ! curl -fsSL --max-time 90 -o "${TD}/${WG_DL}" "https://github.com/ViRb3/wgcf/releases/download/v${VER}/${WG_DL}"; then
+        rm -rf "$TD"; echo "wgcf 下载失败 (v${VER}/${WG_A})" >&2; exit 1
+    fi
+    if ! verify_sha "${TD}/${WG_DL}" "$WANT"; then
+        rm -rf "$TD"; echo "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致" >&2; exit 1
+    fi
+    install -m 755 "${TD}/${WG_DL}" "${WGCF_BIN}.new" || { rm -rf "$TD"; exit 1; }
+    rm -rf "$TD"; trap - EXIT
+    mv -f "${WGCF_BIN}.new" "$WGCF_BIN"
 fi
 
 if [ ! -x "$WP_BIN" ]; then
@@ -7567,23 +7879,32 @@ if [ ! -x "$WP_BIN" ]; then
         TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
     case "$TAG" in ""|null) TAG="v1.1.3" ;; esac
-    TMP_TGZ=$(mktemp)
-    TMP_EX=$(mktemp -d)
-    if ! curl -fsSL --max-time 90 -o "$TMP_TGZ" "https://github.com/whyvl/wireproxy/releases/download/${TAG}/wireproxy_linux_${WP_A}.tar.gz"; then
-        rm -f "$TMP_TGZ"; rm -rf "$TMP_EX"
-        echo "wireproxy 下载失败 (${TAG}/${WP_A})" >&2
-        exit 1
+    WP_DL="wireproxy_linux_${WP_A}.tar.gz"
+    TD=$(mktemp -d)
+    trap 'rm -rf "$TD"' EXIT
+    if ! curl -fsSL --max-time 30 --retry 2 -o "${TD}/checksums.txt" \
+            "https://github.com/whyvl/wireproxy/releases/download/${TAG}/checksums.txt" 2>/dev/null; then
+        rm -rf "$TD"; echo "取不到 wireproxy ${TAG} 的官方 checksums.txt，已放弃安装" >&2; exit 1
     fi
-    tar -xzf "$TMP_TGZ" -C "$TMP_EX" 2>/dev/null || true
-    SRC=$(find "$TMP_EX" -name wireproxy -type f -executable 2>/dev/null | head -1)
-    [ -z "$SRC" ] && SRC=$(find "$TMP_EX" -type f -executable 2>/dev/null | head -1)
-    if [ -z "$SRC" ]; then
-        rm -f "$TMP_TGZ"; rm -rf "$TMP_EX"
-        echo "wireproxy 解压失败，未找到可执行文件" >&2
-        exit 1
+    WANT=$(manifest_sha256 "${TD}/checksums.txt" "$WP_DL") || WANT=""
+    if [ -z "$WANT" ]; then
+        rm -rf "$TD"; echo "checksums.txt 中 ${WP_DL} 的摘要缺失或不唯一，已放弃安装" >&2; exit 1
     fi
-    install -m 755 "$SRC" "$WP_BIN"
-    rm -f "$TMP_TGZ"; rm -rf "$TMP_EX"
+    if ! curl -fsSL --max-time 90 -o "${TD}/${WP_DL}" "https://github.com/whyvl/wireproxy/releases/download/${TAG}/${WP_DL}"; then
+        rm -rf "$TD"; echo "wireproxy 下载失败 (${TAG}/${WP_A})" >&2; exit 1
+    fi
+    if ! verify_sha "${TD}/${WP_DL}" "$WANT"; then
+        rm -rf "$TD"; echo "wireproxy 校验失败：SHA256 与官方 checksums.txt 不一致" >&2; exit 1
+    fi
+    MEMBER=$(tar_member wireproxy "${TD}/${WP_DL}") || {
+        rm -rf "$TD"; echo "wireproxy 包内含不安全路径或成员不唯一，已放弃安装" >&2; exit 1; }
+    mkdir -p "${TD}/x"
+    if ! tar -xzf "${TD}/${WP_DL}" -C "${TD}/x" "$MEMBER" 2>/dev/null; then
+        rm -rf "$TD"; echo "wireproxy 解压失败" >&2; exit 1
+    fi
+    install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD"; exit 1; }
+    rm -rf "$TD"; trap - EXIT
+    mv -f "${WP_BIN}.new" "$WP_BIN"
 fi
 
 mkdir -p "$WG_DIR"
