@@ -4003,6 +4003,23 @@ def _reality_public_params(rcfg):
     return out
 
 
+def managed_inbound_active(config, tag):
+    """托管入站必须有已安装核心和运行证据，磁盘残留配置不代表在线。"""
+    if not Path('/usr/local/bin/xray').is_file():
+        return False
+    idx, inbound = managed_inbound_index(config, tag)
+    if idx < 0:
+        return False
+    state = _systemd_state('xray')
+    if state and state != 'active':
+        return False
+    # 已运行服务仍需对应端口监听；非 systemd 环境同样沿用只读探测。
+    try:
+        return int(inbound.get('port', 0)) in _listening_ports()
+    except (TypeError, ValueError):
+        return False
+
+
 def _listening_ports():
     """读出「当前已被监听」的 TCP/UDP 端口集合。
 
@@ -5413,7 +5430,7 @@ if __name__ == '__main__':
             cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
         except Exception:
             return None
-        if not has_managed_inbound(cfg, REALITY_INBOUND_TAG):
+        if not managed_inbound_active(cfg, REALITY_INBOUND_TAG):
             return None
         with data_lock:
             rcfg = dict(data.get('reality_config') or {})
@@ -5425,7 +5442,7 @@ if __name__ == '__main__':
             cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
         except Exception:
             return None
-        if not has_managed_inbound(cfg, VMESS_INBOUND_TAG):
+        if not managed_inbound_active(cfg, VMESS_INBOUND_TAG):
             return None
         with data_lock:
             vcfg = dict(data.get('vmess_config') or {})
@@ -5437,7 +5454,7 @@ if __name__ == '__main__':
             cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
         except Exception:
             return None
-        if not has_managed_inbound(cfg, VLESSENC_INBOUND_TAG):
+        if not managed_inbound_active(cfg, VLESSENC_INBOUND_TAG):
             return None
         with data_lock:
             ecfg = dict(data.get('vlessenc_config') or {})
@@ -6110,6 +6127,9 @@ if __name__ == '__main__':
                         if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
 
+                    rcfg = _active_reality_config()
+                    vcfg_active = _active_vmess_config()
+                    ecfg_active = _active_vlessenc_config()
                     m = read_meta_file(meta_path)
                     # artifacts 传入 reality + user_id ⇒ 输出「Hy2 + Reality」双节点
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
@@ -7463,7 +7483,7 @@ WantedBy=multi-user.target
             if xray_path.exists():
                 try:
                     cfg = json.loads(xray_path.read_text(encoding='utf-8'))
-                    active = has_managed_inbound(cfg, VMESS_INBOUND_TAG)
+                    active = managed_inbound_active(cfg, VMESS_INBOUND_TAG)
                 except Exception:
                     active = False
             with data_lock:
@@ -7554,7 +7574,7 @@ WantedBy=multi-user.target
             active = False
             if xray_path.exists():
                 try:
-                    active = has_managed_inbound(
+                    active = managed_inbound_active(
                         json.loads(xray_path.read_text(encoding='utf-8')),
                         VLESSENC_INBOUND_TAG)
                 except Exception:
@@ -8127,9 +8147,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     try:
                         _xcfg = json.loads(Path('/etc/hysteria/xray.json')
                                            .read_text(encoding='utf-8'))
-                        d_snap['vmess_inbound'] = has_managed_inbound(_xcfg, VMESS_INBOUND_TAG)
-                        d_snap['reality_inbound'] = has_managed_inbound(_xcfg, REALITY_INBOUND_TAG)
-                        d_snap['vlessenc_inbound'] = has_managed_inbound(_xcfg, VLESSENC_INBOUND_TAG)
+                        d_snap['vmess_inbound'] = managed_inbound_active(_xcfg, VMESS_INBOUND_TAG)
+                        d_snap['reality_inbound'] = managed_inbound_active(_xcfg, REALITY_INBOUND_TAG)
+                        d_snap['vlessenc_inbound'] = managed_inbound_active(_xcfg, VLESSENC_INBOUND_TAG)
                     except Exception:
                         d_snap['vmess_inbound'] = False
                         d_snap['reality_inbound'] = False
@@ -8759,7 +8779,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 try:
                     xray_path = Path('/etc/hysteria/xray.json')
                     if xray_path.exists():
-                        is_active = has_managed_inbound(
+                        is_active = managed_inbound_active(
                             json.loads(xray_path.read_text(encoding='utf-8')),
                             REALITY_INBOUND_TAG)
                 except Exception:

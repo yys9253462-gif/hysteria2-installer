@@ -135,8 +135,32 @@ def setUpModule():
 
     env = dict(os.environ)
     env['HY2_PORTAL_AUTOSTART_PORT'] = str(PORT)
+    # 隔离夹具模拟已运行的 Reality 入站；不依赖主机上的 Xray 或监听端口。
+    (hdir / 'xray.json').write_text(json.dumps({'inbounds': [
+        {'tag': 'vless-reality-in', 'protocol': 'vless', 'port': 443,
+         'settings': {'clients': []}}
+    ]}), encoding='utf-8')
+    bootstrap = '''import runpy, sys
+from pathlib import Path
+namespace = runpy.run_path(sys.argv[1])
+serve = namespace['serve']
+env = serve.__globals__
+root = Path(sys.argv[2]).parent
+real_path = env['Path']
+def fixture_path(value):
+    if str(value) == '/etc/hysteria/xray.json':
+        return root / 'xray.json'
+    if str(value) == '/usr/local/bin/xray':
+        return root.parent / 'bin' / 'xray'
+    return real_path(value)
+env['Path'] = fixture_path
+env['_systemd_state'] = lambda unit: 'active'
+env['_listening_ports'] = lambda: {443}
+env['enforce_node_access'] = lambda *args, **kwargs: True
+serve(sys.argv[2])
+'''
     PROC = subprocess.Popen(
-        [sys.executable, str(ROOT / 'portal.py'), 'serve', str(hdir / 'portal.json')],
+        [sys.executable, '-c', bootstrap, str(ROOT / 'portal.py'), str(hdir / 'portal.json')],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     # 等端口起来
