@@ -317,7 +317,7 @@ echo "nope=$(hy2_tar_find_member "{good}" gost || echo FAIL)"
             self.assertIn('nope=FAIL', out)
 
 
-@unittest.skipUnless(BASH, 'requires bash')
+@unittest.skipUnless(BASH and shutil.which("jq"), "needs bash + jq")
 class DownloadFailureDoesNotClobberTests(unittest.TestCase):
     """下载/校验失败时，现有产物必须保持原样，临时文件被清理。"""
 
@@ -796,7 +796,7 @@ class EmbeddedCopySyncTests(unittest.TestCase):
         self.assertIn('armv7l|armv7)   WG_A="armv7"; WP_A="arm"', port)
 
 
-@unittest.skipUnless(BASH, 'requires bash')
+@unittest.skipUnless(BASH and shutil.which("jq"), "needs bash + jq")
 class AcmeInstallTests(unittest.TestCase):
     """acme.sh 获取链：pin commit + 官方 tree blob 身份 + 先验后装。
 

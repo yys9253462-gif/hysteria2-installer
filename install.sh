@@ -156,14 +156,17 @@ hy2_git_blob_sha() {
 
 # 拒绝含绝对路径或 `..` 的 tar 包（防路径穿越以 root 写出临时目录）。
 hy2_tar_listing_safe() {
-    local member
+    local member listing
     [[ -f "${1:-}" ]] || return 1
+    # 从 stdin 读包：GNU tar 会把带冒号的路径（如 Windows 盘符）当成远程主机。
+    # 读不出清单必须判为不安全（fail-closed），否则损坏或异常的包会被放行。
+    listing="$(tar -tzf - <"$1" 2>/dev/null)" || return 1
     while IFS= read -r member; do
         member="${member%$'\r'}"
         case "$member" in
             /*|..|../*|*/../*|*/..) return 1 ;;
         esac
-    done < <(tar -tzf "$1" 2>/dev/null)
+    done <<<"$listing"
     return 0
 }
 
@@ -174,7 +177,7 @@ hy2_tar_find_member() {
     while IFS= read -r member; do
         member="${member%$'\r'}"
         [[ "${member#./}" == "$2" ]] && { printf '%s\n' "$member"; return 0; }
-    done < <(tar -tzf "$1" 2>/dev/null)
+    done < <(tar -tzf - <"$1" 2>/dev/null)
     return 1
 }
 
