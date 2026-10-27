@@ -8926,10 +8926,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 with data_lock:
                     target_ver = data.get('bbr_target_version', '')
 
+                # tcp_available_congestion_control 只列出**已加载**的模块：新机器上
+                # tcp_bbr 还没 modprobe，只会看到 "reno cubic"，前端据此把按钮全禁用。
+                # 所以把「内核里装了、可被 modprobe 的模块」也算作可用。
+                available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
+                                           capture_output=True, text=True, timeout=2).stdout.split()
+                for algo in ('bbr', 'bbr2', 'bbr3'):
+                    if algo not in available and subprocess.run(
+                            ['modinfo', '-n', 'tcp_' + algo], capture_output=True, timeout=2).returncode == 0:
+                        available.append(algo)
+
                 return self.reply_json(200, {
                     'ok': True,
                     'current': cc_out or '未知',
-                'available': subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'], capture_output=True, text=True, timeout=2).stdout.split(),
+                    'available': available,
                     'qdisc': qdisc_out or 'fq_codel',
                     'kernel': kernel_ver,
                     'configured': configured_bbr or target_ver or cc_out,

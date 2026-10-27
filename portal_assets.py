@@ -304,6 +304,7 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .bbr-btn.v2:hover { background: #d9f7be; }
 .bbr-btn.v3 { background: #fff0f6; border-color: #ffd6e7; color: #c41d7f; }
 .bbr-btn.v3:hover { background: #ffadd2; }
+.bbr-btn:disabled { opacity: .45; cursor: not-allowed; filter: grayscale(.6); }
 
 .bbr-info-bar { background: #f8fbfb; border: 1px solid var(--line); border-radius: 14px; padding: 16px 20px; margin-bottom: 18px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
 .bbr-stat-val { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--accent); font-weight: 800; font-size: 14px; }
