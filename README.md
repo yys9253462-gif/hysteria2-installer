@@ -19,13 +19,22 @@
 - 🧭 **VLESS-Reality 备用通道 (可选)**：在 Web 控制台一键启用 Xray Reality（TCP）。订阅里同时下发 Hy2 与 Reality 两个节点，Clash 用 url-test 自动择优 —— UDP 被 QoS 或阻断时自动切到 TCP 通道；每个 Hy2 用户对应一个 Reality 身份，停用 / 删除用户时两边同步生效。
 - 🧩 **VMess-WS-TLS 兼容通道 (可选)**：与 Reality 共用 Xray 核心，可在 Web 控制台独立启停，互不影响。使用独立 TCP 端口、随机且稳定的 WebSocket 路径，**需要已绑定域名并持有客户端可校验的证书**（自签证书会被拒绝启用）。每个 Hy2 用户对应一个 VMess 身份，订阅同时下发 `vmess://`、Clash 与 sing-box 配置，停用 / 到期 / 超额与 Reality 一并收回。⚠️ 上游 Xray 已把 VMess 标记为**非移除性弃用**（缺少前向保密），目前仍可正常使用，但新部署建议优先选下面的 VLESS Encryption。
 - 🔐 **VLESS Encryption 通道 (可选)**：VMess 的官方替代路线，Xray v25.9.5+ 提供。使用 ML-KEM-768 后量子密钥交换与 1-RTT 前向保密，与 Reality / VMess 共用 Xray 核心、各自独立启停。同样需要已绑定域名与客户端可校验的证书；密钥对由 `xray vlessenc` 生成，只在首次启用时创建，**重置会让已下发的链接全部失效**。每个 Hy2 用户对应一个 VLESS 身份，订阅同时下发 `vless://`（含 `encryption` 参数）、Clash 与 sing-box 配置。⚠️ 需要较新的客户端支持，老客户端可能不识别该加密参数。
-- 🔄 **Web 端双重版本检测与一键升级**：在 Web 仪表盘在线比对 Hysteria 2 官方内核与控制面板自身版本，发现新版一键升级。面板更新检测覆盖 `portal.py`、`portal_assets.py` 和四个计量模块，任一差异或缺失都会提示更新，检测不完整时显示无法确认。在线安装、终端门户升级、面板自更新与 `awgctl.sh` 获取均先把 `main` 锁定到具体 commit 再下载（完整本地文件快路径除外）；若 GitHub API 无法解析 commit 则中止，不回退到浮动 `main`，以免跨版本混装。锁定后仍支持 API / jsDelivr / raw 三源回退，每个文件除内容特征与 Python 语法校验外，还必须与**该 commit 的 git blob 身份**（`sha1("blob <len>\0"+content)`，注意不等于文件 sha1）一致，任一不过就整体放弃；换上新版后若 20 秒内健康检查（`/api/health`）不通过，自动换回旧版本。
+- 🔄 **Web 端双重版本检测与一键升级**：在 Web 仪表盘在线比对 Hysteria 2 官方内核与控制面板自身版本，发现新版一键升级。面板更新检测覆盖 `portal.py`、`portal_assets.py` 和四个计量模块，任一差异或缺失都会提示更新，检测不完整时显示无法确认。在线安装、终端门户升级、面板自更新与 `awgctl.sh` 获取均先把 `main` 锁定到具体 commit 再下载（完整本地文件快路径除外）；若 GitHub API 无法解析 commit 则中止，不回退到浮动 `main`，以免跨版本混装。锁定后仍支持 API / jsDelivr / raw 三源回退，每个文件除内容特征与 Python 语法校验外，还必须与**该 commit 的 git blob 身份**（`sha1("blob <len>\0"+content)`，注意不等于文件 sha1）一致，任一不过就整体放弃。预期的 blob 身份只从 GitHub API 取得：API 不可用或被限流（未认证每 IP 每小时 60 次）时本次更新失败、旧版本原样保留，jsDelivr / raw 只负责传输内容；换上新版后若 20 秒内健康检查（`/api/health`）不通过，自动换回旧版本。
 
 > **下载完整性保证与边界（2026-10-27）**：Hysteria 核心、gost、Xray、wgcf、wireproxy 的安装/升级都会先解析确定版本与架构，从**官方**发布取校验清单（`hashes.txt` / `checksums.txt` / Xray 的 `.dgst`，后者只认 SHA2-256），按精确资产名解析**唯一** SHA256，下载到私有临时目录校验通过才解包/替换/执行。清单取不到、为空、资产缺失、同一资产匹配到多条、摘要畸形或内容不匹配，一律 fail-closed，错误不会覆盖现有产物。第三方镜像（`ghfast.top` / `github.moeyy.xyz`）只在**已从官方取得预期摘要之后**才作为传输候选，内容必须与官方摘要逐字节一致，它们本身不能提供可信摘要。AWG 的 `SHA256SUMS` 缺失已改为硬失败，且**没有任何跳过开关**（既无 CLI 选项也不读环境变量）。tar/zip 解包会拒绝绝对路径与 `..` 成员，并且只接受唯一精确同名的成员（不再"取包内第一个可执行文件"）。
 >
 > **这些校验挡不住什么**：所有摘要都与产物来自**同一上游发布**（同源），不构成独立签名 —— 若上游账号或 Release 资产本身被替换，摘要会一起被替换。真正的供应链保证需要上游签名（cosign / minisign）或把摘要固定在仓库 commit 里。
 >
-> **acme.sh（DNS API 兜底签发）的获取与版本策略（2026-10-27）**：不再执行 `get.acme.sh` 的管道安装脚本。流程改为：GitHub 官方 API 把 `acmesh-official/acme.sh` 的 `master` 解析成 **40 位 commit** → 取该 commit 的官方递归 tree → 只下载**本次会执行的 4 个文件**（`acme.sh`、`dnsapi/dns_cf.sh`、`dnsapi/dns_ali.sh`、`dnsapi/dns_dp.sh`）到私有临时目录，逐个比对 `sha1("blob <len>\0"+content)` 是否等于官方 tree 里的 blob（路径必须唯一、必须是普通文件，链接/子模块一律拒绝）→ 全部通过后才执行安装器 → 安装后再核一次（除上游会改写的 shebang 外逐字节一致）。任一环节失败（API 限流、tree 截断、路径异常、内容不符、安装失败）都硬退出并给出可读原因，且不覆盖现有安装、不删除原有证书/账号数据。安装后会把 `account.conf` 的 `AUTO_UPGRADE` 设为 `'0'`：acme.sh 的 `--cron` 在 `AUTO_UPGRADE=1` 时会先在线升级再续期，等于后台定期执行未校验的新代码；**cron 续期本身保留**，证书正常自动续期。已存在的 acme.sh 一律**不重装、不覆盖、不删除**：先用官方固定 commit 的 tree 逐文件核验 `acme.sh` 与三个 DNS 插件（只允许上游安装器改写的 shebang 差异，且 shebang 必须是安全形态：**绝对路径且位于标准系统目录**（`/bin`、`/usr/bin`、`/usr/local/bin`、`/sbin`、`/usr/sbin`、`/usr/local/sbin`）下的 `sh`/`bash`，或 `/usr/bin/env sh|bash`；`#!/tmp/x/bash` 这类同 basename 的任意路径一律不信任），**核验通过**才继续使用并关闭其自动升级；**核验不通过（内容不符、缺插件、API 限流/元数据取不到）则硬失败**——不执行该脚本、不调用它签发、不写它的 `account.conf`、不关闭它的自动升级，现有证书/账号/脚本原样保留。修复办法是**保留数据**：整体备份 `~/.acme.sh` 后把不一致的 `acme.sh` 与 `dnsapi/` 插件**移出**（`mv`，不是删），再重跑本脚本重新校验安装；证书目录与 `account.conf` 保持不动。**不要直接删掉整个 `~/.acme.sh`**（会连同证书与账号一起丢失）。版本策略是"跟随上游 master 的固定 commit"（每次安装时重新 pin，不在本仓库写死某个 commit）。**关闭自动升级后如何更新 acme.sh**：先把 `~/.acme.sh` 整体备份，再删除其中的 `acme.sh`（保留证书与账号目录），重新运行本脚本 —— 会重新 pin 到最新 commit 并逐文件校验后安装；本项目**不提供**任何"跳过校验的更新命令"。
+> **acme.sh（DNS API 兜底签发）的获取与版本策略（2026-10-27）**：不再执行 `get.acme.sh` 的管道安装脚本。
+>
+> - **全新安装**：GitHub 官方 API 把 `acmesh-official/acme.sh` 的 `master` 解析成 **40 位 commit** → 取该 commit 的官方递归 tree → 只下载**本次会执行的 4 个文件**（`acme.sh`、`dnsapi/dns_cf.sh`、`dnsapi/dns_ali.sh`、`dnsapi/dns_dp.sh`）到私有临时目录，逐个比对 `sha1("blob <len>\0"+content)` 是否等于官方 tree 里的 blob（路径必须唯一、必须是普通文件，链接/子模块一律拒绝）→ 全部通过后才执行安装器 → 安装后再核一次（除上游会改写的 shebang 外逐字节一致）。任一环节失败（API 限流、tree 截断、路径异常、内容不符、安装失败）都硬退出并给出可读原因，不覆盖现有安装、不删除原有证书/账号数据。
+> - **关闭自动升级、保留续期**：安装后把 `account.conf` 的 `AUTO_UPGRADE` 设为 `'0'` —— acme.sh 的 `--cron` 在 `AUTO_UPGRADE=1` 时会先在线升级再续期，等于后台定期执行未校验的新代码。**cron 续期本身保留**，证书正常自动续期。
+> - **记录固定 commit**：安装成功后把所用 commit 写入 `~/.acme.sh/.hy2-pinned-commit`（权限 600）；写不进去视为安装失败。自动升级关掉后文件不会再变，所以以后的核验都对比**这个记录**，上游 `master` 之后怎么前进都不影响已装好的节点。
+> - **已有安装**：一律**不重装、不覆盖、不删除**，先逐文件核验 `acme.sh` 与三个 DNS 插件，只允许上游安装器改写的 shebang 差异（且必须是安全形态：位于 `/bin`、`/usr/bin`、`/usr/local/bin`、`/sbin`、`/usr/sbin`、`/usr/local/sbin` 下的 `sh`/`bash` 绝对路径，或 `/usr/bin/env sh|bash`；`#!/tmp/x/bash` 这类同名任意路径一律不信任）。对比对象：
+>   - 有 `.hy2-pinned-commit` 记录 → 只对比记录的 commit；对不上即视为被改动，**不会**回退去对比 `master`。记录内容非法（不是 40 位 commit、是符号链接）同样阻断，且不会被自动改写。
+>   - 没有记录（以前用 `get.acme.sh` 装的旧节点）→ 对比上游**当前** `master`；通过后关闭自动升级并补写记录，此后按记录核验。版本较旧的旧安装通常对不上，会被阻断，按下面的办法重新校验安装即可。
+> - **核验不通过**（内容不符、缺插件、API 限流/元数据取不到）则硬失败：不执行该脚本、不调用它签发、不写它的 `account.conf`、不关闭它的自动升级，现有证书/账号/脚本原样保留。修复办法是**保留数据**：整体备份 `~/.acme.sh` 后把不一致的 `acme.sh` 与 `dnsapi/` 插件**移出**（`mv`，不是删），再重跑本脚本重新校验安装（会写入新的固定 commit 记录）；证书目录与 `account.conf` 保持不动。**不要直接删掉整个 `~/.acme.sh`**（会连同证书与账号一起丢失）。
+> - **如何更新 acme.sh**：先整体备份 `~/.acme.sh`，再移出其中的 `acme.sh`（保留证书与账号目录），重新运行本脚本 —— 会重新固定到上游最新 commit、逐文件校验后安装，并更新固定 commit 记录。本项目**不提供**任何"跳过校验的更新命令"。
 >
 > **acme.sh 方案的边界**：上游没有独立签名（无 cosign/minisign/发布附件摘要），预期身份来自 GitHub 官方 API 返回的 tree，因此信任根是 **GitHub 账号与传输 TLS** —— 若上游仓库/账号本身被攻破，本方案挡不住；它挡住的是"镜像/中间人/浮动分支在下载时被替换"这一类。GitHub Actions 的 `actions/*` 仍使用浮动 major tag。
 - 🕳️ **独立「入站代理 & WARP」扩展专区 (SOCKS5 / HTTP / HTTPS)**：集成 GOST 引擎，支持 Web 端一键安装/修复核心；解耦独立页面一键添加/删除三种入站代理服务（独立账号密码认证），客户端无需安装 Hysteria 也能直接把服务器当普通代理用，配置动态生成并平滑热重载。
@@ -452,8 +461,8 @@ Hysteria 在订阅端口上提供 HTTPS，把请求转发给只监听 127.0.0.1 
 ### 开发
 
 开发检查：`bash -n install.sh` 和 `python3 -m unittest discover -s tests -v`。
-`portal.py` 现在由 `install.sh` **在运行时获取**（三级回退：GitHub API → jsDelivr → raw，
-拿到后做 Python 语法校验），所以**不需要**再手动同步任何内嵌副本 —— 改完 `portal.py`
+`portal.py` 现在由 `install.sh` **在运行时获取**（先把 `main` 锁定到具体 commit，三级回退：GitHub API → jsDelivr → raw，
+拿到后做 Python 语法校验，并与该 commit 的 git blob 身份逐文件比对），所以**不需要**再手动同步任何内嵌副本 —— 改完 `portal.py`
 直接提交即可，机器上重新执行一次安装/更新就会拿到新版。若要本地调试，把 `portal.py`
 放在 `install.sh` 同目录即可优先使用本地文件。
 
