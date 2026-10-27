@@ -3,3 +3,6 @@ __pycache__/
 .env
 *.pem
 *.key
+
+# 本地开发预览配置
+.claude/
