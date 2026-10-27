@@ -1485,9 +1485,11 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         limit_bytes = int(u.get("limit_bytes", 0))
         total_used_bytes += used_bytes
 
-        is_traffic_ok = limit_bytes == 0 or used_bytes < limit_bytes
-        is_time_ok = u.get("expires_at") is None or u.get("expires_at") >= now_ts
-        is_active = u.get("status") == "active" and is_time_ok and is_traffic_ok
+        # 展示用的分支判断必须与准入判据 user_access_allowed 同源：
+        # 缺 status 视为 active，expires_at 到点即过期。
+        is_traffic_ok = limit_bytes <= 0 or used_bytes < limit_bytes
+        is_time_ok = u.get("expires_at") is None or u.get("expires_at") > now_ts
+        is_active = user_access_allowed(u, now_ts)
 
         if is_active:
             active_count += 1
@@ -1496,7 +1498,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             status_html = '<span class="status-pill expired">流量超额</span>'
         elif not is_time_ok:
             status_html = '<span class="status-pill expired">已到期</span>'
-        elif u.get("status") != "active":
+        elif u.get("status", "active") != "active":
             status_html = '<span class="status-pill expired">已停用</span>'
         else:
             status_html = '<span class="status-pill active">正常</span>'
@@ -2625,14 +2627,15 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     used_bytes = int(uinfo.get("used_bytes", 0))
     limit_bytes = int(uinfo.get("limit_bytes", 0))
     now_ts = int(time.time())
-    is_traffic_ok = limit_bytes == 0 or used_bytes < limit_bytes
-    is_time_ok = uinfo.get("expires_at") is None or uinfo.get("expires_at") >= now_ts
+    # 与 user_access_allowed 同源：到点即过期、缺 status 视为 active。
+    is_traffic_ok = limit_bytes <= 0 or used_bytes < limit_bytes
+    is_time_ok = uinfo.get("expires_at") is None or uinfo.get("expires_at") > now_ts
 
     if not is_traffic_ok:
         status_html = '<span class="status-pill expired">流量已超额</span>'
     elif not is_time_ok:
         status_html = '<span class="status-pill expired">服务已到期</span>'
-    elif uinfo.get("status") != "active":
+    elif uinfo.get("status", "active") != "active":
         status_html = '<span class="status-pill expired">账号已停用</span>'
     else:
         status_html = '<span class="status-pill active">运行正常</span>'
@@ -6023,6 +6026,10 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
 
                     pwd = params.get('password') or secrets.token_hex(16)
+                    # 密码必须是字符串：数字/数组会原样落盘，/auth 与 Xray 同步各自
+                    # str() 后的形态不一致，用户拿到的连接参数就对不上。
+                    if not isinstance(pwd, str) or not pwd.strip():
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid user parameter: password must be a non-empty string'})
                     # 🔴 2026-10-25 修：这些值直接来自请求体，`int('abc')` 会抛
                     # ValueError。该分支不在任何 try 里，异常会穿透 do_POST →
                     # 连接被掐断，客户端只看到 "Remote end closed connection"，
@@ -6807,8 +6814,8 @@ if __name__ == '__main__':
                 write_gost_selfcheck()
                 service_content = GOST_UNIT_CONTENT
                 Path('/etc/systemd/system/gost.service').write_text(service_content, encoding='utf-8')
-                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
-                subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True)
+                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
 
                 # 重新生成 gost.yml 并启动服务
                 if not reload_gost():
@@ -7103,8 +7110,8 @@ RestartSec=3
 WantedBy=multi-user.target
 '''
                 Path('/etc/systemd/system/xray.service').write_text(service_content, encoding='utf-8')
-                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True)
-                subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True)
+                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=30)
                 self._generate_and_apply_reality(True)
 
                 # 不要谎报成功：xray 默认监听 TCP 443，若该端口已被别的服务
@@ -7663,6 +7670,10 @@ WantedBy=multi-user.target
 
                 if not VALID_USER_ID_RE.match(user_id):
                     return self.reply(400, b'Invalid user_id format')
+                # 与 REST API 同一条规则：保留名不能作为真实用户（placeholder 会和
+                # Xray 的占位 client 撞 email，admin_master 是机主账号）。
+                if action == 'create' and user_id in RESERVED_USER_IDS:
+                    return self.reply(400, b'Reserved user_id')
 
                 if action == 'create' and user_id:
                     pwd = form.get('password', [''])[0].strip() or secrets.token_hex(16)
@@ -7674,7 +7685,8 @@ WantedBy=multi-user.target
                     except (ValueError, TypeError, OverflowError):
                         return self.reply(400, b'Invalid duration, IP limit or traffic quota')
                     # 上限 1e6 GB：没有上限时超大值会在 int() 处抛 OverflowError。
-                    if (days <= 0 or not 0 <= ip_limit <= 1000 or not math.isfinite(traffic_gb)
+                    # 天数上限与 REST API 的 users/create 一致（1..36500）。
+                    if (not 1 <= days <= 36500 or not 0 <= ip_limit <= 1000 or not math.isfinite(traffic_gb)
                             or not 0 <= traffic_gb <= 1000000):
                         return self.reply(400, b'Invalid duration, IP limit or traffic quota')
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0

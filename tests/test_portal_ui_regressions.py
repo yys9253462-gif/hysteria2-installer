@@ -250,6 +250,51 @@ class FrontendRegressionTest(unittest.TestCase):
                             auth=self.auth)
         self.assertIn(st, (200, 302), '普通用户应能正常注销')
 
+    def test_web_form_rejects_reserved_user_id(self):
+        """Web 表单与 REST API 同一规则：placeholder 是 Xray 占位 client 的保留名。"""
+        st, _, _ = self.req('POST', self.prefix + 'manage-user',
+                            form={'action': 'create', 'user_id': 'placeholder',
+                                  'duration_days': '30'},
+                            auth=self.auth)
+        self.assertEqual(st, 400, f'保留名开户应返回 400，实际 {st}')
+
+    def test_web_form_rejects_out_of_range_duration(self):
+        """天数上限与 REST API 一致（1..36500）。"""
+        st, _, _ = self.req('POST', self.prefix + 'manage-user',
+                            form={'action': 'create', 'user_id': 'tmp_toolong',
+                                  'duration_days': '99999999'},
+                            auth=self.auth)
+        self.assertEqual(st, 400)
+
+    def test_api_create_rejects_non_string_password(self):
+        """数字密码会原样落盘，与 /auth、Xray 同步时的 str() 形态对不上。"""
+        st, _, _ = self.req('POST', '/api/v1/users/create',
+                            raw=json.dumps({'user_id': 'tmp_numpw', 'password': 12345}),
+                            auth='Bearer ' + self.data['api_key'])
+        self.assertEqual(st, 400)
+
+
+class PageStatusConsistencyTest(unittest.TestCase):
+    """管理页的状态展示必须与准入判据 user_access_allowed 同源。"""
+
+    def render(self, users):
+        meta = dict(META, cert_type='acme', pin_sha256='')
+        return portal.page_html(meta, 'hysteria2://x@h:1/', '#s', 'c', '{}',
+                                users=users, api_key=None, token='t', session_secret='s')
+
+    def test_missing_status_is_active(self):
+        page = self.render({'legacy_user': {'password': 'pw-legacy', 'expires_at': None}})
+        row = re.search(r'<tr data-user-row[^>]*>.*?</tr>', page, re.S).group(0)
+        self.assertIn('data-state="active"', row)
+        self.assertNotIn('已停用', row, '缺 status 的老数据被误显示成「已停用」')
+
+    def test_expiry_at_now_is_expired(self):
+        now = int(time.time())
+        page = self.render({'edge_user': {'password': 'pw-edge', 'status': 'active', 'expires_at': now}})
+        row = re.search(r'<tr data-user-row[^>]*>.*?</tr>', page, re.S).group(0)
+        self.assertIn('data-state="inactive"', row)
+        self.assertIn('已到期', row)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
