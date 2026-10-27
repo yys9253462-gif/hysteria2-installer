@@ -203,21 +203,43 @@ download_binaries() {
     fi
 
     # 用同一 Release 里 CI 生成的 SHA256SUMS 校验，挡住下载损坏/被截断的包。
-    # 老的 Release 可能没有这个文件：取不到时只告警，不阻断安装。
+    # 🔴 取不到 SHA256SUMS 一律失败（2026-10-27 从 fail-open 改为 fail-closed）：
+    #    旧的「只告警继续装」意味着删掉 SHA256SUMS 就能让校验被完全跳过。
+    #    这里**不提供任何跳过开关**（既无 CLI 选项也不读环境变量）：
+    #    缺摘要就拒绝安装，不存在绕过路径。
     local sums_url want got
     sums_url="https://github.com/${AWG_REPO}/releases/download/${AWG_RELEASE_TAG}/SHA256SUMS"
-    if curl -fsSL --connect-timeout 20 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null; then
-        want="$(awk -v f="amneziawg-linux-${arch}-awg${line}.tar.gz"             '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n)} n==f {print $1; exit}' "${tmpd}/SHA256SUMS")"
-        got="$(sha256sum "${tmpd}/awg.tar.gz" | awk '{print $1}')"
-        if [[ -z "$want" || "$want" != "$got" ]]; then
-            rm -rf "$tmpd"
-            log_err "校验失败：安装包的 SHA256 与 Release 中的 SHA256SUMS 不一致，已放弃安装"
-            return 1
-        fi
-        log_info "SHA256 校验通过"
-    else
-        log_warn "未取到 SHA256SUMS，跳过完整性校验"
+    if ! curl -fsSL --connect-timeout 20 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null; then
+        # curl -o 会先建文件：失败时可能留下空/半截的 SHA256SUMS，
+        # 一并清掉，避免被当成"清单存在但没有该资产"。
+        rm -rf "$tmpd"
+        log_err "未取到 ${AWG_RELEASE_TAG} 的 SHA256SUMS，无法校验安装包，已放弃安装。"
+        return 1
     fi
+    # 精确资产名、唯一匹配、64 位十六进制，否则视为失败（不取"第一条"）。
+    want="$(awk -v f="amneziawg-linux-${arch}-awg${line}.tar.gz" \
+            '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==f) print $1}' \
+            "${tmpd}/SHA256SUMS" | tr 'A-F' 'a-f' | sort -u)"
+    if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+        rm -rf "$tmpd"
+        log_err "SHA256SUMS 中安装包的摘要缺失或不唯一（实际: [${want}]），已放弃安装"
+        return 1
+    fi
+    got="$(sha256sum "${tmpd}/awg.tar.gz" | awk '{print $1}')"
+    if [[ "$want" != "$got" ]]; then
+        rm -rf "$tmpd"
+        log_err "校验失败：安装包的 SHA256 与 Release 中的 SHA256SUMS 不一致，已放弃安装"
+        return 1
+    fi
+    log_info "SHA256 校验通过"
+
+    # 拒绝含绝对路径 / `..` 的成员，防止以 root 写出临时目录之外。
+    local member
+    while IFS= read -r member; do
+        case "$member" in
+            /*|..|../*|*/../*|*/..) rm -rf "$tmpd"; log_err "安装包内含不安全路径成员，已放弃安装"; return 1 ;;
+        esac
+    done < <(tar -tzf "${tmpd}/awg.tar.gz" 2>/dev/null)
 
     if ! tar -xzf "${tmpd}/awg.tar.gz" -C "$tmpd" 2>/dev/null; then
         rm -rf "$tmpd"; log_err "解压失败（包可能已损坏）"; return 1
@@ -1097,6 +1119,7 @@ hy2-awgctl —— AmneziaWG (AWG) 服务端控制工具
 安装与维护:
   install    [--line 2|3] [--port N] [--endpoint HOST] [--client NAME]
              安装或重装。--endpoint 是客户端连接地址（域名或公网 IP）。
+             安装包必须通过 Release 的 SHA256SUMS 校验；取不到校验清单即失败。
   update     [--line 2|3]
              更新二进制。切换协议线会重新生成混淆参数，客户端必须重新导入。
   uninstall  [--keep-binaries]

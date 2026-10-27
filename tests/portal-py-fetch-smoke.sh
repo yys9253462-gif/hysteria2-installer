@@ -22,7 +22,9 @@ echo "（从 install.sh 读到 PORTAL_FILES = $PORTAL_FILES）"
 echo "（从 install.sh 读到 METER_FILES  = $METER_FILES）"
 echo
 
-for fn in portal_files_ok portal_fetch_files portal_fetch_py portal_ensure_py; do
+# 门户取文件现在还要比对 git blob 身份（2026-10-27），这三个辅助函数一并摘出来。
+for fn in hy2_git_blob_sha portal_remote_blob_shas portal_verify_blobs \
+          portal_files_ok portal_fetch_files portal_fetch_py portal_ensure_py; do
     eval "$(sed -n "/^${fn}() {/,/^}/p" install.sh)"
 done
 

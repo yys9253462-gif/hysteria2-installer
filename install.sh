@@ -45,6 +45,476 @@ log_warn() { echo -e "${YELLOW}[WARN]${PLAIN} $1"; }
 log_err()  { echo -e "${RED}[ERROR]${PLAIN} $1"; }
 log_step() { echo -e "${CYAN}==>${PLAIN} ${BLUE}$1${PLAIN}"; }
 
+# ==============================================================================
+# 下载完整性校验（2026-10-27）
+# ------------------------------------------------------------------------------
+# 下载任何上游二进制/脚本的固定顺序：
+#   1) 先解析出**确定的版本**与**确定的架构**（不依赖浮动 latest 下载）；
+#   2) 从该版本的**官方**发布取校验清单（hashes.txt / checksums.txt / *.dgst）；
+#   3) 按**精确资产名**解析出唯一 SHA256；
+#   4) 下载到私有临时目录（mktemp -d），先校验、再解包/替换/执行。
+#
+# 下面这些情况一律 fail-closed（返回非 0，绝不"跳过校验继续装"）：
+#   * 清单取不到 / 清单为空 / 清单里没有该资产；
+#   * 同一资产在清单里匹配到多条（可能被人为注入）；
+#   * 摘要不是 64 位十六进制；
+#   * 下载内容与摘要不一致。
+#
+# 第三方镜像**不能**提供可信摘要：只有先从官方取得预期摘要，才允许把镜像
+# 当作传输候选，且内容必须与官方摘要逐字节一致。
+# 同源摘要只能证明"与官方发布一致"，不构成独立签名，挡不住官方发布本身被替换。
+# ==============================================================================
+
+# 计算文件 SHA256（小写十六进制）；文件不可读返回 1。
+hy2_sha256_file() {
+    [[ -f "${1:-}" ]] || return 1
+    sha256sum "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# 校验文件 SHA256 是否等于预期值；预期值格式非法即失败。
+hy2_verify_sha256() {
+    local got
+    [[ "${2:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    got="$(hy2_sha256_file "$1")" || return 1
+    [[ -n "$got" && "$got" == "$2" ]]
+}
+
+# 从 `<sha256>  <name>` 形式的清单里取唯一匹配资产的摘要。
+# 兼容：行尾 CRLF、`*name`、`./name`、`build/name`（按 basename 兜底匹配）。
+# 无匹配 / 多条匹配 / 摘要畸形 => 返回 1。
+hy2_manifest_sha256() {
+    local manifest="${1:-}" asset="${2:-}"
+    local line digest name base count=0 found=""
+    [[ -n "$asset" && -f "$manifest" && -r "$manifest" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        [[ "$line" == \#* ]] && continue
+        [[ "$line" == *[[:space:]]* ]] || continue          # 畸形行：缺少分隔符
+        digest="${line%%[[:space:]]*}"
+        name="${line#*[[:space:]]}"
+        name="${name#"${name%%[![:space:]]*}"}"             # 去掉前导空白
+        name="${name%$'\r'}"
+        name="${name#\*}"
+        name="${name#./}"
+        base="${name##*/}"
+        [[ "$name" == "$asset" || "$base" == "$asset" ]] || continue
+        digest="$(printf '%s' "$digest" | tr 'A-F' 'a-f')"
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1        # 匹配到但摘要畸形
+        count=$((count + 1))
+        found="$digest"
+    done < "$manifest"
+    [[ $count -eq 1 && -n "$found" ]] || return 1
+    printf '%s\n' "$found"
+}
+
+# 从 Xray 的 `.dgst` 里取 SHA2-256（格式：`SHA2-256= <hex>`）。
+# 只认 SHA2-256，绝不拿 MD5/SHA1 当校验依据；缺失或重复 => 返回 1。
+hy2_dgst_sha256() {
+    local dgst="${1:-}" line key value digest count=0 found=""
+    [[ -f "$dgst" && -r "$dgst" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        [[ "$line" == *=* ]] || continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        key="$(printf '%s' "$key" | tr -d '[:space:]' | tr 'a-z' 'A-Z')"
+        [[ "$key" == "SHA2-256" || "$key" == "SHA2_256" ]] || continue
+        digest="$(printf '%s' "$value" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
+        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+        count=$((count + 1))
+        found="$digest"
+    done < "$dgst"
+    [[ $count -eq 1 && -n "$found" ]] || return 1
+    printf '%s\n' "$found"
+}
+
+# 下载校验清单到 $2（仅取文本，不做任何执行）。
+hy2_fetch_manifest() {
+    curl -fsSL --connect-timeout 15 --max-time 30 --retry 2 --retry-delay 2 \
+        -o "${2:-}" "${1:-}" 2>/dev/null
+}
+
+# 下载清单并解析出资产摘要：$1=清单 URL $2=精确资产名 $3=临时工作目录。
+hy2_expected_sha256() {
+    local out="${3:-}/.checksums"
+    [[ -n "${3:-}" && -d "$3" ]] || return 1
+    hy2_fetch_manifest "$1" "$out" || return 1
+    hy2_manifest_sha256 "$out" "$2"
+}
+
+# 计算 git blob sha1（`sha1("blob <len>\0" + content)`）。
+# GitHub contents API 返回的 sha 就是这个值 —— 注意它**不等于**文件的 sha1，
+# 少写 blob 头会永远对不上。
+hy2_git_blob_sha() {
+    local f="${1:-}" size
+    [[ -f "$f" ]] || return 1
+    size="$(wc -c < "$f" | tr -d '[:space:]')"
+    [[ "$size" =~ ^[0-9]+$ ]] || return 1
+    { printf 'blob %s\0' "$size"; cat -- "$f"; } | sha1sum | awk '{print $1}'
+}
+
+# 拒绝含绝对路径或 `..` 的 tar 包（防路径穿越以 root 写出临时目录）。
+hy2_tar_listing_safe() {
+    local member
+    [[ -f "${1:-}" ]] || return 1
+    while IFS= read -r member; do
+        member="${member%$'\r'}"
+        case "$member" in
+            /*|..|../*|*/../*|*/..) return 1 ;;
+        esac
+    done < <(tar -tzf "$1" 2>/dev/null)
+    return 0
+}
+
+# 在包内查找与 $2 同名的成员，输出**包内实际成员名**（可能是 ./name）。
+hy2_tar_find_member() {
+    local member
+    [[ -f "${1:-}" ]] || return 1
+    while IFS= read -r member; do
+        member="${member%$'\r'}"
+        [[ "${member#./}" == "$2" ]] && { printf '%s\n' "$member"; return 0; }
+    done < <(tar -tzf "$1" 2>/dev/null)
+    return 1
+}
+
+# 把 HY2_ARCH 映射成 Hysteria 官方资产后缀。
+# ⚠️ 上游**没有** hysteria-linux-armv7，armv7 机器要用 hysteria-linux-arm
+#    （实测 armv7 的 URL 404，arm 存在）。旧的 armv7 映射是已证实的缺陷。
+hy2_core_asset_arch() {
+    case "${1:-}" in
+        amd64) echo amd64 ;;
+        arm64) echo arm64 ;;
+        armv7) echo arm ;;
+        *) return 1 ;;
+    esac
+}
+
+# ==============================================================================
+# acme.sh 获取与校验（2026-10-27）
+# ------------------------------------------------------------------------------
+# 旧实现是 `curl https://get.acme.sh | sh`：下载即执行，没有任何内容校验，
+# 而 get.acme.sh 自己还会再去 raw 拉 master 分支的 acme.sh 执行 —— 整条链路
+# 全是"浮动的、未校验的远程代码"。
+#
+# 现在的做法（信任根 = GitHub 官方 API + raw 的 TLS，且固定到 commit）：
+#   1) GitHub API 解析 acmesh-official/acme.sh 的 master 为 **40 位 commit**；
+#   2) 取该 commit 的 **官方 git tree**（recursive），逐路径得到预期 blob 身份；
+#   3) 只下载**本次真正会执行/安装**的文件到私有临时目录：
+#        acme.sh、dnsapi/dns_cf.sh、dnsapi/dns_ali.sh、dnsapi/dns_dp.sh
+#      每个文件都必须满足 sha1("blob <len>\0"+content) == 官方 tree 里的 blob；
+#   4) 全部通过后，才在临时目录里执行 `./acme.sh --install` 安装。
+#
+# 为什么是逐文件而不是下 tar.gz：
+#   * 归档解包要额外防路径穿越/链接/危险成员，且"只验入口"会放过 dnsapi 等
+#     真正会被 source 的代码；逐文件校验天然不存在解包面。
+#   * 只取 4 个文件，校验范围与执行范围一致（不多验、也不少验）。
+# 不提供任何镜像/无摘要 fallback；任何一步失败都直接失败并给出可读原因。
+# 上游 acme.sh 没有独立签名（无 cosign/minisign），同源元数据挡不住
+# GitHub 仓库/账号本身被替换 —— 这是本方案明确的边界。
+# ==============================================================================
+
+HY2_ACME_REPO="acmesh-official/acme.sh"
+# 只包含本项目会执行的入口与三个 DNS 插件（dns_cf / dns_ali / dns_dp）。
+HY2_ACME_FILES="acme.sh dnsapi/dns_cf.sh dnsapi/dns_ali.sh dnsapi/dns_dp.sh"
+# 已有安装核验通过后记录实际比对的 commit（仅用于日志/后续提示，不参与校验）。
+HY2_ACME_VERIFIED_COMMIT=""
+
+# 路径必须是仓库内相对路径：拒绝绝对路径、`..`/`.` 组件、反斜杠、空段、以 `-` 开头。
+hy2_acme_path_safe() {
+    local p="${1:-}"
+    [[ -n "$p" ]] || return 1
+    [[ "$p" != /* ]] || return 1
+    [[ "$p" != *\\* ]] || return 1
+    [[ "$p" != -* ]] || return 1
+    [[ "$p" != *//* ]] || return 1
+    [[ "/$p/" != *"/../"* ]] || return 1
+    [[ "/$p/" != *"/./"* ]] || return 1
+    [[ "$p" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+    return 0
+}
+
+# 解析 acme.sh 的 master 为固定 40 位 commit；失败返回 1（绝不回退浮动分支）。
+hy2_acme_pin_commit() {
+    local json sha
+    command -v jq >/dev/null 2>&1 || return 1
+    json="$(curl -fsSL --connect-timeout 15 --max-time 30 --retry 2 \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${HY2_ACME_REPO}/commits/master" 2>/dev/null)" || return 1
+    sha="$(printf '%s' "$json" | jq -r '.sha // empty' 2>/dev/null)" || return 1
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    printf '%s\n' "$sha"
+}
+
+# 取固定 commit 的官方递归 tree（JSON）；truncated 视为失败（列表不完整）。
+hy2_acme_tree_json() {
+    local commit="${1:-}" json
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    json="$(curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${HY2_ACME_REPO}/git/trees/${commit}?recursive=1" 2>/dev/null)" || return 1
+    [[ "$(printf '%s' "$json" | jq -r '.truncated // false' 2>/dev/null)" == "false" ]] || return 1
+    printf '%s\n' "$json"
+}
+
+# 从 tree JSON 取某个路径的预期 blob；路径必须唯一、type=blob、mode 是普通文件。
+# 拒绝 submodule（type=commit）与符号链接（mode 120000）。
+hy2_acme_blob_for_path() {
+    local json="${1:-}" path="${2:-}" line type mode sha
+    [[ -n "$json" && -n "$path" ]] || return 1
+    hy2_acme_path_safe "$path" || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    line="$(printf '%s' "$json" | jq -r --arg p "$path" '
+        [ .tree[]? | select(.path == $p) ] as $m
+        | if ($m | length) == 1
+          then ($m[0].type + " " + ($m[0].mode | tostring) + " " + $m[0].sha)
+          else "" end' 2>/dev/null)" || return 1
+    [[ -n "$line" ]] || return 1
+    read -r type mode sha <<<"$line"
+    [[ "$type" == "blob" ]] || return 1
+    [[ "$mode" == "100644" || "$mode" == "100755" ]] || return 1
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+    printf '%s\n' "$sha"
+}
+
+# 下载固定 commit 的单个文件并比对 git blob 身份；不匹配则删除并返回 1。
+hy2_acme_fetch_verified() {
+    local repo="${1:-}" commit="${2:-}" path="${3:-}" expect="${4:-}" dest="${5:-}" got
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 1
+    [[ "$expect" =~ ^[0-9a-f]{40}$ ]] || return 1
+    hy2_acme_path_safe "$path" || return 1
+    [[ -n "$dest" ]] || return 1
+    mkdir -p "$(dirname "$dest")" || return 1
+    curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+        -o "$dest" "https://raw.githubusercontent.com/${repo}/${commit}/${path}" 2>/dev/null || {
+        rm -f "$dest"; return 1; }
+    got="$(hy2_git_blob_sha "$dest")" || { rm -f "$dest"; return 1; }
+    if [[ "$got" != "$expect" ]]; then
+        rm -f "$dest"
+        return 1
+    fi
+    return 0
+}
+
+# 关闭 acme.sh 自身的在线自动升级（cron 里 AUTO_UPGRADE=1 时会先 upgrade 再续期，
+# 那等于后台定期执行未校验的新代码）。只改这一个配置项，先备份 account.conf。
+# ⚠️ 不关闭 cron 本身：证书续期仍由 `--cron` 完成。
+hy2_acme_disable_auto_upgrade() {
+    local conf="${1:-}" tmp
+    [[ -n "$conf" ]] || return 1
+    mkdir -p "$(dirname "$conf")" || return 1
+    if [[ ! -f "$conf" ]]; then
+        printf "AUTO_UPGRADE='0'\n" > "$conf" || return 1
+        chmod 600 "$conf" 2>/dev/null || true
+        return 0
+    fi
+    cp -a "$conf" "${conf}.hy2-bak" || return 1
+    tmp="$(mktemp)" || return 1
+    if grep -qE '^AUTO_UPGRADE=' "$conf"; then
+        sed "s|^AUTO_UPGRADE=.*|AUTO_UPGRADE='0'|" "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    elif grep -qE '^#AUTO_UPGRADE=' "$conf"; then
+        sed "s|^#AUTO_UPGRADE=.*|AUTO_UPGRADE='0'|" "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
+    else
+        cp -a "$conf" "$tmp" || { rm -f "$tmp"; return 1; }
+        printf "\nAUTO_UPGRADE='0'\n" >> "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    cat "$tmp" > "$conf" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    grep -qE "^AUTO_UPGRADE='0'$" "$conf" || return 1
+    return 0
+}
+
+# 下载 → 逐文件校验 → 安装。任何一步失败都返回 1，且不执行任何未校验内容。
+# $1 = acme.sh 工作目录（默认 $HOME/.acme.sh）。
+hy2_acme_install_verified() {
+    local home="${1:-$HOME/.acme.sh}"
+    local commit tree_json work path blob dest had_home=0
+    local acct="${home}/acme.sh"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        log_err "缺少 jq，无法校验 acme.sh 的官方元数据，已放弃安装。"
+        return 1
+    fi
+    # 已存在的安装一律不覆盖：证书/账号数据都在同一个 home 下，
+    # 重装既无必要也可能破坏已有账号。调用方应走 hy2_acme_check_existing。
+    if [[ -e "$acct" ]]; then
+        log_err "已存在 ${acct}，本函数拒绝覆盖；请用 hy2_acme_check_existing 处理现有安装。"
+        return 1
+    fi
+    if ! commit="$(hy2_acme_pin_commit)"; then
+        log_err "无法从 GitHub 官方 API 解析 ${HY2_ACME_REPO} 的 commit（可能是网络/限流）。"
+        log_err "未认证请求限额 60 次/小时/IP。为不执行未校验代码，已放弃安装 acme.sh。"
+        return 1
+    fi
+    if ! tree_json="$(hy2_acme_tree_json "$commit")"; then
+        log_err "取不到 ${HY2_ACME_REPO}@${commit} 的官方文件树（或返回被截断）。"
+        log_err "为不执行未校验代码，已放弃安装 acme.sh。"
+        return 1
+    fi
+
+    work="$(mktemp -d)" || { log_err "无法创建临时目录，已放弃安装 acme.sh。"; return 1; }
+
+    for path in $HY2_ACME_FILES; do
+        if ! blob="$(hy2_acme_blob_for_path "$tree_json" "$path")"; then
+            log_err "官方文件树里 ${path} 缺失/不唯一/类型不安全（链接或子模块），已放弃安装。"
+            rm -rf "$work"
+            return 1
+        fi
+        dest="${work}/${path}"
+        if ! hy2_acme_fetch_verified "$HY2_ACME_REPO" "$commit" "$path" "$blob" "$dest"; then
+            log_err "${path} 下载失败或内容与官方 tree 的 blob 身份不符，已放弃安装。"
+            rm -rf "$work"
+            return 1
+        fi
+    done
+
+    # 全部校验通过后才允许执行安装器（安装器本身也是刚校验过的 acme.sh）。
+    chmod +x "${work}/acme.sh" || { rm -rf "$work"; log_err "无法设置可执行位，已放弃安装。"; return 1; }
+    had_home=0
+    if [[ -d "$home" ]]; then had_home=1; fi
+    if ! ( cd "$work" && ./acme.sh --install --home "$home" ); then
+        log_err "acme.sh 安装器执行失败（文件已通过校验，失败发生在安装阶段）。"
+        if [[ $had_home -eq 0 ]]; then
+            rm -rf "$home"
+            log_err "已清理本次新建的 ${home}，原有环境未改动。"
+        fi
+        rm -rf "$work"
+        return 1
+    fi
+
+    # 安装后复核：落地的文件除首行 shebang 外必须与已校验内容逐字节一致。
+    # 上游 install() 会把 shebang 改成 `#!<bash 路径>`，这是唯一允许的差异。
+    for path in $HY2_ACME_FILES; do
+        if ! hy2_acme_same_except_shebang "${work}/${path}" "${home}/${path}"; then
+            log_err "安装后的 ${path} 与已校验内容不一致（除 shebang 外），已放弃使用。"
+            rm -rf "$work"
+            if [[ $had_home -eq 0 ]]; then rm -rf "$home"; fi
+            return 1
+        fi
+    done
+    rm -rf "$work"
+
+    if ! hy2_acme_disable_auto_upgrade "${home}/account.conf"; then
+        log_err "无法关闭 acme.sh 的自动升级（account.conf 写入失败），已放弃使用。"
+        return 1
+    fi
+    log_info "acme.sh 已固定到 commit ${commit} 并通过逐文件 blob 校验；自动升级已关闭，续期 cron 保留。"
+    return 0
+}
+
+# shebang 只允许"单个解释器路径"或 `/usr/bin/env sh|bash` 这一种带空格的形态。
+# 绝不接受带参数/元字符的 shebang（例如 `#!/bin/sh -c '...'`、
+# `#!/usr/bin/env -S bash -c ...`）—— 那会让"只差 shebang"变成任意代码执行口子。
+hy2_acme_shebang_safe() {
+    local line="${1:-}" interp base
+    [[ "$line" == '#!'* ]] || return 1
+    interp="${line#\#\!}"
+    [[ -n "$interp" ]] || return 1
+    if [[ "$interp" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+        base="${interp##*/}"
+        [[ "$base" == "sh" || "$base" == "bash" ]] || return 1
+        # 🔴 必须是**标准系统目录**下的绝对路径。`#!/tmp/evil/bash`、
+        #    `#!/opt/x/bash` 这类同 basename 的任意路径不能因为"看起来像 bash"
+        #    就被信任 —— 否则"只允许 shebang 不同"等于允许执行任意程序。
+        [[ "$interp" == /* ]] || return 1
+        case "${interp%/*}" in
+            /bin|/usr/bin|/usr/local/bin|/sbin|/usr/sbin|/usr/local/sbin) return 0 ;;
+        esac
+        return 1
+    fi
+    [[ "$interp" =~ ^/usr/bin/env\ (sh|bash)$ ]] || return 1
+    return 0
+}
+
+# 比较两个文件：完全相同，或**仅首行 shebang**不同且该 shebang 是安全形态；
+# 允许 shebang 差异是因为上游 install() 会把所有 .sh 的首行改成 `#!<bash 路径>`。
+hy2_acme_same_except_shebang() {
+    local src="${1:-}" dst="${2:-}"
+    [[ -f "$src" && -f "$dst" ]] || return 1
+    cmp -s "$src" "$dst" && return 0
+    hy2_acme_shebang_safe "$(head -n1 "$src" 2>/dev/null)" || return 1
+    hy2_acme_shebang_safe "$(head -n1 "$dst" 2>/dev/null)" || return 1
+    cmp -s <(tail -n +2 "$src") <(tail -n +2 "$dst")
+}
+
+# 已有安装的身份核验：本项目会执行的 4 个文件（acme.sh + 三个 DNS 插件）
+# 必须全部与**官方固定 commit 的内容**一致，只允许上游安装器改写的 shebang 差异。
+# 预期内容取自官方 tree 的 blob 身份，绝不用待验证文件自算摘要充当预期。
+# 本函数**只读**：不写配置、不执行任何脚本、不删除/移动任何文件。
+hy2_acme_verify_existing() {
+    local home="${1:-$HOME/.acme.sh}"
+    local commit tree_json work path blob inst
+
+    if ! command -v jq >/dev/null 2>&1; then
+        log_err "缺少 jq，无法校验已有 acme.sh 的官方身份。"
+        return 1
+    fi
+    work="$(mktemp -d)" || { log_err "无法创建临时目录，无法校验已有 acme.sh。"; return 1; }
+    if ! commit="$(hy2_acme_pin_commit)"; then
+        log_err "无法从 GitHub 官方 API 解析 ${HY2_ACME_REPO} 的 commit（网络/限流）。"
+        rm -rf "$work"; return 1
+    fi
+    if ! tree_json="$(hy2_acme_tree_json "$commit")"; then
+        log_err "取不到 ${HY2_ACME_REPO}@${commit} 的官方文件树（或返回被截断）。"
+        rm -rf "$work"; return 1
+    fi
+    for path in $HY2_ACME_FILES; do
+        inst="${home}/${path}"
+        if [[ ! -f "$inst" ]]; then
+            log_err "已有安装缺少 ${path}，无法确认它将要执行的内容。"
+            rm -rf "$work"; return 1
+        fi
+        if ! blob="$(hy2_acme_blob_for_path "$tree_json" "$path")"; then
+            log_err "官方文件树里 ${path} 缺失/不唯一/类型不安全。"
+            rm -rf "$work"; return 1
+        fi
+        if ! hy2_acme_fetch_verified "$HY2_ACME_REPO" "$commit" "$path" "$blob" "${work}/${path}"; then
+            log_err "无法取得 ${path} 的可信预期内容（下载失败或与官方 tree 不符）。"
+            rm -rf "$work"; return 1
+        fi
+        # 只允许首行 shebang 不同；其余任何字节差异都不放过。
+        if ! hy2_acme_same_except_shebang "${work}/${path}" "$inst"; then
+            log_err "已有 ${inst} 与官方 ${commit} 的内容不一致（除 shebang 外）。"
+            rm -rf "$work"; return 1
+        fi
+    done
+    rm -rf "$work"
+    HY2_ACME_VERIFIED_COMMIT="$commit"
+    return 0
+}
+
+# 已存在的 acme.sh：**不重装、不覆盖、不删除**。
+#   1) 先做身份核验；**核验不通过就硬失败**，绝不在任何执行/签发前放行；
+#   2) 只有核验通过才关闭它自身的在线自动升级（cron 会定期执行新代码）。
+# 核验失败时：不执行 acme.sh、不签发、不写 account.conf、不调用禁升级命令，
+# 现有证书/账号/脚本原样保留，并给出"保留数据"的修复办法。
+hy2_acme_check_existing() {
+    local home="${1:-$HOME/.acme.sh}"
+    local acct="${home}/acme.sh"
+
+    log_warn "检测到已安装的 acme.sh（${acct}），本次不覆盖、不重装。"
+    if ! hy2_acme_verify_existing "$home"; then
+        log_err "已阻止：现有 acme.sh 的身份无法确认（与官方固定 commit 不一致，或元数据取不到）。"
+        log_err "本次不执行该脚本、不调用它签发证书，也没有改动它的任何配置。"
+        log_err "现有证书、账号与脚本均原样保留（未删除、未覆盖、未关闭其自动升级）。"
+        log_err "已有历史版本不等于恶意；但身份无法验证时不能拿它去执行或签发。"
+        log_err "修复办法（保留数据）："
+        log_err "  1) 整体备份：cp -a ${home} ${home}.bak.\$(date +%s)"
+        log_err "  2) 把 ${acct} 与 dnsapi/ 下不一致的插件**移出**（mv，不要直接删）到备份目录；"
+        log_err "  3) 重跑本脚本 —— 会重新 pin 官方 commit 并逐文件校验后安装；"
+        log_err "     证书目录与 account.conf 保持不动，不影响已有证书与账号。"
+        return 1
+    fi
+    log_info "现有 acme.sh 与官方 ${HY2_ACME_VERIFIED_COMMIT} 逐文件一致（除 shebang），来源可确认。"
+    if hy2_acme_disable_auto_upgrade "${home}/account.conf"; then
+        log_info "已关闭现有 acme.sh 的在线自动升级（AUTO_UPGRADE=0），续期 cron 保留。"
+    else
+        log_warn "未能关闭现有 acme.sh 的自动升级，请手工在 ${home}/account.conf 设 AUTO_UPGRADE='0'。"
+    fi
+    return 0
+}
+
 # 端口合法性：1-65535 的纯数字。
 # 抽成公共函数，保证「交互输入」和「环境变量传入」走同一套校验 ——
 # 之前交互路径不校验、环境变量路径更不校验，输错会一路写进配置，
@@ -301,6 +771,10 @@ install_dependencies() {
 }
 
 # 2. 安装与更新官方核心二进制
+#
+# 顺序固定为「先定版本 → 取官方摘要 → 下载 → 校验 → 才替换」。
+# 旧实现直接下 latest 再 `version` 试跑就覆盖：`version` 是被下载的二进制自己
+# 执行的，植入后门完全可以正常打印版本号，等于没有完整性校验。
 install_binary() {
     log_step "获取 Hysteria 2 官方最新版本..."
     # ⚠️ 必须 `|| LATEST_TAG=""`（2026-10-09 修）：命令替换里的 curl 失败会因
@@ -309,26 +783,78 @@ install_binary() {
     # 而「api.github.com 被墙/限流」恰恰是本工具用户最常见的处境，
     # 为此专门写的 download.hysteria.network 直链回退形同虚设。
     LATEST_TAG=$(curl -s --max-time 10 https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r '.tag_name // empty') || LATEST_TAG=""
-    
+
+    local asset_arch asset tmpdir expected got
+    if ! asset_arch="$(hy2_core_asset_arch "$HY2_ARCH")"; then
+        log_err "Hysteria 2 不支持当前 CPU 架构: ${HY2_ARCH}"
+        return 1
+    fi
+    asset="hysteria-linux-${asset_arch}"
+
     if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
-        log_warn "从 GitHub API 获取版本失败，尝试直接下载官方最新发布版..."
-        DOWNLOAD_URL="https://download.hysteria.network/app/latest/hysteria-linux-${HY2_ARCH}"
-        LATEST_TAG="latest"
-    else
-        DOWNLOAD_URL="https://github.com/apernet/hysteria/releases/download/${LATEST_TAG}/hysteria-linux-${HY2_ARCH}"
+        log_warn "从 GitHub API 获取版本失败，尝试从官方下载站解析最新版本..."
+        # 用固定版本目录而不是 `latest/`：`latest` 是浮动指针，下载与取摘要之间
+        # 可能已经切换版本，导致摘要与资产对不上（或更糟：对上了另一个版本）。
+        local resolved
+        resolved="$(curl -fsSIL --max-time 20 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
+            awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)"
+        if [[ "$resolved" =~ /app/(v[0-9][^/]*)/${asset}$ ]]; then
+            # 下载站只给出裸版本号（v2.13.0），而 GitHub 的 release tag 是
+            # `app/v2.13.0`。用裸版本号拼 GitHub URL 实测 404（hashes.txt 与资产
+            # 都是），回退路径会因此永远失败，必须补回 app/ 前缀。
+            LATEST_TAG="app/${BASH_REMATCH[1]}"
+        fi
+        if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
+            log_err "无法确定 Hysteria 2 版本，已放弃安装（不做无校验下载）。"
+            return 1
+        fi
     fi
 
-    log_info "目标版本: ${LATEST_TAG} (${HY2_ARCH})"
+    log_info "目标版本: ${LATEST_TAG} (${asset})"
     log_step "下载二进制文件至 ${HY2_BIN}..."
-    
-    if curl -fL --progress-bar "$DOWNLOAD_URL" -o "${HY2_BIN}.tmp"         && chmod +x "${HY2_BIN}.tmp" && "${HY2_BIN}.tmp" version >/dev/null 2>&1; then
-        mv "${HY2_BIN}.tmp" "$HY2_BIN"
-        log_info "Hysteria 2 二进制安装成功！版本信息: $($HY2_BIN version 2>&1 | grep -E '^Version:' | head -n1 || echo '未知')"
-    else
-        rm -f "${HY2_BIN}.tmp"
-        log_err "下载失败，请检查网络连接。"
-        exit 1
+
+    tmpdir="$(mktemp -d)"
+    # 官方同版本的 hashes.txt；hysteria 的 tag 形如 app/v2.13.0，路径要原样保留。
+    if ! expected="$(hy2_expected_sha256 \
+            "https://github.com/apernet/hysteria/releases/download/${LATEST_TAG}/hashes.txt" \
+            "$asset" "$tmpdir")"; then
+        rm -rf "$tmpdir"
+        log_err "取不到 Hysteria ${LATEST_TAG} 的官方校验清单（hashes.txt）或其中没有 ${asset}。"
+        log_err "无法验证下载内容，已放弃安装，现有二进制未改动。"
+        return 1
     fi
+
+    if ! curl -fL --progress-bar --max-time 300 \
+            "https://github.com/apernet/hysteria/releases/download/${LATEST_TAG}/${asset}" \
+            -o "${tmpdir}/${asset}"; then
+        rm -rf "$tmpdir"
+        log_err "下载失败，请检查网络连接。现有二进制未改动。"
+        return 1
+    fi
+    got="$(hy2_sha256_file "${tmpdir}/${asset}")" || got=""
+    if [[ -z "$got" || "$got" != "$expected" ]]; then
+        rm -rf "$tmpdir"
+        log_err "Hysteria 二进制校验失败：SHA256 与官方 hashes.txt 不一致。"
+        log_err "  期望: ${expected}"
+        log_err "  实际: ${got:-<无法读取>}"
+        log_err "已放弃安装，现有二进制未改动。"
+        return 1
+    fi
+    chmod +x "${tmpdir}/${asset}"
+    # 摘要通过后再跑一次 version 作为附加检查（不替代摘要）。
+    if ! "${tmpdir}/${asset}" version >/dev/null 2>&1; then
+        rm -rf "$tmpdir"
+        log_err "校验通过但二进制无法运行（架构不匹配？），已放弃安装。"
+        return 1
+    fi
+    if ! install -m 0755 "${tmpdir}/${asset}" "${HY2_BIN}.new"; then
+        rm -rf "$tmpdir"
+        log_err "写入 ${HY2_BIN}.new 失败，现有二进制未改动。"
+        return 1
+    fi
+    rm -rf "$tmpdir"
+    mv -f "${HY2_BIN}.new" "$HY2_BIN"
+    log_info "Hysteria 2 二进制安装成功！版本信息: $($HY2_BIN version 2>&1 | grep -E '^Version:' | head -n1 || echo '未知')"
 }
 
 # 3. 证书处理模块（自签名 / 自有证书 / ACME 域名证书）
@@ -739,18 +1265,32 @@ setup_cert_via_dns_api() {
     fi
 
     local acct="${HOME}/.acme.sh/acme.sh"
-    if [[ ! -x "$acct" ]]; then
+    if [[ -x "$acct" ]]; then
+        # 已有安装：不重装、不覆盖；**身份核验不通过就硬失败**，
+        # 绝不在执行该脚本 / 调用它签发之前放行。
+        if ! hy2_acme_check_existing "$HOME/.acme.sh"; then
+            log_err "已有 acme.sh 未通过身份核验，已停止：本次不执行它、不签发证书。"
+            log_err "现有证书/账号/脚本均未被改动；按上面的修复办法处理后重跑。"
+            return 1
+        fi
+    else
         log_step "正在安装 acme.sh（DNS API 签发，不占用任何端口）..."
-        if ! curl -fsSL --max-time 60 https://get.acme.sh | sh -s --home "$HOME/.acme.sh" >/dev/null 2>&1; then
-            log_err "acme.sh 安装失败（凭据已就绪，仅是工具装不上）。"
-            log_err "可手动安装：curl https://get.acme.sh | sh -s --home ~/.acme.sh"
+        # 🔴 绝不把 get.acme.sh 的内容直接管道给 shell：那是下载即执行，
+        # 而且 get.acme.sh 自己还会再去拉浮动 master 的 acme.sh。这里改成
+        # pin commit + 逐文件 blob 身份校验，只有全部通过才执行安装器；
+        # 任何失败都保持原环境不变。
+        if ! hy2_acme_install_verified "$HOME/.acme.sh"; then
+            log_err "acme.sh 安装失败（凭据已就绪，仅是工具装不上/未通过校验）。"
+            log_err "本项目不再执行未校验的远程安装脚本；请确认本机可访问 GitHub API 后重试。"
             return 1
         fi
     fi
     [[ -x "$acct" ]] || { log_err "acme.sh 不可用。"; return 1; }
 
     log_info "使用 ${provider} DNS API 签发..."
-    # 避免 acme.sh 自升级失败卡住流程
+    # 注意：上游 acme.sh **没有** SKIP_ACME_SH_UPGRADE 这个开关（grep 全文件 0 次命中），
+    # 真正生效的是 account.conf 里的 AUTO_UPGRADE='0'（安装/检查时已写入）。
+    # 这里保留导出只是为了兼容旧脚本行为，不要指望它阻止升级。
     export SKIP_ACME_SH_UPGRADE=1
     local ok=0
     case "$provider" in
@@ -1578,15 +2118,56 @@ if [[ "$TARGET" == "core" ]]; then
     case "$ARCH" in
         x86_64) HY_ARCH="amd64" ;;
         aarch64|arm64) HY_ARCH="arm64" ;;
-        armv7l) HY_ARCH="armv7" ;;
+        armv7l) HY_ARCH="arm" ;;   # 上游没有 armv7 资产，armv7 用 arm（旧映射是 404）
         *) echo "不支持的架构: $ARCH" >&2; exit 1 ;;
     esac
+    ASSET="hysteria-linux-${HY_ARCH}"
+
+    # 先定版本，再取该版本的官方 hashes.txt —— 绝不拿浮动 latest 的字节当依据。
+    TAG=$(curl -s --max-time 10 https://api.github.com/repos/apernet/hysteria/releases/latest \
+          | jq -r '.tag_name // empty' 2>/dev/null) || TAG=""
+    if [[ -z "$TAG" || "$TAG" == "null" ]]; then
+        _loc=$(curl -fsSIL --max-time 20 "https://download.hysteria.network/app/latest/${ASSET}" 2>/dev/null \
+               | awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)
+        if [[ "$_loc" =~ /app/(v[0-9][^/]*)/${ASSET}$ ]]; then
+            # 下载站给的是裸版本号，GitHub 的 tag 是 `app/vX.Y.Z`；不补前缀会 404。
+            TAG="app/${BASH_REMATCH[1]}"
+        fi
+    fi
+    if [[ -z "$TAG" || "$TAG" == "null" ]]; then
+        echo "无法确定 Hysteria 版本，已放弃更新（不做无校验下载）" >&2
+        exit 1
+    fi
+
+    SUMDIR="$(mktemp -d)"
+    trap 'rm -rf "$SUMDIR"; rm -f "$TMP_FILE"' EXIT
+    if ! curl -fsSL --max-time 30 --retry 2 \
+            "https://github.com/apernet/hysteria/releases/download/${TAG}/hashes.txt" \
+            -o "${SUMDIR}/hashes.txt" 2>/dev/null; then
+        echo "取不到 ${TAG} 的官方 hashes.txt，已放弃更新，现有核心未改动" >&2
+        exit 1
+    fi
+    # 精确资产名解析唯一 SHA256；空/重复/畸形一律失败。
+    WANT="$(awk -v a="$ASSET" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==a || n ~ ("/" a "$")) print $1}' \
+            "${SUMDIR}/hashes.txt" | tr 'A-F' 'a-f' | sort -u)"
+    if [[ ! "$WANT" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "hashes.txt 中 ${ASSET} 的摘要缺失或不唯一（实际: [${WANT}]），已放弃更新" >&2
+        exit 1
+    fi
+
     # mktemp 而不是固定的 /tmp/hy2_update_*：root 写可预测路径会被符号链接劫持。
     TMP_FILE="$(mktemp "${HY2_BIN}.update.XXXXXX")"
-    trap 'rm -f "$TMP_FILE"' EXIT
-    curl -fsSL "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}" -o "$TMP_FILE"
+    curl -fsSL --max-time 300 "https://github.com/apernet/hysteria/releases/download/${TAG}/${ASSET}" -o "$TMP_FILE" || {
+        echo "下载失败，现有核心未改动" >&2; exit 1; }
+    GOT="$(sha256sum "$TMP_FILE" | awk '{print $1}')"
+    if [[ "$GOT" != "$WANT" ]]; then
+        echo "校验失败：SHA256 与官方 hashes.txt 不一致，已放弃更新" >&2
+        echo "  期望: $WANT" >&2
+        echo "  实际: $GOT" >&2
+        exit 1
+    fi
     chmod +x "$TMP_FILE"
-    # 先确认新文件真能跑，再替换；坏包直接覆盖会让服务起不来、所有客户端断线。
+    # 摘要之后再跑一次作为附加检查；坏包直接覆盖会让服务起不来、所有客户端断线。
     if ! "$TMP_FILE" version >/dev/null 2>&1; then
         echo "下载的 Hysteria 二进制无法运行，已放弃更新" >&2
         exit 1
@@ -1620,6 +2201,25 @@ elif [[ "$TARGET" == "portal" ]]; then
     [[ "$_bundle_ref" =~ ^[0-9a-f]{40}$ ]] || { echo "无法固定门户版本，保留全部旧文件" >&2; exit 1; }
     _bundle_dir="$(mktemp -d)"
     _bundle_files="portal.py portal_assets.py usage-meter-core-20261007-v1.py usage-meter-readers-20261007-v1.py usage-meter-runtime-20261007-v1.py usage-meter-xray-config-20261007-v1.py"
+    # 本脚本是独立生成的文件，不能依赖 install.sh 里的函数：内联 git blob 身份计算。
+    # blob sha = sha1("blob <len>\0" + content)，与 GitHub contents API 的 sha 一致，
+    # 注意它**不等于**文件的 sha1。
+    _blob_sha() {
+        local _f="$1" _n
+        _n="$(wc -c < "$_f" | tr -d '[:space:]')"
+        [[ "$_n" =~ ^[0-9]+$ ]] || return 1
+        { printf 'blob %s\0' "$_n"; cat -- "$_f"; } | sha1sum | awk '{print $1}'
+    }
+    # 该 commit 下每个文件的 git blob 身份（contents API 一次取回全部 sha）。
+    # 只有内容与该身份一致才算通过 —— 只校验 marker 挡不住 CDN 返回与所 pin
+    # commit 不符的内容。
+    _bundle_map="$(mktemp)"
+    if ! curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/contents/?ref=${_bundle_ref}" -o "$_bundle_map" 2>/dev/null; then
+        rm -rf "$_bundle_dir" "$_bundle_map"
+        echo "无法取得 ${_bundle_ref:0:7} 的文件身份，保留全部旧文件" >&2
+        exit 1
+    fi
     # 全部先下载并检查；旧缓存、缺文件或语法错误不允许半更新。
     for _m in $_bundle_files; do
         case "$_m" in
@@ -1628,6 +2228,24 @@ elif [[ "$TARGET" == "portal" ]]; then
             usage-meter-core-*|usage-meter-runtime-*) _marker='ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"' ;;
             *) _marker='def ' ;;
         esac
+        _want_sha="$(python3 -c '
+import json, re, sys
+try:
+    items = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+for it in items if isinstance(items, list) else []:
+    if isinstance(it, dict) and it.get("name") == sys.argv[2]:
+        s = it.get("sha") or ""
+        if re.fullmatch(r"[0-9a-f]{40}", s):
+            print(s)
+        break
+' "$_bundle_map" "$_m" 2>/dev/null)" || _want_sha=""
+        if [[ ! "$_want_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            rm -rf "$_bundle_dir" "$_bundle_map"
+            echo "无法取得 ${_m}@${_bundle_ref:0:7} 的预期身份，保留全部旧文件" >&2
+            exit 1
+        fi
         _tmp_m="$_bundle_dir/$_m"
         _file_ok=0
         for _url in "https://api.github.com/repos/${REPO}/contents/${_m}?ref=${_bundle_ref}" \
@@ -1635,16 +2253,18 @@ elif [[ "$TARGET" == "portal" ]]; then
                     "https://raw.githubusercontent.com/${REPO}/${_bundle_ref}/${_m}"; do
             if curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" "$_url" -o "$_tmp_m" 2>/dev/null &&
                grep -Fq "$_marker" "$_tmp_m" &&
-               python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$_tmp_m" 2>/dev/null; then
+               python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$_tmp_m" 2>/dev/null &&
+               [[ "$(_blob_sha "$_tmp_m")" == "$_want_sha" ]]; then
                 _file_ok=1; break
             fi
         done
         if [[ "$_file_ok" != "1" ]]; then
-            echo "门户整包校验失败: ${_m}，保留全部旧文件" >&2
-            rm -rf "$_bundle_dir"
+            rm -rf "$_bundle_dir" "$_bundle_map"
+            echo "门户整包校验失败: ${_m}（内容与 ${_bundle_ref:0:7} 不符或语法不通），保留全部旧文件" >&2
             exit 1
         fi
     done
+    rm -f "$_bundle_map"
     if [[ "$_file_ok" == "1" ]]; then
         # 写入失败时恢复整包，避免模块接口不一致。
         python3 - "$HY2_DIR" "$_bundle_dir" $_bundle_files <<'PYBUNDLE'
@@ -2085,6 +2705,53 @@ portal_fetch_files() {
     return 0
 }
 
+# 取某个 commit 下仓库根目录各文件的 git blob 身份，输出 "name sha" 每行一条。
+# 一次目录列表请求即可拿到全部文件（contents API 的 JSON 里就带 sha），
+# 比逐文件请求省额度。取不到返回 1 —— 调用方必须 fail-closed。
+portal_remote_blob_shas() {
+    local ref="${1:-}" json
+    [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
+    json="$(mktemp)"
+    if ! curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${AWG_REPO}/contents/?ref=${ref}" -o "$json" 2>/dev/null; then
+        rm -f "$json"
+        return 1
+    fi
+    python3 -c '
+import json, re, sys
+try:
+    items = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+if not isinstance(items, list):
+    sys.exit(1)
+rows = []
+for it in items:
+    if not isinstance(it, dict):
+        continue
+    name, sha = it.get("name"), it.get("sha") or ""
+    if name and re.fullmatch(r"[0-9a-f]{40}", sha):
+        rows.append(name + " " + sha)
+print("\n".join(rows))
+' "$json" || { rm -f "$json"; return 1; }
+    rm -f "$json"
+    return 0
+}
+
+# 核对目录里每个文件的内容与预期 blob 身份一致；$2 为 "name sha" 行。
+# 任何缺失/不一致都返回 1（不做"部分一致也算过"）。
+portal_verify_blobs() {
+    local dir="$1" map="$2" name sha got
+    [[ -n "$map" ]] || return 1
+    for f in $PORTAL_FILES $METER_FILES; do
+        sha="$(printf '%s\n' "$map" | awk -v n="$f" '$1==n{print $2; exit}')"
+        [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+        got="$(hy2_git_blob_sha "${dir}/${f}")" || return 1
+        [[ "$got" == "$sha" ]] || return 1
+    done
+    return 0
+}
+
 # 每一源的真实失败原因累积在这里，供最终报错逐条展示。
 # 🔴 旧实现把「网络拉不到」与「拉到了但本地校验不过」都压成同一个 return 1，
 #    最终只报「三个源均失败」+「请确认能访问 GitHub」，于是本地校验 bug
@@ -2109,6 +2776,18 @@ portal_fetch_py() {
     if [[ ! "$PORTAL_FETCH_REF" =~ ^[0-9a-f]{40}$ ]]; then
         PORTAL_FETCH_ERR="无法固定门户版本，未下载或修改门户文件"; return 1
     fi
+    # 该 commit 下每个文件的 git blob 身份：下载后逐文件比对。
+    # 🔴 只校验 marker + 语法挡不住"CDN 返回与所 pin commit 不符的内容"：
+    #    只要内容里含 marker 且语法合法，就会被写成 root 运行的面板代码。
+    local PORTAL_BLOBS
+    if ! PORTAL_BLOBS="$(portal_remote_blob_shas "$PORTAL_FETCH_REF")" || [[ -z "$PORTAL_BLOBS" ]]; then
+        # 拿不到预期身份就无从核对，三个源一律不采信（fail-closed）。
+        # 归为"网络/身份获取类"而不是"校验类"：本地校验逻辑并没有跑过。
+        PORTAL_FETCH_ERR="  [GitHub API] 无法取得 ${PORTAL_FETCH_REF:0:7} 的文件身份（contents API）"$'\n'
+        PORTAL_FETCH_ERR+="  [jsDelivr] 缺少可核对的预期文件身份，未下载"$'\n'
+        PORTAL_FETCH_ERR+="  [raw.githubusercontent] 缺少可核对的预期文件身份，未下载"$'\n'
+        return 1
+    fi
     # spec 格式：名称|base|模式
     while IFS='|' read -r name base mode; do
         [[ -z "$name" ]] && continue
@@ -2119,11 +2798,15 @@ portal_fetch_py() {
         done
 
         if portal_fetch_files "$dir" "$base" "$mode"; then
-            if portal_files_ok "$dir"; then
+            if ! portal_files_ok "$dir"; then
+                why="文件已取回，但未通过校验（关键标记缺失或 Python 语法不通）"
+                PORTAL_FETCH_ALL_VERIFY_FAILED=1
+            elif ! portal_verify_blobs "$dir" "$PORTAL_BLOBS"; then
+                why="文件已取回，但内容与所 pin commit ${PORTAL_FETCH_REF:0:7} 的文件身份不符"
+                PORTAL_FETCH_ALL_VERIFY_FAILED=1
+            else
                 return 0
             fi
-            why="文件已取回，但未通过校验（关键标记缺失或 Python 语法不通）"
-            PORTAL_FETCH_ALL_VERIFY_FAILED=1
         else
             why="网络拉取失败（${PORTAL_FETCH_FILES_ERR:-下载失败}）"
         fi
@@ -2517,6 +3200,7 @@ install_warp_local_proxy() {
     WARP_SOCKS_ADDR="127.0.0.1:${WARP_SOCKS_PORT}"
 
     # 1. 下载 wgcf (匿名注册 WARP 设备)
+    # 顺序：先解析确定版本 → 取该版本官方 checksums.txt → 下载 → 校验 → 才安装。
     if [[ ! -x "$WGCF_BIN" ]]; then
         log_step "下载 wgcf 二进制..."
         # 动态探测最新 release + asset 名 (避免硬编码版本号失效)
@@ -2531,13 +3215,31 @@ install_warp_local_proxy() {
         WGCF_DL="wgcf_${WGCF_VER}_linux_${WGCF_ARCH}"
         WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/${WGCF_DL}"
         log_info "目标 wgcf 版本: v${WGCF_VER}"
-        if ! curl -fsSL -o "$WGCF_BIN.tmp" "$WGCF_URL"; then
-            rm -f "$WGCF_BIN.tmp"
+        TMP_DIR="$(mktemp -d)"
+        if ! WGCF_SUM="$(hy2_expected_sha256 \
+                "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/checksums.txt" \
+                "$WGCF_DL" "$TMP_DIR")"; then
+            rm -rf "$TMP_DIR"
+            log_err "取不到 wgcf v${WGCF_VER} 的官方 checksums.txt（或其中没有 ${WGCF_DL}），已放弃安装。"
+            return 1
+        fi
+        if ! curl -fsSL --max-time 120 -o "${TMP_DIR}/${WGCF_DL}" "$WGCF_URL"; then
+            rm -rf "$TMP_DIR"
             log_err "wgcf 下载失败 ($WGCF_URL), 请检查网络或版本号"
             return 1
         fi
-        install -m 755 "$WGCF_BIN.tmp" "$WGCF_BIN"
-        rm -f "$WGCF_BIN.tmp"
+        if ! hy2_verify_sha256 "${TMP_DIR}/${WGCF_DL}" "$WGCF_SUM"; then
+            rm -rf "$TMP_DIR"
+            log_err "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致，已放弃安装。"
+            return 1
+        fi
+        if ! install -m 755 "${TMP_DIR}/${WGCF_DL}" "${WGCF_BIN}.new"; then
+            rm -rf "$TMP_DIR"
+            log_err "安装 wgcf 失败，现有文件未改动。"
+            return 1
+        fi
+        rm -rf "$TMP_DIR"
+        mv -f "${WGCF_BIN}.new" "$WGCF_BIN"
     fi
 
     # 2. 下载 wireproxy (把 WireGuard 配置转成 socks5 代理)
@@ -2549,32 +3251,57 @@ install_warp_local_proxy() {
         else
             WP_TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
         fi
-        WP_VER="${WP_TAG#v}"
-        [[ -z "$WP_VER" || "$WP_VER" == "null" ]] && WP_VER="1.1.3"
-        # wireproxy 不同版本命名约定不同 (有的 wireproxy-VER-linux-ARCH, 有的 wireproxy_linux_ARCH.tar.gz)
-        # 优先尝试 tar.gz 格式 (因为 wireproxy 实际是单文件 + 不会变)
-        WP_URL="https://github.com/whyvl/wireproxy/releases/download/${WP_TAG}/wireproxy_linux_${WP_ARCH}.tar.gz"
+        # ⚠️ 旧实现回退只改了 WP_VER，拼 URL 却仍用空的 WP_TAG，于是回退分支拼出
+        #    `.../download//wireproxy_...`（404），回退形同虚设。现在统一用 WP_TAG。
+        if [[ -z "$WP_TAG" || "$WP_TAG" == "null" ]]; then
+            WP_TAG="v1.1.3"
+        fi
+        WP_ASSET="wireproxy_linux_${WP_ARCH}.tar.gz"
+        WP_URL="https://github.com/whyvl/wireproxy/releases/download/${WP_TAG}/${WP_ASSET}"
         log_info "目标 wireproxy 版本: ${WP_TAG}"
-        TMP_TGZ=$(mktemp)
-        if ! curl -fsSL -o "$TMP_TGZ" "$WP_URL"; then
-            rm -f "$TMP_TGZ"
+        TMP_DIR="$(mktemp -d)"
+        if ! WP_SUM="$(hy2_expected_sha256 \
+                "https://github.com/whyvl/wireproxy/releases/download/${WP_TAG}/checksums.txt" \
+                "$WP_ASSET" "$TMP_DIR")"; then
+            rm -rf "$TMP_DIR"
+            log_err "取不到 wireproxy ${WP_TAG} 的官方 checksums.txt（或其中没有 ${WP_ASSET}），已放弃安装。"
+            return 1
+        fi
+        if ! curl -fsSL --max-time 120 -o "${TMP_DIR}/${WP_ASSET}" "$WP_URL"; then
+            rm -rf "$TMP_DIR"
             log_err "wireproxy 下载失败 ($WP_URL)"
             return 1
         fi
-        TMP_EXTRACT=$(mktemp -d)
-        tar -xzf "$TMP_TGZ" -C "$TMP_EXTRACT" 2>/dev/null
-        WP_SRC=$(find "$TMP_EXTRACT" -name wireproxy -type f -executable 2>/dev/null | head -1)
-        if [[ -z "$WP_SRC" ]]; then
-            # 兜底: 如果解压出来的不是 wireproxy 而是 wireproxy_linux_amd64 等
-            WP_SRC=$(find "$TMP_EXTRACT" -type f -executable 2>/dev/null | head -1)
-        fi
-        if [[ -z "$WP_SRC" ]]; then
-            log_err "wireproxy 解压失败，找不到可执行文件"
-            rm -rf "$TMP_TGZ" "$TMP_EXTRACT"
+        if ! hy2_verify_sha256 "${TMP_DIR}/${WP_ASSET}" "$WP_SUM"; then
+            rm -rf "$TMP_DIR"
+            log_err "wireproxy 校验失败：SHA256 与官方 checksums.txt 不一致，已放弃安装。"
             return 1
         fi
-        install -m 755 "$WP_SRC" "$WP_BIN"
-        rm -rf "$TMP_TGZ" "$TMP_EXTRACT"
+        if ! hy2_tar_listing_safe "${TMP_DIR}/${WP_ASSET}"; then
+            rm -rf "$TMP_DIR"
+            log_err "wireproxy 包内含不安全路径成员，已放弃安装。"
+            return 1
+        fi
+        WP_MEMBER="$(hy2_tar_find_member "${TMP_DIR}/${WP_ASSET}" wireproxy)" || WP_MEMBER=""
+        if [[ -z "$WP_MEMBER" ]]; then
+            rm -rf "$TMP_DIR"
+            log_err "wireproxy 包内没有 wireproxy 成员，已放弃安装。"
+            return 1
+        fi
+        TMP_EXTRACT="$(mktemp -d)"
+        # 只解出那一个确定成员，不再"取包内第一个可执行文件"当 root 二进制。
+        if ! tar -xzf "${TMP_DIR}/${WP_ASSET}" -C "$TMP_EXTRACT" "$WP_MEMBER" 2>/dev/null; then
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT"
+            log_err "wireproxy 解压失败"
+            return 1
+        fi
+        if ! install -m 755 "${TMP_EXTRACT}/${WP_MEMBER}" "${WP_BIN}.new"; then
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT"
+            log_err "安装 wireproxy 失败，现有文件未改动。"
+            return 1
+        fi
+        rm -rf "$TMP_DIR" "$TMP_EXTRACT"
+        mv -f "${WP_BIN}.new" "$WP_BIN"
     fi
 
     # 3. 匿名注册 WARP 设备 (一次性)
@@ -2735,17 +3462,51 @@ install_gost() {
     esac
 
     DOWNLOAD_URL="https://github.com/go-gost/gost/releases/download/${GOST_LATEST}/gost_${GOST_VER}_${GOST_ASSET}.tar.gz"
+    GOST_ASSET_NAME="gost_${GOST_VER}_${GOST_ASSET}.tar.gz"
     log_info "目标版本: ${GOST_LATEST} (${GOST_ASSET})"
     log_step "下载并解压 gost 二进制..."
     TMP_DIR=$(mktemp -d)
-    if ! curl -fL --progress-bar "$DOWNLOAD_URL" -o "$TMP_DIR/gost.tar.gz"; then
+    # 先从该版本的官方 checksums.txt 取摘要，再下载校验；取不到就不装。
+    if ! GOST_SUM="$(hy2_expected_sha256 \
+            "https://github.com/go-gost/gost/releases/download/${GOST_LATEST}/checksums.txt" \
+            "$GOST_ASSET_NAME" "$TMP_DIR")"; then
+        rm -rf "$TMP_DIR"
+        log_err "取不到 gost ${GOST_LATEST} 的官方 checksums.txt（或其中没有 ${GOST_ASSET_NAME}），已放弃安装。"
+        return 1
+    fi
+    if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/$GOST_ASSET_NAME" "$DOWNLOAD_URL"; then
         rm -rf "$TMP_DIR"
         log_err "gost 下载失败，请检查网络连接。"
         return 1
     fi
-    tar -xzf "$TMP_DIR/gost.tar.gz" -C "$TMP_DIR"
-    find "$TMP_DIR" -name gost -type f -exec install -m 755 {} "$GOST_BIN" \;
+    if ! hy2_verify_sha256 "$TMP_DIR/$GOST_ASSET_NAME" "$GOST_SUM"; then
+        rm -rf "$TMP_DIR"
+        log_err "gost 校验失败：SHA256 与官方 checksums.txt 不一致，已放弃安装。"
+        return 1
+    fi
+    if ! hy2_tar_listing_safe "$TMP_DIR/$GOST_ASSET_NAME"; then
+        rm -rf "$TMP_DIR"
+        log_err "gost 包内含不安全路径成员，已放弃安装。"
+        return 1
+    fi
+    GOST_MEMBER="$(hy2_tar_find_member "$TMP_DIR/$GOST_ASSET_NAME" gost)" || GOST_MEMBER=""
+    if [[ -z "$GOST_MEMBER" ]]; then
+        rm -rf "$TMP_DIR"
+        log_err "gost 包内没有 gost 成员，已放弃安装。"
+        return 1
+    fi
+    if ! tar -xzf "$TMP_DIR/$GOST_ASSET_NAME" -C "$TMP_DIR" "$GOST_MEMBER" 2>/dev/null; then
+        rm -rf "$TMP_DIR"
+        log_err "gost 解压失败。"
+        return 1
+    fi
+    if ! install -m 755 "$TMP_DIR/$GOST_MEMBER" "${GOST_BIN}.new"; then
+        rm -rf "$TMP_DIR"
+        log_err "安装 gost 失败，现有文件未改动。"
+        return 1
+    fi
     rm -rf "$TMP_DIR"
+    mv -f "${GOST_BIN}.new" "$GOST_BIN"
     if [[ ! -f "$GOST_BIN" ]]; then
         log_err "gost 二进制解压失败。"
         return 1
@@ -2911,34 +3672,59 @@ EOF
 #     raw.githubusercontent.com/...                        → 旧内容（滞后）
 #   所以顺序是：API（权威、始终最新，未认证限 60 次/小时/IP）
 #   → jsDelivr（无速率限制）→ raw（最后兜底，接受可能滞后）。
-#   这与项目里 gost 安装用多镜像回退的做法一致。
+#
+# 🔴 2026-10-27：先把 main 解析成 40 位 commit，再取三源，并把内容与
+#    GitHub API 给出的 git blob 身份（sha1("blob <len>\0"+content)）比对。
+#    旧实现直接用 `?ref=main` / `@main` 且只 grep 一个字符串标记，
+#    main 一旦被推入恶意提交就会把 hy2-awgctl 刷成攻击者版本并以 root 执行。
+#    注意 blob sha 与「文件 sha1」不同，必须带 blob 头才算得对。
 awg_fetch_ctl() {
     local out="$1"
+    local ref expected blob tmp
 
-    # 1) GitHub API：权威且始终最新（未认证限 60 次/小时/IP，安装场景绰绰有余）
-    if curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" \
-         "https://api.github.com/repos/${AWG_REPO}/contents/awgctl.sh?ref=main" \
-         -o "$out" 2>/dev/null \
-       && [[ -s "$out" ]] && grep -q 'hy2-awgctl' "$out" 2>/dev/null; then
-        return 0
+    # 只解析一次，三个源都读同一快照；解析失败就放弃，绝不回退到浮动 main。
+    ref="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${AWG_REPO}/commits/main" 2>/dev/null |
+        python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha",""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || ref=""
+    if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+        log_err "无法把 main 固定到具体 commit，已放弃获取 awgctl.sh（不回退到浮动 main）"
+        return 1
     fi
 
-    # 2) jsDelivr CDN：无速率限制
-    if curl -fsSL --max-time 30 \
-         "https://cdn.jsdelivr.net/gh/${AWG_REPO}@main/awgctl.sh" \
-         -o "$out" 2>/dev/null \
-       && [[ -s "$out" ]] && grep -q 'hy2-awgctl' "$out" 2>/dev/null; then
-        return 0
+    # 预期 blob 身份：走 contents API 的 JSON（只回一个 sha，不用下载内容）。
+    expected="$(curl -fsSL --max-time 15 -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${AWG_REPO}/contents/awgctl.sh?ref=${ref}" 2>/dev/null |
+        python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha",""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || expected=""
+    if [[ ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then
+        log_err "无法取得 awgctl.sh@${ref} 的预期 blob 身份，已放弃获取（不做无身份比对的下载）"
+        return 1
     fi
 
-    # 3) raw：最后兜底，接受可能滞后
-    if curl -fsSL --max-time 30 \
-         "https://raw.githubusercontent.com/${AWG_REPO}/main/awgctl.sh" \
-         -o "$out" 2>/dev/null \
-       && [[ -s "$out" ]] && grep -q 'hy2-awgctl' "$out" 2>/dev/null; then
+    tmp="$(mktemp)"
+    local -a sources=(
+        "https://api.github.com/repos/${AWG_REPO}/contents/awgctl.sh?ref=${ref}"
+        "https://cdn.jsdelivr.net/gh/${AWG_REPO}@${ref}/awgctl.sh"
+        "https://raw.githubusercontent.com/${AWG_REPO}/${ref}/awgctl.sh"
+    )
+    local url got
+    for url in "${sources[@]}"; do
+        : > "$tmp"
+        if ! curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" "$url" -o "$tmp" 2>/dev/null; then
+            continue
+        fi
+        [[ -s "$tmp" ]] && grep -q 'hy2-awgctl' "$tmp" 2>/dev/null || continue
+        got="$(hy2_git_blob_sha "$tmp")" || got=""
+        if [[ "$got" != "$expected" ]]; then
+            log_warn "awgctl.sh 来源 ${url%%\?*} 的内容与 ${ref} 的 blob 身份不一致，换下一个源"
+            continue
+        fi
+        if ! install -m 0755 "$tmp" "$out"; then
+            continue
+        fi
+        rm -f "$tmp"
         return 0
-    fi
-
+    done
+    rm -f "$tmp"
+    log_err "awgctl.sh 三个源均未取得与 ${ref} 一致的受信内容"
     return 1
 }
 
