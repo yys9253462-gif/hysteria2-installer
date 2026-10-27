@@ -1519,8 +1519,10 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         note = u.get("note") or "-"
         user_key = user_view_key(session_secret, uid, u.get('view_nonce', '')) if session_secret else ""
         
-        user_rows.append(f"""<tr>
-          <td><strong>{html.escape(uid)}</strong><div style="font-size:11px;color:var(--muted)">{html.escape(note)}</div></td>
+        row_state = "active" if is_active else "inactive"
+        row_search = html.escape((uid + " " + (u.get("note") or "")).lower())
+        user_rows.append(f"""<tr data-user-row data-state="{row_state}" data-search="{row_search}">
+          <td class="uid-cell"><strong title="{html.escape(uid)}">{html.escape(uid)}</strong><div class="uid-note" title="{html.escape(note)}">{html.escape(note)}</div></td>
           <td>{status_html}</td>
           <td>{ip_limit_str} ({online_str})</td>
           <td>
@@ -1741,12 +1743,22 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </form>
     </details>
 
-    <div class="user-table-wrap">
+    <div class="user-toolbar">
+      <input id="user-search" type="search" placeholder="搜索用户标识 / 备注 / 订单号" autocomplete="off">
+      <select id="user-filter" aria-label="按状态筛选">
+        <option value="all">全部状态</option>
+        <option value="active">仅正常</option>
+        <option value="inactive">仅异常（到期/超额/停用）</option>
+      </select>
+      <span class="user-count" id="user-count"></span>
+    </div>
+    <div class="user-table-wrap user-table-scroll">
       <table class="user-table">
         <thead><tr><th>用户标识</th><th>状态</th><th>IP 限制 (实时)</th><th>已用流量 / 配额</th><th>到期时间</th><th>连接密码</th><th>操作</th></tr></thead>
-        <tbody>{users_table_html}</tbody>
+        <tbody id="user-tbody">{users_table_html}</tbody>
       </table>
     </div>
+    <div class="user-pager" id="user-pager"></div>
   </section>
 </div>
 

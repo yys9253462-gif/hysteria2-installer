@@ -72,6 +72,24 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .user-table th{background:#f8fbfb;padding:12px 14px;color:var(--muted);font-weight:700;border-bottom:1px solid var(--line);white-space:nowrap}
 .user-table td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:middle;white-space:nowrap}
 .user-table tr:last-child td{border-bottom:none}
+.user-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px}
+.user-toolbar input,.user-toolbar select{height:36px;border:1px solid var(--line);border-radius:10px;padding:0 12px;font-size:13px;background:#fff;color:var(--ink)}
+.user-toolbar input{flex:1 1 260px;min-width:0}
+.user-count{font-size:12px;color:var(--muted);margin-left:auto}
+.user-table-scroll{max-height:640px;overflow:auto}
+.user-table-scroll thead th{position:sticky;top:0;z-index:2}
+.user-table td{padding:8px 12px}
+.user-table th{padding:10px 12px}
+.user-table .uid-cell{max-width:300px}
+.user-table .uid-cell strong,.user-table .uid-note{display:block;overflow:hidden;text-overflow:ellipsis}
+.user-table .uid-note{font-size:11px;color:var(--muted)}
+.user-table th:last-child,.user-table td:last-child{position:sticky;right:0;background:#fff;box-shadow:-6px 0 8px -6px rgba(18,43,49,.18)}
+.user-table th:last-child{background:#f8fbfb;z-index:3}
+.user-pager{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:center;margin-top:12px}
+.user-pager button{min-width:34px;height:32px;border:1px solid var(--line);border-radius:8px;background:#fff;cursor:pointer;font-size:12px;color:var(--ink)}
+.user-pager button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.user-pager button:disabled{opacity:.4;cursor:not-allowed}
+.user-pager .pager-info{font-size:12px;color:var(--muted);margin:0 6px}
 .status-pill{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}
 .status-pill.active{background:#eafaf3;color:#0b8650}
 .status-pill.expired{background:#fff1f0;color:#cf3c3c}
@@ -1784,6 +1802,56 @@ if (btnRebootServer) {
     }
   });
 }
+
+// 多用户表：搜索 / 状态筛选 / 分页。用户上百时整表直出会把页面拉得极长，
+// 「操作」列也被挤出视口；这里只在客户端切显隐，不改动行内的按钮与表单。
+(function initUserTable() {
+  const tbody = document.getElementById('user-tbody');
+  if (!tbody) return;
+  const rows = Array.from(tbody.querySelectorAll('tr[data-user-row]'));
+  const search = document.getElementById('user-search');
+  const filter = document.getElementById('user-filter');
+  const countEl = document.getElementById('user-count');
+  const pager = document.getElementById('user-pager');
+  const PAGE_SIZE = 20;
+  let page = 1;
+
+  function render() {
+    const q = (search && search.value || '').trim().toLowerCase();
+    const st = filter ? filter.value : 'all';
+    const matched = rows.filter(r => (st === 'all' || r.dataset.state === st) && (!q || r.dataset.search.includes(q)));
+    const pages = Math.max(1, Math.ceil(matched.length / PAGE_SIZE));
+    if (page > pages) page = pages;
+    const start = (page - 1) * PAGE_SIZE;
+    const visible = new Set(matched.slice(start, start + PAGE_SIZE));
+    rows.forEach(r => { r.style.display = visible.has(r) ? '' : 'none'; });
+    if (countEl) countEl.textContent = '共 ' + rows.length + ' 个用户 · 匹配 ' + matched.length + ' 个';
+    if (!pager) return;
+    pager.textContent = '';
+    if (pages <= 1) return;
+    const btn = (label, target, opts = {}) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      if (opts.active) b.className = 'active';
+      b.disabled = !!opts.disabled;
+      b.addEventListener('click', () => { page = target; render(); });
+      pager.appendChild(b);
+    };
+    btn('‹', page - 1, { disabled: page === 1 });
+    for (let i = 1; i <= pages; i++) {
+      if (i === 1 || i === pages || Math.abs(i - page) <= 2) btn(String(i), i, { active: i === page });
+      else if (Math.abs(i - page) === 3) {
+        const s = document.createElement('span'); s.className = 'pager-info'; s.textContent = '…'; pager.appendChild(s);
+      }
+    }
+    btn('›', page + 1, { disabled: page === pages });
+  }
+
+  if (search) search.addEventListener('input', () => { page = 1; render(); });
+  if (filter) filter.addEventListener('change', () => { page = 1; render(); });
+  render();
+})();
 
 checkBbrStatus();
 checkCertStatus();

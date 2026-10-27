@@ -231,7 +231,7 @@ class FrontendRegressionTest(unittest.TestCase):
         """机主那一行的 HTML 里不应出现删除按钮。"""
         st, _, body = self.req('GET', self.prefix, auth=self.auth)
         html = body.decode('utf-8', 'replace')
-        rows = re.findall(r'<tr>.*?</tr>', html, re.S)
+        rows = re.findall(r'<tr[ >].*?</tr>', html, re.S)
         master_rows = [r for r in rows if portal.MASTER_USER_ID in r]
         self.assertTrue(master_rows, '用户表里应有机主账号那一行')
         for r in master_rows:
