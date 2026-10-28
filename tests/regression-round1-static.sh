@@ -137,17 +137,28 @@ for fn in sanitize_outbound_name validate_outbound render_outbound_yaml \
 done
 
 echo
-echo "=== 7) 🔴 apply_outbounds_config 必须显式接收 data/data_lock ==="
-# serve() 的闭包变量，模块级函数直接用会 NameError（"点保存就断线"）
+echo "=== 7) 🔴 出站应用函数必须显式接收 data/data_lock ==="
+# serve() 的闭包变量，模块级函数直接用会 NameError（"点保存就断线"）。
+# 2026-10-28 更新：apply_outbounds_config 已被 apply_egress_config 取代
+# （统一接管 WARP 规则与自定义出站的事务性应用），检查对象随之迁移。
+# 旧检查 grep 的调用点 'applied, aerr = apply_outbounds_config(...)' 在
+# 代码迁移后已不存在，导致该项永远红 —— 是测试陈旧，不是代码缺陷。
 if grep -qE "def apply_outbounds_config\(data, data_lock" portal.py; then
     ok "apply_outbounds_config(data, data_lock, ...) 签名正确"
 else
-    bad "签名不对 —— 会抛 NameError: data_lock is not defined"
+    bad "apply_outbounds_config 签名不对 —— 会抛 NameError: data_lock is not defined"
 fi
-if grep -q 'applied, aerr = apply_outbounds_config(data, data_lock)' portal.py; then
-    ok "调用点已传参"
+if grep -qE "def apply_egress_config\(data, data_lock" portal.py; then
+    ok "apply_egress_config(data, data_lock, ...) 签名正确"
 else
-    bad "调用点未传参"
+    bad "apply_egress_config 签名不对 —— 会抛 NameError: data_lock is not defined"
+fi
+if grep -q 'applied, error = apply_egress_config(data, data_lock)' portal.py; then
+    ok "apply_egress_config 调用点已传参"
+elif grep -q 'applied, aerr = apply_outbounds_config(data, data_lock)' portal.py; then
+    ok "apply_outbounds_config 调用点已传参（旧布局）"
+else
+    bad "出站应用调用点未传参"
 fi
 
 echo

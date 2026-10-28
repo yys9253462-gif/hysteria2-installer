@@ -4635,6 +4635,13 @@ def serve(path):
     VALID_USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
     # AmneziaWG 客户端名称：与 awgctl.sh 中的校验保持一致
     VALID_AWG_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,32}$')
+    # AmneziaWG 连接地址（endpoint）：域名或 IP 字面量，可带可选端口。
+    # 🔴 必须禁掉换行/空白：endpoint 会被渲染进客户端 .conf 文件
+    # （render_client_config 的 `Endpoint = ${endpoint}:${port}`），
+    # 一个带换行的值能往配置里注入任意行（2026-10-28 修）。
+    # 允许 IPv6 字面量（含冒号）与域名（含连字符/点/下划线）。
+    VALID_AWG_ENDPOINT_RE = re.compile(
+        r'^[A-Za-z0-9_.\-]+(?::[0-9]{1,5})?$|^\[[0-9A-Fa-f:.]+\](?::[0-9]{1,5})?$')
 
     # 实时速率计算滑动窗口数据结构: {uid: [(timestamp, total_bytes_tx, total_bytes_rx)]}
     speed_tracker = {}
@@ -5574,6 +5581,17 @@ if __name__ == '__main__':
             # Reality 与 VMess 的 clients 都由 enforce_node_access 一并收回。
             return apply_access()
 
+        def _extend_deadline(self, seconds):
+            """为本连接延长死线（见 ThreadingHTTPServer.extend_deadline 的说明）。
+
+            seconds 取该端点自己的最长预期耗时（subprocess 超时 + 余量）。
+            连接不存在或已结束就是无操作，不影响别的请求。
+            """
+            try:
+                self.server.extend_deadline(self.connection, seconds)
+            except Exception:
+                pass
+
         def _generate_and_apply_reality(self, restart=True, force=False):
             """生成（或刷新）Reality 的服务端配置。
 
@@ -6501,6 +6519,10 @@ if __name__ == '__main__':
                     ref = form.get('ref', ['main'])[0]
                     if ref != 'main' and not re.fullmatch(r'[0-9a-f]{40}', ref):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid immutable ref'})
+                    # 六个文件 × 三个源 × 30 秒超时 + blob 校验，最坏远超
+                    # 30 秒默认死线：不抬死线，更新结果永远送不回浏览器
+                    # （副作用照常发生，面板却显示失败/无响应，2026-10-28 修）。
+                    self._extend_deadline(600)
                     # 门户前后端与四个计量模块必须一起更新，避免新旧回调接口不兼容。
                     # 🔴 必须成对更新 —— 门户同时是 Hysteria 的鉴权后端，
                     # 只换其中一个会让它起不来、所有客户端连不上。
@@ -6600,6 +6622,8 @@ if __name__ == '__main__':
                                                      'error': 'AmneziaWG 尚未安装'})
                     # 先刷新控制脚本自身，再更新二进制。不需要重启面板。
                     ensure_awgctl(force=True)
+                    # awgctl update 要下载并核验二进制，超时 420 秒。
+                    self._extend_deadline(480)
                     rc, out, err = awg_run(['update'], timeout=420)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False,
@@ -6632,7 +6656,7 @@ if __name__ == '__main__':
                     threading.Thread(target=upgrade_worker, daemon=True).start()
                 return
             except Exception as e:
-                return self.reply_json(500, {'ok': False, 'error': str(e)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
         def _manage_proxy_operation(self, action, params):
             if action not in ('create', 'delete'):
@@ -6738,6 +6762,9 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
+                # 下载走多源回退、单源 180 秒超时：默认 30 秒连接死线
+                # 会先一步关掉连接（2026-10-28 修，见 _extend_deadline）。
+                self._extend_deadline(600)
                 if Path('/usr/local/bin/gost').exists():
                     version = subprocess.run(['/usr/local/bin/gost', '-V'], capture_output=True, timeout=5)
                     if version.returncode == 0:
@@ -6868,6 +6895,11 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': '协议线只能是 2 或 3'})
                 if not endpoint:
                     return self.reply_json(400, {'ok': False, 'error': '必须提供客户端连接地址（域名或公网 IP）'})
+                # 连接地址必须是「域名或 IP:端口」形态：含换行/空白会让
+                # render_client_config 把任意行注入客户端配置文件（2026-10-28 修）。
+                if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
+                    return self.reply_json(400, {'ok': False,
+                        'error': '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'})
                 # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃冲突的取值
                 if port:
                     if not port.isdigit() or not (1 <= int(port) <= 65535):
@@ -6876,6 +6908,8 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': '该端口落在 Hysteria2 的端口跳跃区间 20000-40000 内，会导致 AWG 收不到握手包，请改用 50000-59000'})
                 if not ensure_awgctl():
                     return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
+                # 安装要下载并核验两个二进制，awgctl 超时 420 秒。
+                self._extend_deadline(480)
 
                 args = ['install', '--line', line, '--endpoint', endpoint]
                 if port:
@@ -6914,6 +6948,11 @@ if __name__ == '__main__':
                 if not ensure_awgctl():
                     return self.reply_json(500, {'ok': False, 'error': 'hy2-awgctl 不可用'})
 
+                # update / set_line 的 awgctl 超时给到 420 秒（要下载并交叉
+                # 验证二进制），必须先把连接死线抬到覆盖全程。
+                if action in ('set_line', 'update'):
+                    self._extend_deadline(480)
+
                 if action == 'peer_add':
                     name = (form.get('name', [''])[0] or '').strip()
                     endpoint = (form.get('endpoint', [''])[0] or '').strip()
@@ -6921,6 +6960,12 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': '客户端名称只允许字母、数字、点、下划线、连字符，长度 1-32'})
                     if not endpoint:
                         return self.reply_json(400, {'ok': False, 'error': '必须提供连接地址'})
+                    # 与安装通道同一校验：换行/空白能注入客户端配置行（2026-10-28 修）。
+                    if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
+                        return self.reply_json(400, {'ok': False,
+                            'error': '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'})
+                    # peer-add 会生成密钥并渲染服务端配置，90 秒超时。
+                    self._extend_deadline(120)
                     rc, out, err = awg_run(['peer-add', name, '--endpoint', endpoint], timeout=90)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False, 'error': '创建失败：' + awg_err_tail(rc, out, err, 400)})
@@ -7047,13 +7092,15 @@ if __name__ == '__main__':
                     'rules': current_rules,
                 })
             except Exception as e:
-                return self.reply_json(500, {'ok': False, 'error': str(e)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
         def _h_post_install_xray(self, prefix):
             """POST /install-xray 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
+                # 三个下载源 × 45 秒 + 校验/解压，全程远超 30 秒默认死线。
+                self._extend_deadline(300)
                 machine = platform.machine().lower()
                 # 架构映射必须覆盖 armv7：旧实现把除 aarch64 外的一切都当成 amd64，
                 # 于是 armv7 机器会被静默装上 Xray-linux-64.zip 并当作 xray 运行。
@@ -7211,7 +7258,7 @@ WantedBy=multi-user.target
 
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
             except Exception as e:
-                return self.reply_json(500, {'ok': False, 'error': str(e)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
         def _vmess_certificate(self, domain, protocol='VMess'):
             """挑一张**能对外出示**的证书给 TLS 协议用，返回 (cert, key, sni)。
@@ -7669,7 +7716,7 @@ WantedBy=multi-user.target
                 subprocess.Popen(['bash', '-c', 'sleep 1 && reboot'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 return self.reply_json(200, {'ok': True, 'message': '服务器正在重启中'})
             except Exception as e:
-                return self.reply_json(500, {'ok': False, 'error': str(e)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
         def _h_post_manage_user(self, prefix):
             """POST /manage-user 的处理逻辑（从 do_POST 机械搬移而来）。"""
@@ -7828,6 +7875,8 @@ WantedBy=multi-user.target
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
+                # 安装脚本 subprocess 超时 180 秒，必须同步抬连接死线。
+                self._extend_deadline(240)
                 install_warp_sh = r'''
 set -eo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -8074,8 +8123,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 '''
                 res = subprocess.run(['bash', '-c', install_warp_sh], capture_output=True, text=True, timeout=180)
                 if res.returncode != 0:
-                    err_detail = (res.stderr or res.stdout or '安装失败').strip()
-                    return self.reply_json(500, {'ok': False, 'error': f'安装失败: {err_detail}'})
+                    err_detail = (res.stderr or res.stdout or '').strip()
+                    # 🔴 2026-10-28 修：裸 bash -c 脚本失败时 stderr 常为空
+                    # （set -e 中断、无 trap），旧代码会回一句「安装失败: 安装失败」
+                    # —— 与没说一样，且没有任何落盘日志可查。
+                    # 现在：a) 兜底文案写明最常见根因与排查命令；
+                    # b) 尾部输出写进 stderr 日志（journalctl -u hysteria-portal 可见）。
+                    if not err_detail:
+                        print('[portal] install-warp failed rc=%d stdout_tail=%r' % (
+                            res.returncode, (res.stdout or '')[-500:]), file=sys.stderr, flush=True)
+                        err_detail = ('脚本中断且无错误输出（rc=%d）。常见原因：apt 源不可达、'
+                                      'wgcf 注册接口被限流。排查：journalctl -u hysteria-portal -n 50'
+                                      % res.returncode)
+                    return self.reply_json(500, {'ok': False, 'error': f'安装失败: {err_detail[-400:]}'})
 
                 # Install success is not routing success: apply the domain ACL
                 # directly, never call the legacy script with mismatched arguments.
@@ -8100,15 +8160,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not self.verify_api_key():
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized API key'})
                 sub = self.path[len('/api/v1/'):].split('?', 1)[0]
-                # 剥掉 query 再比较。
-                #
-                # ⚠️ self.path 是**含 query 的**原始路径，`/api/v1/speedtest?x=1`
-                # 会让 sub 变成 'speedtest?x=1'，等值比较直接落空 → 404。
-                # 既有端点（node/meta、users/list…）都有这个毛病，
-                # 改成"全部剥 query"会改变它们的行为，超出本次改动范围。
-                # 这里只让**新端点**自己扛住：切掉 '?' 再比，
-                # 且 _h_api_speedtest 不读任何 query 参数
-                # （靶点硬编码，见 SPEEDTEST_TARGETS 的安全说明）。
+                # 下方比较前 sub 已在上游剥掉 query（见 8160 行 split('?', 1)[0]），
+                # speedtest / unlock-check 处再剥一次是历史遗留的双保险 ——
+                # 保留无害。🔴 2026-10-28 更正：旧注释声称「既有端点
+                # (node/meta、users/list…) 会因 query 落空 → 404」已不成立，
+                # 上游统一剥 query 后所有端点都扛得住 `/api/v1/node/meta?x=1`。
+                # 该注释误导过排障方向（让人以为 404 是 query 引起的），删除。
                 if sub.split('?', 1)[0] == 'speedtest':
                     return self._h_api_speedtest()
                 if sub.split('?', 1)[0] == 'unlock-check':
@@ -8550,6 +8607,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 endpoint = (query.get('endpoint', [''])[0] or '').strip() or awg_state()['endpoint']
                 if not endpoint:
                     return self.reply(400, b'Endpoint not configured; re-run install with an endpoint')
+                # 与 POST 通道同一校验：换行/空白能注入客户端配置行。
+                if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
+                    return self.reply(400, b'Invalid endpoint format')
 
                 try:
                     rc, out, err = awg_run(['client-conf', name, '--endpoint', endpoint], timeout=60)
@@ -8824,6 +8884,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             以节点 IP 出口的任意 HTTP 代理。
             各项并发执行、单项 8 秒超时，整体约 10 秒内返回。
             """
+            self._extend_deadline(60)
             results = run_unlock_checks()
             return self.reply_json(200, {'ok': True, 'results': results, 'time': int(time.time())})
 
@@ -8874,6 +8935,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'error_label': '节点未安装 ping，无法测速',
                     'results': [],
                 })
+            # 18 个靶点 × 3 包，单个 ping 最坏 10 秒：并行后耗时约等于
+            # 最慢的单个靶点，但 30 秒死线仍可能不够（丢包重传多的线路）。
+            self._extend_deadline(120)
 
             # 并行探测（2026-10-25 修）。旧实现串行 ping 18 个靶点，
             # 每个最坏 10 秒 → 单请求可达 180 秒；而门户只有 8 个并发槽、
@@ -8990,7 +9054,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'need_reboot': need_reboot
                 })
             except Exception as e:
-                return self.reply_json(500, {'ok': False, 'error': str(e)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
         def _ob_list(self):
             """GET <prefix>outbounds/list —— 出站列表 + 模式 + 内建出站。"""
@@ -9269,6 +9333,25 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             self.deadline_lock = threading.Lock()
             super().__init__(*args, **kwargs)
             threading.Thread(target=self.watch_deadlines, daemon=True).start()
+
+        def extend_deadline(self, request, seconds):
+            """长操作续期连接死线（2026-10-28 修）。
+
+            🔴 30 秒死线曾无差别杀掉所有合法的慢端点：install-gost /
+            install-xray / install-warp / do-upgrade / awg update 的
+            subprocess 超时给到 180-420 秒，但连接在 30 秒整就被
+            watch_deadlines 关闭 —— 用户在面板点「安装」永远收到
+            "Empty reply from server"，日志里只有一条 BrokenPipeError。
+            处理线程继续跑完全程、副作用全部发生，唯独响应送不出去。
+
+            处理办法：慢端点在开始前调一次本方法，把该连接的死线抬到
+            覆盖自己的最长操作时长。死线防的是「连接挂着不动」的
+            slow-loris 行为，不是防「服务端正在干活」。
+            """
+            with self.deadline_lock:
+                if request in self.deadlines:
+                    self.deadlines[request] = max(self.deadlines[request],
+                                                  time.monotonic() + seconds)
 
         def watch_deadlines(self):
             while True:

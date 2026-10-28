@@ -179,6 +179,20 @@ validate_port() {
     return 0
 }
 
+# 连接地址（endpoint）：域名或 IP 字面量，可带可选端口。
+# 🔴 必须拦掉换行/空白：endpoint 会被渲染进客户端 .conf
+# （render_client_config 的 `Endpoint = ${endpoint}:${port}`），
+# 带换行的值能往配置里注入任意行。门户侧有同一校验（VALID_AWG_ENDPOINT_RE），
+# 这里是纵深防御 —— CLI 直调同样走 render_client_config。
+validate_endpoint() {
+    local ep="$1"
+    if [[ "$ep" =~ ^[A-Za-z0-9_.-]+(:[0-9]{1,5})?$ ]] || [[ "$ep" =~ ^\[[0-9A-Fa-f:.]+\](:[0-9]{1,5})?$ ]]; then
+        return 0
+    fi
+    log_err "连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符: ${ep}"
+    return 1
+}
+
 # ==============================================================================
 # 二进制获取
 # ==============================================================================
@@ -579,6 +593,9 @@ cmd_peer_add() {
 
     [[ -n "$name" ]] || die "用法: hy2-awgctl peer-add <名称> [--endpoint HOST]"
     [[ "$name" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || die "客户端名称只允许字母/数字/._- 且不超过 32 字符"
+    if [[ -n "$endpoint" ]]; then
+        validate_endpoint "$endpoint" || die "连接地址非法"
+    fi
 
     if peer_exists "$name"; then
         die "客户端已存在: ${name}"
@@ -700,6 +717,7 @@ cmd_client_conf() {
         endpoint="$(meta_get endpoint)"
     fi
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
+    validate_endpoint "$endpoint" || die "连接地址非法"
 
     render_client_config "$name" "$endpoint"
 }
@@ -736,6 +754,11 @@ cmd_install() {
         line="$(version_line)"
     fi
     [[ "$line" == "2" || "$line" == "3" ]] || die "协议线只能是 2 或 3，收到: ${line}"
+
+    # 连接地址（可选，但要给就必须是合法形态：防止注入客户端配置行）
+    if [[ -n "$endpoint" ]]; then
+        validate_endpoint "$endpoint" || die "连接地址非法"
+    fi
 
     # 架构
     local arch
@@ -1074,6 +1097,9 @@ cmd_qr() {
     [[ -n "$name" ]] || die "用法: hy2-awgctl qr <名称> [--endpoint HOST]"
     if ! command -v qrencode >/dev/null 2>&1; then
         die "缺少 qrencode，请先安装：apt-get install -y qrencode"
+    fi
+    if [[ -n "$endpoint" ]]; then
+        validate_endpoint "$endpoint" || die "连接地址非法"
     fi
     render_client_config "$name" "${endpoint:-$(meta_get endpoint)}" | qrencode -t ANSIUTF8
 }
