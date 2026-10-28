@@ -2005,6 +2005,12 @@ function renderCore(core) {
     btn.type = 'button';
     btn.addEventListener('click', () => installCore(core, btn));
     actions.appendChild(btn);
+    if (core.installed) {
+      const del = coreEl('button', 'button danger', '卸载');
+      del.type = 'button';
+      del.addEventListener('click', () => uninstallCore(core, del));
+      actions.appendChild(del);
+    }
   }
   if (core.manage) {
     const go = coreEl('button', 'button', core.installable ? '前往使用' : (core.installed ? '前往管理' : '前往安装'));
@@ -2059,6 +2065,35 @@ async function installCore(core, btn) {
   } finally {
     btn.disabled = false;
     btn.textContent = orig;
+    await loadCores();
+  }
+}
+
+async function uninstallCore(core, btn) {
+  const confirmed = await showConfirm({
+    title: '卸载 ' + core.name,
+    text: '将停止并删除 ' + core.name + ' 程序与 systemd 服务。若还有协议在使用它会被拒绝，请先到协议页关闭。协议的配置会保留，重新安装后再开启即可沿用。',
+    icon: '🗑️',
+    confirmText: '确定卸载',
+    isDanger: true
+  });
+  if (!confirmed) return;
+  btn.disabled = true;
+  btn.textContent = '⏳ 正在卸载...';
+  try {
+    const res = await fetch(location.pathname + 'uninstall-core', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'name=' + encodeURIComponent(core.id)
+    });
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (json && json.ok) showToast(json.message || '已卸载', 'success');
+    else alert((json && json.error) || ('卸载失败（HTTP ' + res.status + '）'));
+  } catch (e) {
+    alert('请求异常: ' + e.message);
+  } finally {
     await loadCores();
   }
 }

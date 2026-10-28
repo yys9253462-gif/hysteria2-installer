@@ -6938,6 +6938,9 @@ if __name__ == '__main__':
             if self.path == prefix + 'install-core':
                 return self._h_post_install_core(prefix)
 
+            if self.path == prefix + 'uninstall-core':
+                return self._h_post_uninstall_core(prefix)
+
             if self.path == prefix + 'set-bbr':
                 return self._h_post_set_bbr(prefix)
 
@@ -8050,6 +8053,49 @@ if __name__ == '__main__':
                 else:
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里安装该核心'})
                 return self.reply_json(200 if ok else 500, {'ok': ok, ('message' if ok else 'error'): msg})
+            except Exception as exc:
+                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+
+        def _core_users(self, name):
+            """返回仍在使用该核心的协议名列表；非空时拒绝卸载。"""
+            if name == 'sing-box':
+                return ['AnyTLS'] if _active_anytls_config() else []
+            try:
+                cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                return []
+            labels = {REALITY_INBOUND_TAG: 'VLESS-Reality', VMESS_INBOUND_TAG: 'VMess',
+                      VLESSENC_INBOUND_TAG: 'VLESS Encryption'}
+            return [labels[tag] for tag in MANAGED_INBOUND_TAGS if has_managed_inbound(cfg, tag)]
+
+        def _h_post_uninstall_core(self, prefix):
+            """POST /uninstall-core —— 卸载 Xray / sing-box 核心。
+
+            有协议还在用就拒绝：直接删核心会让这些协议的用户全部断线，
+            而协议页仍显示「已启用」。先去协议页关掉，再回来卸载。
+            协议的配置（密钥、端口、secret）保留，重装核心后再开启即可沿用。
+            """
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
+                name = parse_qs(body).get('name', [''])[0]
+                units = {'xray': ('xray', '/usr/local/bin/xray'),
+                         'sing-box': (ANYTLS_SERVICE, ANYTLS_BINARY)}
+                if name not in units:
+                    return self.reply_json(400, {'ok': False, 'error': '不支持在这里卸载该核心'})
+                in_use = self._core_users(name)
+                if in_use:
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '以下协议仍在使用 %s：%s。请先到对应协议页关闭后再卸载' % (name, '、'.join(in_use))})
+                unit, binary = units[name]
+                subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
+                Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
+                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
+                Path(binary).unlink(missing_ok=True)
+                return self.reply_json(200, {'ok': True, 'message': '%s 已卸载' % name})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 

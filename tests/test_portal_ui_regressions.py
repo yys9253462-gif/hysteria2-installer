@@ -294,6 +294,14 @@ class FrontendRegressionTest(unittest.TestCase):
         st, _, _ = self.req('POST', self.prefix + 'install-core', form={'name': 'gost'}, auth=self.auth)
         self.assertEqual(st, 400)
 
+    def test_uninstall_core_rejects_non_core(self):
+        st, _, _ = self.req('POST', self.prefix + 'uninstall-core', form={'name': 'hysteria'}, auth=self.auth)
+        self.assertEqual(st, 400)
+
+    def test_uninstall_core_requires_auth(self):
+        st, _, _ = self.req('POST', self.prefix + 'uninstall-core', form={'name': 'xray'})
+        self.assertEqual(st, 401)
+
     def test_protocol_pages_link_to_cores_instead_of_installing(self):
         st, _, body = self.req('GET', self.prefix, auth=self.auth)
         page = body.decode('utf-8')
