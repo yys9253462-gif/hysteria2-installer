@@ -143,6 +143,31 @@ class PortalMeter:
                 'measurement_gaps':copy.deepcopy(m.get('gaps',[])),
                 'legacy_auth_value':self.data.get('users',{}).get(uid,{}).get('legacy_auth_value', self.data.get('users',{}).get(uid,{}).get('used_bytes',0))}
 
+    def hot_summary(self, uid):
+        """summary() 的轻量版：只算 /traffic-speed 高频轮询需要的标量字段。
+
+        🔴 2026-10-28 修（性能）：summary() 对每个用户 deepcopy
+        measurement_gaps（最多 100 条）、measurement_sources、
+        current_online —— 而 /traffic-speed 每 2 秒一次 × 全部用户，
+        前端只消费 measured_bytes / measurement_ok / used_bytes 等
+        5 个标量。200 用户实测每次 56ms 全花在没人读的深拷贝上，
+        且全程持有 meter lock 与 portal 的 data_lock（usage_summary
+        在 data_lock 内被调用），用户量大时会卡 /auth 鉴权。
+        热路径改用本方法：不做任何 deepcopy，只读标量。
+        """
+        with self.lock:
+            m=self.data.get('usage_meter',{})
+            health=m.get('health',{})
+            enabled=self.enabled_sources()
+            fresh=bool(enabled) and all(health.get(s,{}).get('ok',False) and
+                time.time()-datetime.fromisoformat(health[s]['sampled_at']).timestamp()<30
+                for s in enabled)
+            initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)
+            return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
+                'measurement_ok':initialized and fresh and not m.get('gaps'),
+                'measurement_started_at':m.get('started_at'),
+                'measurement_scope':'since_measurement_started'}
+
     def run(self):
         while not self.stop.is_set():
             self.poll(); self.stop.wait(5)

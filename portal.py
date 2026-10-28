@@ -4967,6 +4967,22 @@ def serve(path):
                 'measurement_started_at': None, 'measurement_gaps': [],
                 'legacy_auth_value': data.get('users', {}).get(uid, {}).get('used_bytes', 0)}
 
+    def usage_hot_summary(uid):
+        """usage_summary 的热路径版（2026-10-28 修）。
+
+        /traffic-speed 每 2 秒轮询 × 全部用户，前端只消费 5 个标量字段；
+        走完整 summary() 会给每个用户 deepcopy gaps/sources/online，
+        白耗 CPU 且长时间占住 data_lock（/auth 会被卡）。
+        优先用计量模块的 hot_summary；拿不到（未初始化）退回最小值。
+        """
+        if usage_meter is not None:
+            hot = getattr(usage_meter, 'hot_summary', None)
+            if hot is not None:
+                return hot(uid)
+        return {'measured_bytes': None, 'measurement_ok': False,
+                'measurement_started_at': None,
+                'measurement_scope': 'unavailable'}
+
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
         gost_cfg_path = portal_path.parent / 'gost.yml'
@@ -8723,8 +8739,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # usage_summary 里的 measurement_gaps（最多 100 条）与
                     # measurement_sources 每个用户都要 deepcopy 一次，
                     # 响应体会随用户数平方级膨胀（实测 500 用户 5.4 MiB/次）。
-                    # 这里只取需要的字段，完整信息仍在用户详情端点里。
-                    _summary = usage_summary(uid)
+                    # 2026-10-28 再收紧：改用 usage_hot_summary，把 deepcopy
+                    # 本身也省掉 —— 只读标量，锁持有时间从 O(N×gaps) 降到 O(N)。
+                    _summary = usage_hot_summary(uid)
                     entry['measured_bytes'] = _summary.get('measured_bytes')
                     entry['measurement_ok'] = _summary.get('measurement_ok')
                     entry['measurement_started_at'] = _summary.get('measurement_started_at')

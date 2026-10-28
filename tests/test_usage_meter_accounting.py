@@ -152,9 +152,12 @@ class MeterAccountingTest(unittest.TestCase):
         tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
         names = {'_meter_speed_sample', '_h_get_traffic_speed'}
         functions = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in names]
+        # 2026-10-28：热路径改走 usage_hot_summary（见 tests/test_round7_fixes.py）。
+        # fixture 同步提供两个入口，行为与 meter.hot_summary / meter.summary 对齐。
         env = {'time': time, 'data_lock': threading.RLock(), 'speed_tracker': {},
                'SPEED_WINDOW_SECONDS': 15, 'data': self.data,
-               'usage_summary': lambda uid: self.meter.summary(uid)}
+               'usage_summary': lambda uid: self.meter.summary(uid),
+               'usage_hot_summary': lambda uid: self.meter.hot_summary(uid)}
         exec(compile(ast.Module(body=functions, type_ignores=[]), 'portal-speed', 'exec'), env)
         class Handler:
             path = '/fixture/check-version'
