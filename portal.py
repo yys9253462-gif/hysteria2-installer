@@ -1253,6 +1253,9 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                     text=True, timeout=5).stdout.strip()
             if started.returncode != 0 or active != 'active':
                 raise RuntimeError('Xray 启动失败，已恢复原配置')
+            # 核心管理页单独安装 Xray 时只写单元不 enable；第一次真正有配置跑起来
+            # 才设开机自启（幂等）。
+            subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
     except Exception:
         if replaced:
             if original is None:
@@ -1633,6 +1636,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
   <button class="tab-btn" data-tab="users" type="button">👥 多用户管理 ({active_count}/{len(users)})</button>
   <button class="tab-btn" data-tab="proxies" type="button">🧩 扩展服务</button>
   <button class="tab-btn" data-tab="reality" type="button">🛡️ 备用通道与网络</button>
+  <button class="tab-btn" data-tab="cores" type="button">🧱 核心管理</button>
   <button class="tab-btn" data-tab="cluster" type="button">🔑 接入控制台 / REST API</button>
   <button class="tab-btn" data-tab="configs" type="button">⚙️ 系统与版本</button>
 </div>
@@ -2096,7 +2100,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
       <div style="display:flex;gap:10px;align-items:center">
         <span class="status-pill" id="reality-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
-        <button class="button primary" id="btn-install-xray" type="button" style="padding:6px 14px;font-size:12px;display:none">⚡ 一键安装 Xray 核心</button>
+        <button class="button primary js-goto" data-goto="cores" id="btn-install-xray" type="button" style="padding:6px 14px;font-size:12px;display:none">🧱 前往核心管理安装</button>
         <button class="toggle-btn off" id="btn-toggle-reality" type="button" style="display:none">切换中...</button>
       </div>
     </div>
@@ -2166,6 +2170,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
       <div style="display:flex;gap:10px;align-items:center">
         <span class="status-pill" id="vmess-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
+        <button class="button primary js-goto" data-goto="cores" id="vmess-goto-cores" type="button" style="padding:6px 14px;font-size:12px;display:none">🧱 前往核心管理安装</button>
         <button class="toggle-btn off" id="btn-toggle-vmess" type="button" style="display:none">切换中...</button>
       </div>
     </div>
@@ -2225,6 +2230,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
       <div style="display:flex;gap:10px;align-items:center">
         <span class="status-pill" id="vlessenc-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
+        <button class="button primary js-goto" data-goto="cores" id="vlessenc-goto-cores" type="button" style="padding:6px 14px;font-size:12px;display:none">🧱 前往核心管理安装</button>
         <button class="toggle-btn off" id="btn-toggle-vlessenc" type="button" style="display:none">切换中...</button>
       </div>
     </div>
@@ -2284,6 +2290,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
       <div style="display:flex;gap:10px;align-items:center">
         <span class="status-pill" id="anytls-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
+        <button class="button primary js-goto" data-goto="cores" id="anytls-goto-cores" type="button" style="padding:6px 14px;font-size:12px;display:none">🧱 前往核心管理安装</button>
         <button class="toggle-btn off" id="btn-toggle-anytls" type="button" style="display:none">切换中...</button>
       </div>
     </div>
@@ -2435,6 +2442,21 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 </div>
 
 <!-- Tab 3: 集群与通用 REST API 对接视图 -->
+<!-- 核心管理（2026-10-28）：所有核心集中在这里看装没装、版本与服务状态，
+     Xray / sing-box 在这里单独安装；各协议页只负责启停，不再各自放安装按钮。 -->
+<div class="tab-pane" id="pane-cores">
+  <section class="card">
+    <div class="user-header">
+      <div>
+        <h2>🧱 核心管理</h2>
+        <p style="font-size:13px">各协议依赖的核心程序：安装状态、版本、服务运行情况。装好核心后，到对应协议页打开开关即可使用</p>
+      </div>
+      <button class="button" id="btn-refresh-cores" type="button" style="padding:6px 14px;font-size:12px">↻ 刷新</button>
+    </div>
+    <div class="core-grid" id="core-grid"><div class="core-empty">检测中...</div></div>
+  </section>
+</div>
+
 <div class="tab-pane" id="pane-cluster">
 {teyir_block}
 
@@ -3690,6 +3712,97 @@ def _singbox_version(binary=ANYTLS_BINARY, run=subprocess.run):
         return None
     m = re.search(r'version\s+v?(\d+)\.(\d+)\.(\d+)', out or '')
     return tuple(int(x) for x in m.groups()) if m else None
+
+
+XRAY_UNIT_CONTENT = '''[Unit]
+Description=Xray Service (VLESS-Reality / VMess / VLESS Encryption)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/xray run -c /etc/hysteria/xray.json
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+'''
+
+
+def write_xray_unit():
+    """写 xray.service 并 daemon-reload；不 enable —— 没有任何协议配置时
+    开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
+    unit = Path('/etc/systemd/system/xray.service')
+    if not unit.exists() or unit.read_text(encoding='utf-8') != XRAY_UNIT_CONTENT:
+        unit.write_text(XRAY_UNIT_CONTENT, encoding='utf-8')
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+
+
+def install_xray_binary():
+    """下载官方 Xray-core 并校验 SHA2-256 后装到 /usr/local/bin/xray，返回 (ok, message)。
+
+    只装二进制，不写配置、不启用任何协议：核心管理页单独安装时用它，
+    Reality 的一键安装在它之上再生成配置（2026-10-28 从 install-xray 拆出）。
+    """
+    machine = platform.machine().lower()
+    # 架构映射必须覆盖 armv7：旧实现把除 aarch64 外的一切都当成 amd64，
+    # 于是 armv7 机器会被静默装上 Xray-linux-64.zip 并当作 xray 运行。
+    if 'aarch64' in machine or 'arm64' in machine:
+        xarch = 'arm64-v8a'
+    elif 'armv7' in machine or 'armhf' in machine:
+        xarch = 'arm32-v7a'
+    elif 'x86_64' in machine or 'amd64' in machine:
+        xarch = '64'
+    else:
+        return False, '不支持的 CPU 架构，无法选择 Xray 资产: %s' % machine
+    xasset = f"Xray-linux-{xarch}.zip"
+    xbase = 'https://github.com/XTLS/Xray-core/releases/download/v26.3.27/'
+    # 先取官方 `.dgst` 并只认 SHA2-256；取不到就不装。
+    expected = fetch_expected_sha256(xbase + xasset + '.dgst', None,
+                                     parser=parse_xray_dgst)
+    if not expected:
+        return False, ('取不到 %s 的官方 SHA2-256 摘要（.dgst 缺失、畸形或重复）—— '
+                       '无法验证下载内容，已放弃安装' % xasset)
+    dl_urls = [
+        xbase + xasset,
+        f"https://ghfast.top/{xbase}{xasset}",
+        f"https://github.moeyy.xyz/{xbase}{xasset}",
+    ]
+    installed = False
+    errors = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zpath = Path(tmpdir) / 'xray.zip'
+        for u in dl_urls:
+            host = u.split('/')[2] if '//' in u else u
+            try:
+                req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=45) as resp, open(zpath, 'wb') as out_f:
+                    shutil.copyfileobj(resp, out_f)
+                if not verify_sha256(zpath, expected):
+                    errors.append('%s: SHA256 与官方 .dgst 不一致' % host)
+                    continue
+                if not zipfile.is_zipfile(str(zpath)):
+                    errors.append('%s: 内容不是有效 zip' % host)
+                    continue
+                with zipfile.ZipFile(zpath, 'r') as zf:
+                    member = safe_zip_members(zf.namelist(), 'xray')
+                    zf.extract(member, path=tmpdir)
+                bin_path = Path(tmpdir) / 'xray'
+                if bin_path.exists():
+                    staged = Path('/usr/local/bin/xray.new')
+                    shutil.copyfile(str(bin_path), str(staged))
+                    os.chmod(str(staged), 0o755)
+                    os.replace(str(staged), '/usr/local/bin/xray')
+                    installed = True
+                    break
+                errors.append('%s: 包内没有 xray' % host)
+            except Exception as exc:
+                errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
+
+    if not installed:
+        return False, '下载或解压 Xray 核心失败 —— ' + ' ｜ '.join(errors)
+    return True, 'Xray-core 安装完成'
 
 
 def install_singbox():
@@ -6822,6 +6935,9 @@ if __name__ == '__main__':
             if self.path == prefix + 'manage-anytls':
                 return self._h_post_manage_anytls(prefix)
 
+            if self.path == prefix + 'install-core':
+                return self._h_post_install_core(prefix)
+
             if self.path == prefix + 'set-bbr':
                 return self._h_post_set_bbr(prefix)
 
@@ -7476,83 +7592,11 @@ if __name__ == '__main__':
             try:
                 # 三个下载源 × 45 秒 + 校验/解压，全程远超 30 秒默认死线。
                 self._extend_deadline(300)
-                machine = platform.machine().lower()
-                # 架构映射必须覆盖 armv7：旧实现把除 aarch64 外的一切都当成 amd64，
-                # 于是 armv7 机器会被静默装上 Xray-linux-64.zip 并当作 xray 运行。
-                if 'aarch64' in machine or 'arm64' in machine:
-                    xarch = 'arm64-v8a'
-                elif 'armv7' in machine or 'armhf' in machine:
-                    xarch = 'arm32-v7a'
-                elif 'x86_64' in machine or 'amd64' in machine:
-                    xarch = '64'
-                else:
-                    return self.reply_json(500, {'ok': False, 'error':
-                        '不支持的 CPU 架构，无法选择 Xray 资产: %s' % machine})
-                xasset = f"Xray-linux-{xarch}.zip"
-                xbase = 'https://github.com/XTLS/Xray-core/releases/download/v26.3.27/'
-                # 先取官方 `.dgst` 并只认 SHA2-256；取不到就不装。
-                expected = fetch_expected_sha256(xbase + xasset + '.dgst', None,
-                                                 parser=parse_xray_dgst)
-                if not expected:
-                    return self.reply_json(500, {'ok': False, 'error':
-                        '取不到 %s 的官方 SHA2-256 摘要（.dgst 缺失、畸形或重复）—— '
-                        '无法验证下载内容，已放弃安装' % xasset})
-                dl_urls = [
-                    xbase + xasset,
-                    f"https://ghfast.top/{xbase}{xasset}",
-                    f"https://github.moeyy.xyz/{xbase}{xasset}",
-                ]
-                installed = False
-                errors = []
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    zpath = Path(tmpdir) / 'xray.zip'
-                    for u in dl_urls:
-                        host = u.split('/')[2] if '//' in u else u
-                        try:
-                            req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
-                            with urllib.request.urlopen(req, timeout=45) as resp, open(zpath, 'wb') as out_f:
-                                shutil.copyfileobj(resp, out_f)
-                            if not verify_sha256(zpath, expected):
-                                errors.append('%s: SHA256 与官方 .dgst 不一致' % host)
-                                continue
-                            if not zipfile.is_zipfile(str(zpath)):
-                                errors.append('%s: 内容不是有效 zip' % host)
-                                continue
-                            with zipfile.ZipFile(zpath, 'r') as zf:
-                                member = safe_zip_members(zf.namelist(), 'xray')
-                                zf.extract(member, path=tmpdir)
-                            bin_path = Path(tmpdir) / 'xray'
-                            if bin_path.exists():
-                                staged = Path('/usr/local/bin/xray.new')
-                                shutil.copyfile(str(bin_path), str(staged))
-                                os.chmod(str(staged), 0o755)
-                                os.replace(str(staged), '/usr/local/bin/xray')
-                                installed = True
-                                break
-                            errors.append('%s: 包内没有 xray' % host)
-                        except Exception as exc:
-                            errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
+                ok, msg = install_xray_binary()
+                if not ok:
+                    return self.reply_json(500, {'ok': False, 'error': msg})
 
-                if not installed:
-                    return self.reply_json(500, {'ok': False,
-                        'error': '下载或解压 Xray 核心失败 —— ' + ' ｜ '.join(errors)})
-
-                service_content = '''[Unit]
-Description=Xray Service (VLESS-Reality / VMess / VLESS Encryption)
-After=network.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=/usr/local/bin/xray run -c /etc/hysteria/xray.json
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-'''
-                Path('/etc/systemd/system/xray.service').write_text(service_content, encoding='utf-8')
-                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                write_xray_unit()
                 subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=30)
                 self._generate_and_apply_reality(True)
 
@@ -7933,6 +7977,82 @@ WantedBy=multi-user.target
                 },
             })
 
+        def _h_get_cores_status(self, subpath):
+            """GET /cores-status —— 核心管理页：各核心装没装、版本、服务状态、被谁依赖。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+
+            def version_of(binary, args, pattern):
+                if not Path(binary).exists():
+                    return ''
+                try:
+                    out = subprocess.run([binary] + args, capture_output=True, text=True, timeout=5)
+                    m = re.search(pattern, (out.stdout or '') + (out.stderr or ''))
+                    return m.group(1) if m else '已安装'
+                except Exception:
+                    return '已安装'
+
+            def state_of(unit):
+                if not Path('/etc/systemd/system/%s.service' % unit).exists() and \
+                        not Path('/lib/systemd/system/%s.service' % unit).exists():
+                    return 'none'
+                return _systemd_state(unit) or 'unknown'
+
+            singbox = _singbox_version()
+            cores = [
+                {'id': 'hysteria', 'name': 'Hysteria 2', 'used_by': ['Hysteria 2 主协议'],
+                 'version': version_of('/usr/local/bin/hysteria', ['version'], r'Version:\s*v?([\w.\-]+)'),
+                 'service': 'hysteria-server', 'installable': False,
+                 'manage': 'configs', 'note': '主协议核心，升级请在「系统与版本」'},
+                {'id': 'xray', 'name': 'Xray-core', 'used_by': ['VLESS-Reality', 'VMess', 'VLESS Encryption'],
+                 'version': version_of('/usr/local/bin/xray', ['version'], r'Xray\s+v?([\w.\-]+)'),
+                 'service': 'xray', 'installable': True, 'manage': 'reality/reality-node'},
+                {'id': 'sing-box', 'name': 'sing-box', 'used_by': ['AnyTLS'],
+                 'version': '.'.join(map(str, singbox)) if singbox else '',
+                 'service': ANYTLS_SERVICE, 'installable': True, 'manage': 'reality/anytls'},
+                {'id': 'gost', 'name': 'GOST', 'used_by': ['SOCKS5 / HTTP 入站代理'],
+                 'version': version_of('/usr/local/bin/gost', ['-V'], r'gost\s+v?([\w.\-]+)'),
+                 'service': 'gost', 'installable': False, 'manage': 'proxies/ingress',
+                 'note': '安装时会同时生成代理配置，请在「扩展服务 → 入站代理」中安装'},
+                {'id': 'warp', 'name': 'WARP (wgcf + wireproxy)', 'used_by': ['WARP 分流'],
+                 'version': '已安装' if Path('/usr/local/bin/wireproxy').exists() else '',
+                 'service': 'wireproxy', 'installable': False, 'manage': 'proxies/warp',
+                 'note': '安装需要注册 WARP 账户，请在「扩展服务 → WARP 分流」中安装'},
+                {'id': 'amneziawg', 'name': 'AmneziaWG', 'used_by': ['AmneziaWG VPN'],
+                 'version': '已安装' if awg_installed() else '',
+                 'service': AWG_SVC_NAME, 'installable': False, 'manage': 'proxies/awg',
+                 'note': '安装需要选择协议版本与端点，请在「扩展服务 → AmneziaWG」中安装'},
+            ]
+            for core in cores:
+                core['installed'] = bool(core['version'])
+                core['state'] = state_of(core['service'])
+            return self.reply_json(200, {'ok': True, 'cores': cores})
+
+        def _h_post_install_core(self, prefix):
+            """POST /install-core —— 只安装核心二进制，不启用任何协议。
+
+            Xray / sing-box 是纯核心：装好后由各协议页的开关去生成配置并启动。
+            GOST / WARP / AmneziaWG 的安装本身带配置，仍在各自页面完成。
+            """
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            try:
+                self._extend_deadline(420)
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
+                name = parse_qs(body).get('name', [''])[0]
+                if name == 'xray':
+                    ok, msg = install_xray_binary()
+                    if ok:
+                        write_xray_unit()
+                elif name == 'sing-box':
+                    ok, msg = install_singbox()
+                else:
+                    return self.reply_json(400, {'ok': False, 'error': '不支持在这里安装该核心'})
+                return self.reply_json(200 if ok else 500, {'ok': ok, ('message' if ok else 'error'): msg})
+            except Exception as exc:
+                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+
         def _apply_anytls_enable(self):
             """启用 AnyTLS：装 sing-box → 选端口 → 写配置并重启 → 落 data。
 
@@ -7944,9 +8064,9 @@ WantedBy=multi-user.target
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('AnyTLS 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain, 'AnyTLS')
-            ok, msg = install_singbox()
-            if not ok:
-                raise RuntimeError(msg)
+            version = _singbox_version()
+            if not version or version < ANYTLS_MIN_SINGBOX:
+                raise RuntimeError('sing-box 核心未安装或版本低于 1.12，请先在「核心管理」中安装')
             with data_lock:
                 old = dict(data.get('anytls_config') or {})
                 _data_now = dict(data)
@@ -7985,8 +8105,6 @@ WantedBy=multi-user.target
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                # 首次启用要下载 sing-box（单源最长 180 秒），先抬高连接死线。
-                self._extend_deadline(420)
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
@@ -9015,6 +9133,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             if subpath == 'anytls-status':
                 return self._h_get_anytls_status(subpath)
+
+            if subpath == 'cores-status':
+                return self._h_get_cores_status(subpath)
 
             if subpath == 'bbr-status':
                 return self._h_get_bbr_status(subpath)

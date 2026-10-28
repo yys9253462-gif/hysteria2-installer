@@ -273,6 +273,35 @@ class FrontendRegressionTest(unittest.TestCase):
                             auth='Bearer ' + self.data['api_key'])
         self.assertEqual(st, 400)
 
+    # ---- 核心管理页 ----
+
+    def test_cores_status_lists_every_core(self):
+        st, _, body = self.req('GET', self.prefix + 'cores-status', auth=self.auth)
+        self.assertEqual(st, 200)
+        cores = {c['id']: c for c in json.loads(body)['cores']}
+        self.assertEqual(set(cores), {'hysteria', 'xray', 'sing-box', 'gost', 'warp', 'amneziawg'})
+        self.assertEqual({k for k, c in cores.items() if c['installable']}, {'xray', 'sing-box'})
+        for core in cores.values():
+            self.assertIn('installed', core)
+            self.assertIn('state', core)
+
+    def test_cores_status_requires_auth(self):
+        st, _, _ = self.req('GET', self.prefix + 'cores-status')
+        self.assertEqual(st, 401)
+
+    def test_install_core_rejects_non_core(self):
+        """GOST / WARP / AWG 的安装带配置，不能走纯核心安装接口。"""
+        st, _, _ = self.req('POST', self.prefix + 'install-core', form={'name': 'gost'}, auth=self.auth)
+        self.assertEqual(st, 400)
+
+    def test_protocol_pages_link_to_cores_instead_of_installing(self):
+        st, _, body = self.req('GET', self.prefix, auth=self.auth)
+        page = body.decode('utf-8')
+        self.assertIn('data-tab="cores"', page)
+        for el in ('btn-install-xray', 'vmess-goto-cores', 'vlessenc-goto-cores', 'anytls-goto-cores'):
+            tag = re.search(r'<button[^>]*id="%s"[^>]*>' % el, page).group(0)
+            self.assertIn('data-goto="cores"', tag, el + ' 应跳转到核心管理，而不是就地安装')
+
 
 class PageStatusConsistencyTest(unittest.TestCase):
     """管理页的状态展示必须与准入判据 user_access_allowed 同源。"""

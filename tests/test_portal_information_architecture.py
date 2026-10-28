@@ -51,7 +51,7 @@ class InformationArchitectureTest(unittest.TestCase):
     def test_top_level_tabs_are_task_groups(self):
         labels = re.findall(r'class="tab-btn[^"]*" data-tab="([a-z]+)"[^>]*>([^<]+)<', self.page)
         self.assertEqual([t for t, _ in labels],
-                         ['connect', 'users', 'proxies', 'reality', 'cluster', 'configs'])
+                         ['connect', 'users', 'proxies', 'reality', 'cores', 'cluster', 'configs'])
         # 标签不再罗列具体服务名，否则每加一个服务都要改标题
         text = dict(labels)
         self.assertNotIn('WARP', text['proxies'])

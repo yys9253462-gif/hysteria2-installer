@@ -374,6 +374,17 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .awg-desc { font-size: 12.5px; color: var(--muted); line-height: 1.7; margin: 0 0 14px; }
 .awg-meta { display: flex; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 16px; }
 .awg-meta span { background: #f3f7f6; border: 1px solid #d4e5e1; border-radius: 12px; padding: 4px 11px; font-weight: 650; }
+/* 核心管理页（2026-10-28） */
+.core-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; margin-top: 16px; }
+.core-card { border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; background: #fff; display: flex; flex-direction: column; gap: 10px; }
+.core-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+.core-name { font-size: 15px; font-weight: 800; color: var(--ink); }
+.core-meta { font-size: 12px; color: var(--muted); line-height: 1.7; }
+.core-meta b { color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-weight: 700; }
+.core-note { font-size: 11.5px; color: var(--muted); background: #f8fbfb; border-radius: 8px; padding: 6px 10px; }
+.core-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: auto; }
+.core-actions .button { padding: 6px 14px; font-size: 12px; }
+.core-empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
 .awg-install-box { background: #f8fbfa; border: 1px solid #d9ebe6; border-radius: 14px; padding: 16px 18px; margin-bottom: 18px; }
 .awg-label { display: block; font-size: 12px; font-weight: 700; color: var(--muted); margin: 12px 0 5px; }
 .awg-label:first-child { margin-top: 0; }
@@ -512,7 +523,9 @@ document.querySelectorAll('[data-tab]').forEach(btn => {
       checkRealityStatus();
       checkVmessStatus();
       checkVlessencStatus();
+      checkAnytlsStatus();
     }
+    if (btn.dataset.tab === 'cores') loadCores();
   });
 });
 
@@ -1277,34 +1290,6 @@ async function checkRealityStatus() {
   } catch (_) {}
 }
 
-if (btnInstallXray) {
-  btnInstallXray.addEventListener('click', async () => {
-    if (!confirm("确定要一键安装 Xray 官方核心并部署 VLESS-Reality 节点吗？")) return;
-    btnInstallXray.disabled = true;
-    const orig = btnInstallXray.textContent;
-    btnInstallXray.textContent = '⏳ 正在下载并配置 Xray (约 20-30 秒)...';
-    try {
-      const res = await fetch(location.pathname + 'install-xray', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-      });
-      const json = await res.json();
-      if (json.ok) {
-        alert(json.message || 'Xray-core 安装并启动成功！');
-        await checkRealityStatus();
-      } else {
-        alert(json.error || '安装失败');
-      }
-    } catch (e) {
-      alert('请求异常: ' + e.message);
-    } finally {
-      btnInstallXray.disabled = false;
-      btnInstallXray.textContent = orig;
-    }
-  });
-}
-
 if (btnToggleReality) {
   btnToggleReality.addEventListener('click', async () => {
     btnToggleReality.disabled = true;
@@ -1390,6 +1375,8 @@ async function checkVmessStatus() {
     if (!json.installed) {
       // 没有 Xray 核心时不能显示「已关闭」—— 那会让人以为点一下就能开。
       vmessBadge.textContent = '● 未安装 Xray 核心';
+      const gotoVmess = document.getElementById('vmess-goto-cores');
+      if (gotoVmess) gotoVmess.style.display = 'inline-flex';
       vmessBadge.style.background = '#fff1f0';
       vmessBadge.style.color = '#cf3c3c';
       if (btnToggleVmess) btnToggleVmess.style.display = 'none';
@@ -1397,6 +1384,8 @@ async function checkVmessStatus() {
       return;
     }
     if (btnToggleVmess) btnToggleVmess.style.display = 'inline-flex';
+    const gotoVmessOk = document.getElementById('vmess-goto-cores');
+    if (gotoVmessOk) gotoVmessOk.style.display = 'none';
     if (json.active) {
       vmessBadge.textContent = '● 运行中 (TCP ' + (json.config.port || '--') + ')';
       vmessBadge.style.background = '#eaf3de';
@@ -1493,6 +1482,8 @@ async function checkVlessencStatus() {
     if (!json.ok) return;
     if (!json.installed) {
       vlessencBadge.textContent = '● 未安装 Xray 核心';
+      const gotoVlessenc = document.getElementById('vlessenc-goto-cores');
+      if (gotoVlessenc) gotoVlessenc.style.display = 'inline-flex';
       vlessencBadge.style.background = '#fff1f0';
       vlessencBadge.style.color = '#cf3c3c';
       if (btnToggleVlessenc) btnToggleVlessenc.style.display = 'none';
@@ -1500,6 +1491,8 @@ async function checkVlessencStatus() {
       return;
     }
     if (btnToggleVlessenc) btnToggleVlessenc.style.display = 'inline-flex';
+    const gotoVlessencOk = document.getElementById('vlessenc-goto-cores');
+    if (gotoVlessencOk) gotoVlessencOk.style.display = 'none';
     if (json.active) {
       vlessencBadge.textContent = '● 运行中 (TCP ' + (json.config.port || '--') + ')';
       vlessencBadge.style.background = '#eaf3de';
@@ -1588,7 +1581,15 @@ async function checkAnytlsStatus() {
     if (!res.ok) { if (seq === anytlsStatusSeq) anytlsBadge.textContent = '● 状态未知（请求失败）'; return; }
     const json = await res.json();
     if (seq !== anytlsStatusSeq || !json.ok) return;
-    // 没装 sing-box 也显示开关：首次开启会自动下载安装。
+    const gotoAnytls = document.getElementById('anytls-goto-cores');
+    if (!json.installed) {
+      setAnytlsBadge('● 未安装 sing-box 核心', '#fff1f0', '#cf3c3c');
+      if (btnToggleAnytls) btnToggleAnytls.style.display = 'none';
+      if (gotoAnytls) gotoAnytls.style.display = 'inline-flex';
+      if (anytlsContentBox) anytlsContentBox.style.display = 'none';
+      return;
+    }
+    if (gotoAnytls) gotoAnytls.style.display = 'none';
     if (btnToggleAnytls) btnToggleAnytls.style.display = 'inline-flex';
     const verEl = document.getElementById('anytls-ver-val');
     if (verEl) verEl.textContent = json.version || '未安装';
@@ -1621,7 +1622,7 @@ if (btnToggleAnytls) {
   btnToggleAnytls.addEventListener('click', async () => {
     if (btnToggleAnytls.disabled) return;
     btnToggleAnytls.disabled = true;
-    btnToggleAnytls.textContent = '切换中（首次需下载 sing-box）...';
+    btnToggleAnytls.textContent = '切换中...';
     try {
       const res = await fetch(location.pathname + 'manage-anytls', {
         method: 'POST',
@@ -1947,6 +1948,141 @@ if (btnRebootServer) {
 
 checkBbrStatus();
 checkCertStatus();
+
+// ---------------------------------------------------------------------------
+// 核心管理页（2026-10-28）：核心集中安装与查看，协议页只做启停。
+// ---------------------------------------------------------------------------
+const coreGrid = document.getElementById('core-grid');
+const CORE_STATE_TEXT = {
+  active: ['● 运行中', '#eaf3de', '#27500a'],
+  inactive: ['○ 未运行', '#f1efe8', '#5f5e5a'],
+  failed: ['● 运行失败', '#fff1f0', '#cf3c3c'],
+  activating: ['● 启动中', '#fffbe6', '#ad6800'],
+  none: ['○ 无服务', '#f1efe8', '#5f5e5a'],
+};
+
+function coreEl(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text !== undefined) el.textContent = text;
+  return el;
+}
+
+function renderCore(core) {
+  const card = coreEl('div', 'core-card');
+  const head = coreEl('div', 'core-head');
+  head.appendChild(coreEl('div', 'core-name', core.name));
+  const pill = coreEl('span', 'status-pill');
+  if (core.installed) {
+    const st = CORE_STATE_TEXT[core.state] || ['● ' + core.state, '#f1efe8', '#5f5e5a'];
+    pill.textContent = '已安装 · ' + st[0];
+    pill.style.background = st[1];
+    pill.style.color = st[2];
+  } else {
+    pill.textContent = '未安装';
+    pill.style.background = '#fff1f0';
+    pill.style.color = '#cf3c3c';
+  }
+  head.appendChild(pill);
+  card.appendChild(head);
+
+  const meta = coreEl('div', 'core-meta');
+  const line = (label, value) => {
+    const row = coreEl('div');
+    row.appendChild(document.createTextNode(label + '：'));
+    row.appendChild(coreEl('b', '', value));
+    meta.appendChild(row);
+  };
+  line('版本', core.installed ? core.version : '—');
+  line('服务', core.service);
+  line('用于', (core.used_by || []).join('、'));
+  card.appendChild(meta);
+  if (core.note) card.appendChild(coreEl('div', 'core-note', core.note));
+
+  const actions = coreEl('div', 'core-actions');
+  if (core.installable) {
+    const btn = coreEl('button', 'button primary', core.installed ? '重新安装 / 修复' : '⚡ 安装');
+    btn.type = 'button';
+    btn.addEventListener('click', () => installCore(core, btn));
+    actions.appendChild(btn);
+  }
+  if (core.manage) {
+    const go = coreEl('button', 'button', core.installable ? '前往使用' : (core.installed ? '前往管理' : '前往安装'));
+    go.type = 'button';
+    go.addEventListener('click', () => gotoTarget(core.manage));
+    actions.appendChild(go);
+  }
+  card.appendChild(actions);
+  return card;
+}
+
+let coresSeq = 0;
+async function loadCores() {
+  if (!coreGrid) return;
+  const seq = ++coresSeq;
+  try {
+    const res = await fetch(location.pathname + 'cores-status', { credentials: 'same-origin' });
+    const json = await res.json();
+    if (seq !== coresSeq) return;
+    if (!res.ok || !json.ok) throw new Error(json.error || ('HTTP ' + res.status));
+    coreGrid.textContent = '';
+    json.cores.forEach(core => coreGrid.appendChild(renderCore(core)));
+  } catch (e) {
+    if (seq === coresSeq) coreGrid.replaceChildren(coreEl('div', 'core-empty', '读取核心状态失败：' + e.message));
+  }
+}
+
+async function installCore(core, btn) {
+  const confirmed = await showConfirm({
+    title: (core.installed ? '重新安装 ' : '安装 ') + core.name,
+    text: '将从官方 Release 下载并校验 SHA256 后安装，只安装核心程序，不会自动开启任何协议。可能需要一两分钟。',
+    icon: '🧱',
+    confirmText: '开始安装'
+  });
+  if (!confirmed) return;
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = '⏳ 正在下载并校验...';
+  try {
+    const res = await fetch(location.pathname + 'install-core', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'name=' + encodeURIComponent(core.id)
+    });
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (json && json.ok) showToast(json.message || '安装完成', 'success');
+    else alert((json && json.error) || ('安装失败（HTTP ' + res.status + '）'));
+  } catch (e) {
+    alert('请求异常: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+    await loadCores();
+  }
+}
+
+function gotoTarget(target) {
+  const [tabId, subId] = String(target).split('/');
+  switchTab(tabId, subId);
+  if (tabId === 'cores') loadCores();
+  if (tabId === 'reality') {
+    checkRealityStatus();
+    checkVmessStatus();
+    checkVlessencStatus();
+    checkAnytlsStatus();
+  }
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+document.querySelectorAll('.js-goto').forEach(btn => {
+  btn.addEventListener('click', () => gotoTarget(btn.dataset.goto));
+});
+const btnRefreshCores = document.getElementById('btn-refresh-cores');
+if (btnRefreshCores) btnRefreshCores.addEventListener('click', loadCores);
+if (location.hash.startsWith('#cores')) loadCores();
+
 
 // 版本检测与一键更新交互
 const coreVerDisplay = document.getElementById('core-ver-display');
