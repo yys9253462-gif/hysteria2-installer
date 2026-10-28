@@ -488,9 +488,14 @@ def add_private_network_guard(config):
         rules = routing['rules'] = []
     guard = {'type': 'field', 'ip': list(XRAY_PRIVATE_REJECT_IPS),
              'outboundTag': XRAY_BLOCK_OUTBOUND_TAG}
-    # 放在最前面：先拒内网，再走其它规则（含计量 API 的回环转发）。
-    if guard not in rules:
-        rules.insert(0, guard)
+    # 先拒内网，再走其它规则 —— 但计量 API 的回环规则例外，必须排在拦截之前
+    # （2026-10-28 修）。原来拦截规则 insert(0) 压在 API 规则前面：发往 127.0.0.1:19997
+    # 的统计调用全部命中 127.0.0.0/8 进黑洞，Reality 计量与设备上限静默失效。
+    # API 规则只匹配本地 dokodemo 入站，排最前不放行任何用户流量。
+    api_tag = (config.get('api') or {}).get('tag')
+    api_rules = [r for r in rules if isinstance(r, dict) and api_tag and r.get('outboundTag') == api_tag]
+    others = [r for r in rules if r != guard and r not in api_rules]
+    routing['rules'] = api_rules + [guard] + others
     return config
 
 def _acl_head():

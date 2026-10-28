@@ -31,9 +31,9 @@ def add_stats(config, port):
     else:
         if any(i.get('port')==port for i in cfg['inbounds']):raise ValueError('port conflict')
         cfg['inbounds'].append(desired)
-    rule={'type':'field','inboundTag':['usage-meter-api-in'],'outboundTag':'usage-meter-api'}
     rules=cfg.setdefault('routing',{}).setdefault('rules',[])
-    if rule not in rules:rules.insert(0,rule)
+    if API_RULE not in rules:rules.insert(0,copy.deepcopy(API_RULE))
+    api_rule_first(cfg)
     assert original_clients==[i.get('settings',{}).get('clients') for i in cfg['inbounds'][:len(original_clients)]]
     return cfg
 
@@ -59,9 +59,28 @@ def add_iplimit_routing(cfg):
     return cfg
 
 
+API_RULE={'type':'field','inboundTag':['usage-meter-api-in'],'outboundTag':'usage-meter-api'}
+
+
+def api_rule_first(cfg):
+    """回环统计 API 的路由规则必须排在所有规则最前（2026-10-28 修）。
+
+    portal 的内网拦截规则（ip 含 127.0.0.0/8 → block-private）也用 insert(0)，
+    谁后插谁在前；它一旦排到 API 规则前面，发往 127.0.0.1 的统计调用全被黑洞：
+    Reality 计量与设备上限静默失效（斯德哥尔摩/香港/洛杉矶实测）。
+    API 规则只匹配本地 dokodemo 入站，放最前不影响任何用户流量。返回是否改动。
+    """
+    rules=cfg.setdefault('routing',{}).setdefault('rules',[])
+    if API_RULE not in rules or rules.index(API_RULE)==0:return False
+    rules.remove(API_RULE);rules.insert(0,API_RULE)
+    return True
+
+
 def iplimit_routing_ready(cfg):
+    rules=(cfg.get('routing') or {}).get('rules') or []
     return ('RoutingService' in ((cfg.get('api') or {}).get('services') or []) and
-            any(o.get('tag')==IPLIMIT_OUTBOUND_TAG and o.get('protocol')=='blackhole' for o in cfg.get('outbounds',[])[1:]))
+            any(o.get('tag')==IPLIMIT_OUTBOUND_TAG and o.get('protocol')=='blackhole' for o in cfg.get('outbounds',[])[1:]) and
+            (API_RULE not in rules or rules.index(API_RULE)==0))
 
 
 def enable_iplimit_routing(config_path, binary, address):
@@ -74,6 +93,7 @@ def enable_iplimit_routing(config_path, binary, address):
         return {'enabled':True,'changed':False,'backup':None}
     clients=[copy.deepcopy(i.get('settings',{}).get('clients')) for i in config.get('inbounds',[])]
     add_iplimit_routing(config)
+    api_rule_first(config)
     assert clients==[i.get('settings',{}).get('clients') for i in config.get('inbounds',[])]
     candidate=path.with_name(path.name+'.iplimit-candidate.json')
     # 只保留最近一份备份（2026-10-24 修）：旧实现每次都用纳秒时间戳新建
