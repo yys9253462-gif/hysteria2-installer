@@ -21,11 +21,15 @@ main{max-width:1160px;margin:auto;padding:32px 28px 48px}.topbar{display:flex;ju
 .eyebrow{font-size:11px;letter-spacing:.16em;font-weight:750;color:var(--accent)}h1{font-size:32px;letter-spacing:-.04em;margin:6px 0}h2{font-size:18px;margin:0 0 4px}p{margin:0;color:var(--muted)}.hero{margin-bottom:24px}.hero p{font-size:14px}
 
 /* Tab 导航容器 */
-.tab-bar{display:flex;gap:8px;border-bottom:2px solid var(--line);margin-bottom:26px;overflow-x:auto;padding-bottom:2px}
-.tab-btn{display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border:none;background:none;color:var(--muted);font-size:14px;font-weight:700;cursor:pointer;border-radius:10px 10px 0 0;position:relative;transition:all .18s ease;white-space:nowrap}
-.tab-btn:hover{color:var(--ink);background:#ebf3f1}
-.tab-btn.active{color:var(--accent);background:#fff}
-.tab-btn.active:after{content:'';position:absolute;bottom:-2px;left:0;right:0;height:2px;background:var(--accent)}
+/* 顶部主菜单（2026-10-28 美化）：整块圆角导航条 + 主题色填充的当前项，
+   与下方白底子标签区分层级；宽屏铺满一行，窄屏横滑且不显示滚动条。 */
+.tab-bar{display:flex;flex-wrap:wrap;gap:4px;padding:5px;margin-bottom:26px;background:rgba(255,255,255,.92);border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 20px rgba(18,43,49,.06);overflow-x:auto;scrollbar-width:none;position:sticky;top:10px;z-index:30;backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.tab-bar::-webkit-scrollbar{display:none}
+.tab-btn{flex:1 1 auto;display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:10px 14px;border:none;background:none;color:var(--muted);font-size:13.5px;font-weight:700;cursor:pointer;border-radius:11px;transition:background .18s ease,color .18s ease,box-shadow .18s ease;white-space:nowrap}
+.tab-btn:hover{color:var(--ink);background:#eef6f4}
+.tab-btn.active{color:#fff;background:var(--accent);box-shadow:0 4px 12px rgba(8,127,116,.28)}
+.tab-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media(max-width:1180px) and (min-width:761px){.tab-btn{padding:9px 9px;font-size:12.5px;gap:5px}}
 .tab-pane{display:none}
 .tab-pane.active{display:block;animation:fadeIn .2s ease-out}
 @keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
@@ -129,7 +133,8 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 @media(max-width:760px){
   main{padding:20px 16px 32px}.topbar{padding-bottom:20px}.layout,.config-grid{grid-template-columns:1fr}.qr-frame{max-width:248px;margin:18px auto}.card{padding:20px}h1{font-size:26px}.advanced-title{display:block}footer{gap:15px;flex-direction:column}.private{font-size:10px}.brand{font-size:13px}
   .login-card{padding:28px 20px;border-radius:20px}
-  .tab-btn{padding:9px 12px;font-size:13px}
+  .tab-bar{flex-wrap:nowrap;top:6px;border-radius:14px;scroll-snap-type:x proximity}
+  .tab-btn{flex:0 0 auto;padding:9px 12px;font-size:13px;scroll-snap-align:center}
   .subtab-btn{padding:8px 12px;font-size:12.5px}
   .modal-form{grid-template-columns:1fr;gap:14px;padding:16px}
 }
@@ -164,7 +169,8 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 @media(max-width:760px){
   main{padding:20px 16px 32px}.topbar{padding-bottom:20px}.layout,.config-grid{grid-template-columns:1fr}.qr-frame{max-width:248px;margin:18px auto}.card{padding:20px}h1{font-size:26px}.advanced-title{display:block}footer{gap:15px;flex-direction:column}.private{font-size:10px}.brand{font-size:13px}
   .login-card{padding:28px 20px;border-radius:20px}
-  .tab-btn{padding:9px 12px;font-size:13px}
+  .tab-bar{flex-wrap:nowrap;top:6px;border-radius:14px;scroll-snap-type:x proximity}
+  .tab-btn{flex:0 0 auto;padding:9px 12px;font-size:13px;scroll-snap-align:center}
 }
 
 /* 专属连接弹窗与独立页面样式 */
@@ -506,6 +512,11 @@ function switchTab(tabId, subId) {
   if (!btn || !pane) return;
   btn.classList.add('active');
   pane.classList.add('active');
+  // 窄屏菜单横滑时，把当前项滚进可见区域（只滚菜单本身，不动页面）。
+  const bar = btn.parentElement;
+  if (bar && bar.scrollWidth > bar.clientWidth) {
+    bar.scrollLeft = btn.offsetLeft - (bar.clientWidth - btn.offsetWidth) / 2;
+  }
   const subs = pane.querySelectorAll('.subtab-btn');
   if (subs.length) {
     const wanted = subId && pane.querySelector('[data-subtab="' + subId + '"]');
