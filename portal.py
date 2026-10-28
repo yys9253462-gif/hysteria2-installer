@@ -2083,6 +2083,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <button class="subtab-btn active" data-subtab="reality-node" type="button">🛡️ Reality 备用节点</button>
     <button class="subtab-btn" data-subtab="vmess" type="button">🧩 VMess 兼容通道</button>
     <button class="subtab-btn" data-subtab="vlessenc" type="button">🔐 VLESS Encryption</button>
+    <button class="subtab-btn" data-subtab="anytls" type="button">🧬 AnyTLS</button>
     <button class="subtab-btn" data-subtab="cert" type="button">🔐 证书状态</button>
     <button class="subtab-btn" data-subtab="bbr" type="button">🚀 BBR 加速</button>
   </div>
@@ -2273,6 +2274,64 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
   </section>
   </div>
 
+  <div class="subtab-pane" id="sub-anytls">
+  <!-- AnyTLS（2026-10-28 加）：由独立的 sing-box 进程承载，不在 xray.json 里。 -->
+  <section class="card" style="margin-bottom:22px">
+    <div class="user-header">
+      <div>
+        <h2>🧬 AnyTLS 通道</h2>
+        <p style="font-size:13px">基于 TLS 的多路复用代理，带填充以弱化 TLS-in-TLS 特征；底层走 TCP，UDP 由客户端封装转发。由 sing-box 承载，与 Xray 上的协议互不影响</p>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <span class="status-pill" id="anytls-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
+        <button class="toggle-btn off" id="btn-toggle-anytls" type="button" style="display:none">切换中...</button>
+      </div>
+    </div>
+    <div class="warp-switch-card" style="background:#f7f9fc;border-color:#d7e2ee">
+      <div class="warp-desc-title" style="color:#1a365d">🧬 启用前须知</div>
+      <p class="warp-desc-text" style="color:#4a5568">
+        AnyTLS 是真正的 TLS 服务端，<b>必须已绑定域名且持有可被客户端校验的证书</b>（与 VMess / VLESS Encryption 相同）。
+        首次开启会从 SagerNet/sing-box 官方 Release 下载并校验 sing-box（需 1.12+），可能需要一两分钟。
+        客户端需支持 AnyTLS：Clash Verge / mihomo、sing-box 1.12+、Shadowrocket 等。
+        每个用户有独立密码，停用 / 到期 / 超额会同步收回。<b>AnyTLS 的流量暂不计入用户已用流量。</b>
+      </p>
+    </div>
+    <div id="anytls-content-box" style="display:none">
+      <div class="layout" style="margin-top:10px">
+        <section class="card qr-card" style="background:#fbfcfd;border-color:var(--line)">
+          <div class="eyebrow" style="color:#0f766e">ANYTLS</div>
+          <h2>AnyTLS 扫码</h2>
+          <p class="hint">机主账号的连接；其他用户请用「专属连接」</p>
+          <div class="qr-frame" style="max-width:220px;margin:16px auto;padding:10px"><div id="anytls-qr-box" style="width:100%;height:auto"></div></div>
+          <div class="tags"><span class="tag">AnyTLS</span><span class="tag">TLS</span><span class="tag" id="anytls-port-tag">TCP --</span></div>
+        </section>
+        <div class="stack">
+          <section class="card" style="border-color:#d7e2ee">
+            <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>AnyTLS 直链 (URI)</h2><p>anytls:// 格式，导入即用</p></div></div>
+            <textarea class="link" id="anytls-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <div class="actions" style="margin-top:12px">
+              <button class="button primary" id="btn-copy-anytls-uri" type="button">复制 AnyTLS 直链</button>
+            </div>
+          </section>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">域名 / SNI</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="anytls-domain-val">-</div>
+            </div>
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">监听端口</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="anytls-tcp-val">-</div>
+            </div>
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">sing-box 版本</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="anytls-ver-val">-</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  </div>
   <div class="subtab-pane" id="sub-cert">
   <!-- 区块: 证书状态与到期告警
        为什么放在最前面：证书过期/临期是「昨天还好好的、今天突然连不上」里最高频的真凶，
@@ -3458,6 +3517,242 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     return 'vmess://' + base64.b64encode(raw).decode('ascii')
 
 
+# ---- AnyTLS（2026-10-28 加，由 sing-box 承载）----
+#
+# Xray 没有 AnyTLS 服务端，所以它跑在**独立的 sing-box 进程**里
+# （systemd 单元 hy2-anytls，配置 /etc/hysteria/anytls.json），不碰 xray.json。
+# 与 VMess / VLESS Encryption 一样是真正的 TLS 服务端，需要域名 + 可信证书；
+# 底层走 TCP，UDP 由客户端用 UDP-over-TCP 封装。
+#
+# 用户密码不能像 VMess 那样用 uuid5(user_id) 派生：user_id 出现在分享链接里，
+# 谁都能算出来。这里用节点私有的 secret 做 HMAC，secret 只在首次启用时生成，
+# 停用再启用也沿用它，否则已下发的订阅会全部失效。
+ANYTLS_SERVICE = 'hy2-anytls'
+ANYTLS_BINARY = '/usr/local/bin/sing-box'
+ANYTLS_CONFIG_NAME = 'anytls.json'
+ANYTLS_INBOUND_TAG = 'anytls-in'
+# AnyTLS 入站从 sing-box 1.12.0 起才有。
+ANYTLS_MIN_SINGBOX = (1, 12, 0)
+ANYTLS_UNIT_CONTENT = '''[Unit]
+Description=AnyTLS (sing-box) managed by hy2 portal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/sing-box run -c /etc/hysteria/anytls.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+'''
+# anytls.json 的读-改-写与启停都在这把锁内，规则同 reality_apply_lock。
+anytls_apply_lock = threading.Lock()
+
+
+def anytls_password_for_user(secret, user_id):
+    """由节点 secret 派生某用户**稳定且不可猜**的 AnyTLS 密码。"""
+    return hmac.new(str(secret).encode('utf-8'),
+                    ('hy2-portal-anytls:' + str(user_id)).encode('utf-8'),
+                    hashlib.sha256).hexdigest()[:32]
+
+
+def anytls_users(data):
+    """AnyTLS 入站的 users —— 与其它协议同一套准入判据 user_access_allowed。
+
+    空表同样要给占位用户：sing-box 的 anytls 入站 users 为空会拒绝启动。
+    占位密码也由 secret 派生（而不是随机），否则每轮收回都会算出不同的
+    配置、触发一次无谓的重启。
+    """
+    secret = (data.get('anytls_config') or {}).get('secret') or ''
+    users = []
+    if secret:
+        all_users = data.get('users', {}) or {}
+        for uid in sorted(all_users):
+            if user_access_allowed(all_users.get(uid) or {}):
+                users.append({'name': uid, 'password': anytls_password_for_user(secret, uid)})
+    if not users:
+        users = [{'name': 'placeholder',
+                  'password': anytls_password_for_user(secret or secrets.token_hex(16), 'placeholder')}]
+    return users
+
+
+def build_anytls_config(acfg, users, cert_file, key_file):
+    """生成 sing-box 的完整配置（只有一个 anytls 入站）。
+
+    出站同样要拒绝内网 / 云元数据，与 Hy2 ACL、Xray 的 add_private_network_guard
+    对齐。先 resolve 再按 IP 拒：客户端用域名访问内网地址时也能挡住。
+    """
+    return {
+        'log': {'level': 'warn', 'timestamp': True},
+        'inbounds': [{
+            'type': 'anytls',
+            'tag': ANYTLS_INBOUND_TAG,
+            'listen': '::',
+            'listen_port': int(acfg['port']),
+            'users': users,
+            'tls': {
+                'enabled': True,
+                'server_name': acfg.get('sni') or acfg.get('domain'),
+                'certificate_path': cert_file,
+                'key_path': key_file,
+            },
+        }],
+        'outbounds': [{'type': 'direct', 'tag': 'direct'}],
+        'route': {
+            'rules': [
+                {'action': 'resolve'},
+                {'ip_cidr': list(PRIVATE_REJECT_RULES), 'action': 'reject'},
+            ],
+            'final': 'direct',
+        },
+    }
+
+
+def anytls_uri_for_user(acfg, user_id, label=None):
+    """anytls:// 直链（mihomo / sing-box 系 / Shadowrocket 通用格式）。"""
+    if not acfg or not acfg.get('secret'):
+        return ''
+    host = acfg.get('domain')
+    port = acfg.get('port')
+    if not (host and port):
+        return ''
+    pwd = anytls_password_for_user(acfg['secret'], user_id)
+    params = urlencode({'sni': acfg.get('sni') or host})
+    return f"anytls://{pwd}@{host}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
+
+
+def apply_anytls_config(config, config_path, restart=True, run=subprocess.run):
+    """原子应用 sing-box 配置：预检 → 替换 → 重启 → 核对，任何一步失败就回滚。
+
+    调用方必须持有 anytls_apply_lock。
+    """
+    config_path = Path(config_path)
+    original = config_path.read_bytes() if config_path.exists() else None
+    candidate = config_path.with_name('anytls.candidate.json')
+    candidate.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding='utf-8')
+    os.chmod(str(candidate), 0o600)
+    replaced = False
+    try:
+        run([ANYTLS_BINARY, 'check', '-c', str(candidate)],
+            capture_output=True, timeout=15, check=True)
+        candidate.replace(config_path)
+        replaced = True
+        if restart:
+            run(['systemctl', 'reset-failed', ANYTLS_SERVICE], capture_output=True, timeout=5)
+            run(['systemctl', 'restart', ANYTLS_SERVICE], capture_output=True, timeout=15, check=True)
+            run(['systemctl', 'is-active', '--quiet', ANYTLS_SERVICE],
+                capture_output=True, timeout=5, check=True)
+    except Exception:
+        if replaced:
+            if original is None:
+                config_path.unlink(missing_ok=True)
+            else:
+                config_path.write_bytes(original)
+            if restart and original is not None:
+                run(['systemctl', 'restart', ANYTLS_SERVICE], capture_output=True, timeout=15)
+        raise
+    finally:
+        candidate.unlink(missing_ok=True)
+
+
+def sync_anytls_users(root, snapshot, apply=None, service_active=None):
+    """把 anytls.json 的 users 对齐到当前准入名单（停用/到期/超额/删除即收回）。
+
+    名单没变就什么也不做；变了就重写并重启 —— sing-box 只有重启才会
+    断开已建立的会话，否则被收回的用户能一直用到自己断线。
+    服务没在运行（例如整机流量超额停用中）时只写文件、不拉起服务。
+    """
+    path = Path(root) / ANYTLS_CONFIG_NAME
+    if not path.exists() or not (snapshot.get('anytls_config') or {}).get('enabled'):
+        return False
+    apply = apply or apply_anytls_config
+    if service_active is None:
+        service_active = lambda: _systemd_state(ANYTLS_SERVICE) == 'active'  # noqa: E731
+    with anytls_apply_lock:
+        config = json.loads(path.read_text(encoding='utf-8'))
+        wanted = anytls_users(snapshot)
+        inbound = next((i for i in config.get('inbounds') or []
+                        if isinstance(i, dict) and i.get('tag') == ANYTLS_INBOUND_TAG), None)
+        if inbound is None or inbound.get('users') == wanted:
+            return False
+        inbound['users'] = wanted
+        apply(config, path, restart=service_active())
+        return True
+
+
+def _singbox_version(binary=ANYTLS_BINARY, run=subprocess.run):
+    """返回 sing-box 版本元组；读不出来返回 None。"""
+    try:
+        out = run([binary, 'version'], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+    m = re.search(r'version\s+v?(\d+)\.(\d+)\.(\d+)', out or '')
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def install_singbox():
+    """从 SagerNet/sing-box 官方 Release 安装 sing-box，返回 (ok, message)。
+
+    sing-box 的 Release 没有 checksums 文件，预期摘要取 GitHub API 给每个
+    资产记录的 sha256 digest（只信 api.github.com，镜像只作传输候选）。
+    """
+    current = _singbox_version()
+    if current and current >= ANYTLS_MIN_SINGBOX:
+        return True, 'sing-box %s 已安装' % '.'.join(map(str, current))
+    machine = platform.machine().lower()
+    arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64',
+            'armv7l': 'armv7', 'armv7': 'armv7'}.get(machine)
+    if not arch:
+        return False, '不支持的 CPU 架构: %s' % machine
+    try:
+        req = urllib.request.Request('https://api.github.com/repos/SagerNet/sing-box/releases/latest',
+                                     headers={'User-Agent': 'hy2-portal'})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            release = json.loads(r.read().decode('utf-8'))
+    except Exception as exc:
+        return False, '取不到 sing-box 最新版本信息: %s' % exc
+    tag = str(release.get('tag_name') or '')
+    ver = tag.lstrip('v')
+    asset_name = f'sing-box-{ver}-linux-{arch}.tar.gz'
+    asset = next((a for a in release.get('assets') or [] if a.get('name') == asset_name), None)
+    digest = str((asset or {}).get('digest') or '')
+    expected = digest[len('sha256:'):] if digest.startswith('sha256:') else ''
+    if not re.fullmatch(r'[0-9a-f]{64}', expected):
+        return False, '取不到 %s 的官方 SHA256，无法校验下载内容，已放弃安装' % asset_name
+    official = f'https://github.com/SagerNet/sing-box/releases/download/{tag}/{asset_name}'
+    errors = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        archive = Path(tmpdir) / 'sing-box.tar.gz'
+        for url in (official, 'https://ghfast.top/' + official):
+            host = url.split('/')[2]
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'hy2-portal'})
+                with urllib.request.urlopen(req, timeout=180) as resp, open(archive, 'wb') as out:
+                    shutil.copyfileobj(resp, out)
+                if not verify_sha256(archive, expected):
+                    errors.append('%s: SHA256 与官方不一致' % host)
+                    continue
+                with tarfile.open(str(archive), 'r:gz') as tar:
+                    member_name = safe_tar_members([m.name for m in tar.getmembers() if m.isfile()],
+                                                   'sing-box')
+                    member = tar.getmember(member_name)
+                    staged = Path(ANYTLS_BINARY + '.new')
+                    with tar.extractfile(member) as src, open(staged, 'wb') as dst:
+                        shutil.copyfileobj(src, dst)
+                os.chmod(str(staged), 0o755)
+                version = _singbox_version(str(staged))
+                if not version or version < ANYTLS_MIN_SINGBOX:
+                    staged.unlink(missing_ok=True)
+                    return False, 'sing-box 版本 %s 不支持 AnyTLS（需要 1.12.0+）' % ver
+                os.replace(str(staged), ANYTLS_BINARY)
+                return True, 'sing-box %s 安装完成' % ver
+            except Exception as exc:
+                errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
+    return False, '下载 sing-box 失败 —— ' + ' ｜ '.join(errors)
+
+
 # ---- VLESS Encryption（2026-10-24 加，VMess 的上游替代路线）----
 #
 # 与 Reality 的区别：Reality 借用大厂站点的证书握手来伪装，**不需要自己的域名**；
@@ -3782,6 +4077,9 @@ def enforce_node_access(root, snapshot, force_ids=()):
                 online=request_stats('/online')
                 if any(int(online.get(uid, 0)) > 0 for uid in active):
                     raise RuntimeError('Hy2 sessions still present after revocation')
+    # AnyTLS 跑在独立的 sing-box 进程里，不在 xray.json 中，必须单独收回；
+    # 放在 xray.json 的提前返回之前，否则只开 AnyTLS 的节点永远收不回。
+    sync_anytls_users(root,snapshot)
     xj=root/'xray.json'
     if not xj.exists():
         return True
@@ -3857,7 +4155,10 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None):
             ports.add(int(value))
         except (TypeError, ValueError):
             pass
-    for key in ('reality_config', 'vmess_config', 'vlessenc_config'):
+    for key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
+        # AnyTLS 停用后保留 secret 与端口记录（再启用要沿用），但那个端口已经空出来了。
+        if key == 'anytls_config' and not ((data or {}).get(key) or {}).get('enabled'):
+            continue
         if key == exclude_key:
             # 协议**自己**的端口不是冲突：重新启用时应当沿用它。
             # 不排除的话，重新生成配置会把自己的端口也当成「被占用」，
@@ -4203,7 +4504,7 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
 
 
 def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
-              vmess=None, vlessenc=None):
+              vmess=None, vlessenc=None, anytls=None):
     """生成 hy2:// 直链 + Clash / Sing-box 配置。
 
     reality（可选）—— 传 rcfg 时会**额外产出一条 VLESS-Reality 节点**，
@@ -4350,13 +4651,33 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                              tls=dict(enabled=True, server_name=e_sni,
                                       utls=dict(enabled=True, fingerprint='chrome')))
 
+    # ---- AnyTLS（可选，2026-10-28 加）----
+    # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
+    anytls_proxy = None
+    anytls_sing = None
+    if anytls and user_id and anytls.get('domain') and anytls.get('port') \
+            and anytls.get('secret'):
+        a_name = name + '-AnyTLS'
+        a_host = anytls['domain']
+        a_sni = anytls.get('sni') or a_host
+        a_pwd = anytls_password_for_user(anytls['secret'], user_id)
+        anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
+                            port=int(anytls['port']), password=a_pwd, udp=True,
+                            sni=a_sni, **{'client-fingerprint': 'chrome'})
+        anytls_sing = dict(type='anytls', tag=a_name, server=a_host,
+                           server_port=int(anytls['port']), password=a_pwd,
+                           tls=dict(enabled=True, server_name=a_sni,
+                                    utls=dict(enabled=True, fingerprint='chrome')))
+
     proxies = [proxy] + ([reality_proxy] if reality_proxy else []) + \
               ([vmess_proxy] if vmess_proxy else []) + \
-              ([vlessenc_proxy] if vlessenc_proxy else [])
+              ([vlessenc_proxy] if vlessenc_proxy else []) + \
+              ([anytls_proxy] if anytls_proxy else [])
     sing_outbounds = [sing] + ([reality_sing] if reality_sing else []) + \
                      ([vmess_sing] if vmess_sing else []) + \
-                     ([vlessenc_sing] if vlessenc_sing else [])
-    alternates = [p['name'] for p in (reality_proxy, vmess_proxy, vlessenc_proxy) if p]
+                     ([vlessenc_sing] if vlessenc_sing else []) + \
+                     ([anytls_sing] if anytls_sing else [])
+    alternates = [p['name'] for p in (reality_proxy, vmess_proxy, vlessenc_proxy, anytls_proxy) if p]
 
     if alternates:
         # url-test：客户端定时探测多条链路，自动选延迟低的。
@@ -4377,7 +4698,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         sing_doc['outbounds'].append({
             'type': 'urltest', 'tag': 'PROXY',
             'outbounds': [sing['tag']] + [o['tag'] for o in
-                                          (reality_sing, vmess_sing, vlessenc_sing) if o],
+                                          (reality_sing, vmess_sing, vlessenc_sing, anytls_sing) if o],
             'url': 'https://www.gstatic.com/generate_204',
             'interval': '5m', 'tolerance': 50,
         })
@@ -4770,7 +5091,7 @@ def serve(path):
     # 超额停用只停**对外提供代理**的服务，portal 自己不停 —— 否则控制台
     # 下个周期就没法远程恢复。停之前记下哪些本来是开着的，恢复时只启动它们，
     # 不会把机主有意关掉的服务顺手拉起来。
-    TRAFFIC_SUSPEND_UNITS = ('hysteria-server', 'xray', 'gost', 'amneziawg-server')
+    TRAFFIC_SUSPEND_UNITS = ('hysteria-server', 'xray', 'gost', 'amneziawg-server', ANYTLS_SERVICE)
 
     def _unit_active(unit):
         try:
@@ -5503,6 +5824,14 @@ if __name__ == '__main__':
             ecfg = dict(data.get('vlessenc_config') or {})
         return ecfg or None
 
+    def _active_anytls_config():
+        """AnyTLS 的配置：已启用且 sing-box 配置文件在才算（停用后只保留 secret）。"""
+        with data_lock:
+            acfg = dict(data.get('anytls_config') or {})
+        if not acfg.get('enabled') or not (portal_path.parent / ANYTLS_CONFIG_NAME).exists():
+            return None
+        return acfg
+
     def regenerate_page():
         m = read_meta_file(meta_path)
         uri, clash, sing = artifacts(m)
@@ -6184,13 +6513,14 @@ if __name__ == '__main__':
                     rcfg = _active_reality_config()
                     vcfg_active = _active_vmess_config()
                     ecfg_active = _active_vlessenc_config()
+                    acfg_active = _active_anytls_config()
                     m = read_meta_file(meta_path)
                     # artifacts 传入 reality + user_id ⇒ 输出「Hy2 + Reality」双节点
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
                     uri, clash_yaml, sing_json = artifacts(
                         m, auth_override=pwd, name_override=f"Teyir-Hy2-{user_id}",
                         reality=rcfg, user_id=user_id, vmess=vcfg_active,
-                        vlessenc=ecfg_active)
+                        vlessenc=ecfg_active, anytls=acfg_active)
                     public_ip = m.get('public_ip', '127.0.0.1')
                     reality_uri = reality_uri_for_user(
                         rcfg, user_id, public_ip, label=f"Teyir-Reality-{user_id}")
@@ -6200,6 +6530,8 @@ if __name__ == '__main__':
                     vlessenc_uri = vlessenc_uri_for_user(
                         ecfg_active, user_id, public_ip,
                         label=f"Teyir-VLESS-Enc-{user_id}") if ecfg_active else ''
+                    anytls_uri = anytls_uri_for_user(
+                        acfg_active, user_id, label=f"Teyir-AnyTLS-{user_id}") if acfg_active else ''
                     return self.reply_json(200, {
                         'ok': True,
                         'user_id': user_id,
@@ -6214,6 +6546,7 @@ if __name__ == '__main__':
                         'vmess_uuid': vmess_uuid_for_user(user_id) if vcfg_active else '',
                         'vlessenc_uri': vlessenc_uri,
                         'vlessenc_uuid': reality_uuid_for_user(user_id) if ecfg_active else '',
+                        'anytls_uri': anytls_uri,
                         'clash': clash_yaml,
                         'sing_box': sing_json
                     })
@@ -6485,6 +6818,9 @@ if __name__ == '__main__':
 
             if self.path == prefix + 'manage-vlessenc':
                 return self._h_post_manage_vlessenc(prefix)
+
+            if self.path == prefix + 'manage-anytls':
+                return self._h_post_manage_anytls(prefix)
 
             if self.path == prefix + 'set-bbr':
                 return self._h_post_set_bbr(prefix)
@@ -7597,6 +7933,131 @@ WantedBy=multi-user.target
                 },
             })
 
+        def _apply_anytls_enable(self):
+            """启用 AnyTLS：装 sing-box → 选端口 → 写配置并重启 → 落 data。
+
+            与 Xray 系协议一样「配置先落地、数据后写入」，事务失败时 data
+            不会留下「显示已启用、实际没有」的状态。secret 只在首次生成。
+            """
+            m = read_meta_file(meta_path)
+            domain = (m.get('server_name') or '').strip()
+            if not domain or not _is_dns_name(domain):
+                raise RuntimeError('AnyTLS 需要先绑定域名（当前无可用 server_name）')
+            cert_file, key_file, sni = self._vmess_certificate(domain, 'AnyTLS')
+            ok, msg = install_singbox()
+            if not ok:
+                raise RuntimeError(msg)
+            with data_lock:
+                old = dict(data.get('anytls_config') or {})
+                _data_now = dict(data)
+            try:
+                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                            if Path('/etc/hysteria/xray.json').exists() else None)
+            except (OSError, ValueError):
+                _cfg_now = None
+            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config')
+            listen_port, reason = _pick_reality_port(
+                preferred=old.get('port') or 2096, extra_blocked=blocked)
+            if not listen_port:
+                raise RuntimeError(reason)
+            new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
+                       'secret': old.get('secret') or secrets.token_hex(32)}
+            with data_lock:
+                preview = dict(data)
+                preview['anytls_config'] = new_cfg
+                users = anytls_users(preview)
+            unit_path = Path('/etc/systemd/system/%s.service' % ANYTLS_SERVICE)
+            if not unit_path.exists() or unit_path.read_text(encoding='utf-8') != ANYTLS_UNIT_CONTENT:
+                unit_path.write_text(ANYTLS_UNIT_CONTENT, encoding='utf-8')
+                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+            subprocess.run(['systemctl', 'enable', ANYTLS_SERVICE], capture_output=True, timeout=30)
+            with anytls_apply_lock:
+                apply_anytls_config(build_anytls_config(new_cfg, users, cert_file, key_file),
+                                    portal_path.parent / ANYTLS_CONFIG_NAME, restart=True)
+            with data_lock:
+                data['anytls_config'] = new_cfg
+            save_data()
+            firewall_port(listen_port, 'tcp', open_=True)
+            return new_cfg
+
+        def _h_post_manage_anytls(self, prefix):
+            """POST /manage-anytls —— 独立启停 AnyTLS（sing-box），不影响 Xray 上的协议。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            try:
+                # 首次启用要下载 sing-box（单源最长 180 秒），先抬高连接死线。
+                self._extend_deadline(420)
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
+                action = parse_qs(body).get('action', ['toggle'])[0]
+                enabled = _active_anytls_config() is not None
+                if action == 'toggle':
+                    action = 'disable' if enabled else 'enable'
+                if action not in ('enable', 'disable'):
+                    return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                if action == 'enable':
+                    with data_lock:
+                        suspended = bool((data.get('traffic_suspend') or {}).get('suspended'))
+                    if suspended:
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '节点因流量超额停用中，请在控制台恢复节点后再启用 AnyTLS'})
+                    cfg = self._apply_anytls_enable()
+                    return self.reply_json(200, {'ok': True, 'active': True, 'port': cfg['port'],
+                                                 'uri': anytls_uri_for_user(cfg, MASTER_USER_ID,
+                                                                            label='AnyTLS-' + cfg['domain'])})
+                if not enabled:
+                    return self.reply_json(200, {'ok': True, 'active': False,
+                                                 'message': 'AnyTLS 本来就没有启用'})
+                with anytls_apply_lock:
+                    subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
+                                   capture_output=True, timeout=30)
+                    (portal_path.parent / ANYTLS_CONFIG_NAME).unlink(missing_ok=True)
+                with data_lock:
+                    acfg = dict(data.get('anytls_config') or {})
+                    closed_port = int(acfg.get('port') or 0)
+                    # secret 与端口保留：再次启用时沿用，已下发的订阅不失效。
+                    acfg['enabled'] = False
+                    data['anytls_config'] = acfg
+                save_data()
+                if closed_port:
+                    firewall_port(closed_port, 'tcp', open_=False)
+                return self.reply_json(200, {'ok': True, 'active': False})
+            except Exception as exc:
+                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+
+        def _h_get_anytls_status(self, subpath):
+            """GET /anytls-status —— 以 sing-box 服务实际状态为准。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            acfg = _active_anytls_config() or {}
+            running = bool(acfg) and _systemd_state(ANYTLS_SERVICE) == 'active'
+            version = _singbox_version()
+            uri = anytls_uri_for_user(acfg, MASTER_USER_ID,
+                                      label='AnyTLS-' + str(acfg.get('domain', ''))) if acfg else ''
+            qr_svg = ''
+            if running and uri:
+                try:
+                    qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode('utf-8'),
+                                        capture_output=True, timeout=3)
+                    if qr.returncode == 0:
+                        qr_svg = qr.stdout.decode('utf-8')
+                except Exception as exc:
+                    _log_ignored('anytls_qr', exc)
+            return self.reply_json(200, {
+                'ok': True,
+                'installed': bool(version),
+                'version': '.'.join(map(str, version)) if version else '',
+                'enabled': bool(acfg),
+                'active': running,
+                'config': {
+                    'uri': uri if running else '',
+                    'domain': acfg.get('domain', ''),
+                    'sni': acfg.get('sni', ''),
+                    'port': acfg.get('port', 0) if running else 0,
+                    'qr_svg': qr_svg,
+                },
+            })
+
         def _h_post_manage_vlessenc(self, prefix):
             """POST /manage-vlessenc —— 独立启停 VLESS Encryption。
 
@@ -8506,7 +8967,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
                     vmess=_active_vmess_config(),
-                    vlessenc=_active_vlessenc_config())
+                    vlessenc=_active_vlessenc_config(),
+                    anytls=_active_anytls_config())
 
                 if action_file == 'clash.yaml':
                     return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml')
@@ -8550,6 +9012,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             if subpath == 'vlessenc-status':
                 return self._h_get_vlessenc_status(subpath)
+
+            if subpath == 'anytls-status':
+                return self._h_get_anytls_status(subpath)
 
             if subpath == 'bbr-status':
                 return self._h_get_bbr_status(subpath)
@@ -8599,7 +9064,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
                     vmess=_active_vmess_config(),
-                    vlessenc=_active_vlessenc_config())
+                    vlessenc=_active_vlessenc_config(),
+                    anytls=_active_anytls_config())
                 qr_svg = ""
                 try:
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')

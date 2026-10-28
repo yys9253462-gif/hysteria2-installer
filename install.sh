@@ -4342,6 +4342,11 @@ uninstall_all() {
         # 否则配置目录删了它还在跑，Reality 用户要到重启后才断。
         systemctl disable --now xray 2>/dev/null || true
         rm -f /etc/systemd/system/xray.service /usr/local/bin/xray
+        # AnyTLS 的 sing-box 同样由门户安装，配置在 /etc/hysteria/anytls.json。
+        if [[ -f /etc/systemd/system/hy2-anytls.service ]]; then
+            systemctl disable --now hy2-anytls 2>/dev/null || true
+            rm -f /etc/systemd/system/hy2-anytls.service /usr/local/bin/sing-box
+        fi
         # BUGFIX: 卸载时同时清理 WARP 相关服务与配置
         systemctl disable --now wireproxy 2>/dev/null || true
         systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true
@@ -4551,6 +4556,7 @@ show_menu_status() {
     # Xray 现在承载三种协议（Reality / VMess / VLESS Encryption），
     # 状态行不能只写 Reality，否则用户会以为只有 Reality 在跑。
     [[ -f /etc/systemd/system/xray.service ]] && extra+="Xray(Reality/VMess/VLESS-Enc): $(unit_state_text xray)  "
+    [[ -f /etc/systemd/system/hy2-anytls.service ]] && extra+="AnyTLS: $(unit_state_text hy2-anytls)  "
     [[ -f /usr/local/bin/gost ]] && extra+="GOST: $(unit_state_text gost)  "
     [[ -f /etc/systemd/system/wireproxy.service ]] && extra+="WARP: $(unit_state_text wireproxy)"
     [[ -n "$extra" ]] && echo -e "扩展服务: ${extra}"

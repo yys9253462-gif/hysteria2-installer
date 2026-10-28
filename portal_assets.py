@@ -525,6 +525,7 @@ document.querySelectorAll('.subtab-btn').forEach(btn => {
     // 子页状态同样可能被终端 / REST API / 整机停用改过，切进来时重新拉一次。
     if (btn.dataset.subtab === 'vmess') checkVmessStatus();
     if (btn.dataset.subtab === 'vlessenc') checkVlessencStatus();
+    if (btn.dataset.subtab === 'anytls') checkAnytlsStatus();
     if (btn.dataset.subtab === 'reality-node') checkRealityStatus();
     history.replaceState(null, null, '#' + paneId + '/' + btn.dataset.subtab);
   });
@@ -1564,6 +1565,97 @@ if (btnCopyVlessencUri) {
 }
 
 checkVlessencStatus();
+
+// AnyTLS 卡片：由独立的 sing-box 承载，开关与 Xray 系协议互不影响。
+const anytlsBadge = document.getElementById('anytls-badge');
+const btnToggleAnytls = document.getElementById('btn-toggle-anytls');
+const anytlsContentBox = document.getElementById('anytls-content-box');
+const anytlsUriVal = document.getElementById('anytls-uri-val');
+const btnCopyAnytlsUri = document.getElementById('btn-copy-anytls-uri');
+
+function setAnytlsBadge(text, bg, color) {
+  anytlsBadge.textContent = text;
+  anytlsBadge.style.background = bg;
+  anytlsBadge.style.color = color;
+}
+
+let anytlsStatusSeq = 0;
+async function checkAnytlsStatus() {
+  if (!anytlsBadge) return;
+  const seq = ++anytlsStatusSeq;
+  try {
+    const res = await fetch(location.pathname + 'anytls-status', { credentials: 'same-origin' });
+    if (!res.ok) { if (seq === anytlsStatusSeq) anytlsBadge.textContent = '● 状态未知（请求失败）'; return; }
+    const json = await res.json();
+    if (seq !== anytlsStatusSeq || !json.ok) return;
+    // 没装 sing-box 也显示开关：首次开启会自动下载安装。
+    if (btnToggleAnytls) btnToggleAnytls.style.display = 'inline-flex';
+    const verEl = document.getElementById('anytls-ver-val');
+    if (verEl) verEl.textContent = json.version || '未安装';
+    const cfg = json.config || {};
+    if (json.active) {
+      setAnytlsBadge('● 运行中 (TCP ' + (cfg.port || '--') + ')', '#eaf3de', '#27500a');
+      btnToggleAnytls.textContent = '已开启 (点击关闭)';
+      btnToggleAnytls.className = 'toggle-btn on';
+      if (anytlsContentBox) anytlsContentBox.style.display = 'block';
+      if (anytlsUriVal) anytlsUriVal.value = cfg.uri || '';
+      const qrBox = document.getElementById('anytls-qr-box');
+      if (qrBox) qrBox.innerHTML = cfg.qr_svg || '';
+      const domainEl = document.getElementById('anytls-domain-val');
+      if (domainEl) domainEl.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
+      const tcpEl = document.getElementById('anytls-tcp-val');
+      if (tcpEl) tcpEl.textContent = 'TCP ' + (cfg.port || '--');
+      const portTag = document.getElementById('anytls-port-tag');
+      if (portTag) portTag.textContent = 'TCP ' + (cfg.port || '--');
+    } else {
+      if (json.enabled) setAnytlsBadge('● 已启用但服务未运行', '#fff1f0', '#cf3c3c');
+      else setAnytlsBadge('○ 已关闭', '#f1efe8', '#5f5e5a');
+      btnToggleAnytls.textContent = json.enabled ? '已启用 (点击关闭)' : '已关闭 (点击开启)';
+      btnToggleAnytls.className = json.enabled ? 'toggle-btn on' : 'toggle-btn off';
+      if (anytlsContentBox) anytlsContentBox.style.display = 'none';
+    }
+  } catch (_) {}
+}
+
+if (btnToggleAnytls) {
+  btnToggleAnytls.addEventListener('click', async () => {
+    if (btnToggleAnytls.disabled) return;
+    btnToggleAnytls.disabled = true;
+    btnToggleAnytls.textContent = '切换中（首次需下载 sing-box）...';
+    try {
+      const res = await fetch(location.pathname + 'manage-anytls', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'action=toggle'
+      });
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (!res.ok || !json || !json.ok) {
+        alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
+      }
+      await checkAnytlsStatus();
+    } catch (e) {
+      alert('请求异常: ' + e.message);
+    } finally {
+      btnToggleAnytls.disabled = false;
+    }
+  });
+}
+
+if (btnCopyAnytlsUri) {
+  btnCopyAnytlsUri.addEventListener('click', () => {
+    if (anytlsUriVal && anytlsUriVal.value) {
+      navigator.clipboard.writeText(anytlsUriVal.value).then(() => {
+        const orig = btnCopyAnytlsUri.textContent;
+        btnCopyAnytlsUri.textContent = '✓ 已复制直链';
+        setTimeout(() => btnCopyAnytlsUri.textContent = orig, 1500);
+      });
+    }
+  });
+}
+
+checkAnytlsStatus();
 
 // BBR 状态获取与一键切换交互
 const bbrBadge = document.getElementById('bbr-badge');
