@@ -4967,6 +4967,21 @@ def serve(path):
                 'measurement_started_at': None, 'measurement_gaps': [],
                 'legacy_auth_value': data.get('users', {}).get(uid, {}).get('used_bytes', 0)}
 
+    def usage_list_summary(uid):
+        """users/list 用的 usage_summary：measurement_gaps 不再逐用户复制（2026-10-28 修）。
+
+        gaps 是**整台节点**的计量缺口（最多 100 条），每个用户都一样。
+        原来每个用户各带一份完整拷贝：53 个用户的日本-东京 users/list 实测 628 KB，
+        超过控制台 256 KiB 读取上限被截断，对账/同步/开户全部失败。
+        现在每个用户只带条数，完整列表由调用方在信封里放一次（键名不变，
+        新版控制台读不到用户里的就用信封里的；单个用户的接口仍带完整列表）。
+        返回 (不含 gaps 的 summary, gaps)。
+        """
+        summary = usage_summary(uid)
+        gaps = summary.pop('measurement_gaps', None) or []
+        summary['measurement_gap_count'] = len(gaps)
+        return summary, gaps
+
     def usage_hot_summary(uid):
         """usage_summary 的热路径版（2026-10-28 修）。
 
@@ -6361,8 +6376,10 @@ if __name__ == '__main__':
                     # BUGFIX #10: 商城节点对账用, 列出所有动态用户 (脱敏不返回 password)
                     now_ts = int(time.time())
                     users_out = []
+                    node_gaps = []
                     with data_lock:
                         for uid, info in data.get('users', {}).items():
+                            summary, node_gaps = usage_list_summary(uid)
                             entry = {
                                 'user_id': uid,
                                 'expires_at': info.get('expires_at', 0),
@@ -6375,7 +6392,7 @@ if __name__ == '__main__':
                                 'status': info.get('status', 'active'),
                                 'traffic_limit_bytes': info.get('limit_bytes', 0),
                                 'traffic_used_bytes': info.get('used_bytes', 0),
-                                **usage_summary(uid),
+                                **summary,
                                 # 真实在线 IP：来自鉴权时更新的 ip_tracker，
                                 # 窗口与限流判定同一个 IP_TIMEOUT_SECONDS。
                                 # 内存态 —— portal 重启后为空，这是真实语义：
@@ -6389,7 +6406,8 @@ if __name__ == '__main__':
                                 'created_at': info.get('created_at', now_ts),
                             }
                             users_out.append(entry)
-                    return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out})
+                    return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out,
+                                                 'measurement_gaps': node_gaps})
 
                 elif sub == 'proxy-services/add':
                     status, payload = self._manage_proxy_operation('create', params)
@@ -8400,8 +8418,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # BUGFIX #10: 商城节点对账用, 列出所有动态用户 (脱敏不返回 password)
                     now_ts = int(time.time())
                     users_out = []
+                    node_gaps = []
                     with data_lock:
                         for uid, info in data.get('users', {}).items():
+                            summary, node_gaps = usage_list_summary(uid)
                             users_out.append({
                                 'user_id': uid,
                                 'expires_at': info.get('expires_at', 0),
@@ -8410,7 +8430,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 'status': info.get('status', 'active'),
                                 'traffic_limit_bytes': info.get('limit_bytes', 0),
                                 'traffic_used_bytes': info.get('used_bytes', 0),
-                                **usage_summary(uid),
+                                **summary,
                                 # 见 POST 分支同一字段的注释。
                                 'online_ips': [
                                     {'ip': ip, 'last_seen': int(t)}
@@ -8420,7 +8440,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 'ip_limit': info.get('ip_limit', 0),
                                 'created_at': info.get('created_at', now_ts),
                             })
-                    return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out})
+                    return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out,
+                                                 'measurement_gaps': node_gaps})
                 if sub == 'proxy-services/list':
                     with data_lock:
                         items = list(data.get('proxy_services', []))
