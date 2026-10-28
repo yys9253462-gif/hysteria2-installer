@@ -53,6 +53,49 @@ except ImportError as _e:      # pragma: no cover - 只在部署缺文件时触�
         '修复：重新执行一次安装 / 更新（bash install.sh install 或门户里的「更新」）。' % _e
     ) from _e
 
+# ---- GitHub API token（可选，2026-10-28）----
+#
+# GitHub 匿名 API 每个公网 IP 每小时只有 60 次，同机其它程序（实测 tokyo 上的
+# agent2api 更新检查）会把它耗光，面板的版本检测 / 自更新随之失败。
+# 把一个只读 token 放进 GITHUB_TOKEN_FILE 后，所有发往 api.github.com 的请求
+# 按账号计额度（5000 次/小时）。只给 api.github.com 加，镜像与下载站一律不带；
+# 用 unredirected header，跳转到别的主机时不会被转发。
+GITHUB_TOKEN_FILE = Path('/etc/hysteria/github-token')
+_github_token_cache = {'mtime': None, 'token': ''}
+
+
+def github_token():
+    """读取 token（按 mtime 缓存）；文件不存在、为空或格式不对时返回空串。"""
+    try:
+        mtime = GITHUB_TOKEN_FILE.stat().st_mtime
+    except OSError:
+        _github_token_cache.update(mtime=None, token='')
+        return ''
+    if mtime != _github_token_cache['mtime']:
+        try:
+            value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
+        except OSError:
+            value = ''
+        # 只接受 token 字符集，防止把换行等注入到请求头里。
+        _github_token_cache.update(mtime=mtime,
+                                   token=value if re.fullmatch(r'[A-Za-z0-9_]{20,255}', value) else '')
+    return _github_token_cache['token']
+
+
+class GitHubTokenHandler(urllib.request.BaseHandler):
+    """只给发往 api.github.com 的请求加 Authorization。"""
+    handler_order = 400
+
+    def https_request(self, req):
+        if req.host.split(':')[0].lower() == 'api.github.com' and not req.has_header('Authorization'):
+            token = github_token()
+            if token:
+                req.add_unredirected_header('Authorization', 'Bearer ' + token)
+        return req
+
+
+urllib.request.install_opener(urllib.request.build_opener(GitHubTokenHandler()))
+
 # 机主账号。它的 password 就是 Hysteria 的 auth_password —— /auth 是遍历
 # data['users'] 按密码匹配的，这条记录一旦被删，主密码立刻变成 "User not found"，
 # 机主本人都会被踢下线且再也连不上（只能重装）。因此全站禁止注销它。

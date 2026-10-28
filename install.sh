@@ -40,6 +40,27 @@ AWG_SERVICE="/etc/systemd/system/amneziawg-server.service"
 AWG_PORT_MIN=50000
 AWG_PORT_MAX=59000
 
+# ---- GitHub API token（可选）----
+# 匿名 API 每 IP 每小时 60 次，同机其它程序会耗光它。存在 token 文件时，
+# 只给发往 https://api.github.com/ 的 curl 加 Authorization；token 经进程替换
+# 以 `-H @文件` 传入，不出现在命令行参数里（ps 看不到）。镜像与下载站不带。
+HY2_GITHUB_TOKEN_FILE="${HY2_DIR}/github-token"
+curl() {
+    local _a _tok=""
+    for _a in "$@"; do
+        case "$_a" in
+            https://api.github.com/*)
+                [[ -r "$HY2_GITHUB_TOKEN_FILE" ]] && _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
+                break ;;
+        esac
+    done
+    if [[ "$_tok" =~ ^[A-Za-z0-9_]{20,255}$ ]]; then
+        command curl -H @<(printf 'Authorization: Bearer %s\n' "$_tok") "$@"
+    else
+        command curl "$@"
+    fi
+}
+
 log_info() { echo -e "${GREEN}[INFO]${PLAIN} $1"; }
 log_warn() { echo -e "${YELLOW}[WARN]${PLAIN} $1"; }
 log_err()  { echo -e "${RED}[ERROR]${PLAIN} $1"; }
