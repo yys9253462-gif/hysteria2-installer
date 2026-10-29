@@ -556,9 +556,13 @@ class TestRepoInvariants(unittest.TestCase):
         self.assertIn("if key in ('clash', 'sing', 'qr'):", block,
                       "下载类端点必须在取 data[key] 之前重生成，否则发的是内存旧值")
         regen = block.index("regenerate_page()")
-        read = block.index("content = data[key].encode()")
+        # 2026-10-29：读取改成容错的 (data.get(key) or '')，断言随之更新；
+        # 不变量不变 —— 重建仍必须发生在读取之前。
+        read = block.index("content = (data.get(key) or '').encode()")
         self.assertLess(regen, read,
                         "重生成必须发生在读 data[key] 之前")
+        self.assertIn("data.get(key) or ''", block,
+                      "读取必须容错：qr 可能因 qrencode 缺失而根本没有写进 data")
 
 
     def test_cert_choice_falls_back_to_self_signed(self):

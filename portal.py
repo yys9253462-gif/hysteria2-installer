@@ -411,20 +411,32 @@ def validate_outbound(entry):
     return True, cleaned, ''
 
 
+def _yaml_scalar(value):
+    """把任意字符串安全地渲染成 YAML 单引号标量。
+
+    校验层只要求「可见 ASCII」，但 `*`（别名）、`{`/`[`（流式集合）、
+    `&`（锚点）、`%`（指令）开头的值直接拼进 YAML 会让整份配置解析失败 ——
+    Hysteria 起不来，用户只看到「应用失败」却不知道是密码写法的问题。
+    单引号标量里只需把 `'` 写成 `''`。
+    """
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def render_outbound_yaml(entry):
     """把一条出站配置渲染成 YAML 片段（缩进与 config.yaml 风格一致）。"""
     otype = entry['type']
-    lines = ['  - name: %s' % entry['name'], '    type: %s' % otype]
+    lines = ['  - name: %s' % _yaml_scalar(entry['name']),
+             '    type: %s' % otype]
     if otype == 'socks5':
         lines.append('    socks5:')
-        lines.append('      addr: %s' % entry['addr'])
+        lines.append('      addr: %s' % _yaml_scalar(entry['addr']))
         if entry.get('username'):
-            lines.append('      username: %s' % entry['username'])
+            lines.append('      username: %s' % _yaml_scalar(entry['username']))
         if entry.get('password'):
-            lines.append('      password: %s' % entry['password'])
+            lines.append('      password: %s' % _yaml_scalar(entry['password']))
     elif otype == 'http':
         lines.append('    http:')
-        lines.append('      url: %s' % entry['url'])
+        lines.append('      url: %s' % _yaml_scalar(entry['url']))
         lines.append('      insecure: %s' % ('true' if entry.get('insecure') else 'false'))
     elif otype == 'direct':
         lines.append('    direct:')
@@ -681,8 +693,10 @@ def render_egress_config(original, state):
     mode = state.get('outbound_mode', 'rules')
     if mode == 'global' and not outs:
         mode = 'rules'
-    if not rules and not outs:
-        return base.rstrip('\n') + '\n'
+    # 🔴 不能在这里提前返回「已剥离 ACL 的 base」（2026-10-29 修）：
+    # 关闭 WARP 且没有自定义规则时 rules 恰好为空，旧代码直接返回 base ——
+    # 连内网 / 云元数据的 reject 规则一起消失了，界面却显示重载成功。
+    # 统一交给 build_acl_block：即使没有规则，它也会输出 reject 头 + 兜底。
     return base.rstrip('\n') + '\n\n' + build_acl_block(mode, rules, outs, tail, existing_names=existing) + '\n'
 
 
@@ -2785,6 +2799,22 @@ def login_html(token, error_msg=None):
 <script>{LOGIN_SCRIPT}</script></body></html>'''
 
 
+
+def share_unavailable_html(reason):
+    """分享链接不可用时给一个可读的说明页，而不是一行裸 403。
+
+    用户拿到的是一条 URL，看到英文 "Access denied" 只会以为链接坏了；
+    实际原因通常是到期、超额或停用（2026-10-29 加）。
+    """
+    body = html.escape(reason or '该链接当前不可用')
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>链接不可用</title>
+<style>{STYLE}</style></head><body><main style="max-width:640px">
+<header class="hero"><div class="eyebrow">HYSTERIA 2 CLIENT ACCESS</div>
+<h1>链接当前不可用</h1><p>{body}</p></header>
+<section class="card"><p class="hint">如需继续使用，请联系节点管理员续费或恢复账号。
+本页不包含任何连接凭据。</p></section></main></body></html>"""
+
 def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None):
     used_bytes = int(uinfo.get("used_bytes", 0))
     limit_bytes = int(uinfo.get("limit_bytes", 0))
@@ -2821,7 +2851,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # **绝不兜底成伪造的 8443**（8443 在本项目里是被主动避开的黑名单端口）。
     if sub_port is None:
         sub_port = resolve_subscription_port({})[0]
-    clash_sub_url = f"https://{host}:{sub_port}/{token}/u/{quote(uid)}/clash.yaml?k={user_key}"
+    clash_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/clash.yaml?k={user_key}"
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>个人专属连接 · {html.escape(uid)}</title><style>{STYLE}</style></head><body><main style="max-width:860px">
 <nav class="topbar"><div class="brand"><span class="logo">H₂</span> HYSTERIA <span> / 个人连接中心</span></div><div>{status_html}</div></nav>
@@ -3650,6 +3680,10 @@ anytls_apply_lock = threading.Lock()
 # 核心安装/卸载串行化：两个并发 install-core 会同时写 xray.new / sing-box.new，
 # 后完成者覆盖前者；与 uninstall 并发时还可能「刚装好就被删」（2026-10-29 加）。
 core_operation_lock = threading.Lock()
+# AWG 操作串行化：peer-add 是「读 peers.json → 算下一个地址 → 写回」的
+# 读-改-写，两个并发请求会同时读到旧列表 —— 后写者覆盖前者（客户端丢失），
+# 或两名客户端拿到同一个 address（2026-10-29 加）。
+awg_operation_lock = threading.Lock()
 
 
 def anytls_password_for_user(secret, user_id):
@@ -3725,7 +3759,7 @@ def anytls_uri_for_user(acfg, user_id, label=None):
         return ''
     pwd = anytls_password_for_user(acfg['secret'], user_id)
     params = urlencode({'sni': acfg.get('sni') or host})
-    return f"anytls://{pwd}@{host}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
+    return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
 
 
 def apply_anytls_config(config, config_path, restart=True, run=subprocess.run):
@@ -4060,7 +4094,7 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     tag = label or ('VLESS-Enc-' + str(user_id))
     params = {'encryption': enc, 'security': 'tls', 'sni': str(vcfg.get('sni') or host),
               'type': 'tcp', 'headerType': 'none', 'fp': 'chrome'}
-    return (f"vless://{reality_uuid_for_user(user_id)}@{host}:{port}"
+    return (f"vless://{reality_uuid_for_user(user_id)}@{_host_for_url(host)}:{port}"
             f"?{urlencode(params, safe='')}#{quote(tag)}")
 
 
@@ -4753,7 +4787,7 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
         return ''
     uid_uuid = reality_uuid_for_user(user_id)
     tag = label or ('VLESS-Reality-' + str(user_id))
-    return (f"vless://{uid_uuid}@{public_ip}:{port}"
+    return (f"vless://{uid_uuid}@{_host_for_url(public_ip)}:{port}"
             f"?security=reality&encryption=none&pbk={pub_key}"
             f"&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision"
             f"&sni={dest_sni}&sid={short_id}#{quote(tag)}")
@@ -4776,6 +4810,20 @@ def _valid_port(value):
     except (TypeError, ValueError):
         return 0
     return port if 1 <= port <= 65535 else 0
+
+
+def _host_for_url(host):
+    """IPv6 字面量拼进 URL 时必须加方括号。
+
+    `https://2001:db8::1:8443/...` 无法解析；正确写法是 `[2001:db8::1]`。
+    安装器只取 IPv4，所以正常路径不会命中，但手工写入 server_name/public_ip
+    或将来支持 IPv6 时会（2026-10-29 加）。
+    """
+    host = str(host or '')
+    if ':' in host and not host.startswith('['):
+        return '[' + host + ']'
+    return host
+
 
 def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
               vmess=None, vlessenc=None, anytls=None):
@@ -4825,7 +4873,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         params.update({'obfs': 'salamander', 'obfs-password': obfs_password})
     if hop_port_range:
         params['mport'] = hop_port_range
-    uri = f"hysteria2://{quote(password, safe='')}@{host}:{listen_port}?{urlencode(params)}#{quote(name)}"
+    uri = f"hysteria2://{quote(password, safe='')}@{_host_for_url(host)}:{listen_port}?{urlencode(params)}#{quote(name)}"
     
     proxy = dict(name=name, type='hysteria2', server=host, port=listen_port,
                  password=password, sni=server_name, **{'skip-cert-verify': is_insecure})
@@ -5103,9 +5151,12 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     data = json.loads(path.read_text(encoding='utf-8'))
     uri, clash, sing = artifacts(m)
     host = m['public_ip'] if m['is_insecure'] else m['server_name']
-    subscription = f"https://{access['username']}:{access['password']}@{host}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
+    subscription = (f"https://{access['username']}:{access['password']}@"
+                    f"{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml")
     
-    if 'session_secret' not in data:
+    # 空串 / null 也要重新生成：session_secret 是分享链接 k 的 HMAC 密钥，
+    # 空串等于「任何人都能算出任意用户的 k」（`in` 判断只看键在不在）。
+    if not isinstance(data.get('session_secret'), str) or not data['session_secret']:
         data['session_secret'] = secrets.token_hex(32)
     if 'api_key' not in data:
         data['api_key'] = access.get('api_key') or secrets.token_hex(24)
@@ -5220,7 +5271,9 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
 def serve(path):
     portal_path = Path(path)
     data = json.loads(portal_path.read_text(encoding='utf-8'))
-    session_secret = data.get('session_secret', data['auth_hash'])
+    # 与 prepare() 同一条规则：空串/None 不能当密钥用（.get 的默认值只在
+    # 键缺失时生效，手工改坏或截断写入会留下空串）。
+    session_secret = data.get('session_secret') or data['auth_hash']
     meta_path = portal_path.parent / 'client_meta.json'
 
     data_lock = threading.RLock()
@@ -5643,7 +5696,14 @@ def serve(path):
 
     def gost_ports_ready():
         with data_lock:
-            ports = [int(item['port']) for item in data.get('proxy_services', [])]
+            # 容错：数据里某条记录的 port 被改坏时，跳过它而不是让整个
+            # reload 因 ValueError 失败（2026-10-29 修）。
+            ports = []
+            for item in data.get('proxy_services', []):
+                try:
+                    ports.append(int(item['port']))
+                except (KeyError, TypeError, ValueError):
+                    continue
         for port in ports:
             try:
                 with socket.create_connection(('127.0.0.1', port), timeout=0.2):
@@ -6040,8 +6100,14 @@ if __name__ == '__main__':
             return False
 
     def awg_run(args, timeout=420):
-        """调用 hy2-awgctl。返回 (returncode, stdout, stderr)。"""
-        proc = subprocess.run([AWG_CTL] + args, capture_output=True, text=True, timeout=timeout)
+        """调用 hy2-awgctl。返回 (returncode, stdout, stderr)。
+
+        所有调用都用同一把锁串行化：awgctl 的 peer 增删与协议线切换都是
+        读-改-写配置，并发执行会丢客户端或撞地址。
+        """
+        with awg_operation_lock:
+            proc = subprocess.run([AWG_CTL] + args, capture_output=True, text=True,
+                                  timeout=timeout)
         return proc.returncode, proc.stdout, proc.stderr
 
     def awg_err_tail(rc, out, err, limit=700):
@@ -6618,6 +6684,11 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': False, 'msg': 'Bad auth request'})
 
                 now_ts = int(time.time())
+                # 🔴 锁内只做判定与状态更新，**不要在锁内写响应**（2026-10-29 修）。
+                # data_lock 是全局锁，/auth 又是每个新连接必走的路径；慢客户端
+                # 或发送缓冲区满时，reply_json 里的 socket 写入会阻塞（最长到
+                # 连接超时），期间所有请求都在排队，包括新的鉴权。
+                deny = None
                 with data_lock:
                     users = data.get('users', {})
                     matched_uid, matched_user = None, None
@@ -6627,47 +6698,44 @@ if __name__ == '__main__':
                             break
 
                     if not matched_user:
-                        self.record_auth_failure()
-                        return self.reply_json(200, {'ok': False, 'msg': 'User not found'})
-
+                        deny = 'User not found'
                     # 判据与 user_access_allowed 同源：缺 status 视为 active、
                     # 缺 expires_at 视为永久，否则会出现「Reality 能连、Hy2 被拒」。
-                    if matched_user.get('status', 'active') != 'active':
-                        return self.reply_json(200, {'ok': False, 'msg': 'User account inactive'})
+                    elif matched_user.get('status', 'active') != 'active':
+                        deny = 'User account inactive'
+                    elif matched_user.get('expires_at') is not None and matched_user['expires_at'] <= now_ts:
+                        deny = 'User account expired'
+                    else:
+                        # 判超额只看**已累计的真实用量**（used_bytes 由计量模块维护）。
+                        # 这里绝不能把 auth 请求里的 tx/rx 加进来 —— 那是带宽声明。
+                        limit_bytes = int(matched_user.get('limit_bytes', 0))
+                        used_bytes = int(matched_user.get('used_bytes', 0))
+                        if limit_bytes > 0 and used_bytes >= limit_bytes:
+                            deny = 'Traffic quota exceeded'
+                        else:
+                            # -------- 同时在线 IP 限制检查 -------- #
+                            ip_limit = int(matched_user.get('ip_limit', 0))
+                            if ip_limit > 0 and client_ip:
+                                tracker = ip_tracker.setdefault(matched_uid, {})
+                                active_ips = {ip: t for ip, t in tracker.items()
+                                              if now_ts - t < IP_TIMEOUT_SECONDS}
+                                ip_tracker[matched_uid] = active_ips
+                                # 已连着的设备即使超过 180 秒没重新鉴权也要算在内。
+                                # Reality 放行中的 IP 也占名额：两个协议共用同一个设备上限。
+                                occupied = (set(active_ips) | live_online_ips(matched_uid)
+                                            | reality_live_ips(matched_uid))
+                                if client_ip not in occupied and len(occupied) >= ip_limit:
+                                    deny = f'Concurrent IP limit exceeded ({ip_limit} max)'
+                                else:
+                                    active_ips[client_ip] = now_ts
+                            elif client_ip:
+                                tracker = ip_tracker.setdefault(matched_uid, {})
+                                tracker[client_ip] = now_ts
 
-                    if matched_user.get('expires_at') is not None and matched_user['expires_at'] <= now_ts:
-                        return self.reply_json(200, {'ok': False, 'msg': 'User account expired'})
-
-                    # -------- 流量限额检查与增量累加 -------- #
-                    limit_bytes = int(matched_user.get('limit_bytes', 0))
-                    used_bytes = int(matched_user.get('used_bytes', 0))
-                    # 判超额只看**已累计的真实用量**（used_bytes 由计量模块维护）。
-                    # 这里绝不能把 auth 请求里的 tx/rx 加进来 —— 那是带宽声明。
-                    #
-                    # 速率样本改由计量模块的真实增量提供：/traffic-speed 端点
-                    # 消费 speed_tracker，没有写入侧它会永远返回 0。
-
-                    if limit_bytes > 0 and used_bytes >= limit_bytes:
-                        # 流量超额，阻断拒绝连接
-                        return self.reply_json(200, {'ok': False, 'msg': 'Traffic quota exceeded'})
-
-                    # -------- 同时在线 IP 限制检查 -------- #
-                    ip_limit = int(matched_user.get('ip_limit', 0))
-                    if ip_limit > 0 and client_ip:
-                        tracker = ip_tracker.setdefault(matched_uid, {})
-                        active_ips = {ip: t for ip, t in tracker.items() if now_ts - t < IP_TIMEOUT_SECONDS}
-                        ip_tracker[matched_uid] = active_ips
-                        # 已连着的设备即使超过 180 秒没重新鉴权也要算在内。
-                        # Reality 放行中的 IP 也占名额：两个协议共用同一个设备上限。
-                        occupied = set(active_ips) | live_online_ips(matched_uid) | reality_live_ips(matched_uid)
-
-                        if client_ip not in occupied and len(occupied) >= ip_limit:
-                            return self.reply_json(200, {'ok': False, 'msg': f'Concurrent IP limit exceeded ({ip_limit} max)'})
-                        active_ips[client_ip] = now_ts
-                    elif client_ip:
-                        tracker = ip_tracker.setdefault(matched_uid, {})
-                        tracker[client_ip] = now_ts
-
+                if deny == 'User not found':
+                    self.record_auth_failure()
+                if deny:
+                    return self.reply_json(200, {'ok': False, 'msg': deny})
                 return self.reply_json(200, {'ok': True, 'id': matched_uid})
 
             # 2. REST API 接口通道 (独立 API 速率桶)
@@ -7075,7 +7143,13 @@ if __name__ == '__main__':
                                                  'measurement_gaps': node_gaps})
 
                 elif sub == 'proxy-services/add':
-                    status, payload = self._manage_proxy_operation('create', params)
+                    # API 通道此前没有异常保护：数据里某条代理的 port 被改坏时
+                    # int() 抛 ValueError 会穿透 do_POST，连接被直接掐断
+                    # （2026-10-29 修，与 users/create 同型）。
+                    try:
+                        status, payload = self._manage_proxy_operation('create', params)
+                    except Exception as exc:
+                        return self.reply_json(500, {'ok': False, 'error': 'proxy add failed: %s' % exc})
                     return self.reply_json(status, payload)
 
                 elif sub == 'proxy-services/list':
@@ -7094,7 +7168,10 @@ if __name__ == '__main__':
                     })
 
                 elif sub == 'proxy-services/delete':
-                    status, payload = self._manage_proxy_operation('delete', params)
+                    try:
+                        status, payload = self._manage_proxy_operation('delete', params)
+                    except Exception as exc:
+                        return self.reply_json(500, {'ok': False, 'error': 'proxy delete failed: %s' % exc})
                     return self.reply_json(status, payload)
 
                 elif sub == 'node/suspend':
@@ -7387,7 +7464,12 @@ if __name__ == '__main__':
                         return 400, {'ok': False, 'error': 'Port must be in 1..65535'}
                     if ptype == 'https':
                         gost_tls_paths(portal_path.parent)
-                    existing = {int(item['port']) for item in previous}
+                    existing = set()
+                    for item in previous:
+                        try:
+                            existing.add(int(item['port']))
+                        except (KeyError, TypeError, ValueError):
+                            continue
                     candidates = [port] if port else [random.randint(12000, 58000) for _ in range(100)]
                     selected = 0
                     for candidate in candidates:
@@ -9386,22 +9468,51 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not VALID_USER_ID_RE.match(target_uid):
                     return self.reply(400, b'Invalid user_id format')
 
+                authed = self.is_authenticated()
                 with data_lock:
                     u = data.get('users', {}).get(target_uid)
-                    if not u:
-                        return self.reply(404, b'User not found')
-                    u_copy = dict(u)
+                    u_copy = dict(u) if u else None
 
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 k_val = query.get('k', [''])[0]
-                expected_k = user_view_key(session_secret, target_uid, u_copy.get('view_nonce', ''))
+                expected_k = (user_view_key(session_secret, target_uid, u_copy.get('view_nonce', ''))
+                              if u_copy else '')
 
-                if not self.is_authenticated() and not (k_val and hmac.compare_digest(k_val, expected_k)):
-                    return self.reply(403, b'Access denied: invalid key')
+                if not authed:
+                    # ⚠️ 顺序很重要（2026-10-29 修）：
+                    #   1. 未鉴权时「用户不存在」必须与「key 错误」返回同一个响应，
+                    #      否则知道门户 token 的人可以逐个试出哪些 user_id 存在；
+                    #   2. hmac.compare_digest 遇到非 ASCII 的 str 会抛 TypeError
+                    #      （do_GET 没有兜底，连接直接被重置），所以先挡非 ASCII。
+                    ok_key = bool(k_val) and k_val.isascii() and u_copy is not None                         and hmac.compare_digest(k_val, expected_k)
+                    if not ok_key:
+                        return self.reply(403, b'Access denied: invalid key')
+                elif u_copy is None:
+                    return self.reply(404, b'User not found')
                 if not user_share_available(u_copy):
-                    return self.reply(403, b'User subscription unavailable')
+                    # 区分原因，给一条人能看懂的说明（旧实现只有一行英文 403）。
+                    now_ts = int(time.time())
+                    limit_b = int(u_copy.get('limit_bytes', 0) or 0)
+                    used_b = int(u_copy.get('used_bytes', 0) or 0)
+                    exp = u_copy.get('expires_at')
+                    if u_copy.get('status', 'active') != 'active':
+                        reason = '账号已被停用'
+                    elif exp is not None and exp <= now_ts:
+                        reason = '服务已到期'
+                    elif limit_b > 0 and used_b >= limit_b:
+                        reason = '流量已超额'
+                    else:
+                        reason = '当前不可用'
+                    return self.reply(403, share_unavailable_html(reason).encode('utf-8'),
+                                      'text/html; charset=utf-8')
 
                 m = read_meta_file(meta_path)
+                # meta 损坏时 artifacts 会退回 localhost/默认端口，生成一条
+                # 永远连不上的链接却返回 200（2026-10-29 修）。
+                if not (m.get('server_name') or m.get('public_ip')):
+                    return self.reply(503, share_unavailable_html(
+                        '节点元信息缺失或损坏，请联系管理员检查 client_meta.json').encode('utf-8'),
+                        'text/html; charset=utf-8')
                 pwd = u_copy.get('password', '')
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
@@ -9634,7 +9745,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if key in ('clash', 'sing', 'qr'):
                 regenerate_page()
             with data_lock:
-                content = data[key].encode()
+                # 用 .get：qrencode 从未成功时 data 里可能根本没有 'qr'
+                # （例如从旧备份恢复的 portal.json），旧实现会 KeyError 并
+                # 直接掐断连接，而不是返回一个可读的错误（2026-10-29 修）。
+                content = (data.get(key) or '').encode()
             self.reply(200, content, mime)
 
         # ==========================================================================
