@@ -68,6 +68,13 @@ class InstallBundleTransactionTests(unittest.TestCase):
             # All bytes still copy/rename on a temporary filesystem; no services run.
             injector = base / "inject.py"
             injector.write_text('''import os, shutil, sys
+if os.name == "nt":
+    import msvcrt, types
+    def flock(fd, operation):
+        os.lseek(fd, 0, 0)
+        try: msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc: raise BlockingIOError("update lock busy") from exc
+    sys.modules["fcntl"] = types.SimpleNamespace(flock=flock, LOCK_EX=2, LOCK_NB=4)
 kind, fail_at = os.environ.get("FAIL_KIND"), int(os.environ.get("FAIL_AT", "0"))
 real_replace = os.replace
 count = 0
@@ -88,7 +95,7 @@ def copy2(src, dst, *args, **kwargs):
         raise OSError("injected backup failure")
     return real_copy2(src, dst, *args, **kwargs)
 shutil.copy2 = copy2
-code = sys.stdin.read()
+code = sys.stdin.buffer.read().decode("utf-8")
 sys.argv = ["transaction"] + sys.argv[1:]
 exec(compile(code, "bundle-transaction", "exec"))
 ''', encoding="utf-8")

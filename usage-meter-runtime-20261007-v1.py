@@ -38,7 +38,7 @@ def _source_fresh(health, source, max_age=30):
         return False
     try:
         when = datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OSError, OverflowError):
         return False
     return 0 <= time.time() - when < max_age
 
@@ -75,7 +75,7 @@ def _recent_gaps(m, window_seconds=86400):
             continue
         try:
             when = datetime.fromisoformat(str(at).replace('Z', '+00:00')).timestamp()
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OSError, OverflowError):
             recent.append(gap)
             continue
         if when >= cutoff:
@@ -83,6 +83,41 @@ def _recent_gaps(m, window_seconds=86400):
     # 内容快照保留原地修改检测；命中时直接比较结构，避免逐用户序列化整表。
     _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=recent)
     return recent
+
+def _measurement_total(meter, enabled, uid):
+    sources=meter.get('sources')
+    if not enabled or not isinstance(sources,dict):
+        return None
+    for source in enabled:
+        saved=sources.get(source)
+        if (not isinstance(saved,dict) or not isinstance(saved.get('epoch'),str)
+                or not saved['epoch'] or not isinstance(saved.get('counters'),dict)):
+            return None
+    try:
+        return core.total_bytes(meter,uid)
+    except ValueError:
+        return None
+
+
+def _rollback_sample(current, before, applied):
+    """撤销仍属于本次采样的字段；锁外发生的删除和修改优先。"""
+    missing=object()
+    for key in before.keys() | applied.keys():
+        old=before.get(key,missing)
+        written=applied.get(key,missing)
+        live=current.get(key,missing)
+        if old == written:
+            continue
+        if (old is missing or isinstance(old,dict)) and isinstance(written,dict) and isinstance(live,dict):
+            _rollback_sample(live,{} if old is missing else old,written)
+            if old is missing and not live:
+                current.pop(key,None)
+        elif live == written:
+            if old is missing:
+                current.pop(key,None)
+            else:
+                current[key]=copy.deepcopy(old)
+
 
 class PortalMeter:
     def __init__(self, data, lock, save, config, read=None, epoch=None, on_speed=None):
@@ -166,14 +201,19 @@ class PortalMeter:
                     meter.setdefault('started_at',now)
                     old=self.data.get('usage_meter')
                     user_changes=[]
+                    # 先验证所有待写账户，后面的损坏累计不能让前面的账户半提交。
+                    measured={uid: core.total_bytes(meter, uid)
+                              for uid, user in self.data.get('users', {}).items()
+                              if isinstance(user, dict)}
                     for uid, user in self.data.get('users', {}).items():
                         if not isinstance(user, dict):
                             continue
                         user_before={k: user[k] for k in ('used_bytes', 'legacy_auth_value') if k in user}
                         user.setdefault('legacy_auth_value', user.get('used_bytes', 0))
-                        user['used_bytes']=core.total_bytes(meter, uid)
+                        user['used_bytes']=measured[uid]
                         user_after={k: user[k] for k in ('used_bytes', 'legacy_auth_value')}
                         user_changes.append((uid, user, user_before, user_after))
+                    applied_meter=copy.deepcopy(meter)
                     self.data['usage_meter']=meter
                     sampled=time.monotonic()
                     previous=self.sample_times.get(source)
@@ -194,8 +234,9 @@ class PortalMeter:
                                 if key in before: user[key]=before[key]
                                 else: user.pop(key, None)
                         if self.data.get('usage_meter') is meter:
-                            if old is None: self.data.pop('usage_meter',None)
-                            else: self.data['usage_meter']=old
+                            _rollback_sample(meter,old if isinstance(old,dict) else {},applied_meter)
+                            if old is None and not meter:
+                                self.data.pop('usage_meter',None)
                     raise
                 self.sample_times[source]=sampled
                 if self.on_speed is not None and interval > 0:
@@ -209,6 +250,10 @@ class PortalMeter:
                     missing=object()
                     old_meter=self.data.get('usage_meter',missing)
                     failed_meter=self.data.setdefault('usage_meter',{})
+                    if not isinstance(failed_meter, dict):
+                        # 财务状态损坏时保留原件，不能清零，也不能让诊断再次杀死线程。
+                        print('[meter] invalid usage_meter container', file=sys.stderr)
+                        continue
                     old_health=failed_meter.get('health',missing)
                     health=old_health if isinstance(old_health,dict) else {}
                     failed_meter['health']=health
@@ -234,15 +279,18 @@ class PortalMeter:
     def summary(self, uid):
         with self.lock:
             m=self.data.get('usage_meter',{})
+            if not isinstance(m, dict):
+                m={}
             health=m.get('health')
             if not isinstance(health, dict):
                 health={}
             enabled=self.enabled_sources()
             fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
-            initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)
+            measured=_measurement_total(m,enabled,uid)
+            initialized=measured is not None
             user=self.data.get('users',{}).get(uid,{})
             legacy=user.get('legacy_auth_value',user.get('used_bytes',0)) if isinstance(user,dict) else None
-            return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
+            return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),
                 'measurement_ok':initialized and fresh and not _recent_gaps(m),
                 'measurement_current_ok': initialized and fresh,
@@ -270,13 +318,16 @@ class PortalMeter:
         """
         with self.lock:
             m=self.data.get('usage_meter',{})
+            if not isinstance(m, dict):
+                m={}
             health=m.get('health')
             if not isinstance(health, dict):
                 health={}
             enabled=self.enabled_sources()
             fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
-            initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)
-            return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
+            measured=_measurement_total(m,enabled,uid)
+            initialized=measured is not None
+            return {'measured_bytes':measured,
                 'measurement_ok':initialized and fresh and not _recent_gaps(m),
                 'measurement_started_at':m.get('started_at'),
                 'measurement_scope':'since_measurement_started'}

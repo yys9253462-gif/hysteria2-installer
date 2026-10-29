@@ -39,8 +39,9 @@ class MeterBundleGuardTests(unittest.TestCase):
     def test_terminal_upgrade_is_all_or_nothing_when_cache_is_stale(self):
         source = (ROOT / 'install.sh').read_text(encoding='utf-8')
         start = source.index('    REPO="yys9253462-gif/hysteria2-installer"', source.index('elif [[ "$TARGET" == "portal" ]]'))
-        end = source.index('        # 计量配置自愈', start)
-        block = source[start:end] + '\nfi\n'
+        # 此测试仅验证真实下载/校验段；事务行为由 terminal transaction 测试执行。
+        end = source.index('    if [[ "$_file_ok" == "1" ]]; then', start)
+        block = source[start:end]
         for stale in (False, True):
             with self.subTest(stale=stale), tempfile.TemporaryDirectory() as td:
                 root = Path(td)
@@ -52,7 +53,7 @@ class MeterBundleGuardTests(unittest.TestCase):
                 if stale:
                     p = fixture / 'usage-meter-runtime-20261007-v1.py'
                     p.write_text(p.read_text(encoding='utf-8').replace('2026-10-12-real-usage-v2', 'old'), encoding='utf-8')
-                # 不触网，不调用 systemctl；只测试实际下载+落地代码段。
+                # 不触网，不调用 systemctl；只测试实际下载与完整六文件校验。
                 # 目录列表 JSON：文件名 -> fixture 内容的 git blob 身份。
                 # 门户取文件现在除了 marker/语法，还要比对 blob 身份（2026-10-27）。
                 import hashlib as _h
@@ -85,7 +86,7 @@ curl() {
   fi
   if [[ "$url" == */contents/*\?ref=* ]]; then
     local n="${url#*/contents/}"; n="${n%%\?*}"
-    printf '%s' "$LISTING" | python3 -c 'import json,sys; n=sys.argv[1]; print(json.dumps({"sha": next((i["sha"] for i in json.load(sys.stdin) if i["name"]==n), "")}))' "$n"
+    cp "$PWD/fixture/$n" "$dest"
     return
   fi
   [[ "$url" == *aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa* ]] || return 9
@@ -93,11 +94,14 @@ curl() {
   cp "$PWD/fixture/$file" "$dest"
 }
 '''
+                # 将 mktemp 的 stage 保留在当前隔离目录，直接断言校验产物。
+                stub += 'mktemp(){ if [[ "$1" == -d ]]; then mkdir -p "$PWD/stage"; printf "%s\\n" "$PWD/stage"; else command mktemp "$@"; fi; }\n'
                 result = self.run_shell(stub + block, root)
                 self.assertEqual(result.returncode == 0, not stale, result.stderr)
                 for name in FILES:
-                    expected = ('original-' + name).encode() if stale else (fixture / name).read_bytes()
-                    self.assertEqual((target / name).read_bytes(), expected)
+                    self.assertEqual((target / name).read_bytes(), ('original-' + name).encode())
+                    if not stale:
+                        self.assertEqual((root / 'stage' / name).read_bytes(), (fixture / name).read_bytes())
 
     def test_installer_pins_snapshot_and_rejects_unresolvable_ref(self):
         source = (ROOT / 'install.sh').read_text(encoding='utf-8')

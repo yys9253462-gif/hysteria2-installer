@@ -2659,34 +2659,8 @@ for it in items if isinstance(items, list) else []:
     done
     rm -f "$_bundle_map"
     if [[ "$_file_ok" == "1" ]]; then
-        # 写入失败时恢复整包，避免模块接口不一致。
-        python3 - "$HY2_DIR" "$_bundle_dir" $_bundle_files <<'PYBUNDLE'
-import os, pathlib, shutil, sys, time
-dest, stage = map(pathlib.Path, sys.argv[1:3])
-files = sys.argv[3:]
-backup = dest / 'backups' / ('portal-bundle-' + time.strftime('%Y%m%d-%H%M%S'))
-backup.mkdir(parents=True, mode=0o700)
-existing = {f: (dest / f).exists() for f in files}
-for f in files:
-    if existing[f]: shutil.copy2(dest / f, backup / f)
-written = []
-try:
-    for f in files:
-        temp = dest / (f + '.bundle-new')
-        shutil.copyfile(stage / f, temp)
-        temp.chmod(0o644)
-        os.replace(temp, dest / f)
-        written.append(f)
-except Exception:
-    for f in written:
-        if existing[f]: shutil.copy2(backup / f, dest / f)
-        else: (dest / f).unlink()
-    raise
-PYBUNDLE
-        _write_rc=$?
-        rm -rf "$_bundle_dir"
-        [[ "$_write_rc" == "0" ]] || exit 1
-        echo "面板、前端与计量模块已整包更新"
+        # 配置自愈在持有跨进程锁的事务内执行，与发布/验证/回滚串行。
+        cat > "$_bundle_dir/repair-config.sh" <<'PORTALREPAIR'
         # 计量配置自愈（2026-10-08）：老装机 / 手工改过的 config.yaml 可能没有
         # trafficStats 段，于是 usage-meter-config.json 从未生成，portal 启动即
         # `真实计量未初始化: FileNotFoundError` —— 换模块也治不好。
@@ -2711,8 +2685,20 @@ if not re.search(r'^trafficStats:', s, re.M):
 io.open(path, 'w', encoding='utf-8', newline='\n').write(s)
 PYEOF2
                 chmod 600 "$HY2_DIR/config.yaml"
-                echo "已补写 trafficStats 段，重启 hysteria-server 使其生效"
-                systemctl restart hysteria-server 2>/dev/null || true
+                # 停用节点只补配置；恢复节点时由正常启动流程加载。
+                # 读取失败也不主动拉起 Hy2（不能把坏 JSON 当成未停用）。
+                if python3 -I - "$HY2_DIR/portal.json" <<'PYSUSPEND'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as handle:
+    data = json.load(handle)
+sys.exit(1 if (data.get('traffic_suspend') or {}).get('suspended') else 0)
+PYSUSPEND
+                then
+                    echo "已补写 trafficStats 段，重启 hysteria-server 使其生效"
+                    systemctl restart hysteria-server 2>/dev/null || true
+                else
+                    echo "已补写 trafficStats 段；节点停用或状态不可读，暂不重启 hysteria-server"
+                fi
             fi
             cat > "$HY2_DIR/usage-meter-config.json" <<METEREOF2
 {"hysteria": {"url": "http://127.0.0.1:19996", "secret": "${_upd_secret}"}, "reality": {"binary": "/usr/local/bin/xray", "address": "127.0.0.1:19997"}}
@@ -2836,7 +2822,88 @@ EOCS2
             systemctl enable --now hy2-cert-selfheal.path  >/dev/null 2>&1 || true
             echo "证书一致性自愈单元已启用"
         fi
-        systemctl restart hysteria-portal 2>/dev/null || true
+PORTALREPAIR
+        export HY2_DIR
+        python3 -I - "$HY2_DIR" "$_bundle_dir" $_bundle_files <<'PYBUNDLE'
+import json, os, pathlib, shutil, subprocess, sys, tempfile, time, urllib.request
+import fcntl
+
+dest, download = map(pathlib.Path, sys.argv[1:3])
+files = sys.argv[3:]
+# 所有更新入口共用且保留同一 inode；锁持有到新版本验证或旧版本恢复验证结束。
+lock = open(dest / '.portal-update.lock', 'a+b')
+try:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit('另一个门户更新正在发布或验证，请稍后重试')
+
+# 校验端口失败必须发生在写入之前；portal.json 与客户数据从不参与回滚。
+with (dest / 'portal.json').open(encoding='utf-8') as handle:
+    port = json.load(handle)['port']
+if type(port) is not int or not 1 <= port <= 65535:
+    sys.exit('门户端口无效，保留全部旧文件')
+
+def restart_and_verify():
+    try:
+        result = subprocess.run(['systemctl', 'restart', 'hysteria-portal'], timeout=30)
+        if result.returncode:
+            return False
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    for _ in range(20):
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:%d/api/health' % port,
+                                        timeout=2) as response:
+                if json.loads(response.read()).get('ok') is True:
+                    return True
+        except Exception:
+            pass
+        time.sleep(1)
+    return False
+
+backup_root = dest / 'backups'
+backup_root.mkdir(mode=0o700, exist_ok=True)
+backup = pathlib.Path(tempfile.mkdtemp(prefix='portal-bundle-', dir=backup_root))
+existing = {f: (dest / f).exists() for f in files}
+for f in files:
+    if existing[f]:
+        shutil.copy2(dest / f, backup / f)
+print('门户整包备份: ' + str(backup), flush=True)
+# 独占 stage 与目标同文件系统，发布和回滚都使用原子 replace。
+with tempfile.TemporaryDirectory(prefix='.portal-bundle-', dir=dest) as stage_dir:
+    stage = pathlib.Path(stage_dir)
+    written = []
+    try:
+        for f in files:
+            shutil.copyfile(download / f, stage / f)
+            (stage / f).chmod(0o644)
+        for f in files:
+            os.replace(stage / f, dest / f)
+            written.append(f)
+        result = subprocess.run(['bash', str(download / 'repair-config.sh')], timeout=120)
+        if result.returncode:
+            raise RuntimeError('门户配置自愈失败')
+        if not restart_and_verify():
+            raise RuntimeError('新门户启动或健康检查失败')
+    except Exception as exc:
+        print(str(exc) + '，恢复本次旧门户整包', file=sys.stderr)
+        try:
+            for f in reversed(written):
+                if existing[f]:
+                    shutil.copy2(backup / f, stage / f)
+                    os.replace(stage / f, dest / f)
+                else:
+                    (dest / f).unlink()
+        except Exception as restore_error:
+            sys.exit('恢复旧门户整包失败；备份保留在 %s: %s' % (backup, restore_error))
+        if written and not restart_and_verify():
+            sys.exit('旧门户已恢复但启动验证失败；备份保留在 ' + str(backup))
+        sys.exit('更新失败；旧门户已恢复' + ('并通过健康检查' if written else '，文件未改动'))
+print('面板、前端与计量模块已整包更新并通过健康检查')
+PYBUNDLE
+        _write_rc=$?
+        rm -rf "$_bundle_dir"
+        [[ "$_write_rc" == "0" ]] || exit 1
     fi
 fi
 EOUG
@@ -3319,10 +3386,16 @@ portal_ensure_py() {
     # 与 do_upgrade 的整包事务相同：备齐旧文件后才替换，失败恢复内容和模式。
     # 备份使用唯一目录并保留，避免同秒重试覆盖上一次可恢复的包。
     if ! python3 -I - "$dest_dir" "$stage" $PORTAL_FILES $METER_FILES <<'PYINSTALLBUNDLE'
-import os, pathlib, shutil, sys, tempfile
+import fcntl, os, pathlib, shutil, sys, tempfile
 
 dest, stage = map(pathlib.Path, sys.argv[1:3])
 files = sys.argv[3:]
+# 与终端/Web 更新共享锁，覆盖备份、发布与失败恢复。文件不能删除。
+lock = open(dest / '.portal-update.lock', 'a+b')
+try:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    sys.exit('另一个门户更新正在发布或验证，请稍后重试')
 backup_root = dest / 'backups'
 backup_root.mkdir(mode=0o700, exist_ok=True)
 backup = pathlib.Path(tempfile.mkdtemp(prefix='portal-bundle-', dir=backup_root))

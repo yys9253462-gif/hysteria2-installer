@@ -41,6 +41,9 @@ def apply_sample(state, source, epoch, counters, sampled_at):
                 {'source': source, 'at': sampled_at,
                  'reason': 'corrupt_state_reset'})
     totals = new.setdefault('totals', {})
+    # 加上增量前校验原值，负数/布尔值不能被一次采样洗成正常整数。
+    for uid in clean:
+        total_bytes(new, uid)
     reset_users = []
     corrupt_users = []
     first_sample = previous is None
@@ -115,4 +118,11 @@ def apply_sample(state, source, epoch, counters, sampled_at):
 
 
 def total_bytes(state, uid):
-    return sum(state.get('totals', {}).get(uid, {}).values())
+    totals = state.get('totals', {})
+    if not isinstance(totals, dict):
+        raise ValueError('invalid totals')
+    bucket = totals.get(uid, {})
+    if (not isinstance(bucket, dict)
+            or any(type(value) is not int or value < 0 for value in bucket.values())):
+        raise ValueError('invalid user totals')
+    return sum(bucket.values())

@@ -16,6 +16,7 @@ import platform
 import random
 import re
 import secrets
+import select
 import shlex
 import shutil
 import socket
@@ -36,6 +37,11 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, quote, urlencode
+
+try:
+    import fcntl
+except ImportError:  # Windows 非服务开发环境；生产部署使用 Linux flock。
+    fcntl = None
 
 # 前端资源（CSS / 内嵌 JS）拆到了独立模块 portal_assets.py。
 # ⚠️ 部署时门户是**六个文件**：portal.py + portal_assets.py + 四个计量模块
@@ -989,6 +995,76 @@ def atomic_write_private(path, payload):
             os.fsync(dfd)
         finally:
             os.close(dfd)
+
+
+def portal_update_process_lock(base_dir):
+    """与终端更新共用永久锁文件；调用者只能 close，不能 LOCK_UN。
+
+    flock 绑定到 open file description，pass_fds 继承的子进程与父进程共享锁。
+    父进程显式解锁会连带释放子进程的锁；只关闭自己的 fd 才能覆盖后台核验。
+    """
+    if fcntl is None:
+        return None
+    fd = os.open(Path(base_dir) / '.portal-update.lock', os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def portal_update_restart_prefix():
+    """systemd 重启会清理原服务 cgroup，先把持锁脚本迁入独立 scope。"""
+    if os.name == 'posix' and Path('/run/systemd/system').is_dir():
+        runner = shutil.which('systemd-run')
+        if not runner:
+            raise RuntimeError('门户更新需要 systemd-run 独立 scope，未写入更新文件')
+        # --scope 在启动 job 完成后 exec 目标程序，保留 pass_fds 的锁 fd。
+        return [runner, '--scope', '--quiet',
+                '--unit=hysteria-portal-update-' + uuid.uuid4().hex, 'bash', '-c']
+    return ['bash', '-c']
+
+
+def portal_start_update(restart_prefix, script, lock_fd, ready_timeout=10):
+    """只有持锁子脚本就绪才交接；失败时关闭 go 管道，禁止稍后再执行重启。"""
+    if lock_fd is None:  # Windows 开发环境没有 POSIX fd 继承。
+        return subprocess.Popen(restart_prefix + [script], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+    ready_r, ready_w = os.pipe()
+    go_r = go_w = None
+    child = None
+    try:
+        go_r, go_w = os.pipe()
+        # systemd-run --scope exec bash 后才发 ready；go EOF 时必须直接退出。
+        guarded = ('printf R >&%d; exec %d>&-; '
+                   'IFS= read -r portal_update_go <&%d || exit 1; exec %d<&-; '
+                   '[ "$portal_update_go" = go ] || exit 1; %s'
+                   % (ready_w, ready_w, go_r, go_r, script))
+        child = subprocess.Popen(restart_prefix + [guarded], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True,
+                                 pass_fds=(lock_fd, ready_w, go_r))
+        os.close(ready_w)
+        ready_w = None
+        os.close(go_r)
+        go_r = None
+        readable, _, _ = select.select([ready_r], [], [], ready_timeout)
+        if not readable or os.read(ready_r, 1) != b'R' or child.poll() is not None:
+            raise RuntimeError('门户重启脚本未就绪，已放弃更新')
+        os.write(go_w, b'go\n')
+        return child
+    except BaseException:
+        if child is not None:
+            try:
+                child.terminate()
+                child.wait(timeout=2)
+            except Exception as exc:
+                _log_ignored('portal_update.start_cleanup', exc)
+        raise
+    finally:
+        for fd in (ready_r, ready_w, go_r, go_w):
+            if fd is not None:
+                os.close(fd)
 
 
 def portal_update_restart_script(port, backups, created, wait_seconds=20):
@@ -7676,6 +7752,7 @@ if __name__ == '__main__':
             """POST /do-upgrade 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            update_lock_fd = None
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace')
@@ -7701,6 +7778,11 @@ if __name__ == '__main__':
                     ref = form.get('ref', ['main'])[0]
                     if ref != 'main' and not re.fullmatch(r'[0-9a-f]{40}', ref):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid immutable ref'})
+                    try:
+                        update_lock_fd = portal_update_process_lock(PORTAL_SELF.parent)
+                    except BlockingIOError:
+                        return self.reply_json(409, {'ok': False, 'error': '已有门户更新在执行，请等待核验'})
+                    restart_prefix = portal_update_restart_prefix()
                     # 六个文件 × 三个源 × 30 秒超时 + blob 校验，最坏远超
                     # 30 秒默认死线：不抬死线，更新结果永远送不回浏览器
                     # （副作用照常发生，面板却显示失败/无响应，2026-10-28 修）。
@@ -7774,6 +7856,11 @@ if __name__ == '__main__':
                             os.chmod(tmp, 0o644)
                             os.replace(tmp, str(dest))
                             changed = True
+                        if changed:
+                            # scope 内脚本 ready/go 握手完成才交接；失败也走整包回滚。
+                            portal_start_update(
+                                restart_prefix, portal_update_restart_script(data['port'], backups, created),
+                                update_lock_fd)
                     except Exception as e:
                         # 出错就把已替换的恢复回去，绝不留下半新半旧的状态
                         for dest, bak in backups:
@@ -7789,12 +7876,8 @@ if __name__ == '__main__':
                     if not changed:
                         return self.reply_json(200, {'ok': True, 'target': target,
                                                      'message': '面板已是最新，无需更新'})
-                    # 延迟重启，且必须脱离当前会话：本进程马上会被 systemctl 杀掉，
-                    # 不脱离的话重启命令会跟着一起死（start_new_session=True）。
-                    subprocess.Popen(
-                        ['bash', '-c', portal_update_restart_script(data['port'], backups, created)],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        start_new_session=True)
+                    # 已就绪的独立 scope 子脚本持锁至重启、核验与回滚结束。
+                    # 父 handler 的 finally 只关闭自己的 fd，绝不 LOCK_UN。
                     return self.reply_json(200, {'ok': True, 'target': target,
                                                  'message': '面板已更新（后端 + 前端资源），服务重启中'})
 
@@ -7839,6 +7922,9 @@ if __name__ == '__main__':
                 return
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
+            finally:
+                if update_lock_fd is not None:
+                    os.close(update_lock_fd)
 
         def _manage_proxy_operation(self, action, params):
             if action not in ('create', 'delete'):

@@ -119,7 +119,7 @@ class HotSummaryBehaviorTest(unittest.TestCase):
         meter = mod.PortalMeter.__new__(mod.PortalMeter)
         meter.data = {'usage_meter': {
             'started_at': '2026-10-28T00:00:00Z',
-            'sources': {'hysteria': {}},
+            'sources': {'hysteria': {'epoch': 'test-epoch', 'counters': {}}},
             'health': {'hysteria': {'ok': True, 'sampled_at':
                           _t.strftime('%Y-%m-%dT%H:%M:%S+00:00', _t.gmtime())}},
             'gaps': [{'from': 1, 'to': 2}] * 100,
