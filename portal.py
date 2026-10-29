@@ -4850,12 +4850,14 @@ def _listening_ports_detail():
     ok = False
     for flag in ('-lntH', '-lunH'):
         try:
-            out = subprocess.run(['ss', flag], capture_output=True, text=True,
-                                 timeout=5).stdout
+            result = subprocess.run(['ss', flag], capture_output=True, text=True,
+                                    timeout=5)
         except Exception:
             continue
+        if result.returncode != 0:
+            continue
         ok = True
-        for line in out.splitlines():
+        for line in result.stdout.splitlines():
             parts = line.split()
             if len(parts) < 4:
                 continue
@@ -5066,12 +5068,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 端口必须落成合法整数（2026-10-25 修）：meta 被改坏时 listen_port 可能是
     # None / 字符串，旧代码会原样拼出 `hysteria2://...:None` 这种所有客户端
     # 都会拒绝的链接，而且没有任何报错提示。这里退回默认端口。
-    try:
-        listen_port = int(m.get('listen_port') or 19984)
-    except (TypeError, ValueError):
-        listen_port = 19984
-    if not 1 <= listen_port <= 65535:
-        listen_port = 19984
+    listen_port = _valid_port(m.get('listen_port')) or 19984
     obfs_password = m.get('obfs_password', '')
     hop_port_range = m.get('hop_port_range', '')
     # 证书信任策略（已逐条对照 v2rayNG 源码 / Xray 内核行为对齐）：

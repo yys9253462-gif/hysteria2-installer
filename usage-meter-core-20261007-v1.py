@@ -33,6 +33,7 @@ def apply_sample(state, source, epoch, counters, sampled_at):
     if previous is not None:
         if (not isinstance(previous, dict)
                 or not isinstance(previous.get('epoch'), str)
+                or not previous.get('epoch')
                 or not isinstance(previous.get('counters'), dict)):
             previous = None
             sources.pop(source, None)
@@ -48,6 +49,15 @@ def apply_sample(state, source, epoch, counters, sampled_at):
     if new_epoch:
         cursors = {}
     deltas = {}
+    # 游标为防止重复累计而保留；速率只能使用相邻两轮都出现的计数。
+    sampled_users = set()
+    if previous is not None:
+        if 'sampled_users' not in previous:
+            sampled_users = set(cursors)  # 兼容没有相邻采样元数据的旧状态。
+        else:
+            recorded = previous['sampled_users']
+            if isinstance(recorded, list) and all(isinstance(uid, str) for uid in recorded):
+                sampled_users = set(recorded)
     for uid, pair in clean.items():
         old = cursors.get(uid)
         if first_sample:
@@ -76,10 +86,12 @@ def apply_sample(state, source, epoch, counters, sampled_at):
         #     会算出荒谬的速率尖峰。
         #   - 零字节增量也通知速率端点，及时清除上一轮非零速度。
         if (old is not None and not new_epoch and not first_sample
+                and uid in sampled_users
                 and uid not in reset_users and uid not in corrupt_users):
             deltas[uid] = (pair['tx'] - old['tx'], pair['rx'] - old['rx'])
     # 消失的用户保持旧游标：临时空响应不能让再次出现的累计值重复计数。
-    sources[source] = {'epoch': epoch, 'counters': cursors, 'sampled_at': sampled_at}
+    sources[source] = {'epoch': epoch, 'counters': cursors, 'sampled_at': sampled_at,
+                       'sampled_users': list(clean)}
     if first_sample:
         sources[source]['baseline_at'] = sampled_at
     elif 'baseline_at' in previous:

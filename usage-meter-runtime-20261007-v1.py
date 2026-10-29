@@ -28,7 +28,9 @@ def _source_fresh(health, source, max_age=30):
     会让 /traffic-speed 与 users/list 在 data_lock 内抛异常 → 整个列表接口
     500（2026-10-29 修）。解析失败一律视为「不新鲜」。
     """
-    entry = (health or {}).get(source)
+    if not isinstance(health, dict):
+        return False
+    entry = health.get(source)
     if not isinstance(entry, dict) or not entry.get('ok'):
         return False
     raw = entry.get('sampled_at')
@@ -61,8 +63,7 @@ def _recent_gaps(m, window_seconds=86400):
     # 单次 0.12 秒全花在重复计算上（2026-10-29 修）。
     # 缺口列表可能整体替换，也可能在时间戳相同时发生改变；不能只看长度
     # 和最后一条时间，否则会把旧列表的健康结果复用到新的状态。
-    cache_key = (json.dumps(gaps, sort_keys=True, ensure_ascii=False),
-                 int(time.time() // 30), window_seconds)
+    cache_key = (gaps, int(time.time() // 30), window_seconds)
     if _recent_gaps_cache.get('key') == cache_key:
         return _recent_gaps_cache['value']
     cutoff = time.time() - window_seconds
@@ -79,7 +80,8 @@ def _recent_gaps(m, window_seconds=86400):
             continue
         if when >= cutoff:
             recent.append(gap)
-    _recent_gaps_cache.update(key=cache_key, value=recent)
+    # 内容快照保留原地修改检测；命中时直接比较结构，避免逐用户序列化整表。
+    _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=recent)
     return recent
 
 class PortalMeter:
@@ -158,7 +160,9 @@ class PortalMeter:
                     # 已存在客户在后续才第一次出现在计数器中时，core 从零累加是有效的：
                     # 当前服务为所有用户保持单调累计，且初始窗口无计数表示0。
                     outcome = core.apply_sample(meter,source,before,counters,now)
-                    meter.setdefault('health',{})[source]={'ok':True,'sampled_at':now,'error':''}
+                    if not isinstance(meter.get('health'), dict):
+                        meter['health']={}
+                    meter['health'][source]={'ok':True,'sampled_at':now,'error':''}
                     meter.setdefault('started_at',now)
                     old=self.data.get('usage_meter')
                     user_changes=[]
@@ -202,23 +206,42 @@ class PortalMeter:
                             print(f'[meter] on_speed failed: {type(exc).__name__}', file=sys.stderr)
             except Exception as exc:
                 with self.lock:
-                    old=copy.deepcopy(self.data.get('usage_meter'))
-                    self.data.setdefault('usage_meter',{}).setdefault('health',{})[source]={
-                        'ok':False,'sampled_at':now,'error':type(exc).__name__}
+                    missing=object()
+                    old_meter=self.data.get('usage_meter',missing)
+                    failed_meter=self.data.setdefault('usage_meter',{})
+                    old_health=failed_meter.get('health',missing)
+                    health=old_health if isinstance(old_health,dict) else {}
+                    failed_meter['health']=health
+                    old_entry=health.get(source,missing)
+                    failure={'ok':False,'sampled_at':now,'error':type(exc).__name__}
+                    health[source]=failure
                 try:
                     self.save()
                 except Exception:
                     with self.lock:
-                        if old is None: self.data.pop('usage_meter',None)
-                        else: self.data['usage_meter']=old
+                        # 只撤销本轮诊断，保留锁外保存期间的账户删除与累计修改。
+                        if (self.data.get('usage_meter') is failed_meter
+                                and failed_meter.get('health') is health
+                                and health.get(source) is failure):
+                            if old_entry is missing: health.pop(source,None)
+                            else: health[source]=old_entry
+                            if not isinstance(old_health,dict) and not health:
+                                if old_health is missing: failed_meter.pop('health',None)
+                                else: failed_meter['health']=old_health
+                            if old_meter is missing and not failed_meter:
+                                self.data.pop('usage_meter',None)
 
     def summary(self, uid):
         with self.lock:
             m=self.data.get('usage_meter',{})
-            health=m.get('health',{})
+            health=m.get('health')
+            if not isinstance(health, dict):
+                health={}
             enabled=self.enabled_sources()
             fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
             initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)
+            user=self.data.get('users',{}).get(uid,{})
+            legacy=user.get('legacy_auth_value',user.get('used_bytes',0)) if isinstance(user,dict) else None
             return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
                 'measurement_started_at':m.get('started_at'),
                 'measurement_ok':initialized and fresh and not _recent_gaps(m),
@@ -231,7 +254,7 @@ class PortalMeter:
                 'measurement_scope':'since_measurement_started',
                 'measurement_sources':{s:copy.deepcopy(health.get(s, {})) for s in enabled},
                 'measurement_gaps':copy.deepcopy(m.get('gaps',[])),
-                'legacy_auth_value':self.data.get('users',{}).get(uid,{}).get('legacy_auth_value', self.data.get('users',{}).get(uid,{}).get('used_bytes',0))}
+                'legacy_auth_value':legacy}
 
     def hot_summary(self, uid):
         """summary() 的轻量版：只算 /traffic-speed 高频轮询需要的标量字段。
@@ -247,7 +270,9 @@ class PortalMeter:
         """
         with self.lock:
             m=self.data.get('usage_meter',{})
-            health=m.get('health',{})
+            health=m.get('health')
+            if not isinstance(health, dict):
+                health={}
             enabled=self.enabled_sources()
             fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
             initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)

@@ -935,7 +935,11 @@ install_binary() {
         return 1
     fi
     rm -rf "$tmpdir"
-    mv -f "${HY2_BIN}.new" "$HY2_BIN"
+    if ! mv -f "${HY2_BIN}.new" "$HY2_BIN"; then
+        rm -f "${HY2_BIN}.new"
+        log_err "替换 ${HY2_BIN} 失败，现有二进制未改动。"
+        return 1
+    fi
     log_info "Hysteria 2 二进制安装成功！版本信息: $($HY2_BIN version 2>&1 | grep -E '^Version:' | head -n1 || echo '未知')"
 }
 
@@ -2537,22 +2541,46 @@ if [[ "$TARGET" == "core" ]]; then
         echo "下载的 Hysteria 二进制无法运行，已放弃更新" >&2
         exit 1
     fi
-    cp -f "$HY2_BIN" "${HY2_BIN}.bak" 2>/dev/null || true
-    mv -f "$TMP_FILE" "$HY2_BIN"
+    # 本次快照独占路径，绝不覆盖或消费用户已有的 .bak。
+    ROLLBACK_FILE="$(mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
+        echo "创建核心备份失败，现有核心未改动" >&2; exit 1; }
+    if ! cp -p "$HY2_BIN" "$ROLLBACK_FILE"; then
+        rm -f "$ROLLBACK_FILE"
+        echo "备份核心失败，已放弃更新，现有核心未改动" >&2
+        exit 1
+    fi
+    if ! mv -f "$TMP_FILE" "$HY2_BIN"; then
+        rm -f "$ROLLBACK_FILE"
+        echo "替换核心失败，现有核心未改动" >&2
+        exit 1
+    fi
     # 老装机补上 masquerade.proxy.xForwarded（见安装模板的注释）。放在核心升级里做，
     # 是因为这里本来就要重启 Hy2，不会为改配置额外断一次所有用户。
     if [[ -f "$HY2_DIR/config.yaml" ]] && ! grep -qE '^[[:space:]]+xForwarded:' "$HY2_DIR/config.yaml"; then
         sed -i -E 's/^([[:space:]]+)rewriteHost:(.*)$/&\n\1xForwarded: true/' "$HY2_DIR/config.yaml" || true
     fi
+    if [[ "$(jq -r '.traffic_suspend.suspended // false' "$HY2_DIR/portal.json" 2>/dev/null)" == "true" ]]; then
+        rm -f "$ROLLBACK_FILE"
+        echo "核心已更新；节点因流量超额被停用，暂不重启"
+        exit 0
+    fi
     if ! systemctl restart hysteria-server 2>/dev/null; then
-        if [[ -f "${HY2_BIN}.bak" ]]; then
-            mv -f "${HY2_BIN}.bak" "$HY2_BIN"
-            systemctl restart hysteria-server 2>/dev/null || true
+        if ! mv -f "$ROLLBACK_FILE" "$HY2_BIN"; then
+            echo "新版本启动失败，回滚失败；本次旧核心保留在 ${ROLLBACK_FILE}" >&2
+            exit 1
         fi
-        echo "新版本启动失败，已回滚到旧版本" >&2
+        if [[ "$(jq -r '.traffic_suspend.suspended // false' "$HY2_DIR/portal.json" 2>/dev/null)" == "true" ]]; then
+            echo "新版本启动失败，已恢复本次旧核心；节点已停用，暂不重启" >&2
+            exit 1
+        fi
+        if ! systemctl restart hysteria-server 2>/dev/null; then
+            echo "已恢复本次旧核心，但旧版本重启仍失败，请检查服务日志" >&2
+            exit 1
+        fi
+        echo "新版本启动失败，已回滚到本次旧版本" >&2
         exit 1
     fi
-    rm -f "${HY2_BIN}.bak"
+    rm -f "$ROLLBACK_FILE"
 elif [[ "$TARGET" == "portal" ]]; then
     # 从主仓库拉取最新 portal.py 并重启 portal 服务。
     # ⚠️ 不能只用 raw.githubusercontent.com：它有 CDN 缓存，push 后数分钟仍返回旧内容，
@@ -4694,7 +4722,7 @@ restart_service() {
     require_installed || return 1
     refuse_if_suspended || return 1
     log_step "重启 Hysteria 2 服务..."
-    systemctl restart hysteria-server
+    systemctl restart hysteria-server || return 1
     log_info "已重启。"
 }
 
@@ -4891,15 +4919,42 @@ flow_install() {
 }
 
 flow_update_core() {
-    check_root
-    check_arch
-    require_installed
-    install_binary
+    check_root || return 1
+    check_arch || return 1
+    require_installed || return 1
+    local rollback_file
+    rollback_file="$(mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
+        log_err "创建核心备份失败，现有二进制未改动。"; return 1; }
+    if ! cp -p "$HY2_BIN" "$rollback_file"; then
+        rm -f "$rollback_file"
+        log_err "备份核心失败，已放弃更新，现有二进制未改动。"
+        return 1
+    fi
+    if ! install_binary; then
+        rm -f "$rollback_file"
+        return 1
+    fi
     if traffic_suspended; then
+        rm -f "$rollback_file"
         log_warn "核心已更新；节点正因流量超额被 Teyir 停用，暂不重启，恢复时会自动用上新核心。"
         return 0
     fi
-    restart_service
+    if ! restart_service; then
+        if ! mv -f "$rollback_file" "$HY2_BIN"; then
+            log_err "新版本启动失败，回滚失败；本次旧核心保留在 ${rollback_file}。"
+            return 1
+        fi
+        # 再次检查 suspended，避免恢复旧核心时绕过刚生效的停用状态。
+        if traffic_suspended; then
+            log_err "新版本启动失败，已恢复本次旧核心；节点已停用，暂不重启。"
+        elif ! restart_service; then
+            log_err "已恢复本次旧核心，但旧版本重启仍失败，请检查服务日志。"
+        else
+            log_err "新版本启动失败，已回滚到本次旧版本。"
+        fi
+        return 1
+    fi
+    rm -f "$rollback_file"
 }
 
 flow_reconfigure() {
