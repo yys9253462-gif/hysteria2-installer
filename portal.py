@@ -778,6 +778,11 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
         finally:
             if os.path.exists(tmp):
                 os.unlink(tmp)
+        # 整机流量超额停用期间不能启动服务，但配置应当落盘并视为成功 ——
+        # 旧实现继续等 active，12 秒后必然「应用失败、已回滚」，
+        # 于是停用期间任何 WARP/出站改动都保存不了（2026-10-30 修）。
+        if _unit_suspended('hysteria-server'):
+            return True, ''
         _restart_hy2()
         after = ('', '0', '')
         for _ in range(12):
@@ -9381,6 +9386,9 @@ if [ ! -x "$WP_BIN" ]; then
     fi
     case "$TAG" in ""|null) TAG="v1.1.3" ;; esac
     WP_DL="wireproxy_linux_${WP_A}.tar.gz"
+    # 先清掉上一个临时目录：旧 trap 只认当前的 $TD，直接重新赋值会让
+    # wgcf 那次 mktemp 的目录永远留在 /tmp（2026-10-30 修）。
+    rm -rf "$TD"
     TD=$(mktemp -d)
     trap 'rm -rf "$TD"' EXIT
     if ! curl -fsSL --max-time 30 --retry 2 -o "${TD}/checksums.txt" \

@@ -34,7 +34,10 @@ def add_stats(config, port):
     rules=cfg.setdefault('routing',{}).setdefault('rules',[])
     if API_RULE not in rules:rules.insert(0,copy.deepcopy(API_RULE))
     api_rule_first(cfg)
-    assert original_clients==[i.get('settings',{}).get('clients') for i in cfg['inbounds'][:len(original_clients)]]
+    # 用显式 raise 而不是 assert：`python -O` 会把 assert 整段剥掉，
+    # 这条「绝不改 clients」的安全检查就静默消失了（2026-10-30 修）。
+    if original_clients!=[i.get('settings',{}).get('clients') for i in cfg['inbounds'][:len(original_clients)]]:
+        raise ValueError('add_stats must not modify inbound clients')
     return cfg
 
 
@@ -94,7 +97,8 @@ def enable_iplimit_routing(config_path, binary, address):
     clients=[copy.deepcopy(i.get('settings',{}).get('clients')) for i in config.get('inbounds',[])]
     add_iplimit_routing(config)
     api_rule_first(config)
-    assert clients==[i.get('settings',{}).get('clients') for i in config.get('inbounds',[])]
+    if clients!=[i.get('settings',{}).get('clients') for i in config.get('inbounds',[])]:
+        raise ValueError('add_iplimit_routing must not modify inbound clients')
     candidate=path.with_name(path.name+'.iplimit-candidate.json')
     # 只保留最近一份备份（2026-10-24 修）：旧实现每次都用纳秒时间戳新建
     # `xray.json.before-iplimit-<ns>`，而这个函数在每次 Xray 重启后都会被调用，

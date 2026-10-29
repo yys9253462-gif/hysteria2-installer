@@ -13,6 +13,7 @@
   - **VLESS-Reality**（TCP）：借用大厂证书握手，无需域名；
   - **VMess-WS-TLS**、**VLESS Encryption**（后量子密钥交换）、**AnyTLS**：需要域名与可信证书。
   - 订阅里与 Hy2 一起下发，Clash / sing-box 用 url-test 自动择优，UDP 被限时自动走 TCP。
+  - ⚠️ **AnyTLS 的流量暂不计入用户已用流量，也不占用「同时在线 IP」名额**：它由独立的 sing-box 进程承载，而上游的 Clash API 不暴露按用户的用量。停用 / 到期 / 超额仍会同步收回它的登录凭据，但仅靠 AnyTLS 无法触发额度限制 —— 对计费敏感的用户请以 Hy2 或 Xray 协议为主。
 - **核心管理页**：集中查看 Hysteria 2 / Xray / sing-box / GOST / WARP / AmneziaWG 的安装状态、版本与服务状态，Xray 与 sing-box 可在此安装 / 卸载。
 - **扩展服务**：GOST 入站代理（SOCKS5 / HTTP / HTTPS）、Cloudflare WARP 分流（AI 站点走干净出口）、AmneziaWG 抗 DPI VPN。
 - **多用户**：每个用户独立的到期时间、流量额度、同时在线 IP 限制，按真实流量计量；停用 / 到期 / 超额 / 删除即时在所有协议上收回并断开现有连接。
