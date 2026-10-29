@@ -6392,8 +6392,12 @@ def serve(path):
                          'Accept': 'application/vnd.github+json'})
             with urllib.request.urlopen(req, timeout=8) as resp:
                 items = json.loads(resp.read().decode('utf-8'))
-            shas = {it['name']: it.get('sha', '')
-                    for it in items if isinstance(it, dict) and it.get('name')}
+            # GitHub 在限流/出错时返回的是对象（{"message": ...}），不是列表；
+            # 旧写法 `for it in items` 直接抛 TypeError，虽然被下面 except 兜住，
+            # 但每次都白跑一遍请求且永远拿不到缓存。
+            shas = ({it['name']: it.get('sha', '') for it in items
+                     if isinstance(it, dict) and it.get('name')}
+                    if isinstance(items, list) else {})
             if shas:
                 _ver_cache['t'] = now
                 _ver_cache['data'] = shas

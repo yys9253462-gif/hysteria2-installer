@@ -50,12 +50,20 @@ CRLF = bytes([13, 10])   # raw HTTP line ending, kept as bytes to avoid escape c
 
 
 def _run_shell(script_text, cwd=None):
-    """写文件再 `bash <file>`（绝不走 -c：MSYS 会做路径转换）。"""
+    """写文件再 `bash <file>`（绝不走 -c：MSYS 会做路径转换）。
+
+    🔴 必须显式 stdin=DEVNULL：这里跑的是从 install.sh 摘出来的交互片段
+    （`read -rsp "请输入机主账号连接密码"`）。不给 stdin 时子进程会继承调用方
+    的管道，`read` 永远等不到 EOF —— 在 CI 上碰巧是 /dev/null 所以能过，
+    在别的执行环境（本地 IDE、远程 runner）里会挂到超时。
+    """
     fd, path = tempfile.mkstemp(suffix=".sh")
     os.close(fd)
     try:
         Path(path).write_text(script_text, encoding="utf-8", newline="\n")
-        return subprocess.run([BASH, path], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        return subprocess.run([BASH, path], cwd=cwd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              stdin=subprocess.DEVNULL, timeout=120)
     finally:
         try:
             os.unlink(path)
