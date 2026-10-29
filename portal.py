@@ -1501,14 +1501,14 @@ def user_share_available(user, now=None):
     # 判据与 user_access_allowed 逐字一致（含 expires_at=0 视为已过期）。
     # 这里内联而不是调用它：本函数在若干测试里是被单独摘出来执行的，
     # 跨函数引用会 NameError；两处必须同步修改，改动时请对照。
-    now = int(time.time()) if now is None else now
+    now = time.time() if now is None else now
     expires_at = user.get('expires_at')
     try:
         return (user.get('status', 'active') == 'active' and
                 (expires_at is None or float(expires_at) > now) and
                 (int(user.get('limit_bytes', 0)) <= 0 or
                  int(user.get('used_bytes', 0)) < int(user.get('limit_bytes', 0))))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return False
 
 
@@ -1592,7 +1592,10 @@ def read_meta_file(meta_path):
     闭包里的名字不在作用域内。
     """
     try:
-        return json.loads(Path(meta_path).read_text(encoding='utf-8'))
+        meta = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+        if not isinstance(meta, dict):
+            raise ValueError('client metadata must be a JSON object')
+        return meta
     except (OSError, ValueError) as exc:
         print('[portal] client_meta.json unreadable: ' + type(exc).__name__, file=sys.stderr)
         return {}
@@ -2936,7 +2939,7 @@ def _safe_int(value, default=0):
     """
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None):
@@ -4258,7 +4261,7 @@ def user_access_allowed(info, now=None):
                 (expires_at is None or float(expires_at) > now) and
                 (int(info.get('limit_bytes', 0)) <= 0 or
                  int(info.get('used_bytes', 0)) < int(info.get('limit_bytes', 0))))
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return False
 
 REALITY_IPLIMIT_RELEASE_SECONDS = 180
@@ -4895,7 +4898,7 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
         for p in extra_blocked:
             try:
                 iv = int(p)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             if 1 <= iv <= 65535:
                 blocked.add(iv)
@@ -5008,7 +5011,7 @@ def _valid_port(value):
         return 0
     try:
         port = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
     return port if 1 <= port <= 65535 else 0
 
@@ -7365,8 +7368,8 @@ if __name__ == '__main__':
                         # expires_at 可能是 None（「永久」的表示方式之一）：
                         # max(None, int) 会抛 TypeError，而这里在锁内、无兜底，
                         # 连接会被直接掐断（2026-10-29 修）。
-                        base_time = max(int(u.get('expires_at') or 0), now_ts)
                         try:
+                            base_time = max(int(u.get('expires_at') or 0), now_ts)
                             new_expiry = int(base_time) + days * 86400
                             new_limit = int(u.get('limit_bytes', 0)) + added_bytes
                             if not 0 <= new_expiry <= 253402300799 or not 0 <= new_limit <= 2**63 - 1:
@@ -7685,7 +7688,7 @@ if __name__ == '__main__':
                     spec = importlib.util.spec_from_file_location('reality_online_config', Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py')
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
-                    with data_lock:
+                    with reality_apply_lock:
                         outcome = module.enable_reality_online(str(portal_path.parent / 'xray.json'), cfg['binary'], cfg['address'])
                     return self.reply_json(200, {'ok': True, 'reality_online': outcome})
 

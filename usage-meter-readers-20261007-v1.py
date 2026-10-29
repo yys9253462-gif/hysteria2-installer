@@ -149,8 +149,8 @@ def read_live_connections():
             for uid,out in output['users'].items():
                 row=live['users'].get(uid,{'connections':0,'ips':[]})
                 if type(row.get('connections'))!=int or row['connections']<0 or not isinstance(row.get('ips'),list):raise ValueError('invalid_core_live_user')
-                out.update(ok=True,hysteria_ok=True,error='',hysteria_count=row['connections'])
-                out['ips']=[{'ip':str(ipaddress.ip_address(ip)),'protocol':'Hy2','last_seen':output['sampled_at']} for ip in row['ips']]
+                ips=[{'ip':str(ipaddress.ip_address(ip)),'protocol':'Hy2','last_seen':output['sampled_at']} for ip in row['ips']]
+                out.update(ok=True,hysteria_ok=True,error='',hysteria_count=row['connections'],ips=ips)
         else:
             online=read_hysteria_online(h['url'],h['secret'])
             core_counts=online
@@ -185,7 +185,9 @@ def read_live_connections():
         for uid,out in output['users'].items():
             if core_counts is not None and core_counts.get(uid,0)==0:
                 out.update(ok=True,hysteria_ok=True,error='',hysteria_count=0)
-            else:out['error']='Hy2在线IP采集失败：'+type(exc).__name__
+            else:
+                out.update(ok=False,hysteria_ok=False,error='Hy2在线IP采集失败：'+type(exc).__name__)
+                out['ips']=[ip for ip in out['ips'] if ip['protocol']!='Hy2']
     # Reality 若已启用核心在线统计则读取；未启用时明确说明，不用历史access日志猜。
     rcfg=cfg.get('reality',{})
     binary=rcfg.get('binary','')
@@ -209,7 +211,10 @@ def read_live_connections():
                 if not isinstance(ips,dict):raise ValueError('invalid_online_ips')
                 for ip,seen in ips.items():out['ips'].append({'ip':str(ipaddress.ip_address(ip)),'protocol':'Reality','last_seen':int(seen)})
         except Exception as exc:
-            for out in output['users'].values():out['reality_error']='Reality在线IP未启用或不可读取：'+str(exc) if isinstance(exc,ValueError) else 'Reality在线IP读取失败：'+type(exc).__name__
+            for out in output['users'].values():
+                out['reality_ok']=False
+                out['ips']=[ip for ip in out['ips'] if ip['protocol']!='Reality']
+                out['reality_error']='Reality在线IP未启用或不可读取：'+str(exc) if isinstance(exc,ValueError) else 'Reality在线IP读取失败：'+type(exc).__name__
     else:
         for out in output['users'].values():out['reality_ok']=True
     return output

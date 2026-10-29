@@ -41,6 +41,7 @@ def apply_sample(state, source, epoch, counters, sampled_at):
                  'reason': 'corrupt_state_reset'})
     totals = new.setdefault('totals', {})
     reset_users = []
+    corrupt_users = []
     first_sample = previous is None
     new_epoch = previous is not None and previous['epoch'] != epoch
     cursors = {} if previous is None else dict(previous['counters'])
@@ -51,8 +52,12 @@ def apply_sample(state, source, epoch, counters, sampled_at):
         old = cursors.get(uid)
         if first_sample:
             delta = 0  # 不声称此前进程内的历史计数属于新计量窗口。
-        elif new_epoch or old is None:
+        elif new_epoch or uid not in cursors:
             delta = pair['tx'] + pair['rx']
+        elif (not isinstance(old, dict) or
+              any(type(old.get(k)) is not int or old[k] < 0 for k in ('tx', 'rx'))):
+            delta = 0
+            corrupt_users.append(uid)
         elif pair['tx'] < old['tx'] or pair['rx'] < old['rx']:
             # 同一 epoch 出现倒退：不能断言是完整 reset（也可能有人 clear）。
             # 保守重建基线并显式标记缺口，不重复累加旧值。
@@ -70,7 +75,8 @@ def apply_sample(state, source, epoch, counters, sampled_at):
         #     delta 是「自服务启动起的累计」而非本轮增量，当成 5 秒的增量
         #     会算出荒谬的速率尖峰。
         #   - 零字节增量也通知速率端点，及时清除上一轮非零速度。
-        if old is not None and not new_epoch and not first_sample and uid not in reset_users:
+        if (old is not None and not new_epoch and not first_sample
+                and uid not in reset_users and uid not in corrupt_users):
             deltas[uid] = (pair['tx'] - old['tx'], pair['rx'] - old['rx'])
     # 消失的用户保持旧游标：临时空响应不能让再次出现的累计值重复计数。
     sources[source] = {'epoch': epoch, 'counters': cursors, 'sampled_at': sampled_at}
@@ -85,6 +91,9 @@ def apply_sample(state, source, epoch, counters, sampled_at):
     if reset_users:
         gaps.append({'source': source, 'at': sampled_at,
                      'reason': 'counter_regressed_rebased', 'users': reset_users})
+    if corrupt_users:
+        gaps.append({'source': source, 'at': sampled_at,
+                     'reason': 'corrupt_cursor_rebased', 'users': corrupt_users})
     new['gaps'] = gaps[-100:]
     state.clear()
     state.update(new)

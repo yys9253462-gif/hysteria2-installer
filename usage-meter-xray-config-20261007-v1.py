@@ -22,7 +22,11 @@ def add_stats(config, port):
         levels.setdefault(level,{})['statsUserUplink']=True
         levels[level]['statsUserDownlink']=True
         levels[level]['statsUserOnline']=True
-    cfg['api']={'tag':'usage-meter-api','services':['StatsService']}
+    api=cfg.get('api') or {'tag':'usage-meter-api'}
+    cfg['api']=api
+    services=list(api.get('services') or [])
+    if 'StatsService' not in services:services.append('StatsService')
+    api['services']=services
     add_iplimit_routing(cfg)
     entries=[i for i in cfg.setdefault('inbounds',[]) if i.get('tag')=='usage-meter-api-in']
     desired={'tag':'usage-meter-api-in','listen':'127.0.0.1','port':port,'protocol':'dokodemo-door','settings':{'address':'127.0.0.1'}}
@@ -74,8 +78,10 @@ def api_rule_first(cfg):
     API 规则只匹配本地 dokodemo 入站，放最前不影响任何用户流量。返回是否改动。
     """
     rules=cfg.setdefault('routing',{}).setdefault('rules',[])
-    if API_RULE not in rules or rules.index(API_RULE)==0:return False
-    rules.remove(API_RULE);rules.insert(0,API_RULE)
+    if API_RULE in rules:
+        if rules.index(API_RULE)==0:return False
+        rules.remove(API_RULE)
+    rules.insert(0,copy.deepcopy(API_RULE))
     return True
 
 
@@ -83,7 +89,7 @@ def iplimit_routing_ready(cfg):
     rules=(cfg.get('routing') or {}).get('rules') or []
     return ('RoutingService' in ((cfg.get('api') or {}).get('services') or []) and
             any(o.get('tag')==IPLIMIT_OUTBOUND_TAG and o.get('protocol')=='blackhole' for o in cfg.get('outbounds',[])[1:]) and
-            (API_RULE not in rules or rules.index(API_RULE)==0))
+            bool(rules) and rules[0]==API_RULE)
 
 
 def enable_iplimit_routing(config_path, binary, address):
@@ -149,15 +155,17 @@ def enable_reality_online(config_path, binary, address):
     if changed:
         candidate.write_text(json.dumps(config,indent=2),encoding='utf-8')
         os.chmod(candidate,path.stat().st_mode & 0o777)
+        replaced=False
         try:
             subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
+            if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
             shutil.copy2(path,backup)
-            os.replace(candidate,path)
+            os.replace(candidate,path);replaced=True
             subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15,check=True)
             subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
             subprocess.run([binary,'api','statsgetallonlineusers','--server='+address],capture_output=True,timeout=5,check=True)
         except Exception:
-            if backup.exists():
+            if replaced:
                 candidate.write_bytes(original)
                 os.replace(candidate,path)
                 subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15,check=True)

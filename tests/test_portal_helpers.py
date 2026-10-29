@@ -92,6 +92,24 @@ class AdoptWithoutAccessFileTests(unittest.TestCase):
             self.assertTrue(access['url'].startswith('https://node.example.com:8443/'))
 
 
+class MetaFileTests(unittest.TestCase):
+    def test_non_object_json_returns_empty_mapping(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'client_meta.json'
+            for value in ('null', '[]', '"text"', '42'):
+                with self.subTest(value=value):
+                    path.write_text(value, encoding='utf-8')
+                    self.assertEqual(portal.read_meta_file(path), {})
+
+    def test_object_is_preserved(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'client_meta.json'
+            path.write_text('{"server_name": "node.example.com"}', encoding='utf-8')
+            self.assertEqual(portal.read_meta_file(path), {'server_name': 'node.example.com'})
+
+
 class PageRenderToleranceTests(unittest.TestCase):
     """单条坏数据不能让整张用户表 500（2026-10-30 修复）。"""
 
@@ -115,6 +133,11 @@ class PageRenderToleranceTests(unittest.TestCase):
 
 
 class FormatBytesTests(unittest.TestCase):
+    def test_safe_int_rejects_nonfinite_numbers(self):
+        for value in (float('inf'), float('-inf'), float('nan')):
+            with self.subTest(value=value):
+                self.assertEqual(portal._safe_int(value, 7), 7)
+
     def test_terabytes(self):
         self.assertEqual(portal.format_bytes(5 * 1024 ** 4), '5.00 TB')
 

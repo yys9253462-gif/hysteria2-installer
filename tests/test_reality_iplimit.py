@@ -176,8 +176,17 @@ class XrayConfigTests(unittest.TestCase):
         xcfg.add_iplimit_routing(cfg)
         self.assertEqual(cfg['api']['services'], ['StatsService', 'RoutingService'])
         self.assertEqual([o['tag'] for o in cfg['outbounds']], ['direct', 'iplimit-block'])
+        self.assertFalse(xcfg.iplimit_routing_ready(cfg))
+        self.assertTrue(xcfg.api_rule_first(cfg))
         self.assertTrue(xcfg.iplimit_routing_ready(cfg))
         self.assertFalse(xcfg.iplimit_routing_ready(self.base))
+
+    def test_add_stats_preserves_existing_api_services(self):
+        cfg = json.loads(json.dumps(self.base))
+        cfg['api']['services'].append('HandlerService')
+        out = xcfg.add_stats(cfg, 19997)
+        self.assertEqual(out['api']['services'], ['StatsService', 'HandlerService', 'RoutingService'])
+        self.assertEqual(cfg['api']['services'], ['StatsService', 'HandlerService'])
 
     def test_add_stats_includes_routing(self):
         cfg = {'inbounds': [{'tag': 'vless-reality-in', 'protocol': 'vless', 'port': 443,
@@ -190,9 +199,20 @@ class XrayConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'xray.json'
             cfg = xcfg.add_iplimit_routing(json.loads(json.dumps(self.base)))
+            xcfg.api_rule_first(cfg)
             path.write_text(json.dumps(cfg), encoding='utf-8')
             with patch.object(xcfg.subprocess, 'run', side_effect=AssertionError('no restart')):
                 self.assertFalse(xcfg.enable_iplimit_routing(str(path), '/x', '127.0.0.1:1')['changed'])
+
+    def test_enable_installs_missing_api_route(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'xray.json'
+            cfg = xcfg.add_iplimit_routing(json.loads(json.dumps(self.base)))
+            path.write_text(json.dumps(cfg), encoding='utf-8')
+            with patch.object(xcfg.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+                result = xcfg.enable_iplimit_routing(str(path), '/x', '127.0.0.1:1')
+            self.assertTrue(result['changed'])
+            self.assertTrue(xcfg.iplimit_routing_ready(json.loads(path.read_text(encoding='utf-8'))))
 
     def test_enable_restores_on_failed_restart(self):
         with tempfile.TemporaryDirectory() as d:

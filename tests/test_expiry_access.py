@@ -48,6 +48,18 @@ class ShareAvailabilityConsistencyTests(unittest.TestCase):
   self.assertTrue(portal.user_access_allowed(u))
   self.assertTrue(portal.user_share_available(u))
 
+ def test_nonfinite_quota_fails_closed(self):
+  for key in ('limit_bytes', 'used_bytes'):
+   u={key: float('inf'), 'limit_bytes': 10} if key == 'used_bytes' else {key: float('inf')}
+   self.assertFalse(portal.user_access_allowed(u, 100))
+   self.assertFalse(portal.user_share_available(u, 100))
+
+ def test_fractional_expiry_uses_same_clock(self):
+  u={'expires_at':100.2}
+  with patch.object(portal.time, 'time', return_value=100.5):
+   self.assertFalse(portal.user_access_allowed(u))
+   self.assertFalse(portal.user_share_available(u))
+
  def test_quota_exhausted_blocks_both(self):
   u={'status':'active','expires_at':2085974400,'limit_bytes':10,'used_bytes':10}
   self.assertFalse(portal.user_access_allowed(u))

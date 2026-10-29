@@ -30,6 +30,29 @@ class LiveTests(unittest.TestCase):
    result=m.read_live_connections()['users']
   self.assertTrue(result['offline']['hysteria_ok']);self.assertEqual(result['offline']['ips'],[])
   self.assertFalse(result['active']['hysteria_ok'])
+ def test_invalid_core_ip_invalidates_entire_snapshot(self):
+  import io
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test'}}
+  def read(path,*args,**kwargs):return json.dumps(cfg if path.name=='usage-meter-config.json' else {'users':{'good':{},'bad':{}}})
+  payload={'revision':'teyir-live-ips-v1','users':{'good':{'connections':1,'ips':['203.0.113.1']},'bad':{'connections':1,'ips':['bad-ip']}}}
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(payload).encode())):
+   users=m.read_live_connections()['users']
+  for result in users.values():
+   self.assertFalse(result['hysteria_ok']);self.assertEqual(result['ips'],[])
+ def test_reality_query_failure_invalidates_snapshot(self):
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test'},'reality':{'binary':'/xray','address':'127.0.0.1:19997'}}
+  def read(path,*args,**kwargs):
+   if path.name=='usage-meter-config.json':return json.dumps(cfg)
+   if path.name=='xray.json':return json.dumps({'policy':{'levels':{'0':{'statsUserOnline':True}}}})
+   return json.dumps({'users':{'a':{},'b':{}}})
+  def command(args):
+   if 'statsgetallonlineusers' in args:return json.dumps({'users':['a','b']})
+   if '--email=a' in args:return json.dumps({'ips':{'203.0.113.1':1}})
+   raise OSError('query failed')
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
+   users=m.read_live_connections()['users']
+  for result in users.values():
+   self.assertFalse(result['reality_ok']);self.assertEqual(result['ips'],[])
  def test_reality_counter_names_resolve_to_user_ids(self):
   cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test-secret'},'reality':{'binary':'/usr/local/bin/xray','address':'127.0.0.1:19997'}}
   def read(path,*args,**kwargs):

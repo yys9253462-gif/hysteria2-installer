@@ -25,6 +25,20 @@ class MeterAccountingTest(unittest.TestCase):
             read=lambda source, cfg: copy.deepcopy(self.counters[source]),
             epoch=lambda service: 'epoch-1', on_speed=lambda *args: self.samples.append(args))
 
+    def test_corrupt_user_cursor_rebases_without_double_counting(self):
+        for old in ({}, None, {'tx': -1, 'rx': 0}):
+            with self.subTest(old=old):
+                state = {'sources': {'hysteria': {'epoch': 'e', 'counters': {'u': old}}},
+                         'totals': {'u': {'hysteria': 100}}}
+                result = runtime.core.apply_sample(state, 'hysteria', 'e',
+                                                   {'u': {'tx': 15, 'rx': 4}}, 10)
+                self.assertEqual(state['totals']['u']['hysteria'], 100)
+                self.assertEqual(result['deltas'], {})
+                self.assertEqual(state['gaps'][-1]['reason'], 'corrupt_cursor_rebased')
+                runtime.core.apply_sample(state, 'hysteria', 'e',
+                                          {'u': {'tx': 17, 'rx': 5}}, 11)
+                self.assertEqual(state['totals']['u']['hysteria'], 103)
+
     def test_real_total_updates_display_and_quota_preserving_legacy(self):
         self.meter.poll()
         self.counters['hysteria']['admin_master'] = {'tx': 1048576, 'rx': 2097152}
@@ -48,6 +62,24 @@ class MeterAccountingTest(unittest.TestCase):
         self.assertEqual(self.samples[0][3:], (5, 'hysteria'))
         self.assertEqual(self.samples[0][1] / self.samples[0][3], 1048576)
         self.assertEqual(self.samples[1][1:4], (0, 0, 7))
+
+    def test_recent_gap_cache_distinguishes_same_length_and_last_timestamp(self):
+        recent = '2026-10-30T00:00:00+00:00'
+        old = '2000-01-01T00:00:00+00:00'
+        with patch.object(runtime.time, 'time', return_value=1793404800):
+            first = {'gaps': [{'at': old}, {'at': old}]}
+            second = {'gaps': [{'at': recent}, {'at': old}]}
+            self.assertEqual(runtime._recent_gaps(first), [])
+            self.assertEqual(runtime._recent_gaps(second), [{'at': recent}])
+
+    def test_old_gap_is_incomplete_but_current_health_can_recover(self):
+        self.meter.poll()
+        self.data['usage_meter']['gaps'] = [{'source': 'hysteria', 'at': '2000-01-01T00:00:00+00:00',
+                                             'reason': 'service_restart_unsampled_tail_unknown'}]
+        summary = self.meter.summary('admin_master')
+        self.assertTrue(summary['measurement_ok'])
+        self.assertTrue(summary['measurement_current_ok'])
+        self.assertFalse(summary['measurement_complete'])
 
     def test_optional_reality_and_no_sources(self):
         self.meter.poll()

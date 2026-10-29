@@ -19,6 +19,15 @@ class EnableTests(unittest.TestCase):
    with patch.object(m.subprocess,'run',side_effect=run):
     with self.assertRaises(subprocess.CalledProcessError):m.enable_reality_online(str(p),'xray','127.0.0.1:19997')
    self.assertEqual(p.read_bytes(),old)
+ def test_concurrent_change_is_not_overwritten(self):
+  with tempfile.TemporaryDirectory() as d:
+   p=Path(d)/'xray.json';p.write_text('{"inbounds": []}')
+   concurrent=b'{"inbounds": [], "concurrent": true}'
+   def run(args,**kwargs):
+    if args[1:3]==['run','-test']:p.write_bytes(concurrent)
+   with patch.object(m.subprocess,'run',side_effect=run):
+    with self.assertRaisesRegex(RuntimeError, 'changed concurrently'):m.enable_reality_online(str(p),'xray','127.0.0.1:19997')
+   self.assertEqual(p.read_bytes(),concurrent)
  def test_invalid_config_never_replaces_original(self):
   with tempfile.TemporaryDirectory() as d:
    p=Path(d)/'xray.json';old=b'{"inbounds": []}';p.write_bytes(old)

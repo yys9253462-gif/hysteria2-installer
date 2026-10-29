@@ -447,6 +447,17 @@ class BoundaryInputTests(unittest.TestCase):
         self.assertNotEqual(portal._pick_reality_port(preferred=True)[0], 1)
         self.assertNotEqual(portal._pick_reality_port(preferred=2087.5)[0], 2087)
 
+    def test_nonfinite_port_is_rejected(self):
+        for value in (float('inf'), float('-inf'), float('nan')):
+            with self.subTest(value=value):
+                self.assertEqual(portal._valid_port(value), 0)
+
+    def test_nonfinite_blocked_port_does_not_break_selection(self):
+        from unittest.mock import patch
+        with patch.object(portal, '_listening_ports', return_value=set()):
+            port, _ = portal._pick_reality_port(preferred=2087, extra_blocked=[float('inf')])
+        self.assertEqual(port, 2087)
+
     def test_corrupt_meta_returns_empty_dict(self):
         import tempfile
         from pathlib import Path

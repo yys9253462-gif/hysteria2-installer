@@ -88,6 +88,23 @@ class WebWorkflowTests(unittest.TestCase):
         extract_method(name, self.ns)(self.handler, '/test-token/')
         return self.response
 
+    def test_api_renew_rejects_corrupt_expiry_without_mutation(self):
+        branch = next(n for n in ast.walk(TREE) if isinstance(n, ast.If)
+                      and isinstance(n.test, ast.Compare)
+                      and any(isinstance(c, ast.Constant) and c.value == 'users/renew'
+                              for c in n.test.comparators))
+        fn = ast.parse('def renew(self, params, now_ts):\n    pass').body[0]
+        fn.body = copy.deepcopy(branch.body)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                     '<renew>', 'exec'), self.ns)
+        user = {'expires_at': 'invalid', 'limit_bytes': 100}
+        self.data['users']['qa-user'] = user
+        status, _ = self.ns['renew'](self.handler, {'user_id': 'qa-user'}, 100)
+        self.assertEqual(status, 400)
+        self.assertEqual(user, {'expires_at': 'invalid', 'limit_bytes': 100})
+        self.save.assert_not_called()
+        self.sync.assert_not_called()
+
     def test_web_create_syncs_reality_clients(self):
         status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user'})
         self.assertEqual(status, 302)

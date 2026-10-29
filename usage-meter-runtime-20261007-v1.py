@@ -59,9 +59,10 @@ def _recent_gaps(m, window_seconds=86400):
     # 结果只取决于全局 gaps，而 summary()/hot_summary() 会**按用户**各调一次，
     # /traffic-speed 每 2 秒 × 全部用户 × 最多 100 条 gap，实测 2000 用户
     # 单次 0.12 秒全花在重复计算上（2026-10-29 修）。
-    # 以 (条数, 最后一条时间, 30 秒桶) 做缓存：gaps 只在 poll 时变化。
-    last = gaps[-1] if isinstance(gaps[-1], dict) else {}
-    cache_key = (len(gaps), str(last.get('at') or ''), int(time.time() // 30), window_seconds)
+    # 缺口列表可能整体替换，也可能在时间戳相同时发生改变；不能只看长度
+    # 和最后一条时间，否则会把旧列表的健康结果复用到新的状态。
+    cache_key = (json.dumps(gaps, sort_keys=True, ensure_ascii=False),
+                 int(time.time() // 30), window_seconds)
     if _recent_gaps_cache.get('key') == cache_key:
         return _recent_gaps_cache['value']
     cutoff = time.time() - window_seconds
@@ -207,7 +208,7 @@ class PortalMeter:
                 'measurement_started_at':m.get('started_at'),
                 'measurement_ok':initialized and fresh and not _recent_gaps(m),
                 'measurement_current_ok': initialized and fresh,
-                'measurement_complete': initialized and not _recent_gaps(m),
+                'measurement_complete': initialized and not m.get('gaps'),
                 'current_online': copy.deepcopy(self.live_snapshot.get('users',{}).get(uid,{})) if self.live_snapshot is not None and time.time()-self.live_sampled_at < 45 else {'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'},
                 'online_ip_scope': 'recent_authentication',
                 'online_devices': self.online_counts.get(uid, 0) if self.online_counts is not None and time.time()-self.online_sampled_at < 30 else None,
