@@ -53,7 +53,7 @@ class PortalTokenTest(unittest.TestCase):
         return req.unredirected_hdrs.get('Authorization')
 
     def test_only_api_github_gets_token(self):
-        self.file.write_text(TOKEN + '\n', encoding='utf-8')
+        self.write_token(TOKEN + '\n')
         self.assertEqual(self.auth_for('https://api.github.com/repos/a/b/commits/main'), 'Bearer ' + TOKEN)
         for url in ('https://github.com/a/b/releases/download/v1/x.tar.gz',
                     'https://ghfast.top/https://api.github.com/repos/a/b',
@@ -74,7 +74,7 @@ class PortalTokenTest(unittest.TestCase):
         self.assertIsNone(self.auth_for('https://api.github.com/x'))
         for bad in ('', 'short', TOKEN + '\r\nX-Evil: 1', 'tok en' + 'a' * 30):
             with self.subTest(bad=bad):
-                self.file.write_text(bad, encoding='utf-8')
+                self.write_token(bad)
                 os.utime(self.file, (1, len(bad) + 1))  # 强制 mtime 变化
                 self.assertIsNone(self.auth_for('https://api.github.com/x'))
 
@@ -82,6 +82,16 @@ class PortalTokenTest(unittest.TestCase):
         opener = urllib.request._opener
         # 按类名判断：别的测试会从文件再加载一份 portal 模块，重新装上的是同名的另一个类对象。
         self.assertTrue(any(type(h).__name__ == 'GitHubTokenHandler' for h in opener.handlers))
+
+    @unittest.skipUnless(os.name == 'posix', 'POSIX 权限位')
+    def test_world_readable_token_file_is_ignored(self):
+        """权限过宽的 token 文件等同于凭据泄露，必须拒绝使用。"""
+        self.file.write_text(TOKEN, encoding='utf-8')
+        self.file.chmod(0o644)
+        self.assertIsNone(self.auth_for('https://api.github.com/x'))
+        self.file.chmod(0o600)
+        os.utime(self.file, (2, 2))  # 触发重新读取
+        self.assertEqual(self.auth_for('https://api.github.com/x'), 'Bearer ' + TOKEN)
 
 
 @unittest.skipUnless(BASH, 'requires bash')
