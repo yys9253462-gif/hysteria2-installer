@@ -1300,6 +1300,165 @@ CEOF
     return 1
 }
 
+# 确保 acme.sh 可用：已有安装先做身份核验，没有就按固定 commit 校验后安装。
+# DNS API 与借 Nginx 签发两条路共用（2026-10-29 从 setup_cert_via_dns_api 抽出）。
+hy2_acme_ensure() {
+    local acct="${HOME}/.acme.sh/acme.sh"
+    if [[ -x "$acct" ]]; then
+        # 已有安装：不重装、不覆盖；**身份核验不通过就硬失败**，
+        # 绝不在执行该脚本 / 调用它签发之前放行。
+        if ! hy2_acme_check_existing "$HOME/.acme.sh"; then
+            log_err "已有 acme.sh 未通过身份核验，已停止：本次不执行它、不签发证书。"
+            log_err "现有证书/账号/脚本均未被改动；按上面的修复办法处理后重跑。"
+            return 1
+        fi
+    else
+        log_step "正在安装 acme.sh ..."
+        # 🔴 绝不把 get.acme.sh 的内容直接管道给 shell：那是下载即执行，
+        # 而且 get.acme.sh 自己还会再去拉浮动 master 的 acme.sh。这里改成
+        # pin commit + 逐文件 blob 身份校验，只有全部通过才执行安装器；
+        # 任何失败都保持原环境不变。
+        if ! hy2_acme_install_verified "$HOME/.acme.sh"; then
+            log_err "acme.sh 安装失败或未通过校验。"
+            log_err "本项目不再执行未校验的远程安装脚本；请确认本机可访问 GitHub API 后重试。"
+            return 1
+        fi
+    fi
+    [[ -x "$acct" ]] || { log_err "acme.sh 不可用。"; return 1; }
+}
+
+# 借本机 Nginx 完成 HTTP-01 签发（2026-10-29）。
+#
+# 80 被 Nginx 占着时，Hysteria 内置 ACME 无法监听 80；但 HTTP-01 只要求
+# http://<域名>/.well-known/acme-challenge/<token> 能取到文件 —— 让 Nginx 来回答即可：
+#   * Nginx 里已有该域名的站点：用 acme.sh 的 --nginx 模式，它临时往那个
+#     server 块里插入验证路径、签完还原，不碰站点其它配置；
+#   * 没有：新增 conf.d/hy2-acme-<域名>.conf，只回答验证路径、其余一律 404。
+#     这个文件要保留 —— 以后 acme.sh 自动续期还要用它。
+# 任何对 Nginx 配置的改动都先 `nginx -t`，不通过立即撤销，绝不能把现有网站弄挂。
+# 输出 "cert|key"；返回 1 表示这条路走不通（调用方继续走 DNS API 兜底）。
+HY2_ACME_WEBROOT="/var/lib/hy2-acme-webroot"
+
+nginx_has_server_name() {
+    # nginx -T 输出全部生效配置。先按 ; { } 切成单条指令再找 server_name ——
+    # 不能只认行首：`server { listen 80; server_name a.com; }` 这种写在一行里的
+    # 站点会被漏掉，随后新建的同名 server 块会把原网站顶成 404（SE 实测踩到）。
+    # 先去注释、并成一行：server_name 的多个域名可以跨行书写。
+    nginx -T 2>/dev/null | sed 's/#.*//' | tr '\n' ' ' | tr ';{}' '\n\n\n' \
+        | sed -nE 's/^[[:space:]]*server_name[[:space:]]+//p' | tr -s ' \t' '\n\n' | grep -qxF "$1"
+}
+
+nginx_name_conflict() {
+    # 同名 server 块并存时 nginx 只给警告、仍能加载，但先加载的那个会接管该域名。
+    nginx -t 2>&1 | grep -qF "conflicting server name \"$1\""
+}
+
+nginx_reload_checked() {
+    nginx -t >/dev/null 2>&1 || return 1
+    systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1
+}
+
+setup_cert_via_nginx() {
+    local domain="$1" email="$2"
+    # 调用方用 $(...) 取 "cert|key"：日志与 acme.sh 输出全部改走 stderr，
+    # 只有最后那一行结果写到 fd 3（原 stdout）。
+    exec 3>&1 1>&2
+    command -v nginx >/dev/null 2>&1 || return 1
+    [[ "$(port_owner tcp 80)" == *nginx* ]] || { log_warn "TCP 80 不是 Nginx 在监听，无法借 Nginx 签发。"; return 1; }
+    if ! nginx -t >/dev/null 2>&1; then
+        log_warn "Nginx 现有配置自检 (nginx -t) 未通过，为避免影响现有网站，不借 Nginx 签发。"
+        return 1
+    fi
+    hy2_acme_ensure || return 1
+    local acct="${HOME}/.acme.sh/acme.sh" conf="" rc=0
+    export SKIP_ACME_SH_UPGRADE=1
+
+    if nginx_has_server_name "$domain"; then
+        log_step "Nginx 已有 ${domain} 的站点，用 acme.sh --nginx 模式临时插入验证路径..."
+        "$acct" --issue --nginx -d "$domain" --server letsencrypt \
+            --accountemail "$email" --keylength ec-256 || rc=$?
+    else
+        conf="/etc/nginx/conf.d/hy2-acme-${domain}.conf"
+        if [[ ! -d /etc/nginx/conf.d ]]; then
+            log_warn "找不到 /etc/nginx/conf.d，无法为 ${domain} 新增验证配置。"
+            return 1
+        fi
+        log_step "为 ${domain} 新增只响应 ACME 验证路径的 Nginx 配置: ${conf}"
+        mkdir -p "$HY2_ACME_WEBROOT/.well-known/acme-challenge"
+        chmod 755 "$HY2_ACME_WEBROOT" "$HY2_ACME_WEBROOT/.well-known" "$HY2_ACME_WEBROOT/.well-known/acme-challenge"
+        local listen6="    listen [::]:80;"
+        [[ -f /proc/net/if_inet6 ]] || listen6=""
+        cat > "$conf" <<EOF
+# 由 hysteria2-installer 生成：只用于 Let's Encrypt 签发与续期 ${domain}，请勿删除。
+server {
+    listen 80;
+${listen6}
+    server_name ${domain};
+    location ^~ /.well-known/acme-challenge/ {
+        root ${HY2_ACME_WEBROOT};
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+    location / {
+        return 404;
+    }
+}
+EOF
+        chmod 644 "$conf"
+        if ! nginx_reload_checked; then
+            # IPv6 监听不可用时再试一次只监听 IPv4。
+            sed -i '/listen \[::\]:80;/d' "$conf"
+            if ! nginx_reload_checked; then
+                rm -f "$conf"
+                nginx_reload_checked || true
+                log_warn "新增的 Nginx 配置未通过 nginx -t，已撤销，现有网站不受影响。"
+                return 1
+            fi
+        fi
+        if ! nginx -T 2>/dev/null | grep -qF "$conf"; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+            log_warn "Nginx 主配置没有包含 /etc/nginx/conf.d/*.conf，无法借 Nginx 签发。"
+            return 1
+        fi
+        # 最后一道保险：检测漏掉了已有的同名站点时，新块会抢走这个域名，立即撤销。
+        if nginx_name_conflict "$domain"; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+            log_warn "Nginx 里已有 ${domain} 的站点，新增配置会与它冲突，已撤销。"
+            return 1
+        fi
+        "$acct" --issue -w "$HY2_ACME_WEBROOT" -d "$domain" --server letsencrypt \
+            --accountemail "$email" --keylength ec-256 || rc=$?
+    fi
+
+    local certdir="$HOME/.acme.sh/${domain}_ecc"
+    # acme.sh 返回 2 表示「证书仍有效、本次跳过」，同样算成功。
+    if [[ ( $rc -ne 0 && $rc -ne 2 ) || ! -s "$certdir/fullchain.cer" || ! -s "$certdir/${domain}.key" ]]; then
+        # 签发失败就撤掉本次新增的验证配置，不在 Nginx 里留下无用的 server 块。
+        if [[ -n "$conf" ]]; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+        fi
+        log_err "借 Nginx 签发失败（acme.sh 返回 ${rc}）。常见原因：域名没解析到本机、云安全组没放行 TCP 80。"
+        return 1
+    fi
+    # 复制到 /etc/hysteria/cert 并登记续期后的重启命令：Hysteria / Xray / sing-box
+    # 都只在启动时读证书，续期后不重启就一直用旧证书，到期即全部握手失败。
+    local out_cert="${HY2_CERT_DIR}/acme-${domain}.crt" out_key="${HY2_CERT_DIR}/acme-${domain}.key"
+    mkdir -p "$HY2_CERT_DIR"
+    if ! "$acct" --install-cert -d "$domain" --ecc \
+            --fullchain-file "$out_cert" --key-file "$out_key" \
+            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls" >/dev/null; then
+        log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败。"
+        return 1
+    fi
+    chmod 600 "$out_key"
+    log_info "借 Nginx 签发成功；续期由 acme.sh 定时任务自动完成，续期后自动重启相关服务。"
+    echo "$out_cert|$out_key" >&3
+    return 0
+}
+
 # 🔴 兜底路线：在 80/443 被占、且无法借反代签发时，用 **acme.sh 的 DNS API**签发。
 #
 # 为什么这是端口冲突下唯一还走得通的路：
@@ -1314,6 +1473,10 @@ CEOF
 # 拿不到凭据就明确告诉用户怎么办，而不是静默退回自签。
 setup_cert_via_dns_api() {
     local domain="$1"
+    # 调用方用 $(...) 取 "cert|key"：日志与 acme.sh 输出全部改走 stderr，
+    # 只有最后那一行结果写到 fd 3（原 stdout）。此前日志混进结果，CERT_FILE
+    # 会变成「一大段日志 + 路径」，Hysteria 读不到证书（2026-10-29 修）。
+    exec 3>&1 1>&2
 
     # 🔴🔴 必须【先选凭据、后装 acme.sh】。
     # 旧顺序是「先装 acme.sh → 再看有没有凭据」，两个后果：
@@ -1334,27 +1497,7 @@ setup_cert_via_dns_api() {
     fi
 
     local acct="${HOME}/.acme.sh/acme.sh"
-    if [[ -x "$acct" ]]; then
-        # 已有安装：不重装、不覆盖；**身份核验不通过就硬失败**，
-        # 绝不在执行该脚本 / 调用它签发之前放行。
-        if ! hy2_acme_check_existing "$HOME/.acme.sh"; then
-            log_err "已有 acme.sh 未通过身份核验，已停止：本次不执行它、不签发证书。"
-            log_err "现有证书/账号/脚本均未被改动；按上面的修复办法处理后重跑。"
-            return 1
-        fi
-    else
-        log_step "正在安装 acme.sh（DNS API 签发，不占用任何端口）..."
-        # 🔴 绝不把 get.acme.sh 的内容直接管道给 shell：那是下载即执行，
-        # 而且 get.acme.sh 自己还会再去拉浮动 master 的 acme.sh。这里改成
-        # pin commit + 逐文件 blob 身份校验，只有全部通过才执行安装器；
-        # 任何失败都保持原环境不变。
-        if ! hy2_acme_install_verified "$HOME/.acme.sh"; then
-            log_err "acme.sh 安装失败（凭据已就绪，仅是工具装不上/未通过校验）。"
-            log_err "本项目不再执行未校验的远程安装脚本；请确认本机可访问 GitHub API 后重试。"
-            return 1
-        fi
-    fi
-    [[ -x "$acct" ]] || { log_err "acme.sh 不可用。"; return 1; }
+    hy2_acme_ensure || return 1
 
     log_info "使用 ${provider} DNS API 签发..."
     # 注意：上游 acme.sh **没有** SKIP_ACME_SH_UPGRADE 这个开关（grep 全文件 0 次命中），
@@ -1390,7 +1533,7 @@ setup_cert_via_dns_api() {
         return 1
     fi
     log_info "acme.sh 签发成功。"
-    echo "$certdir/fullchain.cer|$certdir/${domain}.key"
+    echo "$certdir/fullchain.cer|$certdir/${domain}.key" >&3
     return 0
 }
 
@@ -1468,11 +1611,21 @@ setup_acme_certificate() {
             _hog="${_hog% }"; _hog="${_hog# }"   # 只留非空的那几个
             log_warn "占用 ${ACRE_PORT_BLOCKER} 的服务不是 Caddy（检测到: ${_hog:-未知}）。"
             if [[ "${_hog}" == *nginx* ]]; then
-                log_warn "Nginx 不会自动申请证书，本脚本无法借它签发。"
-                log_warn "可行做法："
-                log_warn "   a) 用 certbot 为 ${SERVER_NAME} 签一张，然后菜单第 4 项 → 证书方式 2"
-                log_warn "   b) 装Caddy 接管证书签发（走 DNS API，不占端口）"
-                log_warn "   c) 下面的 DNS API 兜底路线"
+                log_step "检测到 Nginx，尝试借 Nginx 完成 HTTP-01 验证签发..."
+                _ngres=0
+                _ngpair="$(setup_cert_via_nginx "$SERVER_NAME" "$ACME_EMAIL")" || _ngres=$?
+                if [[ $_ngres -eq 0 && -n "$_ngpair" ]]; then
+                    CERT_TYPE="custom"
+                    CERT_FILE="${_ngpair%%|*}"
+                    KEY_FILE="${_ngpair#*|}"
+                    IS_INSECURE="false"
+                    # SNI 必须是真实域名：自签模式下它被伪装成 www.bing.com，沿用会握手失败
+                    SERVER_NAME="$SERVER_NAME"
+                    log_info "已使用借 Nginx 签发的正式证书: ${CERT_FILE}"
+                    log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
+                    return 0
+                fi
+                log_warn "借 Nginx 签发未成功，继续尝试 DNS API。"
             fi
         fi
 
