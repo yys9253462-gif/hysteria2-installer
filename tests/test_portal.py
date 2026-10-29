@@ -129,7 +129,11 @@ class PortalTest(unittest.TestCase):
             self.assertEqual(json.loads((root/'portal-access.json').read_text(encoding="utf-8")), access)
             self.assertIn('data-copy="hy2-link"', refreshed['page'])
             self.assertIn("script-src 'sha256-", portal.content_policy())
-            self.assertNotIn('unsafe-inline', portal.content_policy())
+            policy = portal.content_policy()
+            # 只允许 style-src-attr 的 inline（页面大量使用 style="..." 属性，
+            # 哈希覆盖不到它们）；脚本仍然必须逐个哈希放行。
+            script_src = policy.split('script-src', 1)[1].split(';', 1)[0]
+            self.assertNotIn('unsafe-inline', script_src)
             self.assertEqual(len(data['token']), 64)
             self.assertEqual(json.loads(data['clash'])['proxies'][0]['password'], meta['auth_password'])
             self.assertNotIn('</textarea><script>', data['page'])

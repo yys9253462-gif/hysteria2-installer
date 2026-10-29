@@ -110,7 +110,8 @@ class PageRenderTest(unittest.TestCase):
         digest = base64.b64encode(hashlib.sha256(portal.SCRIPT.encode()).digest()).decode()
         policy = portal.content_policy()
         self.assertIn('sha256-' + digest, policy)
-        self.assertNotIn('unsafe-inline', policy)
+        script_src = policy.split('script-src', 1)[1].split(';', 1)[0]
+        self.assertNotIn('unsafe-inline', script_src)
 
 
 @unittest.skipUnless(QRENCODE_AVAILABLE, '需要 qrencode 才能构建测试前置数据（Linux/CI 环境）')

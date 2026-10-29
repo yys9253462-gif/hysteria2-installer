@@ -180,7 +180,7 @@ class FrontendRegressionTest(unittest.TestCase):
         self.assertEqual(st, 200)
         csp = hdrs.get('Content-Security-Policy', '')
         self.assertTrue(csp, f'{label} 必须下发 CSP')
-        self.assertNotIn("'unsafe-inline'", csp,
+        self.assertNotIn("'unsafe-inline'", csp.split('script-src', 1)[1].split(';', 1)[0],
                          f'{label} 的 CSP 不应放通 unsafe-inline（那是把防护整体关掉）')
         html = body.decode('utf-8', 'replace')
         scripts = re.findall(r'<script>(.*?)</script>', html, re.S)

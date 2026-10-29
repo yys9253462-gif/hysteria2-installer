@@ -249,7 +249,11 @@ class JsAssetTest(unittest.TestCase):
                 hashlib.sha256(getattr(portal, name).encode()).digest()).decode()
             self.assertIn('sha256-' + digest, policy,
                           f'CSP 缺少 {name} 的 sha256，该脚本会被浏览器拒绝执行')
-        self.assertNotIn('unsafe-inline', policy)
+        script_src = policy.split('script-src', 1)[1].split(';', 1)[0]
+        self.assertNotIn('unsafe-inline', script_src)
+        # 内联 style 属性必须被放行：哈希只覆盖 <style> 块，页面大量用
+        # style="..." 做颜色/宽度，不放行会静默丢样式（2026-10-29 实测）。
+        self.assertIn("style-src-attr 'unsafe-inline'", policy)
 
 
 class SourceHygieneTest(unittest.TestCase):

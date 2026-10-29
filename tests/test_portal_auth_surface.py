@@ -34,7 +34,7 @@ META = dict(
 # 新增 POST 端点时必须同步这里。
 POST_ENDPOINTS = {
     'do-upgrade', 'install-amneziawg', 'install-gost', 'install-warp',
-    'install-xray', 'login', 'manage-amneziawg', 'manage-proxy',
+    'install-xray', 'login', 'logout', 'manage-amneziawg', 'manage-proxy',
     'manage-outbounds', 'manage-reality', 'manage-user', 'manage-vlessenc', 'manage-anytls', 'install-core', 'uninstall-core',
     'manage-vmess', 'manage-warp', 'reboot-server', 'set-bbr',
 }
@@ -130,6 +130,10 @@ class EndpointAuthTest(unittest.TestCase):
                     # login 本身就是登录入口，返回登录页是设计如此
                     self.assertEqual(status, 200, f'{ep} 应返回登录页')
                     self.assertIn(b'login-form', body, f'{ep} 返回的不是登录页')
+                elif ep == 'logout':
+                    # 退出登录只清 Cookie 并 302 回登录页；不鉴权是刻意的
+                    # （会话过期时也必须能退出）。它不解锁任何数据。
+                    self.assertEqual(status, 302, f'{ep} 应重定向到登录页')
                 else:
                     self.assertEqual(status, 401,
                                      f'{ep} 未鉴权却返回 {status}，疑似鉴权绕过')
@@ -137,7 +141,7 @@ class EndpointAuthTest(unittest.TestCase):
 
     def test_wrong_basic_credentials_are_rejected(self):
         bad = 'Basic ' + base64.b64encode(b'admin:wrong-password').decode()
-        for ep in sorted(POST_ENDPOINTS - {'login'}):
+        for ep in sorted(POST_ENDPOINTS - {'login', 'logout'}):
             with self.subTest(endpoint=ep):
                 status, body = self.request('POST', self.prefix + ep, {}, bad)
                 self.assertIn(status, (401, 403),

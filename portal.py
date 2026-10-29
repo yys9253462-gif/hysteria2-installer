@@ -422,6 +422,31 @@ def _yaml_scalar(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+
+_OUTBOUND_NAME_LINE_RE = re.compile(r"^\s*-\s*name:\s*(.+?)\s*$")
+
+
+def _yaml_name_value(raw):
+    """把 `- name: xxx` 里的值还原成真正的名字。
+
+    render_outbound_yaml 现在给值加单引号（防 YAML 注入），解析时必须把
+    引号去掉，否则 ACL 里引用 'my_proxy' 与规则里的 my_proxy 对不上
+    （2026-10-29 修）。
+    """
+    value = str(raw or '').strip()
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        return value[1:-1].replace('\\"', '"')
+    return value
+
+
+def outbound_names_in(text):
+    """按出现顺序返回配置里所有出站名（已去引号）。"""
+    # 必须带 re.M：否则 ^/$ 只匹配整串的开头结尾，一行都提取不到。
+    return [_yaml_name_value(m)
+            for m in re.findall(_OUTBOUND_NAME_LINE_RE.pattern, text or '', re.M)]
+
 def render_outbound_yaml(entry):
     """把一条出站配置渲染成 YAML 片段（缩进与 config.yaml 风格一致）。"""
     otype = entry['type']
@@ -494,9 +519,9 @@ def strip_managed_outbounds(cfg_text):
     out = []
     skipping = False
     for line in lines:
-        m = re.match(r'^\s*-\s*name:\s*(\S+)\s*$', line)
+        m = _OUTBOUND_NAME_LINE_RE.match(line)
         if m:
-            name = m.group(1)
+            name = _yaml_name_value(m.group(1))
             # 内建出站：不跳过，继续保留
             skipping = name not in builtin
             if skipping:
@@ -608,7 +633,7 @@ def _existing_outbound_names():
         cfg = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
     except Exception:
         return []
-    return re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', cfg, re.M)
+    return outbound_names_in(cfg)
 
 
 def outbound_target_exists(target, outbounds=None, existing_names=None):
@@ -629,7 +654,7 @@ def build_warp_acl_config(original, enabled, rules):
         tail0 = 'direct_ipv4' if re.search(r'^\s*-\s*name:\s*direct_ipv4\s*$', text, re.M) else 'direct'
         return text.rstrip('\n') + '\n\n' + '\n'.join(_acl_head() + ['    - %s(all)' % tail0]) + '\n'
 
-    existing = re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', text, re.M)
+    existing = outbound_names_in(text)
     warp_name = 'warp_socks' if 'warp_socks' in existing else 'warp'
     if warp_name not in existing:
         block = ("\n  - name: warp_socks\n    type: socks5\n"
@@ -683,7 +708,7 @@ def render_egress_config(original, state):
     base = strip_acl_block(build_warp_acl_config(original, enabled, []))
     outs = state.get('custom_outbounds', [])
     base = upsert_outbound_block(base, outs)
-    existing = re.findall(r'^\s*-\s*name:\s*(\S+)\s*$', base, re.M)
+    existing = outbound_names_in(base)
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
     rules = normalize_route_rules(state.get('warp_rules', []))
     if not enabled:
@@ -972,11 +997,21 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20):
     restore = ' '.join('cp -f %s %s;' % (shlex.quote(str(bak)), shlex.quote(str(dest)))
                        for dest, bak in backups)
     remove = ' '.join('rm -f %s;' % shlex.quote(str(dest)) for dest in created)
+    marker = shlex.quote('/etc/hysteria/portal-rollback-failed')
+    # 回滚后再做一次健康检查：旧版本本身也可能起不来（更新前就处于 failed）。
+    # 旧脚本只重启、不复查，最终状态是「服务挂着、界面打不开」，日志却说
+    # 「已自动回滚」（2026-10-29 修）。复查仍失败就写一个明确的标记文件，
+    # 下次启动 / 人工排查能直接看到。
     return ('sleep 1; systemctl restart hysteria-portal; '
             'for i in $(seq 1 %d); do sleep 1; python3 -c %s && exit 0; done; '
             'logger -t hysteria-portal "面板更新后未能启动，已自动回滚到旧版本"; '
-            '%s %s systemctl restart hysteria-portal'
-            % (int(wait_seconds), shlex.quote(probe), restore, remove))
+            '%s %s systemctl restart hysteria-portal; '
+            'for i in $(seq 1 10); do sleep 1; python3 -c %s && '
+            '{ logger -t hysteria-portal "回滚后已恢复"; exit 0; }; done; '
+            'logger -t hysteria-portal "回滚后仍未启动，需要人工介入"; '
+            'echo "portal rollback failed at $(date -Is)" > %s'
+            % (int(wait_seconds), shlex.quote(probe), restore, remove,
+               shlex.quote(probe), marker))
 
 
 PORTAL_BUNDLE_FILES = (
@@ -1195,6 +1230,38 @@ def hysteria_asset_arch(machine=None):
     return HYSTERIA_ARCH_ASSET.get(arch) if arch else None
 
 
+
+def _prune_core_backups(directory, keep=3):
+    """只保留最近 keep 份核心备份。
+
+    每次升级都会复制一份完整二进制（Hysteria ~30 MB / Xray ~36 MB），
+    旧实现从不清理：小盘 VPS 上历经几次升级就可能写满根分区，
+    而 portal.json 的原子写入失败会连带影响用户数据（2026-10-29 加）。
+    """
+    directory = Path(directory)
+    try:
+        items = sorted((p for p in directory.iterdir()
+                        if p.is_file() and p.name.startswith(('hysteria-', 'xray-'))),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return
+    for old in items[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            continue
+
+
+def _require_disk_space(path, need_bytes):
+    """可用空间不足时抛错，避免把盘写满导致数据丢失。"""
+    try:
+        free = shutil.disk_usage(str(path)).free
+    except OSError:
+        return
+    if free < need_bytes:
+        raise RuntimeError('磁盘空间不足：需要约 %d MB，当前可用 %d MB'
+                           % (need_bytes // (1024 * 1024), free // (1024 * 1024)))
+
 def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
     binary = Path(binary)
     current = subprocess.run([str(binary), 'version'], capture_output=True, text=True, timeout=5).stdout
@@ -1209,6 +1276,11 @@ def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hyste
     if not asset_arch:
         raise RuntimeError('Unsupported core architecture')
     asset = 'hysteria-linux-' + asset_arch
+    # 下载 + 备份两份完整二进制，先确认放得下再开始（2026-10-29 加）。
+    try:
+        _require_disk_space(binary.parent, binary.stat().st_size * 2 + 64 * 1024 * 1024)
+    except FileNotFoundError:
+        pass
     fd, name = tempfile.mkstemp(prefix='.hysteria-update-', dir=str(binary.parent))
     os.close(fd)
     candidate = Path(name)
@@ -1266,6 +1338,7 @@ def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hyste
             return {'changed': False, 'version': current_line, 'message': '当前核心版本不低于官方候选，未替换现有补丁'}
         directory = Path(backup_dir)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _prune_core_backups(directory)   # 先腾地方，再写本次备份
         backup = directory / ('hysteria-' + str(time.time_ns()))
         shutil.copy2(binary, backup)
         before = _hy2_runtime_identity()
@@ -1432,6 +1505,29 @@ def user_share_available(user, now=None):
         return False
 
 
+
+def _expiry_text(value):
+    """把 expires_at 渲染成人能看懂的到期时间。
+
+    ⚠️ 旧实现用 `expires_at < 2000000000`（2033 年）判断「是否永久」，
+    于是给了十年有效期的用户会被显示成「永久有效」—— 到期那天会突然停服，
+    而面板一直写着永久（2026-10-29 修）。只有**没设到期**才是永久。
+    """
+    if value is None:
+        return '永久有效'
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return '永久有效'
+    if ts <= 0:
+        return '已过期'
+    if ts > 253402300799:       # 9999-12-31，防御性上限
+        return '永久有效'
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return '永久有效'
+
 def format_bytes(b):
     # 负数只可能来自计数器回退或手工改坏的数据；直接展示 "-1 B" 会让人
     # 以为用量是负的。归零并保留原语义（调用方另有 used_bytes 原始值）。
@@ -1443,8 +1539,11 @@ def format_bytes(b):
         return f"{b/1024:.1f} KB"
     elif b < 1024**3:
         return f"{b/1024**2:.2f} MB"
-    else:
+    elif b < 1024**4:
         return f"{b/1024**3:.2f} GB"
+    else:
+        # 大流量套餐（几 TB）此前一律显示成「数千 GB」，读起来费劲。
+        return f"{b/1024**4:.2f} TB"
 
 
 def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
@@ -1601,7 +1700,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         else:
             status_html = '<span class="status-pill active">正常</span>'
 
-        expires_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(u["expires_at"])) if u.get("expires_at") is not None and u["expires_at"] < 2000000000 else "永久有效"
+        expires_str = _expiry_text(u.get("expires_at"))
         ip_limit = u.get("ip_limit", 0)
         ip_limit_str = f"{ip_limit} IP" if ip_limit > 0 else "不限"
         online_ips = len(u.get("online_ips", {}))
@@ -1718,7 +1817,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HY2 · 节点与集群中心</title><style>{STYLE}</style></head><body><main>
 <nav class="topbar" aria-label="页面标识"><div class="brand"><span class="logo">H₂</span> HYSTERIA <span> / 控制中心</span></div><span class="private">● 集群运行中</span></nav>
-<header class="hero"><div class="eyebrow">HYSTERIA 2 NODE DASHBOARD</div><h1>{html.escape(host)}</h1><p>官方核心驱动 · 极速 QUIC 代理 · 多用户开户与流量/IP限制{fake_sni_hint}</p></header>
+<header class="hero"><div class="eyebrow">HYSTERIA 2 NODE DASHBOARD</div><h1>{html.escape(host)}</h1><p>官方核心驱动 · 极速 QUIC 代理 · 多用户开户与流量/IP限制{fake_sni_hint}</p>
+<form method="POST" action="/{token}/logout" style="margin-top:10px"><button class="button" type="submit" style="padding:6px 14px;font-size:12px">退出登录</button></form></header>
 
 <!-- 顶部 Tab 导航栏 -->
 <div class="tab-bar">
@@ -2832,7 +2932,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     else:
         status_html = '<span class="status-pill active">运行正常</span>'
 
-    expires_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(uinfo["expires_at"])) if uinfo.get("expires_at") is not None and uinfo["expires_at"] < 2000000000 else "永久有效"
+    expires_str = _expiry_text(uinfo.get("expires_at"))
     ip_limit = uinfo.get("ip_limit", 0)
     # 按公网 IP 计：同一 Wi-Fi 下多台设备只占 1 个名额，文案不能写成「台设备」。
     ip_limit_str = f"{ip_limit} 个网络（同一网络下设备不限）" if ip_limit > 0 else "不限制"
@@ -2928,8 +3028,13 @@ def content_policy(extra_script=None):
     scripts = ["'sha256-" + digest(SCRIPT) + "'", "'sha256-" + digest(LOGIN_SCRIPT) + "'", "'sha256-" + digest(USER_SCRIPT) + "'"]
     if extra_script:
         scripts.append("'sha256-" + digest(extra_script) + "'")
+    # ⚠️ style-src 里的哈希只覆盖 <style> 块，**不覆盖 style="..." 属性** ——
+    # CSP 里没有 style-src-attr 时，内联样式属性会被直接丢弃。本页面大量使用
+    # 内联样式做颜色/间距/进度条宽度，实测（浏览器计算样式）颜色被还原成默认值，
+    # 界面静默降级。这里单独放开属性级的 inline，<style> 块仍然受哈希保护。
+    # （旧浏览器不认 style-src-attr，行为与现在一致，不会更差。）
     return ("default-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'sha256-" + digest(STYLE)
-            + "'; script-src " + " ".join(scripts)
+            + "'; style-src-attr 'unsafe-inline'; script-src " + " ".join(scripts)
             + "; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
 
@@ -3423,13 +3528,22 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
 
     # server_name 取值：SAN 首选（现代客户端只看 SAN），CN 兜底。
     # 过滤掉 wildcard / 纯 IP / 明显不是域名的 SAN，避免把 *.example.com 写进 sni。
+    # ⚠️ 先看「当前配置里已有的 server_name 是否仍在这张证书里」（2026-10-29 修）。
+    # 一张证书常覆盖多个域名，直接取第一个非通配 SAN 会在换证后把 SNI 悄悄
+    # 换成另一个域名 —— 已发出的订阅全部连不上。install.sh 的 sync_cert_meta
+    # 已经是这个优先级，两处必须一致。
+    current_sn = str(m.get('server_name') or '').strip().lower()
+    san_lower = [str(x).strip().lower() for x in (sans or [])]
     candidate = ''
-    for san in sans:
-        if san.startswith('*.'):
-            continue
-        if _is_dns_name(san):
-            candidate = san
-            break
+    if current_sn and (current_sn in san_lower or current_sn == str(cn or '').strip().lower()):
+        candidate = str(m.get('server_name')).strip()
+    if not candidate:
+        for san in sans or []:
+            if san.startswith('*.'):
+                continue
+            if _is_dns_name(san):
+                candidate = san
+                break
     if not candidate and _is_dns_name(cn):
         candidate = cn
 
@@ -4263,6 +4377,39 @@ def _systemd_state(unit):
         return ''
 
 
+
+def _nft_input_chain():
+    """找到 nftables 里 hook input 且 policy drop 的链，返回 (family, table, chain)。
+
+    纯 nftables 主机（没有 ufw / firewalld）上，门户自己开的 Reality / VMess /
+    AnyTLS / GOST 端口如果不在这里放行，外网就连不上 —— 而安装器只放行了
+    Hy2 自己的端口（2026-10-29 修）。
+    """
+    try:
+        out = subprocess.run(['nft', 'list', 'ruleset'], capture_output=True, text=True,
+                             timeout=5).stdout
+    except Exception:
+        return None
+    table = ''
+    chain = ''
+    for line in out.splitlines():
+        if line.startswith('table '):
+            parts = line.split()
+            if len(parts) >= 3:
+                table = parts[1] + ' ' + parts[2]
+            chain = ''
+        elif line.lstrip().startswith('chain ') and table:
+            chain = line.split()[1].rstrip('{').rstrip(':')
+        elif 'hook input' in line and 'policy drop' in line and chain:
+            fam, _, name = table.partition(' ')
+            return fam, name, chain
+    return None
+
+
+def _nft_port_rule(proto, port):
+    """匹配本模块写入的 accept 规则（用于幂等判断与删除）。"""
+    return re.compile(r'\b%s\s+dport\s+%d\s+accept\b' % (re.escape(proto), int(port)))
+
 def firewall_port(port, proto='tcp', open_=True):
     """在本机防火墙（ufw / firewalld，仅当它们正在运行）上放行或收回一个端口。
 
@@ -4278,16 +4425,40 @@ def firewall_port(port, proto='tcp', open_=True):
         return
     spec = '%d/%s' % (port, proto)
     try:
+        handled = False
         if shutil.which('ufw'):
             status = subprocess.run(['ufw', 'status'], capture_output=True, text=True, timeout=10).stdout
             if status.startswith('Status: active'):
                 cmd = ['ufw', 'allow', spec] if open_ else ['ufw', 'delete', 'allow', spec]
                 subprocess.run(cmd, capture_output=True, timeout=15)
+                handled = True
         if shutil.which('firewall-cmd') and _systemd_state('firewalld') == 'active':
             flag = '--add-port=' if open_ else '--remove-port='
             subprocess.run(['firewall-cmd', '--zone=public', flag + spec, '--permanent'],
                            capture_output=True, timeout=15)
             subprocess.run(['firewall-cmd', '--reload'], capture_output=True, timeout=15)
+            handled = True
+        if not handled and shutil.which('nft'):
+            # 纯 nftables 主机：安装器只放行了 Hy2 的端口，门户新增的协议端口
+            # 必须在这里补上，否则外网连不上而本机一切正常（2026-10-29 修）。
+            target = _nft_input_chain()
+            if target:
+                fam, tbl, chain = target
+                listed = subprocess.run(['nft', '-a', 'list', 'chain', fam, tbl, chain],
+                                        capture_output=True, text=True, timeout=5).stdout
+                matched = [ln for ln in listed.splitlines() if _nft_port_rule(proto, port).search(ln)]
+                if open_:
+                    if not matched:
+                        subprocess.run(['nft', 'add', 'rule', fam, tbl, chain,
+                                        proto, 'dport', str(port), 'accept'],
+                                       capture_output=True, timeout=10)
+                else:
+                    for line in matched:
+                        hm = re.search(r'# handle (\d+)', line)
+                        if hm:
+                            subprocess.run(['nft', 'delete', 'rule', fam, tbl, chain,
+                                            'handle', hm.group(1)],
+                                           capture_output=True, timeout=10)
     except Exception as exc:
         _log_ignored('firewall_port', exc)
 
@@ -5179,7 +5350,10 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     if 'api_key' not in data:
         data['api_key'] = access.get('api_key') or secrets.token_hex(24)
         access['api_key'] = data['api_key']
-        (root / 'portal-access.json').write_text(json.dumps(access, ensure_ascii=False), encoding='utf-8')
+        # 与其他路径一致：portal-access.json 含用户名/密码/api_key，
+        # write_text 会先按 umask 建出 0644 再补权限（2026-10-29 修）。
+        atomic_write_private(root / 'portal-access.json',
+                             json.dumps(access, ensure_ascii=False).encode('utf-8'))
     if 'users' not in data:
         data['users'] = {
             MASTER_USER_ID: {
@@ -7284,9 +7458,22 @@ if __name__ == '__main__':
             if self.path == prefix + 'manage-user':
                 return self._h_post_manage_user(prefix)
 
-            # 4. Web 表单登录
+            # 4. Web 表单登录 / 退出
             if self.path == prefix + 'login':
                 return self._h_post_login(prefix)
+
+            # 退出登录（2026-10-29 加）：此前没有任何登出入口，勾了「记住我」
+            # 的用户只能去浏览器里手删 Cookie，共用电脑时不安全。
+            if self.path == prefix + 'logout':
+                self.send_response(302)
+                self.send_header('Location', prefix)
+                self.send_header('Set-Cookie',
+                                 'hy2_session=; Path=/%s/; HttpOnly; SameSite=Strict; Secure; Max-Age=0'
+                                 % data['token'])
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                return
 
             if self.path == prefix + 'install-warp':
                 return self._h_post_install_warp(prefix)
