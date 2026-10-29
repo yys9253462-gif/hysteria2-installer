@@ -395,8 +395,10 @@ def validate_outbound(entry):
 
     elif otype == 'http':
         url = (entry.get('url') or '').strip()
-        if not re.match(r'^https?://[^\s/]+(?:/.*)?$', url, re.I):
-            return False, None, "HTTP 代理地址格式应为 http://host:port 或 https://host:port"
+        # 路径里也不允许空白：旧正则的 `.*` 允许空格，带空格的 URL
+        # curl 会直接拒绝，而配置照样写进 YAML（2026-10-30 修）。
+        if not re.match(r'^https?://[^\s/]+(?:/.*)?$', url, re.I) or re.search(r'\s', url):
+            return False, None, "HTTP 代理地址格式应为 http://host:port 或 https://host:port（不能含空格）"
         cleaned['url'] = url
         # insecure 只接受明确的一串真值，其他一律当false（别把 "no" 当 true）
         cleaned['insecure'] = str(entry.get('insecure', '')).strip().lower() in ('1', 'true', 'yes', 'on')
@@ -5335,9 +5337,11 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     sync_cert_trust(m, root, meta_path, config_path=config_path)
     sync_pin(m, root, meta_path)
 
-    access = json.loads((root / 'portal-access.json').read_text(encoding='utf-8'))
     path = root / 'portal.json'
     data = json.loads(path.read_text(encoding='utf-8'))
+    # 凭据文件缺失/损坏时重建（保 token、API Key、用户），而不是让
+    # 「刷新页面」「证书自愈」这类日常操作直接抛异常（2026-10-30 修）。
+    access, _rebuilt = ensure_portal_access(root, m, data)
     uri, clash, sing = artifacts(m)
     host = m['public_ip'] if m['is_insecure'] else m['server_name']
     subscription = (f"https://{access['username']}:{access['password']}@"
@@ -5387,6 +5391,34 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
 
+
+def ensure_portal_access(root, meta, data):
+    """读取 portal-access.json；缺失时重建并返回 (access, rebuilt)。
+
+    重建保留 token / API Key / 全部用户，只换一个新的控制台登录密码
+    （旧密码明文无法从 auth_hash 还原）。adopt 与 refresh 共用，避免
+    「凭据文件一丢，重装/刷新就崩或清空用户表」（2026-10-30 修）。
+    """
+    root = Path(root)
+    path = root / 'portal-access.json'
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding='utf-8')), False
+        except (OSError, ValueError):
+            pass
+    username = secrets.token_hex(8)
+    password = secrets.token_urlsafe(18)
+    auth = base64.b64encode(f'{username}:{password}'.encode())
+    data['auth_hash'] = hashlib.sha256(auth).hexdigest()
+    host = meta['public_ip'] if meta.get('is_insecure') else meta.get('server_name', 'localhost')
+    sub_port, _src = resolve_subscription_port(meta)
+    url = f"https://{_host_for_url(host)}:{sub_port}/{data.get('token', '')}/"
+    access = portal_access_payload(url, username, password, data.get('api_key', ''))
+    atomic_write_private(path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
+    print('[portal] portal-access.json 缺失或损坏，已重建访问凭据'
+          '（token / API Key / 用户保留）', file=sys.stderr)
+    return access, True
+
 def adopt(meta_path, port, node_api_key=None):
     """「重新修改配置 / 重新安装」时沿用现有门户，而不是 prepare() 推倒重建。
 
@@ -5401,12 +5433,25 @@ def adopt(meta_path, port, node_api_key=None):
     path = root / 'portal.json'
     data = json.loads(path.read_text(encoding='utf-8'))
     access_path = root / 'portal-access.json'
-    access = json.loads(access_path.read_text(encoding='utf-8'))
+    access, _rebuilt = ensure_portal_access(root, m, data)
     data['port'] = int(port)
     master = data.setdefault('users', {}).setdefault(MASTER_USER_ID, {
         'expires_at': 2085974400, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
         'status': 'active', 'created_at': int(time.time()), 'note': 'Master Admin'})
-    master['password'] = m['auth_password']
+    # auth_password 缺失时不要崩（旧备份 / 手写 meta 可能没有这个键）：
+    # 保留旧的主密码，比让整个 adopt 失败要好。
+    if isinstance(m.get('auth_password'), str) and m['auth_password']:
+        master['password'] = m['auth_password']
+    # 门户登录密码（= Hy2 主密码）变化后，必须让旧会话失效：
+    # 会话 Cookie 只用 session_secret 签名，而它此前从不轮换，
+    # 改完密码后旧浏览器还能继续用 30 天（2026-10-30 修）。
+    # 用**访问凭据**算（门户登录校验的就是它），不能用 master 密码：
+    # 两者如果漂移，用 master 密码算出来的 hash 会让真正的登录密码失效。
+    _new_hash = hashlib.sha256(base64.b64encode(
+        f"{access.get('username','')}:{access.get('password','')}".encode())).hexdigest()
+    if data.get('auth_hash') != _new_hash:
+        data['auth_hash'] = _new_hash
+        data['session_secret'] = secrets.token_hex(32)
     if node_api_key:
         data['api_key'] = node_api_key
         access['api_key'] = node_api_key
@@ -6774,6 +6819,7 @@ if __name__ == '__main__':
         def reply_json(self, code, payload):
             body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
             self.send_response(code)
+            self._responded = True
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store')
@@ -6879,6 +6925,32 @@ if __name__ == '__main__':
             now = time.monotonic()
             with data_lock:
                 self.server.auth_failures.append(now)
+
+        def handle_one_request(self):
+            """兜住所有未捕获异常：转成 500 JSON 并记录，而不是掐断连接。
+
+            处理器里有大量分支没有各自的 try（历史上多次出现「客户端只看到
+            Remote end closed connection，日志里什么都没有」）。这里统一兜底，
+            至少留下异常类型与路径，前端也能拿到一个可读的错误
+            （2026-10-30 加）。
+            """
+            try:
+                super().handle_one_request()
+            except (BrokenPipeError, ConnectionResetError):
+                self.close_connection = True
+            except Exception as exc:
+                print('[portal] unhandled error on %s %s: %s: %s'
+                      % (getattr(self, 'command', '?'), getattr(self, 'path', '?'),
+                         type(exc).__name__, str(exc)[:200]), file=sys.stderr)
+                # 已经发过响应头就不能再发第二个（会把 HTTP 流写坏）。
+                if getattr(self, '_responded', False):
+                    self.close_connection = True
+                    return
+                try:
+                    self.reply_json(500, {'ok': False,
+                                          'error': 'Internal error: %s' % type(exc).__name__})
+                except Exception:
+                    self.close_connection = True
 
         def do_POST(self):
             try:
@@ -7524,6 +7596,7 @@ if __name__ == '__main__':
             # 的用户只能去浏览器里手删 Cookie，共用电脑时不安全。
             if self.path == prefix + 'logout':
                 self.send_response(302)
+                self._responded = True
                 self.send_header('Location', prefix)
                 self.send_header('Set-Cookie',
                                  'hy2_session=; Path=/%s/; HttpOnly; SameSite=Strict; Secure; Max-Age=0'
@@ -7751,7 +7824,12 @@ if __name__ == '__main__':
                     if raw_port and not 1 <= port <= 65535:
                         return 400, {'ok': False, 'error': 'Port must be in 1..65535'}
                     if ptype == 'https':
-                        gost_tls_paths(portal_path.parent)
+                        # 没有可用证书时给 400 + 可读原因，而不是 500 的
+                        # 「proxy add failed: ...」（2026-10-30 修）。
+                        try:
+                            gost_tls_paths(portal_path.parent)
+                        except RuntimeError as exc:
+                            return 400, {'ok': False, 'error': str(exc)}
                     existing = set()
                     for item in previous:
                         try:
@@ -9050,7 +9128,13 @@ if __name__ == '__main__':
                         existing = data.get('users', {}).get(user_id)
                         if existing is not None:
                             tail = (existing.get('password') or '')[-4:]
-                            used_gb = round(int(existing.get('used_bytes', 0)) / (1024 ** 3), 2)
+                            # 数据被改坏时 int('x') 会抛 ValueError，这里只影响
+                            # 一条提示文案，不值得让整个 409 变成 500（2026-10-30 修）。
+                            try:
+                                _used = int(existing.get('used_bytes') or 0)
+                            except (TypeError, ValueError):
+                                _used = 0
+                            used_gb = round(_used / (1024 ** 3), 2)
                             return self.reply(409, (
                                 f'用户 {user_id} 已存在（当前密码尾号 {tail}，已用 {used_gb} GB）。'
                                 # Web 端没有「修改」入口（只有 REST API 的 users/update），
@@ -9109,6 +9193,7 @@ if __name__ == '__main__':
 
                 regenerate_page()
                 self.send_response(302)
+                self._responded = True
                 self.send_header('Location', prefix + '#users')
                 self.end_headers()
                 return
@@ -9147,6 +9232,7 @@ if __name__ == '__main__':
             max_age = f'; Max-Age={SESSION_MAX_AGE}' if remember else ''
             cookie = f'hy2_session={sess_val}; Path=/{data["token"]}/; HttpOnly; SameSite=Strict; Secure{max_age}'
             self.send_response(302)
+            self._responded = True
             self.send_header('Location', prefix)
             self.send_header('Set-Cookie', cookie)
             self.send_header('Cache-Control', 'no-store')
@@ -9980,6 +10066,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if awg_route == 'awg-conf':
                     body = out.encode('utf-8')
                     self.send_response(200)
+                    self._responded = True
                     self.send_header('Content-Type', 'text/plain; charset=utf-8')
                     # 名称虽已过 VALID_AWG_NAME_RE，仍是全文件唯一一处把变量
                     # 直接拼进响应头的位置。统一再白名单过滤一遍，杜绝 CRLF。
@@ -10662,6 +10749,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
         def reply(self, code, body, mime='text/plain', www_auth=False):
             self.send_response(code)
+            self._responded = True
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store')

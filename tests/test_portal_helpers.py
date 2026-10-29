@@ -62,6 +62,36 @@ class NftRuleMatchTests(unittest.TestCase):
         self.assertFalse(rule.search('udp dport 2087 accept'))
 
 
+class AdoptWithoutAccessFileTests(unittest.TestCase):
+    """portal-access.json 丢失时 adopt 必须重建凭据，而不是清空用户。"""
+
+    def test_rebuilds_access_and_keeps_users(self):
+        import json, tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            meta = root / 'client_meta.json'
+            meta.write_text(json.dumps({'server_name': 'node.example.com',
+                                        'public_ip': '192.0.2.1',
+                                        'subscription_port': 8443}), encoding='utf-8')
+            (root / 'portal.json').write_text(json.dumps({
+                'port': 1111, 'token': 'tok', 'api_key': 'k' * 32,
+                'auth_hash': 'a' * 64, 'session_secret': 's' * 32,
+                'users': {'admin_master': {'password': 'pw'}, 'buyer': {'password': 'p2'}},
+                'page': '', 'clash': '', 'sing': '', 'qr': '', 'proxy_services': [],
+            }), encoding='utf-8')
+            with mock.patch.object(portal, 'refresh', lambda *a, **k: None):
+                portal.adopt(meta, 2222)
+            data = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
+            self.assertEqual(data['port'], 2222)
+            self.assertIn('buyer', data['users'], '用户表不能因为凭据文件缺失被清空')
+            access = json.loads((root / 'portal-access.json').read_text(encoding='utf-8'))
+            self.assertTrue(access['username'])
+            self.assertTrue(access['password'])
+            self.assertEqual(access['api_key'], 'k' * 32)
+            self.assertTrue(access['url'].startswith('https://node.example.com:8443/'))
+
+
 class FormatBytesTests(unittest.TestCase):
     def test_terabytes(self):
         self.assertEqual(portal.format_bytes(5 * 1024 ** 4), '5.00 TB')

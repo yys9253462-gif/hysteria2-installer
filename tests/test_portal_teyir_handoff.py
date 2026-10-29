@@ -225,7 +225,10 @@ class ConsoleHandoffTest(unittest.TestCase):
                     and node.func.id == 'portal_access_payload'):
                 callers.add(node.lineno)
 
-        allowed = 2  # prepare() 写盘 + page_html() 渲染
+        # prepare() 写盘 + page_html() 渲染 + adopt() 重建缺失的凭据文件
+        # （2026-10-30 新增：portal-access.json 丢失时在 CLI 路径里重建，
+        #   保留用户与 API Key；它不在任何 HTTP 路由内，下面的窗口检查仍然生效）。
+        allowed = 3
         self.assertEqual(len(callers), allowed,
                          'portal_access_payload 的调用点数量变了（%s 处，行号 %s）——'
                          '新增的出口必须确认只挂在 Basic 鉴权的网页链路上'

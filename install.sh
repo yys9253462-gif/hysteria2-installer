@@ -3422,7 +3422,9 @@ refresh_portal() {
 
 setup_portal() {
     portal_ensure_py
-    if [[ "${PRESERVE_PORTAL:-0}" == "1" && -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]]; then
+    # 只要求 portal.json：凭据文件缺失时 adopt 会重建一份（保留用户与
+    # API Key），不能因为一个文件丢了就把整个用户表推倒重建（2026-10-30 修）。
+    if [[ "${PRESERVE_PORTAL:-0}" == "1" && -f "$HY2_DIR/portal.json" ]]; then
         # 沿用现有门户：token、门户账号密码、API Key、全部用户与代理服务都保留，
         # Teyir 控制台保存的凭据继续有效（见 portal.py adopt）。
         # 检查返回码：prepare/adopt 失败时若被 set -e 打断，脚本会停在
@@ -3458,7 +3460,9 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 755 "$HY2_DIR"
+    # 目录 700：门户与所有配置只允许 root 访问。portal.py 本身是 644，
+    # 但目录不可遍历时本机其他用户既列不出也读不到（2026-10-30 修）。
+    chmod 700 "$HY2_DIR"
     chmod 644 "$HY2_DIR/portal.py"
     chmod 600 "$HY2_DIR/portal.json" "$HY2_DIR/portal-access.json" "$HY2_META_FILE" "$HY2_CONFIG"
     systemctl daemon-reload
@@ -5015,7 +5019,7 @@ if [[ $# -gt 0 ]]; then
         install)
             # 免交互重装时默认沿用现有门户（凭据、API Key、订阅地址、用户），
             # 要彻底重建请显式传 HY2_PRESERVE_PORTAL=0。
-            if [[ -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]]; then
+            if [[ -f "$HY2_DIR/portal.json" ]]; then
                 PRESERVE_PORTAL="${HY2_PRESERVE_PORTAL:-1}"
             fi
             install_dependencies
