@@ -184,9 +184,21 @@ validate_port() {
 # （render_client_config 的 `Endpoint = ${endpoint}:${port}`），
 # 带换行的值能往配置里注入任意行。门户侧有同一校验（VALID_AWG_ENDPOINT_RE），
 # 这里是纵深防御 —— CLI 直调同样走 render_client_config。
-validate_endpoint() {
+endpoint_has_port() {
+    # 已带端口的形式：host:port 或 [v6]:port。用于渲染时避免拼两次。
     local ep="$1"
-    if [[ "$ep" =~ ^[A-Za-z0-9_.-]+(:[0-9]{1,5})?$ ]] || [[ "$ep" =~ ^\[[0-9A-Fa-f:.]+\](:[0-9]{1,5})?$ ]]; then
+    [[ "$ep" =~ ^\[[0-9A-Fa-f:.]+\]:[0-9]+$ ]] || [[ "$ep" =~ ^[A-Za-z0-9_.-]+:[0-9]+$ ]]
+}
+
+validate_endpoint() {
+    local ep="$1" port=""
+    if [[ "$ep" =~ ^[A-Za-z0-9_.-]+(:([0-9]{1,5}))?$ ]] || [[ "$ep" =~ ^\[[0-9A-Fa-f:.]+\](:([0-9]{1,5}))?$ ]]; then
+        port="${BASH_REMATCH[2]}"
+        # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置。
+        if [[ -n "$port" ]] && (( port < 1 || port > 65535 )); then
+            log_err "连接地址里的端口超出范围（1-65535）: ${ep}"
+            return 1
+        fi
         return 0
     fi
     log_err "连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符: ${ep}"
@@ -478,7 +490,13 @@ render_client_config() {
     echo "[Peer]"
     echo "PublicKey = ${pub}"
     echo "PresharedKey = ${psk}"
-    echo "Endpoint = ${endpoint}:${port}"
+    # endpoint 允许自带端口（validate_endpoint 接受 host:port）；
+    # 无脑再拼一次会得到 host:51820:54321，客户端直接握手失败（2026-10-29 修）。
+    if endpoint_has_port "$endpoint"; then
+        echo "Endpoint = ${endpoint}"
+    else
+        echo "Endpoint = ${endpoint}:${port}"
+    fi
     echo "AllowedIPs = 0.0.0.0/0"
     echo "PersistentKeepalive = 25"
 }

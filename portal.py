@@ -5400,6 +5400,13 @@ def serve(path):
             units = state.get('units') if state.get('suspended') else None
             if units is None:
                 units = [u for u in TRAFFIC_SUSPEND_UNITS if _unit_active(u)]
+            else:
+                # 已处于停用状态时也要复核一遍：停用期间有人手动
+                # systemctl start 起来的服务，必须重新停掉，否则整机超额
+                # 状态形同虚设（2026-10-29 修）。
+                for _u in TRAFFIC_SUSPEND_UNITS:
+                    if _u not in units and _unit_active(_u):
+                        units.append(_u)
             for u in units:
                 r = subprocess.run(['systemctl', 'stop', u], capture_output=True, timeout=20)
                 results[u] = r.returncode == 0
@@ -6738,7 +6745,20 @@ if __name__ == '__main__':
                     if not 0 <= traffic_gb <= 1000000:
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: traffic_gb must be 0..1000000'})
+                    # 与 users/renew 同一上界：无上界时能写入无意义的到期时间。
+                    if not 0 <= expires <= 253402300799:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: expires_at out of range'})
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
+                    # limit_bytes / used_bytes 显式传入时以它为准（控制台对账时
+                    # 会带上这两个字段）。旧实现只校验不使用，调用静默失效
+                    # （2026-10-29 修）。
+                    if 'limit_bytes' in params:
+                        limit_bytes = int(params['limit_bytes'])
+                    initial_used = int(params.get('used_bytes', 0))
+                    # active 同理：旧实现校验了却始终写 status=active，
+                    # 控制台传 {"active": false} 开户会拿到 200 但用户照样能连。
+                    want_active = params.get('active', True)
                     note = str(params.get('note', '')).strip()[:200]
 
                     with data_lock:
@@ -6752,8 +6772,8 @@ if __name__ == '__main__':
                             'expires_at': expires,
                             'ip_limit': ip_limit,
                             'limit_bytes': limit_bytes,
-                            'used_bytes': 0,
-                            'status': 'active',
+                            'used_bytes': initial_used,
+                            'status': 'active' if want_active else 'disabled',
                             'created_at': now_ts,
                             'note': note,
                             'view_nonce': secrets.token_hex(8),
@@ -6778,6 +6798,7 @@ if __name__ == '__main__':
                         data.setdefault('users', {})[user_id] = record
                         pwd, expires = record['password'], record['expires_at']
                         ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
+                        status_after = record.get('status', 'active')
                         # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
                         # 对应一个 VLESS UUID，开户即生效。
                         reality_registry(data)
@@ -6821,7 +6842,12 @@ if __name__ == '__main__':
                         'user_id': user_id,
                         'password': pwd,
                         'ip_limit': ip_limit,
-                        'traffic_gb': traffic_gb,
+                        # 用落盘后的真实配额回报。旧实现回的是本次请求解析出的
+                        # traffic_gb（未传时是 0），同名更新保留旧配额时会误导
+                        # 控制台（2026-10-29 修）。
+                        'traffic_gb': round(limit_bytes / (1024**3), 3),
+                        'limit_bytes': limit_bytes,
+                        'status': status_after,
                         'expires_at': expires,
                         'uri': uri,
                         'reality_uri': reality_uri,
@@ -6906,11 +6932,22 @@ if __name__ == '__main__':
                                 raise ValueError()
                         except (ValueError, TypeError, OverflowError):
                             return self.reply_json(400, {'ok': False, 'error': 'Renewal exceeds supported limits'})
-                        u.update(expires_at=new_expiry, limit_bytes=new_limit, status='active')
+                        # 不能无条件写 status='active'：管理员因滥用手动停用的
+                        # 用户，控制台一续费就会被静默恢复可用（2026-10-29 修）。
+                        # 到期与否由 expires_at 判定，不依赖 status。
+                        u.update(expires_at=new_expiry, limit_bytes=new_limit)
                         exp_at = u['expires_at']
                         lim_b = u.get('limit_bytes', 0)
+                        status_now = u.get('status', 'active')
                     regenerate_page()
-                    return self.reply_json(200, {'ok': True, 'user_id': user_id, 'expires_at': exp_at, 'limit_bytes': lim_b})
+                    # 续费后立即同步协议客户端：过期用户续费后不必等 5 秒的
+                    # 后台 worker 才恢复连接。
+                    if not self._sync_reality_clients():
+                        return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    return self.reply_json(200, {'ok': True, 'user_id': user_id,
+                                                 'expires_at': exp_at, 'limit_bytes': lim_b,
+                                                 'traffic_gb': round(lim_b / (1024**3), 3),
+                                                 'status': status_now})
 
                 elif sub == 'users/delete':
                     user_id = str(params.get('user_id', '')).strip()
@@ -7014,6 +7051,12 @@ if __name__ == '__main__':
                                 'status': info.get('status', 'active'),
                                 'traffic_limit_bytes': info.get('limit_bytes', 0),
                                 'traffic_used_bytes': info.get('used_bytes', 0),
+                                # 与 users/get 同名的原始字段（2026-10-29 补）：
+                                # 两个端点此前一套叫 traffic_*、一套叫原始名，
+                                # 调用方按其中一个写就会取到 undefined。
+                                # 两套并存，谁都不用改。
+                                'limit_bytes': info.get('limit_bytes', 0),
+                                'used_bytes': info.get('used_bytes', 0),
                                 **summary,
                                 # 真实在线 IP：来自鉴权时更新的 ip_tracker，
                                 # 窗口与限流判定同一个 IP_TIMEOUT_SECONDS。
@@ -9183,7 +9226,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'anytls': dict(
                                 {
                                     'installed': bool(_singbox_version()),
-                                    'active': _svc_active(ANYTLS_SERVICE),
+                                    # 与 /anytls-status、_active_*_config 同一判据：
+                                    # 「已启用且配置文件在」。只看服务状态会在
+                                    # 配置被删/损坏但进程还在时误报能力可用。
+                                    'active': _active_anytls_config() is not None
+                                              and _svc_active(ANYTLS_SERVICE),
                                     'configured': bool(d_snap['anytls'].get('domain')),
                                 },
                                 **({'port': int(d_snap['anytls'].get('port') or 0)}
@@ -9268,6 +9315,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 'status': info.get('status', 'active'),
                                 'traffic_limit_bytes': info.get('limit_bytes', 0),
                                 'traffic_used_bytes': info.get('used_bytes', 0),
+                                # 与 users/get 同名的原始字段（2026-10-29 补）：
+                                # 两个端点此前一套叫 traffic_*、一套叫原始名，
+                                # 调用方按其中一个写就会取到 undefined。
+                                # 两套并存，谁都不用改。
+                                'limit_bytes': info.get('limit_bytes', 0),
+                                'used_bytes': info.get('used_bytes', 0),
                                 **summary,
                                 # 见 POST 分支同一字段的注释。
                                 'online_ips': [

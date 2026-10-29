@@ -711,8 +711,16 @@ get_public_ip() {
     # docker0、SSRF 跳转）会把回环地址当成公网 IP 写进 client_meta.json，
     # 生成的订阅与二维码指向 127.0.0.1，客户端永远连不上。
     # 之前是靠 `echo "127.0.0.1"` 兜底，现在兜底没了，这条检查是最后一道闸。
+    # 每一段必须在 0-255 内：正则只验形状，999.999.999.999 也能通过。
+    local _octet
+    for _octet in ${PUBLIC_IP//./ }; do
+        if (( _octet > 255 )); then
+            log_err "取到的「公网 IP」不是合法地址（${PUBLIC_IP}）。"
+            return 1
+        fi
+    done
     case "$PUBLIC_IP" in
-        127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|0.*)
+        127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|0.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*|198.1[89].*|198.2[0-9].*)
             log_err "取到的「公网 IP」是回环或私有地址（${PUBLIC_IP}），不能用于对外服务。"
             log_err "若这台机器确实有公网出口，请检查出口网络/代理设置；"
             log_err "若本就在 NAT 后面，请确认已配置端口转发，或改用 Cloudflare WARP 出口。"
@@ -1043,11 +1051,25 @@ select_local_certificate() {
     fi
     echo -e "${GREEN}发现以下本机证书：${PLAIN}"
     for i in "${!certs[@]}"; do echo -e "  ${YELLOW}$((i+1)).${PLAIN} ${certs[$i]%%|*}"; done
-    read -rp "请选择证书编号: " choice || true   # EOF 时走下面的无效选择分支
+    # 只有一张证书时无需询问 —— README 把 type 4 列为可用于免交互部署，
+    # 但旧实现在无终端时会卡在两次 read 上（第二处还没有容错，
+    # set -e 下会直接终止整个脚本）。
+    if [[ ${#certs[@]} -eq 1 ]]; then
+        choice=1
+    else
+        read -rp "请选择证书编号: " choice || true   # EOF 时走下面的无效选择分支
+    fi
     [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#certs[@]} )) || { log_err "无效选择。"; return 1; }
     cert="${certs[$((choice-1))]%%|*}"; key="${certs[$((choice-1))]#*|}"
     CERT_TYPE="custom"; CERT_FILE="$cert"; KEY_FILE="$key"; IS_INSECURE="false"
-    read -rp "请输入证书绑定的域名 (SNI): " SERVER_NAME
+    # SNI 能直接从证书 SAN/CN 推出来时不必再问（无人值守路径的关键）。
+    if [[ -z "${SERVER_NAME:-}" ]]; then
+        SERVER_NAME="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[A-Za-z0-9*._-]+' | head -1 | sed 's/^DNS://')"
+        [[ -z "$SERVER_NAME" ]] && SERVER_NAME="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')"
+    fi
+    if [[ -z "${SERVER_NAME:-}" ]]; then
+        read -rp "请输入证书绑定的域名 (SNI): " SERVER_NAME || true
+    fi
     [[ -n "$SERVER_NAME" ]] || { log_err "域名不能为空。"; return 1; }
 }
 
@@ -1669,7 +1691,7 @@ setup_acme_certificate() {
             log_err " ⚠️ 若继续，将退回【自签证书】，客户端必须开启"
             log_err "「跳过证书校验 / insecure」，个别客户端干脆不支持。"
             echo ""
-            read -rp "仍要继续退回自签证书吗? [y/N, 默认 N]: " fallback_selfsigned
+            read -rp "仍要继续退回自签证书吗? [y/N, 默认 N]: " fallback_selfsigned || true
             fallback_selfsigned=${fallback_selfsigned:-N}
             if [[ ! "$fallback_selfsigned" =~ ^[Yy]$ ]]; then
                 log_err "已中止。请按上述方式提供 DNS API 凭据，或手动准备证书。"
@@ -1927,27 +1949,33 @@ setup_system_firewall() {
             # 用 read 拆分而不是 set --，避免覆盖函数自身的位置参数（$1/$2/$3）。
             local nft_fam nft_tbl nft_chain
             read -r nft_fam nft_tbl nft_chain <<<"$nft_input"
-            # 幂等：已放行则跳过。判据 = 该链里已有一条 udp 规则包含此端口。
-            # 用「数字边界」正则避免 14617 命中 146170 之类。
-            if nft list chain "$nft_fam" "$nft_tbl" "$nft_chain" 2>/dev/null \
-               | grep -E "udp dport" | grep -qE "(^|[^0-9])${port}([^0-9]|$)"; then
-                log_info "nftables 已放行 UDP ${port}，跳过。"
-            else
-                # 直接追加独立 accept 规则。刻意不做「并入已有 dport 集合」的优化：
-                # 那需要解析 `nft -a` 的 handle 再跑 `nft replace rule`，
-                # handle 的输出格式在不同 nft 版本间有差异，猜测成本高于收益。
-                # 独立规则语义等价，且天然幂等（上面已判重）。
-                nft add rule "$nft_fam" "$nft_tbl" "$nft_chain" udp dport ${port} accept >/dev/null 2>&1 || true
-                if [[ -n "$s_port" && -n "$e_port" ]]; then
-                    nft add rule "$nft_fam" "$nft_tbl" "$nft_chain" udp dport ${s_port}-${e_port} accept >/dev/null 2>&1 || true
-                fi
-                nft add rule "$nft_fam" "$nft_tbl" "$nft_chain" tcp dport ${HY2_SUB_PORT} accept >/dev/null 2>&1 || true
-                if [[ "$CERT_TYPE" == "acme" ]]; then
-                    nft add rule "$nft_fam" "$nft_tbl" "$nft_chain" tcp dport 80 accept >/dev/null 2>&1 || true
-                fi
+            # 幂等判据必须**逐条规则**判断。旧实现只在「主 UDP 端口已放行」时
+            # 整体跳过，于是 TCP 订阅端口、端口跳跃区间、ACME 的 80 都不会补 ——
+            # 重装后订阅端口重新随机时面板公网打不开，日志却写着「已跳过」
+            # （2026-10-29 修）。用「数字边界」正则避免 14617 命中 146170。
+            local _nft_rules _changed=0
+            _nft_rules="$(nft list chain "$nft_fam" "$nft_tbl" "$nft_chain" 2>/dev/null)"
+            _nft_has() { grep -qE "(^|[^0-9])$1([^0-9]|$)" <<<"$2"; }
+            _nft_ensure() {   # $1=proto $2=dport 表达式 $3=匹配串
+                _nft_has "$3" "$_nft_rules" && return 0
+                nft add rule "$nft_fam" "$nft_tbl" "$nft_chain" "$1" dport "$2" accept >/dev/null 2>&1 || true
+                _changed=1
+            }
+            _nft_ensure udp "${port}" "udp dport ${port}"
+            if [[ -n "$s_port" && -n "$e_port" ]]; then
+                _nft_ensure udp "${s_port}-${e_port}" "${s_port}-${e_port}"
+            fi
+            _nft_ensure tcp "${HY2_SUB_PORT}" "tcp dport ${HY2_SUB_PORT}"
+            if [[ "$CERT_TYPE" == "acme" ]]; then
+                _nft_ensure tcp 80 "tcp dport 80"
+            fi
+            if [[ "$_changed" == "1" ]]; then
                 log_info "nftables ($nft_fam $nft_tbl/$nft_chain) 已放行 tcp ${HY2_SUB_PORT} + udp ${port}$([[ -n "$s_port" ]] && echo " + udp ${s_port}-${e_port}")。"
                 log_warn "注意：nft 规则默认不持久化。若本机有 /etc/nftables.conf 或自建加载服务，请同步写入以防重启丢失。"
+            else
+                log_info "nftables 规则已齐备（udp ${port} / tcp ${HY2_SUB_PORT}），跳过。"
             fi
+            unset -f _nft_has _nft_ensure
         fi
     fi
     # 裸 iptables 兜底（既无 ufw/firewalld，也无 nft 的情况）。
@@ -2068,11 +2096,18 @@ PYPORT
 # 只匹配 Hy2 自己的规则形态「UDP 端口区间 → REDIRECT 到单个端口」，
 # 不能按 "REDIRECT.*udp" 一把删：同机 Docker / 其他软件的 UDP 转发也会被误删。
 _clear_hop_chain() {
-    local bin="$1" chain="$2" rule
-    while rule=$("$bin" -t nat -S "$chain" 2>/dev/null             | grep -E -- '-p udp .*--dport [0-9]+:[0-9]+ .*-j REDIRECT --to-ports [0-9]+$' | head -n 1)           && [ -n "$rule" ]; do
+    local bin="$1" chain="$2" rule rules
+    # 先把规则清单**完整**读出来再逐条删。
+    # 旧实现 `grep ... | head -n 1` 在 set -o pipefail 下会让 grep 收到 SIGPIPE
+    # 返回 141，while 条件第一次就为假 —— 规则多时只删掉一条、其余残留
+    # （2026-10-29 修）。清单是一次性快照，边删边遍历也没有问题。
+    rules=$("$bin" -t nat -S "$chain" 2>/dev/null         | grep -E -- '-p udp .*--dport [0-9]+:[0-9]+ .*-j REDIRECT --to-ports [0-9]+$' || true)
+    [ -n "$rules" ] || return 0
+    while IFS= read -r rule; do
+        [ -n "$rule" ] || continue
         # shellcheck disable=SC2086  # -S 输出就是参数列表，按空白拆分是有意的
-        "$bin" -t nat ${rule/#-A /-D } 2>/dev/null || break
-    done
+        "$bin" -t nat ${rule/#-A /-D } 2>/dev/null || true
+    done <<< "$rules"
 }
 
 clear_all_hopping_rules() {
@@ -3206,17 +3241,25 @@ sync_cert_meta() {
 
     local cn sans subject issuer self_signed="false" acme_block="false"
     cn="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -1 | sed 's/ *$//')"
-    sans="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | head -1)"
+    # 收集**全部** SAN：一张证书常覆盖多个域名，只取第一个会把 server_name
+    # 写成错的（客户端 SNI 对不上 → 握手失败）。具体选哪个在下面决定。
+    sans="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | tr '\n' ' ')"
     subject="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/^subject=//' | sed 's/ *$//')"
     issuer="$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/^issuer=//' | sed 's/ *$//')"
     [[ -n "$subject" && "$subject" == "$issuer" ]] && self_signed="true"
     grep -q '^acme:' "$HY2_CONFIG" 2>/dev/null && acme_block="true"
 
     # server_name：SAN 优先（现代客户端只认 SAN），CN 兜底；过滤 wildcard。
-    local new_sn=""
-    if [[ -n "$sans" && "$sans" != \** ]]; then
-        new_sn="$sans"
-    elif [[ -n "$cn" && "$cn" != \** ]]; then
+    local new_sn="" _san
+    # 优先本次配置的域名（SERVER_NAME / HY2_DOMAIN 在 SAN 里时用它），
+    # 否则取第一个非通配 SAN；都没有才退回 CN。
+    local _wanted="${SERVER_NAME:-${HY2_DOMAIN:-}}"
+    for _san in $sans; do
+        [[ -z "$_san" || "$_san" == \** ]] && continue
+        if [[ -n "$_wanted" && "$_san" == "$_wanted" ]]; then new_sn="$_san"; break; fi
+        [[ -z "$new_sn" ]] && new_sn="$_san"
+    done
+    if [[ -z "$new_sn" && -n "$cn" && "$cn" != \** ]]; then
         new_sn="$cn"
     fi
     [[ -n "$new_sn" ]] || new_sn="$(jq -r '.server_name // .public_ip // "localhost"' "$HY2_META_FILE" 2>/dev/null || echo localhost)"

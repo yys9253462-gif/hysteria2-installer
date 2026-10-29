@@ -48,7 +48,13 @@ def parse_xray(raw):
         if isinstance(value,str) and value.isdigit(): value=int(value)
         if type(value) is not int or value<0: raise ValueError('invalid xray counter')
         pair=out.setdefault(parts[1],{'tx':0,'rx':0})
-        key='tx' if parts[3]=='downlink' else 'rx'
+        # 方向必须与 Hy2 的语义对齐（2026-10-29 修）：
+        #   * Hysteria 的 LogTraffic 在上行时记 tx、下行时记 rx
+        #     （core/server/server.go：ReceiveDatagram→tx，SendMessage→rx）；
+        #   * 界面把 rx 标成「下行 Download」、tx 标成「上行 Upload」。
+        # Xray 的 uplink = 客户端→服务端 = 上行 = tx，downlink = 下行 = rx。
+        # 旧实现把两者写反了：Reality/VMess/VLESS-Enc 的上下行显示互换。
+        key='rx' if parts[3]=='downlink' else 'tx'
         if key in pair and pair[key]!=0: raise ValueError('duplicate traffic stat')
         pair[key]=value
     return out

@@ -20,6 +20,34 @@ readers=load('usage_meter_readers', 'usage-meter-readers-20261007-v1.py')
 if getattr(core, 'ACCOUNTING_REVISION', None) != ACCOUNTING_REVISION:
     raise RuntimeError('usage_meter_core_revision_mismatch')
 
+def _recent_gaps(m, window_seconds=86400):
+    """最近 window_seconds 内是否发生过计量缺口。
+
+    `gaps` 是**历史事实**，只在超过 100 条时截断，从不按时间失效。
+    旧实现用 `not m.get('gaps')` 判断健康度，于是节点第一次重启之后
+    measurement_ok 永久为 false —— 控制台再也分不清「刚重启过一次」
+    与「计量真的坏了」（2026-10-29 修）。
+    没有时间戳的条目按「最近」处理（保守，宁可报异常）。
+    """
+    gaps = m.get('gaps') or []
+    if not gaps:
+        return []
+    cutoff = time.time() - window_seconds
+    recent = []
+    for gap in gaps:
+        at = (gap or {}).get('at') if isinstance(gap, dict) else None
+        if not at:
+            recent.append(gap)
+            continue
+        try:
+            when = datetime.fromisoformat(str(at).replace('Z', '+00:00')).timestamp()
+        except (TypeError, ValueError):
+            recent.append(gap)
+            continue
+        if when >= cutoff:
+            recent.append(gap)
+    return recent
+
 class PortalMeter:
     def __init__(self, data, lock, save, config, read=None, epoch=None, on_speed=None):
         self.data, self.lock, self.save, self.config=data,lock,save,config
@@ -131,9 +159,9 @@ class PortalMeter:
             initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)
             return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
                 'measurement_started_at':m.get('started_at'),
-                'measurement_ok':initialized and fresh and not m.get('gaps'),
+                'measurement_ok':initialized and fresh and not _recent_gaps(m),
                 'measurement_current_ok': initialized and fresh,
-                'measurement_complete': initialized and not m.get('gaps'),
+                'measurement_complete': initialized and not _recent_gaps(m),
                 'current_online': copy.deepcopy(self.live_snapshot.get('users',{}).get(uid,{})) if self.live_snapshot is not None and time.time()-self.live_sampled_at < 45 else {'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'},
                 'online_ip_scope': 'recent_authentication',
                 'online_devices': self.online_counts.get(uid, 0) if self.online_counts is not None and time.time()-self.online_sampled_at < 30 else None,
@@ -164,7 +192,7 @@ class PortalMeter:
                 for s in enabled)
             initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)
             return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
-                'measurement_ok':initialized and fresh and not m.get('gaps'),
+                'measurement_ok':initialized and fresh and not _recent_gaps(m),
                 'measurement_started_at':m.get('started_at'),
                 'measurement_scope':'since_measurement_started'}
 
