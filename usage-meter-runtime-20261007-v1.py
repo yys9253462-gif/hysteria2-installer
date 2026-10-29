@@ -141,6 +141,13 @@ class PortalMeter:
                 before=self.epoch(service)
                 counters=self.read(source,cfg)
                 if self.epoch(service)!=before: raise RuntimeError('service_changed_during_read')
+                # 🔴 锁顺序（2026-10-29 修）：
+                # 请求线程是「data_lock → meter.lock」（users/list、traffic-speed
+                # 在持有 data_lock 时调用 summary()），所以这里**绝不能**在
+                # 持有 meter.lock 时去调 save()（它内部拿 data_lock）或
+                # on_speed（同样拿 data_lock）—— 那是典型的 ABBA 死锁，一旦
+                # 交错门户就永久卡死，/auth 不可用、所有客户端掉线。
+                # 现在：锁内只算与写字典，锁外落盘与回调。
                 with self.lock:
                     meter=copy.deepcopy(self.data.get('usage_meter',{}))
                     # 每个账户首次基线：不将已存在、未归属新窗口的进程计数混入。
@@ -158,28 +165,34 @@ class PortalMeter:
                         user.setdefault('legacy_auth_value', user.get('used_bytes', 0))
                         user['used_bytes']=core.total_bytes(meter, uid)
                     self.data['usage_meter']=meter
-                    try: self.save()
-                    except Exception:
-                        self.data['users']=old_users
-                        if old is None: self.data.pop('usage_meter',None)
-                        else: self.data['usage_meter']=old
-                        raise
                     sampled=time.monotonic()
                     previous=self.sample_times.get(source)
                     self.sample_times[source]=sampled
-                    if self.on_speed is not None and previous is not None and sampled > previous:
-                        for uid, pair in outcome.get('deltas', {}).items():
-                            try:
-                                self.on_speed(uid, pair[0], pair[1], sampled-previous, source)
-                            except Exception as exc:
-                                print(f'[meter] on_speed failed: {type(exc).__name__}', file=sys.stderr)
+                    deltas=dict(outcome.get('deltas') or {})
+                    interval=sampled-previous if previous is not None else 0
+                try:
+                    self.save()
+                except Exception:
+                    with self.lock:
+                        self.data['users']=old_users
+                        if old is None: self.data.pop('usage_meter',None)
+                        else: self.data['usage_meter']=old
+                    raise
+                if self.on_speed is not None and interval > 0:
+                    for uid, pair in deltas.items():
+                        try:
+                            self.on_speed(uid, pair[0], pair[1], interval, source)
+                        except Exception as exc:
+                            print(f'[meter] on_speed failed: {type(exc).__name__}', file=sys.stderr)
             except Exception as exc:
                 with self.lock:
                     old=copy.deepcopy(self.data.get('usage_meter'))
                     self.data.setdefault('usage_meter',{}).setdefault('health',{})[source]={
                         'ok':False,'sampled_at':now,'error':type(exc).__name__}
-                    try: self.save()
-                    except Exception:
+                try:
+                    self.save()
+                except Exception:
+                    with self.lock:
                         if old is None: self.data.pop('usage_meter',None)
                         else: self.data['usage_meter']=old
 

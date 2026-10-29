@@ -5475,6 +5475,23 @@ def serve(path):
     # 与 prepare() 同一条规则：空串/None 不能当密钥用（.get 的默认值只在
     # 键缺失时生效，手工改坏或截断写入会留下空串）。
     session_secret = data.get('session_secret') or data['auth_hash']
+    # api_key 与 session_secret 同理：空串会让 Bearer 校验退化成常量比较。
+    # 重新生成后要**落盘**（portal.json 与 portal-access.json 两处），
+    # 否则每次重启都换一个新 key，控制台永远对不上。
+    if not isinstance(data.get('api_key'), str) or not data['api_key']:
+        data['api_key'] = secrets.token_hex(24)
+        try:
+            atomic_write_private(portal_path,
+                                 json.dumps(data, ensure_ascii=False).encode('utf-8'))
+            _access_file = portal_path.parent / 'portal-access.json'
+            if _access_file.exists():
+                _access = json.loads(_access_file.read_text(encoding='utf-8'))
+                _access['api_key'] = data['api_key']
+                atomic_write_private(_access_file,
+                                     json.dumps(_access, ensure_ascii=False).encode('utf-8'))
+            print('[portal] api_key 缺失或无效，已重新生成并落盘', file=sys.stderr)
+        except OSError as _e:
+            print('[portal] api_key 重新生成后写盘失败: %s' % _e, file=sys.stderr)
     meta_path = portal_path.parent / 'client_meta.json'
 
     data_lock = threading.RLock()
@@ -5839,12 +5856,16 @@ def serve(path):
         超过控制台 256 KiB 读取上限被截断，对账/同步/开户全部失败。
         现在每个用户只带条数，完整列表由调用方在信封里放一次（键名不变，
         新版控制台读不到用户里的就用信封里的；单个用户的接口仍带完整列表）。
-        返回 (不含 gaps 的 summary, gaps)。
+        返回 (不含 gaps/sources 的 summary, gaps, sources)。
         """
         summary = usage_summary(uid)
         gaps = summary.pop('measurement_gaps', None) or []
+        # measurement_sources 同样是**节点级**的（每个来源的健康快照），
+        # 每个用户带一份会让几百用户时响应再次逼近 256 KiB 上限
+        # （2026-10-30 修，与 gaps 同源问题）。信封里放一次，用户级留空。
+        sources = summary.pop('measurement_sources', None) or {}
         summary['measurement_gap_count'] = len(gaps)
-        return summary, gaps
+        return summary, gaps, sources
 
     def usage_hot_summary(uid):
         """usage_summary 的热路径版（2026-10-28 修）。
@@ -6722,7 +6743,13 @@ if __name__ == '__main__':
 
         def verify_api_key(self):
             auth_header = self.headers.get('Authorization', '')
-            expected = 'Bearer ' + data.get('api_key', '')
+            # api_key 为空/非字符串时一律拒绝（2026-10-29 修）：
+            # 旧实现拼出常量 "Bearer "，而 HTTP 头允许尾随空格，
+            # 一个 `Authorization: Bearer ` 就能通过 —— 等于 API 全开。
+            key = data.get('api_key')
+            if not isinstance(key, str) or not key:
+                return False
+            expected = 'Bearer ' + key
             # ⚠️ 必须先挡非 ASCII（2026-10-09 修）：hmac.compare_digest 遇到
             # 含非 ASCII 字符的 str 会抛 TypeError（只支持 bytes 或纯 ASCII str）。
             # 一个 `Authorization: Bearer 中文` 的请求就会在处理函数里抛未捕获异常
@@ -6998,8 +7025,13 @@ if __name__ == '__main__':
                 # 动态开户 (支持 duration_days, ip_limit, traffic_gb)
                 if sub == 'users/create':
                     user_id = (params.get('user_id') or ('hy2_' + secrets.token_hex(6))).strip()
-                    if not VALID_USER_ID_RE.match(user_id) or user_id in RESERVED_USER_IDS:
+                    if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
+                    if user_id in RESERVED_USER_IDS:
+                        # 分开提示：机主账号是节点主密码，placeholder 是计量占位名。
+                        # 旧文案把它们混成「ID 格式错误」，排查时会被带偏。
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'user_id 是保留名称（机主账号 / 计量占位），不能用于开户'})
 
                     pwd = params.get('password') or secrets.token_hex(16)
                     # 密码必须是字符串：数字/数组会原样落盘，/auth 与 Xray 同步各自
@@ -7048,7 +7080,9 @@ if __name__ == '__main__':
 
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
-                        if params.get('create_only') and existing is not None:
+                        # 只认明确的真值：字符串 "0"/"false" 不该被当成 true。
+                        _create_only = str(params.get('create_only', '')).strip().lower() in ('1', 'true', 'yes', 'on')
+                        if _create_only and existing is not None:
                             return self.reply_json(409, {'ok': False, 'error': 'User already exists'})
                         if params.get('password') and password_taken(data.get('users', {}), pwd, user_id):
                             return self.reply_json(409, {'ok': False, 'error': 'Password already in use by another user'})
@@ -7069,13 +7103,21 @@ if __name__ == '__main__':
                                 record['view_nonce'] = existing['view_nonce']
                             else:
                                 record.pop('view_nonce')
-                            record['used_bytes'] = int(existing.get('used_bytes', 0))
+                            # 显式传入的字段以本次请求为准；没传才保留旧值
+                            # （2026-10-29 修：旧实现无条件保留旧 status/用量，
+                            # 控制台对账时传 active=false 或 limit_bytes 会被静默忽略）。
+                            if 'used_bytes' not in params:
+                                record['used_bytes'] = int(existing.get('used_bytes', 0))
                             record['created_at'] = existing.get('created_at', now_ts)
-                            record['status'] = existing.get('status', 'active')
+                            if 'active' not in params:
+                                record['status'] = existing.get('status', 'active')
                             for param, field in (('password', 'password'), ('ip_limit', 'ip_limit'),
                                                  ('traffic_gb', 'limit_bytes'), ('note', 'note')):
                                 if param not in params or (param == 'password' and not params.get(param)):
                                     record[field] = existing.get(field, record[field])
+                            # traffic_gb 与 limit_bytes 都没传时才沿用旧配额。
+                            if 'traffic_gb' not in params and 'limit_bytes' not in params:
+                                record['limit_bytes'] = existing.get('limit_bytes', record['limit_bytes'])
                             if 'duration_days' not in params and 'expires_at' not in params:
                                 record['expires_at'] = existing.get('expires_at', record['expires_at'])
                         if existing is not None:
@@ -7093,7 +7135,7 @@ if __name__ == '__main__':
                     regenerate_page()
 
                     # 受控对账开户必须确认Reality生效；失败可GET→update同值重试。
-                    if params.get('create_only') and Path('/etc/hysteria/xray.json').exists():
+                    if _create_only and Path('/etc/hysteria/xray.json').exists():
                         if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
                     else:
@@ -7149,8 +7191,15 @@ if __name__ == '__main__':
                 elif sub == 'users/update':
                     # 安全属性更新：不接收用量/创建时间/流量额度，不覆盖用户对象。
                     user_id = str(params.get('user_id', '')).strip()
-                    if not VALID_USER_ID_RE.match(user_id) or user_id in RESERVED_USER_IDS:
+                    if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
+                    if user_id == MASTER_USER_ID:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            '机主账号不通过本接口修改（主密码即节点鉴权密码）；'
+                            '如需更换请使用终端菜单或在面板中操作'})
+                    if user_id in RESERVED_USER_IDS:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'user_id 是保留名称，不能用于修改'})
                     allowed = {'user_id', 'password', 'expires_at', 'ip_limit', 'status'}
                     if set(params) - allowed:
                         return self.reply_json(400, {'ok': False, 'error': 'Unsupported attribute'})
@@ -7162,7 +7211,8 @@ if __name__ == '__main__':
                             changes['password'] = params['password']
                         if 'expires_at' in params:
                             changes['expires_at'] = int(params['expires_at'])
-                            if changes['expires_at'] < 0: raise ValueError()
+                            # 与 create / renew 使用同一上界（9999-12-31）。
+                            if not 0 <= changes['expires_at'] <= 253402300799: raise ValueError()
                         if 'ip_limit' in params:
                             changes['ip_limit'] = int(params['ip_limit'])
                             if not 0 <= changes['ip_limit'] <= 1000: raise ValueError()
@@ -7181,6 +7231,9 @@ if __name__ == '__main__':
                         u.update(changes)
                         rotate_user_view_key_on_change(previous, u)
                         result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
+                        # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
+                        result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
+                        result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
                     regenerate_page()
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
                     if not self._sync_reality_clients():
@@ -7209,7 +7262,10 @@ if __name__ == '__main__':
                         u = data.get('users', {}).get(user_id)
                         if not u:
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                        base_time = max(u.get('expires_at', 0), now_ts)
+                        # expires_at 可能是 None（「永久」的表示方式之一）：
+                        # max(None, int) 会抛 TypeError，而这里在锁内、无兜底，
+                        # 连接会被直接掐断（2026-10-29 修）。
+                        base_time = max(int(u.get('expires_at') or 0), now_ts)
                         try:
                             new_expiry = int(base_time) + days * 86400
                             new_limit = int(u.get('limit_bytes', 0)) + added_bytes
@@ -7321,9 +7377,10 @@ if __name__ == '__main__':
                     now_ts = int(time.time())
                     users_out = []
                     node_gaps = []
+                    node_sources = {}
                     with data_lock:
                         for uid, info in data.get('users', {}).items():
-                            summary, node_gaps = usage_list_summary(uid)
+                            summary, node_gaps, node_sources = usage_list_summary(uid)
                             entry = {
                                 'user_id': uid,
                                 'expires_at': info.get('expires_at', 0),
@@ -7357,7 +7414,8 @@ if __name__ == '__main__':
                             }
                             users_out.append(entry)
                     return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out,
-                                                 'measurement_gaps': node_gaps})
+                                                 'measurement_gaps': node_gaps,
+                                                 'measurement_sources': node_sources})
 
                 elif sub == 'proxy-services/add':
                     # API 通道此前没有异常保护：数据里某条代理的 port 被改坏时
@@ -9601,6 +9659,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         if u is None:
                             return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                         result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
+                        # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
+                        result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
+                        result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
                     return self.reply_json(200, {'ok': True, 'user_id': user_id, 'user': result})
                 if sub == 'node/traffic':
                     try:
@@ -9631,9 +9692,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     now_ts = int(time.time())
                     users_out = []
                     node_gaps = []
+                    node_sources = {}
                     with data_lock:
                         for uid, info in data.get('users', {}).items():
-                            summary, node_gaps = usage_list_summary(uid)
+                            summary, node_gaps, node_sources = usage_list_summary(uid)
                             users_out.append({
                                 'user_id': uid,
                                 'expires_at': info.get('expires_at', 0),
@@ -9659,7 +9721,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 'created_at': info.get('created_at', now_ts),
                             })
                     return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out,
-                                                 'measurement_gaps': node_gaps})
+                                                 'measurement_gaps': node_gaps,
+                                                 'measurement_sources': node_sources})
                 if sub == 'proxy-services/list':
                     with data_lock:
                         items = list(data.get('proxy_services', []))

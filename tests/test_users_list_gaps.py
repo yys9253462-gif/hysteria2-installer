@@ -40,8 +40,11 @@ class UsersListSourceTest(unittest.TestCase):
         # 网页管理通道与 REST API 通道各有一个 users/list，两处都不能再直接展开 usage_summary。
         src = (ROOT / 'portal.py').read_text(encoding='utf-8')
         ast.parse(src)
+        # 2026-10-30：measurement_sources 也提到信封级（同样是节点级数据），
+        # 用户级只留标量；返回签名随之变成三元组。
         self.assertEqual(src.count("'measurement_gaps': node_gaps"), 2)
-        self.assertEqual(src.count('summary, node_gaps = usage_list_summary(uid)'), 2)
+        self.assertEqual(src.count("'measurement_sources': node_sources"), 2)
+        self.assertEqual(src.count('summary, node_gaps, node_sources = usage_list_summary(uid)'), 2)
 
 
 if __name__ == '__main__':

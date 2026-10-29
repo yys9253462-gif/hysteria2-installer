@@ -115,7 +115,11 @@ PANEL_ADMIN_TOKEN=<JWT> python3 panel-join.py --register --panel https://你的�
 | GET | `/api/v1/node/meta`、`node/traffic` | 节点参数、网卡累计流量 |
 | POST | `/api/v1/node/suspend` | 整机超额停用 / 恢复 |
 | GET | `/api/v1/capabilities`、`speedtest` | 节点能力、三网延迟 |
+| GET | `/api/v1/unlock-check` | 节点本机检测流媒体 / AI 服务解锁情况 |
 | GET | `/api/health` | 存活探针（无需鉴权） |
+
+> 各协议的启停（Reality / VMess / VLESS Encryption / AnyTLS）与核心安装都在**网页控制台**里，
+> 走 Basic / 会话鉴权，不在上表的 Bearer 通道内。`capabilities` 会返回各协议是否安装、是否启用。
 
 撤销类操作要确认旧连接已断开才返回成功，做不到时返回 503 并在后台重试。
 
