@@ -1679,15 +1679,21 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     active_count = 0
     total_used_bytes = 0
 
-    for uid, u in sorted(users.items(), key=lambda x: x[1].get("created_at", 0), reverse=True):
-        used_bytes = int(u.get("used_bytes", 0))
-        limit_bytes = int(u.get("limit_bytes", 0))
+    # 排序键必须能比较：某条记录的 created_at 被改成字符串时，
+    # 旧写法会让整张用户表 500（2026-10-30 修）。
+    for uid, u in sorted(users.items(), key=lambda x: _safe_int(x[1].get("created_at") or 0),
+                         reverse=True):
+        used_bytes = _safe_int(u.get("used_bytes") or 0)
+        limit_bytes = _safe_int(u.get("limit_bytes") or 0)
         total_used_bytes += used_bytes
 
         # 展示用的分支判断必须与准入判据 user_access_allowed 同源：
         # 缺 status 视为 active，expires_at 到点即过期。
         is_traffic_ok = limit_bytes <= 0 or used_bytes < limit_bytes
-        is_time_ok = u.get("expires_at") is None or u.get("expires_at") > now_ts
+        try:
+            is_time_ok = u.get("expires_at") is None or float(u.get("expires_at")) > now_ts
+        except (TypeError, ValueError):
+            is_time_ok = True
         is_active = user_access_allowed(u, now_ts)
 
         if is_active:
@@ -2917,13 +2923,30 @@ def share_unavailable_html(reason):
 <section class="card"><p class="hint">如需继续使用，请联系节点管理员续费或恢复账号。
 本页不包含任何连接凭据。</p></section></main></body></html>"""
 
+
+def _safe_int(value, default=0):
+    """把任意输入转 int；失败返回 default。
+
+    用于渲染循环里的用量/时间字段：单条坏数据不应该让整页 500。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
 def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None):
-    used_bytes = int(uinfo.get("used_bytes", 0))
-    limit_bytes = int(uinfo.get("limit_bytes", 0))
+    # 数据被改坏时（字符串用量、非法到期时间）不能让客户页面 500：
+    # 这几个值直接来自 portal.json（2026-10-30 修）。
+    used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
+    limit_bytes = _safe_int(uinfo.get("limit_bytes") or 0)
     now_ts = int(time.time())
     # 与 user_access_allowed 同源：到点即过期、缺 status 视为 active。
     is_traffic_ok = limit_bytes <= 0 or used_bytes < limit_bytes
-    is_time_ok = uinfo.get("expires_at") is None or uinfo.get("expires_at") > now_ts
+    _exp = uinfo.get("expires_at")
+    try:
+        is_time_ok = _exp is None or float(_exp) > now_ts
+    except (TypeError, ValueError):
+        is_time_ok = True
 
     if not is_traffic_ok:
         status_html = '<span class="status-pill expired">流量已超额</span>'
@@ -7836,18 +7859,34 @@ if __name__ == '__main__':
                             existing.add(int(item['port']))
                         except (KeyError, TypeError, ValueError):
                             continue
+                    # 自动选端口时必须避开本机已知的端口：
+                    # Hy2 主端口、订阅端口、各协议端口、已在监听的端口。
+                    # 旧实现只在 12000-58000 里随机，撞上订阅端口就会
+                    # 「保存成功但 gost 起不来」，然后回滚（2026-10-30 修）。
+                    _meta_now = read_meta_file(meta_path)
+                    try:
+                        _cfg_now = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                    except (OSError, ValueError):
+                        _cfg_now = None
+                    with data_lock:
+                        _data_now = dict(data)
+                    _avoid = managed_reserved_ports(_meta_now, _data_now, _cfg_now)
+                    _avoid |= _listening_ports()
+                    if port and port in _avoid:
+                        # 显式端口也要检查：否则 gost 起不来 → 回滚 →
+                        # 用户只看到「应用失败」（2026-10-30 修）。
+                        return 400, {'ok': False, 'error':
+                            '端口 %d 已被本机占用（Hy2 / 订阅 / 其它服务），请换一个' % port}
                     candidates = [port] if port else [random.randint(12000, 58000) for _ in range(100)]
                     selected = 0
                     for candidate in candidates:
-                        if candidate in existing or (not port and 20000 <= candidate <= 40000):
+                        # 不再用 socket.bind 探测：本文件别处（gost 段）明确记着
+                        # 「bind 探测在某些环境会卡住」。_avoid 已经包含 `ss`
+                        # 读到的监听端口，判断它即可（2026-10-30 修）。
+                        if candidate in existing or candidate in _avoid                                 or (not port and 20000 <= candidate <= 40000):
                             continue
-                        try:
-                            with socket.socket() as probe:
-                                probe.bind(('0.0.0.0', candidate))
-                            selected = candidate
-                            break
-                        except OSError:
-                            continue
+                        selected = candidate
+                        break
                     if not selected:
                         return 400, {'ok': False, 'error': '指定端口已占用，或无法找到空闲端口'}
                     port = selected

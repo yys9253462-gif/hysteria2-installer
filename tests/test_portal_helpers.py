@@ -92,6 +92,28 @@ class AdoptWithoutAccessFileTests(unittest.TestCase):
             self.assertTrue(access['url'].startswith('https://node.example.com:8443/'))
 
 
+class PageRenderToleranceTests(unittest.TestCase):
+    """单条坏数据不能让整张用户表 500（2026-10-30 修复）。"""
+
+    META = {'server_name': 'n.example.com', 'public_ip': '192.0.2.1',
+            'listen_port': 19984, 'auth_password': 'p'}
+
+    def _render(self, users):
+        return portal.page_html(self.META, 'hysteria2://x', '#s', '{}', '{}',
+                                users=users, token='t', session_secret='s')
+
+    def test_corrupt_fields_still_render(self):
+        page = self._render({'bad': {'used_bytes': 'x', 'limit_bytes': None,
+                                     'expires_at': 'soon', 'created_at': 'y'}})
+        self.assertIn('bad', page)
+
+    def test_mixed_created_at_types_sort_without_error(self):
+        page = self._render({'a': {'created_at': 'zzz', 'used_bytes': 1},
+                             'b': {'created_at': 123, 'used_bytes': 2}})
+        self.assertIn('>a<', page)
+        self.assertIn('>b<', page)
+
+
 class FormatBytesTests(unittest.TestCase):
     def test_terabytes(self):
         self.assertEqual(portal.format_bytes(5 * 1024 ** 4), '5.00 TB')

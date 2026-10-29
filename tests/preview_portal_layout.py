@@ -26,7 +26,7 @@ STUB = {
     'bbr-status': {'ok': True, 'current': 'bbr', 'qdisc': 'fq', 'kernel': '6.1.0',
                    'reboot_required': False},
     'cert-status': {'ok': True, 'days_left': 62, 'not_after': '2026-12-25 00:00',
-                    'cn': 'node.example.com', 'sans': 'node.example.com',
+                    'cn': 'node.example.com', 'sans': ['node.example.com'],
                     'issuer': "Let's Encrypt", 'cert_type': 'acme',
                     'server_name': 'node.example.com', 'pin': 'aa:bb:cc'},
     'check-version': {'ok': True, 'core_current': '2.6.4', 'core_latest': '2.6.4',

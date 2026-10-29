@@ -39,6 +39,7 @@ def parse_xray(raw):
         raise ValueError('missing stat array')
     if not isinstance(rows,list): raise ValueError('invalid stat array')
     out={}
+    seen=set()
     for row in rows:
         name=row.get('name','')
         parts=name.split('>>>')
@@ -55,7 +56,10 @@ def parse_xray(raw):
         # Xray 的 uplink = 客户端→服务端 = 上行 = tx，downlink = 下行 = rx。
         # 旧实现把两者写反了：Reality/VMess/VLESS-Enc 的上下行显示互换。
         key='rx' if parts[3]=='downlink' else 'tx'
-        if key in pair and pair[key]!=0: raise ValueError('duplicate traffic stat')
+        # 用显式 seen 集合判重：旧写法 `key in pair` 恒真、再叠加 `!=0`，
+        # 两条同为 0 的重复记录会被静默接受（2026-10-30 修）。
+        if (parts[1], key) in seen: raise ValueError('duplicate traffic stat')
+        seen.add((parts[1], key))
         pair[key]=value
     return out
 

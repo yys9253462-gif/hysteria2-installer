@@ -41,6 +41,28 @@ class XrayDirectionTests(unittest.TestCase):
                          {'u1': {'tx': 111, 'rx': 999}})
 
 
+class XrayDuplicateStatTests(unittest.TestCase):
+    def setUp(self):
+        self.readers = _load('usage-meter-readers-20261007-v1.py')
+
+    def test_duplicate_zero_entries_are_rejected(self):
+        """两条同为 0 的重复统计也必须报错（旧实现只拦非零重复）。"""
+        raw = json.dumps({'stat': [
+            {'name': 'user>>>u1>>>traffic>>>uplink', 'value': 0},
+            {'name': 'user>>>u1>>>traffic>>>uplink', 'value': 0},
+        ]})
+        with self.assertRaises(ValueError):
+            self.readers.parse_xray(raw)
+
+    def test_distinct_users_are_fine(self):
+        raw = json.dumps({'stat': [
+            {'name': 'user>>>u1>>>traffic>>>uplink', 'value': 0},
+            {'name': 'user>>>u2>>>traffic>>>uplink', 'value': 0},
+        ]})
+        self.assertEqual(self.readers.parse_xray(raw),
+                         {'u1': {'tx': 0, 'rx': 0}, 'u2': {'tx': 0, 'rx': 0}})
+
+
 class GapWindowTests(unittest.TestCase):
     def setUp(self):
         self.runtime = _load('usage-meter-runtime-20261007-v1.py')

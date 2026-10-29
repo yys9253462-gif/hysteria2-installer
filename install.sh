@@ -3403,7 +3403,9 @@ sync_cert_meta() {
 }
 
 refresh_portal() {
-    [[ -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]] || { log_err "未找到已有网页配置，请先安装。"; return 1; }
+    # 只要求 portal.json：portal-access.json 丢失时 refresh 会重建一份凭据
+    # （保留 token / API Key / 用户），不该让「刷新页面」直接失败（2026-10-30 修）。
+    [[ -f "$HY2_DIR/portal.json" ]] || { log_err "未找到已有网页配置，请先安装。"; return 1; }
     portal_ensure_py
     chmod 644 "$HY2_DIR/portal.py"
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先自愈信任模型再 refresh，

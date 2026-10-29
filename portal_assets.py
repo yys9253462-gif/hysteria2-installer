@@ -1784,7 +1784,12 @@ async function checkCertStatus() {
   } catch (_) { return; }
 
   certSetField('cert-cn', json.common_name);
-  certSetField('cert-sans', (json.sans && json.sans.length) ? json.sans.join(', ') : '--');
+  // 后端正常返回数组，但数据被改坏/版本不一致时可能是字符串或 null。
+  // 直接 .join 会抛 TypeError，把整张证书卡片（含到期告警）一起废掉，
+  // 而这张卡片恰恰是排查「证书过期」的唯一入口（2026-10-30 修）。
+  const sansList = Array.isArray(json.sans) ? json.sans
+                 : (typeof json.sans === 'string' && json.sans ? [json.sans] : []);
+  certSetField('cert-sans', sansList.length ? sansList.join(', ') : '--');
   certSetField('cert-issuer', certShortIssuer(json.issuer));
   certSetField('cert-type', json.self_signed ? '自签名证书' : (json.cert_type === 'acme' ? "Let's Encrypt (ACME)" : '正式证书'));
   certSetField('cert-notafter', json.not_after || '--');
@@ -2075,7 +2080,11 @@ async function loadCores() {
     if (seq !== coresSeq) return;
     if (!res.ok || !json.ok) throw new Error(json.error || ('HTTP ' + res.status));
     coreGrid.textContent = '';
-    json.cores.forEach(core => coreGrid.appendChild(renderCore(core)));
+    // 后端异常时 cores 可能不是数组（错误对象/undefined），直接 forEach 会
+    // 抛出未处理的 rejection，核心卡片停在「读取中」且没有提示。
+    const cores = Array.isArray(json.cores) ? json.cores : [];
+    if (!cores.length) throw new Error('节点没有返回任何核心信息');
+    cores.forEach(core => coreGrid.appendChild(renderCore(core)));
   } catch (e) {
     if (seq === coresSeq) coreGrid.replaceChildren(coreEl('div', 'core-empty', '读取核心状态失败：' + e.message));
   }
@@ -2635,10 +2644,22 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       
       const shareUrl = location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '?k=' + userKey;
       
-      let trafficText = (json.traffic_limit > 0) 
-        ? ((json.traffic_used / (1024**2)).toFixed(1) + ' MB / ' + (json.traffic_limit / (1024**3)).toFixed(1) + ' GB')
-        : ((json.traffic_used / (1024**2)).toFixed(1) + ' MB (不限)');
-      let expireText = (json.expires_at < 2000000000) ? new Date(json.expires_at * 1000).toLocaleString() : '永久有效';
+      // 统一用 fmtBytes：旧写法把已用强制成 MB、配额强制成 GB，
+      // 小配额（如 500 MB）会显示成「0.5 GB」，大用量则是「1536.0 MB」。
+      const fmtBytes = v => {
+        let n = Number(v || 0), i = 0;
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+        return (i ? n.toFixed(2) : n.toFixed(0)) + ' ' + units[i];
+      };
+      let trafficText = (json.traffic_limit > 0)
+        ? (fmtBytes(json.traffic_used) + ' / ' + fmtBytes(json.traffic_limit))
+        : (fmtBytes(json.traffic_used) + ' (不限)');
+      // 与后端 _expiry_text 同一条规则：只有「没有到期时间」才是永久。
+      // 旧阈值 2e9（2033 年）会把十年有效的用户显示成永久有效（2026-10-30 修）。
+      let expireText = (json.expires_at === null || json.expires_at === undefined)
+        ? '永久有效'
+        : new Date(json.expires_at * 1000).toLocaleString();
       let ipText = (json.ip_limit > 0) ? (json.ip_limit + ' IP') : '不限';
       
       uModalBody.innerHTML = `
