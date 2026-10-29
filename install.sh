@@ -712,15 +712,20 @@ get_public_ip() {
     # 生成的订阅与二维码指向 127.0.0.1，客户端永远连不上。
     # 之前是靠 `echo "127.0.0.1"` 兜底，现在兜底没了，这条检查是最后一道闸。
     # 每一段必须在 0-255 内：正则只验形状，999.999.999.999 也能通过。
-    local _octet
+    local _octet _decimal _normalized=""
     for _octet in ${PUBLIC_IP//./ }; do
-        if (( _octet > 255 )); then
+        # 显式十进制，避免 008 报八进制错误；规范化后再做地址范围判断。
+        _decimal=$((10#${_octet}))
+        if (( _decimal > 255 )); then
             log_err "取到的「公网 IP」不是合法地址（${PUBLIC_IP}）。"
             return 1
         fi
+        _normalized+="${_normalized:+.}${_decimal}"
     done
+    PUBLIC_IP="$_normalized"
     case "$PUBLIC_IP" in
-        127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|0.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[0-2][0-9].*|198.1[89].*|198.2[0-9].*)
+        # CGNAT 为 100.64.0.0/10，基准测试网为 198.18.0.0/15。
+        127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|0.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|198.1[89].*)
             log_err "取到的「公网 IP」是回环或私有地址（${PUBLIC_IP}），不能用于对外服务。"
             log_err "若这台机器确实有公网出口，请检查出口网络/代理设置；"
             log_err "若本就在 NAT 后面，请确认已配置端口转发，或改用 Cloudflare WARP 出口。"
@@ -1089,7 +1094,7 @@ select_local_certificate() {
             *) continue ;;
         esac
         [[ -f "$key" ]] && certs+=("$cert|$key")
-    done < <(find /etc/letsencrypt/live /root/.acme.sh /home -type f \( -name fullchain.pem -o -name fullchain.cer \) 2>/dev/null)
+    done < <(find -L /etc/letsencrypt/live /root/.acme.sh /home -type f \( -name fullchain.pem -o -name fullchain.cer \) 2>/dev/null)
     if [[ ${#certs[@]} -eq 0 ]]; then
         log_err "未发现含完整证书链的证书 (fullchain.pem / fullchain.cer)。"
         log_err "仅含叶证书的 <domain>.cer 已被跳过，请选择其他证书方式。"
@@ -1646,8 +1651,14 @@ setup_acme_certificate() {
         log_warn "    Hysteria 主监听是 UDP 端口，与反代互不冲突。"
         log_warn ""
 
-        if find_cert_in_webserver "$SERVER_NAME" >/dev/null 2>&1; then
+        local existing_pair
+        if existing_pair="$(find_cert_in_webserver "$SERVER_NAME")" && [[ -n "$existing_pair" ]]; then
+            CERT_TYPE="custom"
+            CERT_FILE="${existing_pair%%|*}"
+            KEY_FILE="${existing_pair#*|}"
+            IS_INSECURE="false"
             log_info "已找到 Caddy/Nginx 为 ${SERVER_NAME} 签发的证书，直接复用。"
+            return 0
         elif command -v caddy >/dev/null 2>&1; then
             read -rp "是否让本机 Caddy 为 ${SERVER_NAME} 自动签发证书? [Y/n]: " use_caddy || true
             use_caddy="${use_caddy:-Y}"
@@ -1927,7 +1938,9 @@ setup_ports_and_obfs() {
     HOP_END=40000
     HOP_PORT_RANGE="${HOP_START}-${HOP_END}"
     setup_iptables_port_hopping "$LISTEN_PORT" "$HOP_START" "$HOP_END"
-    log_info "端口跳跃已默认自动启用: UDP ${HOP_PORT_RANGE} -> ${LISTEN_PORT}"
+    if [[ -n "$HOP_PORT_RANGE" ]]; then
+        log_info "端口跳跃已默认自动启用: UDP ${HOP_PORT_RANGE} -> ${LISTEN_PORT}"
+    fi
 
     # Salamander 混淆 (默认全自动开启并生成高熵密钥，免询问)
     # 与 auth 密码同理：菜单 4 保留旧 obfs 密钥，否则所有客户端的 obfs-password
@@ -2209,6 +2222,10 @@ setup_iptables_port_hopping() {
         log_warn "本机没有 iptables 命令，跳过端口跳跃（${s_port}-${e_port} -> ${l_port}）。"
         log_warn "如需端口跳跃，请安装 iptables 后重新执行，或自行用 nftables 配置等价的 UDP 重定向。"
         log_warn "其余功能（Hy2 / Reality / VMess / AnyTLS 等）不受影响。"
+        # 不把未配置转发的范围写入订阅元数据或交给防火墙放行。
+        HOP_START=""
+        HOP_END=""
+        HOP_PORT_RANGE=""
         systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
         return 0
@@ -2916,7 +2933,14 @@ show_client_configs() {
     echo
     echo -e "${YELLOW}第 3 步 · 确认云服务商安全组已放行端口${PLAIN}"
     echo -e "    ${RED}装好了却连不上，十有八九是这里没放行。${PLAIN}"
-    echo -e "    ${GREEN}UDP ${HOP_START:-20000}-${HOP_END:-40000}${PLAIN}   节点连接用的端口跳跃区间（要放行整个区间，不是单个端口）"
+    local _hop_range_display="${HOP_PORT_RANGE:-}"
+    # info 子命令没有经过端口配置，从落盘元数据读取实际启用的范围。
+    if [[ ! -v HOP_PORT_RANGE ]]; then
+        _hop_range_display="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_hop_range_display" ]]; then
+        echo -e "    ${GREEN}UDP ${_hop_range_display}${PLAIN}   节点连接用的端口跳跃区间（要放行整个区间，不是单个端口）"
+    fi
     # ⚠️ 端口为空时不能光打印一个 "TCP"（2026-10-09 修）：菜单 3 / `info` 不会
     # 调 select_subscription_port，此时 HY2_SUB_PORT 就是空的。裸 `${HY2_SUB_PORT}`
     # 会印出「TCP        私密信息页…」—— 新手以为安装漏了东西，其实上面 URL

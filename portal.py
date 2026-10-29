@@ -1498,18 +1498,7 @@ def user_share_available(user, now=None):
     于是 expires_at=0 的用户出现「分享页能打开、节点却连不上」的矛盾状态，
     与 users/list 显示的 active 也不一致。现在两者共用同一个函数。
     """
-    # 判据与 user_access_allowed 逐字一致（含 expires_at=0 视为已过期）。
-    # 这里内联而不是调用它：本函数在若干测试里是被单独摘出来执行的，
-    # 跨函数引用会 NameError；两处必须同步修改，改动时请对照。
-    now = time.time() if now is None else now
-    expires_at = user.get('expires_at')
-    try:
-        return (user.get('status', 'active') == 'active' and
-                (expires_at is None or float(expires_at) > now) and
-                (int(user.get('limit_bytes', 0)) <= 0 or
-                 int(user.get('used_bytes', 0)) < int(user.get('limit_bytes', 0))))
-    except (ValueError, TypeError, OverflowError):
-        return False
+    return user_access_allowed(user, now)
 
 
 
@@ -4251,18 +4240,29 @@ _warp_probe_cache = {}
 
 _ACCESS_APPLIED = {}
 
-def user_access_allowed(info, now=None):
+def user_access_denial(info, now=None):
+    """Hy2、托管协议和分享页共用准入判据，并保留鉴权错误说明。"""
+    if not isinstance(info, dict):
+        return 'Invalid user record'
+    if info.get('status', 'active') != 'active':
+        return 'User account inactive'
     now = time.time() if now is None else now
-    # 缺 expires_at（老版本数据 / 手工添加的用户）视为永久有效：
-    # 按 0 处理会把这些用户全部判成过期，Reality 白名单随之被清空。
-    expires_at = info.get('expires_at')
+    # 只有缺失 / None 表示永久；0、小数、数字字符串走同一时钟判定。
     try:
-        return (info.get('status', 'active') == 'active' and
-                (expires_at is None or float(expires_at) > now) and
-                (int(info.get('limit_bytes', 0)) <= 0 or
-                 int(info.get('used_bytes', 0)) < int(info.get('limit_bytes', 0))))
+        expires_at = info.get('expires_at')
+        if expires_at is not None and not float(expires_at) > now:
+            return 'User account expired'
+        limit_bytes = int(info.get('limit_bytes', 0))
+        used_bytes = int(info.get('used_bytes', 0))
     except (ValueError, TypeError, OverflowError):
-        return False
+        return 'Invalid user record'
+    if limit_bytes > 0 and used_bytes >= limit_bytes:
+        return 'Traffic quota exceeded'
+    return None
+
+
+def user_access_allowed(info, now=None):
+    return user_access_denial(info, now) is None
 
 REALITY_IPLIMIT_RELEASE_SECONDS = 180
 REALITY_IPLIMIT_TAG_PREFIX = 'iplimit-'
@@ -7015,7 +7015,9 @@ if __name__ == '__main__':
                     length = int(self.headers.get('Content-Length', 0))
                     body = self.rfile.read(length).decode('utf-8', errors='replace')
                     req_data = json.loads(body)
-                    client_auth = req_data.get('auth', '').strip()
+                    client_auth = req_data.get('auth', '')
+                    if not isinstance(client_auth, str):
+                        raise ValueError('auth must be a string')
                     client_addr = req_data.get('addr', '')
                     # ⚠️ hysteria HTTP auth 的 tx/rx 是客户端**带宽声明**，
                     # 不是实际传输字节。把它累加进用量会让数字虚高且离谱。
@@ -7030,7 +7032,7 @@ if __name__ == '__main__':
                     self.record_auth_failure()
                     return self.reply_json(200, {'ok': False, 'msg': 'Bad auth request'})
 
-                now_ts = int(time.time())
+                now_ts = time.time()
                 # 🔴 锁内只做判定与状态更新，**不要在锁内写响应**（2026-10-29 修）。
                 # data_lock 是全局锁，/auth 又是每个新连接必走的路径；慢客户端
                 # 或发送缓冲区满时，reply_json 里的 socket 写入会阻塞（最长到
@@ -7040,28 +7042,25 @@ if __name__ == '__main__':
                     users = data.get('users', {})
                     matched_uid, matched_user = None, None
                     for uid, uinfo in users.items():
-                        if hmac.compare_digest(str(uinfo.get('password', '')).encode(), client_auth.encode()):
+                        if not isinstance(uinfo, dict):
+                            continue
+                        password = uinfo.get('password')
+                        if not isinstance(password, str) or not password:
+                            continue
+                        if hmac.compare_digest(password.encode(), client_auth.encode()):
                             matched_uid, matched_user = uid, uinfo
                             break
 
                     if not matched_user:
                         deny = 'User not found'
-                    # 判据与 user_access_allowed 同源：缺 status 视为 active、
-                    # 缺 expires_at 视为永久，否则会出现「Reality 能连、Hy2 被拒」。
-                    elif matched_user.get('status', 'active') != 'active':
-                        deny = 'User account inactive'
-                    elif matched_user.get('expires_at') is not None and matched_user['expires_at'] <= now_ts:
-                        deny = 'User account expired'
                     else:
-                        # 判超额只看**已累计的真实用量**（used_bytes 由计量模块维护）。
-                        # 这里绝不能把 auth 请求里的 tx/rx 加进来 —— 那是带宽声明。
-                        limit_bytes = int(matched_user.get('limit_bytes', 0))
-                        used_bytes = int(matched_user.get('used_bytes', 0))
-                        if limit_bytes > 0 and used_bytes >= limit_bytes:
-                            deny = 'Traffic quota exceeded'
-                        else:
-                            # -------- 同时在线 IP 限制检查 -------- #
+                        deny = user_access_denial(matched_user, now_ts)
+                        try:
                             ip_limit = int(matched_user.get('ip_limit', 0))
+                        except (ValueError, TypeError, OverflowError):
+                            deny = deny or 'Invalid user record'
+                        if deny is None:
+                            # -------- 同时在线 IP 限制检查 -------- #
                             if ip_limit > 0 and client_ip:
                                 tracker = ip_tracker.setdefault(matched_uid, {})
                                 active_ips = {ip: t for ip, t in tracker.items()
@@ -10201,6 +10200,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             with data_lock:
                 for uid, sources in list(speed_tracker.items()):
+                    if uid not in data.get('users', {}):
+                        speed_tracker.pop(uid, None)
+                        continue
                     recent = {source: sample for source, sample in sources.items()
                               if cur_mono - sample[0] <= SPEED_WINDOW_SECONDS}
                     if recent:

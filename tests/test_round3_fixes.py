@@ -132,6 +132,7 @@ class LiveIpLimitTest(unittest.TestCase):
         env = {'json': json, 'time': time, 'hmac': __import__('hmac'),
                'ipaddress': __import__('ipaddress'), 'data_lock': threading.RLock(),
                'data': data, 'ip_tracker': {}, 'IP_TIMEOUT_SECONDS': 180,
+               'user_access_denial': portal.user_access_denial,
                'live_online_ips': lambda uid: set(live_ips),
                'reality_live_ips': lambda uid: set(reality_ips)}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth', 'exec'), env)

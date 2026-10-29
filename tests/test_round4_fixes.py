@@ -41,7 +41,8 @@ class ForwardedAuthTest(unittest.TestCase):
         data = {'users': {'u1': {'password': 'pw', 'status': 'active'}}}
         env = {'json': json, 'time': time, 'hmac': hmac, 'ipaddress': __import__('ipaddress'),
                'data_lock': threading.RLock(), 'data': data, 'ip_tracker': {},
-               'IP_TIMEOUT_SECONDS': 180, 'live_online_ips': lambda uid: set()}
+               'IP_TIMEOUT_SECONDS': 180, 'live_online_ips': lambda uid: set(),
+               'user_access_denial': portal.user_access_denial}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth', 'exec'), env)
         body = json.dumps({'auth': 'wrong', 'addr': '203.0.113.9:1'}).encode()
         handler = mock.Mock()

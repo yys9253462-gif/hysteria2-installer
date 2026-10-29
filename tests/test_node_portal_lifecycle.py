@@ -12,7 +12,8 @@ TREE = ast.parse(SOURCE.read_text(encoding='utf-8'))
 ENV = dict(hashlib=hashlib, hmac=hmac, secrets=secrets, time=time)
 for node in TREE.body:
     if isinstance(node, ast.FunctionDef) and node.name in {
-        'user_view_key', 'rotate_user_view_key_on_change', 'user_share_available'
+        'user_view_key', 'rotate_user_view_key_on_change', 'user_share_available',
+        'user_access_allowed', 'user_access_denial'
     }:
         exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), 'exec'), ENV)
 

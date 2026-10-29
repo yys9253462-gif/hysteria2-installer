@@ -221,7 +221,8 @@ class MeterAccountingTest(unittest.TestCase):
                     and ast.unparse(n.test) == "self.path == '/auth'")
         fn = ast.parse('def handle(self):\n    pass').body[0]
         fn.body = [auth]
-        env = {'json': json, 'time': time, 'hmac': __import__('hmac'), 'ipaddress': __import__('ipaddress'), 'live_online_ips': lambda uid: set(), 'data_lock': threading.RLock(), 'data': self.data}
+        env = {'json': json, 'time': time, 'hmac': __import__('hmac'), 'ipaddress': __import__('ipaddress'), 'live_online_ips': lambda uid: set(), 'data_lock': threading.RLock(), 'data': self.data,
+               'user_access_denial': portal.user_access_denial}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth-quota', 'exec'), env)
         body = json.dumps({'auth': 'unchanged', 'addr': '127.0.0.1:1234'}).encode()
         class Handler:
