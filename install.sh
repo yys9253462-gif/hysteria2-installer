@@ -3268,20 +3268,63 @@ portal_ensure_py() {
         return 1
     fi
 
-    if ! install -m 0644 "${srcdir}/portal.py" "${dest_dir}/portal.py" \
-       || ! install -m 0644 "${srcdir}/portal_assets.py" "${dest_dir}/portal_assets.py"; then
-        log_err "写入门户文件到 ${dest_dir} 失败"
+    # 先在目标文件系统暂存整包；srcdir == dest_dir 时也不会覆盖输入。
+    local stage m
+    if ! stage="$(mktemp -d "${dest_dir}/.portal-bundle-XXXXXX")"; then
         [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
         return 1
     fi
-    local m
-    for m in $METER_FILES; do
-        if ! install -m 0644 "${srcdir}/${m}" "${dest_dir}/${m}"; then
-            log_err "写入计量模块 ${m} 到 ${dest_dir} 失败"
+    for m in $PORTAL_FILES $METER_FILES; do
+        if ! install -m 0644 "${srcdir}/${m}" "${stage}/${m}"; then
+            log_err "暂存门户文件 ${m} 失败，原文件未改动"
+            rm -rf "$stage"
             [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
             return 1
         fi
     done
+    if ! portal_files_ok "$stage"; then
+        log_err "暂存门户整包校验失败，原文件未改动"
+        rm -rf "$stage"
+        [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
+        return 1
+    fi
+    # 与 do_upgrade 的整包事务相同：备齐旧文件后才替换，失败恢复内容和模式。
+    # 备份使用唯一目录并保留，避免同秒重试覆盖上一次可恢复的包。
+    if ! python3 -I - "$dest_dir" "$stage" $PORTAL_FILES $METER_FILES <<'PYINSTALLBUNDLE'
+import os, pathlib, shutil, sys, tempfile
+
+dest, stage = map(pathlib.Path, sys.argv[1:3])
+files = sys.argv[3:]
+backup_root = dest / 'backups'
+backup_root.mkdir(mode=0o700, exist_ok=True)
+backup = pathlib.Path(tempfile.mkdtemp(prefix='portal-bundle-', dir=backup_root))
+existing = {f: (dest / f).exists() for f in files}
+for f in files:
+    if existing[f]:
+        shutil.copy2(dest / f, backup / f)
+written = []
+try:
+    for f in files:
+        os.replace(stage / f, dest / f)
+        written.append(f)
+except Exception:
+    for f in reversed(written):
+        if existing[f]:
+            restore = stage / f
+            shutil.copy2(backup / f, restore)
+            os.replace(restore, dest / f)
+        else:
+            (dest / f).unlink()
+    raise
+print('门户整包备份: ' + str(backup))
+PYINSTALLBUNDLE
+    then
+        log_err "写入门户整包失败；原文件备份保留在 ${dest_dir}/backups/portal-bundle-*"
+        rm -rf "$stage"
+        [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
+        return 1
+    fi
+    rm -rf "$stage"
     [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
     # 计量配置：secret 取自本机 config.yaml 的 trafficStats，
     # 绝不写死进仓库 —— 仓库里只放 usage-meter-config.json.example。

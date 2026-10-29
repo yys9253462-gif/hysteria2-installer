@@ -4268,6 +4268,21 @@ REALITY_IPLIMIT_RELEASE_SECONDS = 180
 REALITY_IPLIMIT_TAG_PREFIX = 'iplimit-'
 
 
+def active_ip_limits(users):
+    """逐账户读取设备上限，损坏记录不能撤销其他账户的拦截。"""
+    limits = {}
+    for uid, info in users.items():
+        if not user_access_allowed(info):
+            continue
+        try:
+            limit = int(info.get('ip_limit', 0))
+        except (ValueError, TypeError, OverflowError):
+            continue
+        if limit > 0:
+            limits[uid] = limit
+    return limits
+
+
 def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
                          release_after=REALITY_IPLIMIT_RELEASE_SECONDS):
     """决定 Reality 上哪些 IP 放行、哪些拦截（纯函数，便于测试）。
@@ -5653,12 +5668,7 @@ def serve(path):
             # "Remote end closed connection without response"，
             # 排查时完全看不出是编码问题。
             payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
-            try:
-                atomic_write_private(portal_path, payload)
-            except OSError:
-                disk_path = Path('/etc/hysteria/portal.json')
-                if disk_path.exists():
-                    atomic_write_private(disk_path, payload)
+            atomic_write_private(portal_path, payload)
 
     # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
     #
@@ -5789,8 +5799,8 @@ def serve(path):
         now = time.monotonic()
         if now - _meter_last_save[0] < METER_SAVE_INTERVAL:
             return
-        _meter_last_save[0] = now
         save_data()
+        _meter_last_save[0] = now
 
         # 每个来源使用实际采样间隔计算速率，不能把 5 秒增量除以固定 3 秒。
     SPEED_WINDOW_SECONDS = 15
@@ -5882,8 +5892,7 @@ def serve(path):
                     ready = True
                     enable_retry_at = 0.0
                 with data_lock:
-                    limits = {uid: int(info.get('ip_limit', 0)) for uid, info in data.get('users', {}).items()
-                              if int(info.get('ip_limit', 0) or 0) > 0 and user_access_allowed(info)}
+                    limits = active_ip_limits(data.get('users', {}))
                     now_ts = time.time()
                     hy2 = {uid: {ip for ip, t in ip_tracker.get(uid, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
                            for uid in limits}
@@ -10200,7 +10209,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             with data_lock:
                 for uid, sources in list(speed_tracker.items()):
-                    if uid not in data.get('users', {}):
+                    if not isinstance(data.get('users', {}).get(uid), dict):
                         speed_tracker.pop(uid, None)
                         continue
                     recent = {source: sample for source, sample in sources.items()
@@ -10218,6 +10227,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     total_rx_speed += u_rx_speed
                     user_speeds[uid] = {'tx': u_tx_speed, 'rx': u_rx_speed}
                 for uid, user in data.get('users', {}).items():
+                    if not isinstance(user, dict):
+                        continue
                     entry = user_speeds.setdefault(uid, {'tx': 0, 'rx': 0})
                     # /traffic-speed 是每 2 秒一次的高频轮询，前端只用
                     # used_bytes / measured_bytes / measurement_ok 三个字段。

@@ -38,7 +38,7 @@ def _source_fresh(health, source, max_age=30):
         when = datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()
     except (TypeError, ValueError):
         return False
-    return time.time() - when < max_age
+    return 0 <= time.time() - when < max_age
 
 
 _recent_gaps_cache = {'key': None, 'value': []}
@@ -161,24 +161,39 @@ class PortalMeter:
                     meter.setdefault('health',{})[source]={'ok':True,'sampled_at':now,'error':''}
                     meter.setdefault('started_at',now)
                     old=self.data.get('usage_meter')
-                    old_users=copy.deepcopy(self.data.get('users', {}))
+                    user_changes=[]
                     for uid, user in self.data.get('users', {}).items():
+                        if not isinstance(user, dict):
+                            continue
+                        user_before={k: user[k] for k in ('used_bytes', 'legacy_auth_value') if k in user}
                         user.setdefault('legacy_auth_value', user.get('used_bytes', 0))
                         user['used_bytes']=core.total_bytes(meter, uid)
+                        user_after={k: user[k] for k in ('used_bytes', 'legacy_auth_value')}
+                        user_changes.append((uid, user, user_before, user_after))
                     self.data['usage_meter']=meter
                     sampled=time.monotonic()
                     previous=self.sample_times.get(source)
-                    self.sample_times[source]=sampled
                     deltas=dict(outcome.get('deltas') or {})
                     interval=sampled-previous if previous is not None else 0
                 try:
                     self.save()
                 except Exception:
                     with self.lock:
-                        self.data['users']=old_users
-                        if old is None: self.data.pop('usage_meter',None)
-                        else: self.data['usage_meter']=old
+                        # 锁外写盘期间用户可能已被删除、停用或重新创建。只撤销
+                        # 本次仍未被改动的计量字段，不能用旧快照替换整张用户表。
+                        for uid, user, before, after in user_changes:
+                            if self.data.get('users', {}).get(uid) is not user:
+                                continue
+                            for key, value in after.items():
+                                if key not in user or user[key] != value:
+                                    continue
+                                if key in before: user[key]=before[key]
+                                else: user.pop(key, None)
+                        if self.data.get('usage_meter') is meter:
+                            if old is None: self.data.pop('usage_meter',None)
+                            else: self.data['usage_meter']=old
                     raise
+                self.sample_times[source]=sampled
                 if self.on_speed is not None and interval > 0:
                     for uid, pair in deltas.items():
                         try:

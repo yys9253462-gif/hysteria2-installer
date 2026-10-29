@@ -181,6 +181,65 @@ class XrayConfigTests(unittest.TestCase):
         self.assertTrue(xcfg.iplimit_routing_ready(cfg))
         self.assertFalse(xcfg.iplimit_routing_ready(self.base))
 
+    def test_add_iplimit_routing_repairs_freedom_tag_and_preserves_other_config(self):
+        for managed_is_default in (False, True):
+            with self.subTest(managed_is_default=managed_is_default):
+                cfg = json.loads(json.dumps(self.base))
+                managed = {'protocol': 'freedom', 'tag': 'iplimit-block',
+                           'settings': {'domainStrategy': 'UseIPv4'},
+                           'sendThrough': '192.0.2.1'}
+                proxy = {'protocol': 'socks', 'tag': 'proxy',
+                         'settings': {'servers': [{'address': '127.0.0.1', 'port': 1080}]}}
+                cfg['outbounds'] = ([managed, proxy] if managed_is_default else
+                                    cfg['outbounds'] + [managed, proxy])
+                cfg['api']['services'].append('HandlerService')
+                cfg['routing']['rules'] = [json.loads(json.dumps(xcfg.API_RULE)),
+                                          {'type': 'field', 'domain': ['example.com'],
+                                           'outboundTag': 'proxy'}]
+                original = json.loads(json.dumps(cfg))
+                self.assertFalse(xcfg.iplimit_routing_ready(cfg))
+
+                xcfg.add_iplimit_routing(cfg)
+
+                self.assertTrue(xcfg.iplimit_routing_ready(cfg))
+                self.assertEqual([o for o in cfg['outbounds'] if o.get('tag') == 'iplimit-block'],
+                                 [{'protocol': 'blackhole', 'tag': 'iplimit-block'}])
+                expected_default = dict(original['outbounds'][0])
+                if managed_is_default:
+                    expected_default.pop('tag')
+                self.assertEqual(cfg['outbounds'][0], expected_default)
+                self.assertEqual([o for o in cfg['outbounds'] if o.get('tag') == 'proxy'], [proxy])
+                self.assertEqual(cfg['inbounds'], original['inbounds'])
+                self.assertEqual(cfg['routing'], original['routing'])
+                self.assertEqual(cfg['api']['services'],
+                                 ['StatsService', 'HandlerService', 'RoutingService'])
+                repaired = json.loads(json.dumps(cfg))
+                xcfg.add_iplimit_routing(cfg)
+                self.assertEqual(cfg, repaired)
+
+    def test_enable_repairs_freedom_tag_once_without_repeated_restart(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'xray.json'
+            cfg = json.loads(json.dumps(self.base))
+            cfg['api']['services'].append('RoutingService')
+            cfg['routing']['rules'] = [json.loads(json.dumps(xcfg.API_RULE))]
+            cfg['outbounds'].append({'protocol': 'freedom', 'tag': 'iplimit-block'})
+            path.write_text(json.dumps(cfg), encoding='utf-8')
+            with patch.object(xcfg.subprocess, 'run',
+                              return_value=subprocess.CompletedProcess([], 0)) as run:
+                result = xcfg.enable_iplimit_routing(str(path), '/x', '127.0.0.1:1')
+                self.assertTrue(result['changed'])
+                self.assertEqual(sum(call.args[0] == ['systemctl', 'restart', 'xray']
+                                     for call in run.call_args_list), 1)
+                self.assertEqual(Path(result['backup']).read_text(encoding='utf-8'), json.dumps(cfg))
+                saved = path.read_bytes()
+                run.reset_mock()
+                result = xcfg.enable_iplimit_routing(str(path), '/x', '127.0.0.1:1')
+                self.assertFalse(result['changed'])
+                run.assert_not_called()
+                self.assertEqual(path.read_bytes(), saved)
+            self.assertTrue(xcfg.iplimit_routing_ready(json.loads(saved)))
+
     def test_add_stats_preserves_existing_api_services(self):
         cfg = json.loads(json.dumps(self.base))
         cfg['api']['services'].append('HandlerService')

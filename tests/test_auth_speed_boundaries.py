@@ -67,6 +67,26 @@ class AuthBoundaryTests(unittest.TestCase):
 
 
 class SpeedBoundaryTests(unittest.TestCase):
+    def test_corrupt_record_does_not_break_speed_response(self):
+        node = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef)
+                    and n.name == '_h_get_traffic_speed')
+        for bad in (None, [], 'broken', 7):
+            with self.subTest(bad=bad):
+                tracker = {'bad': {'hysteria': (100, 90, 80)}}
+                env = dict(portal.__dict__,
+                    data={'users': {'live': {'used_bytes': 17}, 'bad': bad}},
+                    data_lock=threading.RLock(), speed_tracker=tracker,
+                    usage_hot_summary=lambda uid: {}, SPEED_WINDOW_SECONDS=15)
+                exec(compile(ast.Module(body=[node], type_ignores=[]), '<speed-boundary>', 'exec'), env)
+                handler = SimpleNamespace(is_authenticated=lambda: True,
+                                          reply_json=lambda status, payload: payload)
+                with patch.object(time, 'monotonic', return_value=101):
+                    result = env['_h_get_traffic_speed'](handler, '')
+                self.assertEqual(set(result['users']), {'live'})
+                self.assertEqual(result['total_used_bytes'], 17)
+                self.assertEqual((result['node_tx'], result['node_rx']), (0, 0))
+                self.assertNotIn('bad', tracker)
+
     def test_orphan_speed_entry_is_removed_before_aggregation(self):
         node = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef)
                     and n.name == '_h_get_traffic_speed')

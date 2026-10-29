@@ -61,6 +61,14 @@ def add_iplimit_routing(cfg):
     api['services']=services
     outbounds=cfg.setdefault('outbounds',[])
     if not outbounds:outbounds.append({'protocol':'freedom','tag':'direct'})
+    if outbounds[0].get('tag')==IPLIMIT_OUTBOUND_TAG:
+        # 保留原默认出口的行为，托管 tag 留给后面的黑洞。
+        default=copy.deepcopy(outbounds[0])
+        default.pop('tag')
+        outbounds.insert(0,default)
+    for index,outbound in enumerate(outbounds):
+        if outbound.get('tag')==IPLIMIT_OUTBOUND_TAG and outbound.get('protocol')!='blackhole':
+            outbounds[index]={'protocol':'blackhole','tag':IPLIMIT_OUTBOUND_TAG}
     if not any(o.get('tag')==IPLIMIT_OUTBOUND_TAG for o in outbounds):
         outbounds.append({'protocol':'blackhole','tag':IPLIMIT_OUTBOUND_TAG})
     return cfg
