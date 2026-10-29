@@ -20,6 +20,30 @@ readers=load('usage_meter_readers', 'usage-meter-readers-20261007-v1.py')
 if getattr(core, 'ACCOUNTING_REVISION', None) != ACCOUNTING_REVISION:
     raise RuntimeError('usage_meter_core_revision_mismatch')
 
+def _source_fresh(health, source, max_age=30):
+    """某来源的健康条目是否新鲜且可用。
+
+    health 里的 sampled_at 可能缺失、为空或不是合法 ISO（恢复旧备份、
+    手工编辑）。旧实现直接 health[s]['sampled_at'] + fromisoformat，
+    会让 /traffic-speed 与 users/list 在 data_lock 内抛异常 → 整个列表接口
+    500（2026-10-29 修）。解析失败一律视为「不新鲜」。
+    """
+    entry = (health or {}).get(source)
+    if not isinstance(entry, dict) or not entry.get('ok'):
+        return False
+    raw = entry.get('sampled_at')
+    if not isinstance(raw, str) or not raw:
+        return False
+    try:
+        when = datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        return False
+    return time.time() - when < max_age
+
+
+_recent_gaps_cache = {'key': None, 'value': []}
+
+
 def _recent_gaps(m, window_seconds=86400):
     """最近 window_seconds 内是否发生过计量缺口。
 
@@ -32,6 +56,14 @@ def _recent_gaps(m, window_seconds=86400):
     gaps = m.get('gaps') or []
     if not gaps:
         return []
+    # 结果只取决于全局 gaps，而 summary()/hot_summary() 会**按用户**各调一次，
+    # /traffic-speed 每 2 秒 × 全部用户 × 最多 100 条 gap，实测 2000 用户
+    # 单次 0.12 秒全花在重复计算上（2026-10-29 修）。
+    # 以 (条数, 最后一条时间, 30 秒桶) 做缓存：gaps 只在 poll 时变化。
+    last = gaps[-1] if isinstance(gaps[-1], dict) else {}
+    cache_key = (len(gaps), str(last.get('at') or ''), int(time.time() // 30), window_seconds)
+    if _recent_gaps_cache.get('key') == cache_key:
+        return _recent_gaps_cache['value']
     cutoff = time.time() - window_seconds
     recent = []
     for gap in gaps:
@@ -46,6 +78,7 @@ def _recent_gaps(m, window_seconds=86400):
             continue
         if when >= cutoff:
             recent.append(gap)
+    _recent_gaps_cache.update(key=cache_key, value=recent)
     return recent
 
 class PortalMeter:
@@ -111,6 +144,8 @@ class PortalMeter:
                 with self.lock:
                     meter=copy.deepcopy(self.data.get('usage_meter',{}))
                     # 每个账户首次基线：不将已存在、未归属新窗口的进程计数混入。
+                    # 注意：registered_users 只用于诊断（首次接入时记录当时的账户集合），
+                    # 计量准入完全由 totals/sources 决定，没有任何代码读取它。
                     meter.setdefault('registered_users', list(self.data.get('users',{})))
                     # 已存在客户在后续才第一次出现在计数器中时，core 从零累加是有效的：
                     # 当前服务为所有用户保持单调累计，且初始窗口无计数表示0。
@@ -153,9 +188,7 @@ class PortalMeter:
             m=self.data.get('usage_meter',{})
             health=m.get('health',{})
             enabled=self.enabled_sources()
-            fresh=bool(enabled) and all(health.get(s,{}).get('ok',False) and
-                time.time()-datetime.fromisoformat(health[s]['sampled_at']).timestamp()<30
-                for s in enabled)
+            fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
             initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)
             return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
                 'measurement_started_at':m.get('started_at'),
@@ -187,9 +220,7 @@ class PortalMeter:
             m=self.data.get('usage_meter',{})
             health=m.get('health',{})
             enabled=self.enabled_sources()
-            fresh=bool(enabled) and all(health.get(s,{}).get('ok',False) and
-                time.time()-datetime.fromisoformat(health[s]['sampled_at']).timestamp()<30
-                for s in enabled)
+            fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
             initialized=bool(enabled) and all(s in m.get('sources',{}) for s in enabled)
             return {'measured_bytes':core.total_bytes(m,uid) if initialized else None,
                 'measurement_ok':initialized and fresh and not _recent_gaps(m),

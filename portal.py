@@ -1632,13 +1632,13 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
           <td>{expires_str}</td>
           <td><code style="font-size:11px">{html.escape(u.get("password","")[:4] + "****" + u.get("password","")[-4:])}</code></td>
           <td>
-            <button class="button primary btn-user-connect" style="padding:4px 10px;font-size:11px;margin-right:6px" type="button" data-uid="{html.escape(uid)}" data-token="{token}" data-key="{user_key}">专属连接</button>
+            {'' if uid == MASTER_USER_ID else f'''<button class="button primary btn-user-connect" style="padding:4px 10px;font-size:11px;margin-right:6px" type="button" data-uid="{html.escape(uid)}" data-token="{token}" data-key="{user_key}">专属连接</button>'''}
             {'' if uid == MASTER_USER_ID else f'''<form method="POST" action="/{token}/manage-user" style="display:inline" class="js-confirm-delete" data-confirm="确定注销此用户？此操作不可撤销。">
               <input type="hidden" name="action" value="delete">
               <input type="hidden" name="user_id" value="{html.escape(uid)}">
               <button class="button danger" style="padding:4px 10px;font-size:11px" type="submit">删除</button>
             </form>'''}
-            {'<span style="font-size:11px;color:var(--muted)">机主账号不可注销</span>' if uid == MASTER_USER_ID else ''}
+            {'<span style="font-size:11px;color:var(--muted)">机主账号不可注销，也不提供专属分享链接（其密码即节点主密码，链接不会轮换）</span>' if uid == MASTER_USER_ID else ''}
           </td>
         </tr>""")
 
@@ -5108,11 +5108,32 @@ def prepare(meta_path, port, node_api_key=None):
                 proxy_services=[], page=page, qr=qr_svg.decode('utf-8', 'replace'), clash=clash, sing=sing)
     for filename, value in [('portal.json', data), ('portal-access.json', portal_access_payload(base, user, password, api_key))]:
         path = root / filename
-        path.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
-        path.chmod(0o600)
+        # 用 atomic_write_private：write_text 先按 umask 创建再 chmod，
+        # 中间有一段文件是 0644 的窗口，里面装着全部用户密码与 api_key；
+        # chmod 失败时更是永久 0644（2026-10-29 修）。
+        atomic_write_private(path, json.dumps(value, ensure_ascii=False).encode('utf-8'))
 
 
-def sync_download_artifacts(data, uri, clash, sing):
+def qr_svg_for(uri):
+    """生成二维码 SVG；失败返回 None（调用方据此保留旧图）。
+
+    抽出来是为了能在**数据锁外**先算好：qrencode 是子进程，最长 20 秒，
+    在锁内跑会阻塞 /auth（2026-10-29 修）。
+    """
+    try:
+        qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
+                            input=str(uri).encode(), capture_output=True, timeout=20)
+        if qr.returncode == 0 and qr.stdout:
+            return qr.stdout.decode('utf-8', 'replace')
+    except Exception as exc:
+        _log_ignored('qr_refresh', exc)  # 保留旧图，别把框清空
+    return None
+
+
+_QR_UNSET = object()
+
+
+def sync_download_artifacts(data, uri, clash, sing, qr=_QR_UNSET):
     """把 data 里的 clash / sing / qr 与刚算出的 artifacts 对齐。
 
     🔴 为什么必须抽成函数（2026-10-09）：
@@ -5127,13 +5148,10 @@ def sync_download_artifacts(data, uri, clash, sing):
     """
     data['clash'] = clash
     data['sing'] = sing
-    try:
-        qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
-                            input=uri.encode(), capture_output=True, timeout=20)
-        if qr.returncode == 0 and qr.stdout:
-            data['qr'] = qr.stdout.decode('utf-8', 'replace')
-    except Exception as exc:
-        _log_ignored('qr_refresh', exc)  # 保留旧图，别把框清空
+    if qr is _QR_UNSET:
+        qr = qr_svg_for(uri)   # 调用方没预先算，就在这里算（prepare 阶段）
+    if qr:
+        data['qr'] = qr
     return data
 
 
@@ -5271,6 +5289,15 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
 def serve(path):
     portal_path = Path(path)
     data = json.loads(portal_path.read_text(encoding='utf-8'))
+    # 必需字段缺失时给出明确中文错误再退出。旧行为是在后面的 data['port']
+    # 处抛 KeyError，日志里只有一段 traceback —— 而门户是 Hysteria 的鉴权后端，
+    # 它起不来等于全部用户连不上（2026-10-29 加）。
+    _required = ('port', 'token', 'auth_hash', 'users')
+    _missing = [k for k in _required if k not in data]
+    if _missing:
+        raise SystemExit('[portal] portal.json 缺少必需字段: %s。'
+                         '请从备份恢复 portal.json 或重新执行安装。'
+                         % ', '.join(_missing))
     # 与 prepare() 同一条规则：空串/None 不能当密钥用（.get 的默认值只在
     # 键缺失时生效，手工改坏或截断写入会留下空串）。
     session_secret = data.get('session_secret') or data['auth_hash']
@@ -5704,12 +5731,15 @@ def serve(path):
                     ports.append(int(item['port']))
                 except (KeyError, TypeError, ValueError):
                     continue
-        for port in ports:
-            try:
-                with socket.create_connection(('127.0.0.1', port), timeout=0.2):
-                    pass
-            except OSError:
-                return False
+        if not ports:
+            return True
+        # 读监听表而不是逐个 create_connection（2026-10-29 改）：
+        # 每次重载都往 gost 发一次真实连接，会把它记成鉴权失败请求；
+        # 端口恰好处于 TIME_WAIT 时还会误判「未生效」并触发回滚 + 二次 reload。
+        listening, probed = _listening_ports_detail()
+        if not probed:
+            return True      # 探测不了就不阻断，交给服务状态判断
+        return all(port in listening for port in ports)
         return True
 
     def reload_gost():
@@ -5723,6 +5753,12 @@ def serve(path):
                 # 模块级代码看不到 main() 内的嵌套函数，必须用 _unit_suspended。
                 if _unit_suspended('gost'):
                     # 停用期间只更新配置；控制台恢复节点时 gost 会带着它启动。
+                    # 但仍然要确认写出来的是合法 JSON：否则恢复整机时 gost 起不来，
+                    # 而此前每次操作都报告成功（2026-10-29 修）。
+                    try:
+                        json.loads((portal_path.parent / 'gost.yml').read_text(encoding='utf-8'))
+                    except (OSError, ValueError):
+                        return False
                     return True
                 if gost_status():
                     r = subprocess.run(['systemctl', 'reload', 'gost'], capture_output=True, timeout=5)
@@ -6207,10 +6243,17 @@ if __name__ == '__main__':
                 user_ips = {ip: t for ip, t in ip_tracker.get(uid, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
                 u_copy['online_ips'] = user_ips
                 display_users[uid] = u_copy
-            page = page_html(m, uri, subscription, clash, sing, users=display_users,
-                             api_key=data.get('api_key'), token=data['token'],
-                             session_secret=session_secret,
-                             username=access.get('username', ''), password=access.get('password', ''))
+            _api_key = data.get('api_key')
+            _token = data['token']
+
+        # 渲染与二维码都在锁外做（2026-10-29 修，注释此前与实现不符）：
+        # page_html 在上千用户时约 27 ms，qrencode 最坏 20 秒，而 /auth
+        # 每个新连接都要拿同一把 data_lock。
+        page = page_html(m, uri, subscription, clash, sing, users=display_users,
+                         api_key=_api_key, token=_token,
+                         session_secret=session_secret,
+                         username=access.get('username', ''), password=access.get('password', ''))
+        qr_svg = qr_svg_for(uri)
 
         with data_lock:
             # 内容没变就不重写：页面在用户、端口、证书都没变化时是同一份，
@@ -6224,7 +6267,7 @@ if __name__ == '__main__':
             # 会漏保存：例如 qrencode 从不可用变成可用时，新二维码只留在内存里，
             # 重启后下载按钮又回到旧图。
             before_downloads = (data.get('clash'), data.get('sing'), data.get('qr'))
-            sync_download_artifacts(data, uri, clash, sing)
+            sync_download_artifacts(data, uri, clash, sing, qr=qr_svg)
             after_downloads = (data.get('clash'), data.get('sing'), data.get('qr'))
             changed = changed or before_downloads != after_downloads
         if changed:
@@ -10486,8 +10529,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         _got[_tag] = _inb.get('settings', {}).get('clients') or []
             except Exception:
                 _got = {}
-            if any([c.get('email') for c in _want[t]] != [c.get('email') for c in _got.get(t, [])]
-                   for t in _got):
+            # 比较**完整 clients**（含 UUID / flow），而不是只比 email：
+            # 注册表被重建或配置被手工改过时，email 相同但 UUID 已变，
+            # 只比 email 会认为「已同步」而放过（2026-10-29 修）。
+            # 只遍历 _got 里实际存在的入站 —— 解析失败时 _got 为空，
+            # 此时不做判断，避免每次启动都盲目重启 Xray。
+            if any(_want[t] != (_got.get(t) or []) for t in _got):
                 subprocess.run(['systemctl', 'reset-failed', 'xray'],
                                capture_output=True, timeout=5)
                 subprocess.run(['systemctl', 'restart', 'xray'],
@@ -10496,6 +10543,35 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                       file=sys.stderr)
     except Exception as e:
         print('[portal] 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
+
+    # 已启用但配置文件不在：说明配置被删或从未写成功。此时各协议的
+    # _active_*_config() 会如实返回「未启用」，订阅里也不会带上它 ——
+    # 但如果不提示，用户只会觉得「节点突然少了一个」（2026-10-29 加）。
+    try:
+        with data_lock:
+            _enabled = {k: bool((data.get(k) or {}).get('enabled'))
+                        for k in ('reality_config', 'vmess_config',
+                                  'vlessenc_config', 'anytls_config')}
+        _missing = []
+        if _enabled['reality_config'] and not Path('/etc/hysteria/xray.json').exists():
+            _missing.append('Reality')
+        if _enabled['vmess_config'] or _enabled['vlessenc_config']:
+            try:
+                _cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                _cfg = {'inbounds': []}
+            if _enabled['vmess_config'] and not has_managed_inbound(_cfg, VMESS_INBOUND_TAG):
+                _missing.append('VMess')
+            if _enabled['vlessenc_config'] and not has_managed_inbound(_cfg, VLESSENC_INBOUND_TAG):
+                _missing.append('VLESS Encryption')
+        if _enabled['anytls_config'] and not (portal_path.parent / ANYTLS_CONFIG_NAME).exists():
+            _missing.append('AnyTLS')
+        if _missing:
+            print('[portal] 以下协议标记为已启用但配置文件缺失，当前不会生效：%s。'
+                  '请在面板重新开关一次以重建配置。' % '、'.join(_missing),
+                  file=sys.stderr)
+    except Exception as _e:
+        print('[portal] 协议状态自检跳过: %s' % str(_e)[:120], file=sys.stderr)
 
     # AnyTLS 跑在独立的 sing-box 进程里，不在上面那段 xray.json 的兜底范围内。
     # 只开 AnyTLS、从未启用过 Xray 协议的节点根本没有 xray.json，

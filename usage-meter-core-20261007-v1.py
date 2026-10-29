@@ -26,6 +26,19 @@ def apply_sample(state, source, epoch, counters, sampled_at):
     new = copy.deepcopy(state)
     sources = new.setdefault('sources', {})
     previous = sources.get(source)
+    # 旧备份 / 截断写入可能留下缺 epoch 或 counters 的残缺状态，直接取键会
+    # KeyError，而 runtime 每个 poll 周期都会重试 → 计量永久失效，只能手工
+    # 删掉 usage_meter 才能恢复（2026-10-29 修）。
+    # 结构不合法时把它当作首次采样，并显式记一条缺口。
+    if previous is not None:
+        if (not isinstance(previous, dict)
+                or not isinstance(previous.get('epoch'), str)
+                or not isinstance(previous.get('counters'), dict)):
+            previous = None
+            sources.pop(source, None)
+            new.setdefault('gaps', []).append(
+                {'source': source, 'at': sampled_at,
+                 'reason': 'corrupt_state_reset'})
     totals = new.setdefault('totals', {})
     reset_users = []
     first_sample = previous is None

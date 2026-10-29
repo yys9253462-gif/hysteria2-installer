@@ -68,6 +68,49 @@ class GapWindowTests(unittest.TestCase):
         self.assertEqual(len(self.runtime._recent_gaps(meter)), 1)
 
 
+class CorruptMeterStateTests(unittest.TestCase):
+    """残缺的 usage_meter 状态不能让计量永久失效（2026-10-29 修复）。"""
+
+    def setUp(self):
+        self.core = _load('usage-meter-core-20261007-v1.py')
+
+    def test_missing_counters_resets_to_baseline(self):
+        state = {'sources': {'hysteria': {'epoch': 'E1'}}}  # 缺 counters
+        out = self.core.apply_sample(state, 'hysteria', 'E2',
+                                     {'u1': {'tx': 10, 'rx': 20}},
+                                     '2026-10-29T00:00:00+00:00')
+        self.assertEqual(out['deltas'], {})          # 首次基线，不谎报增量
+        self.assertEqual(state['sources']['hysteria']['epoch'], 'E2')
+        self.assertIn('corrupt_state_reset',
+                      [g['reason'] for g in state['gaps']])
+
+    def test_missing_epoch_also_resets(self):
+        state = {'sources': {'hysteria': {'counters': {'u1': {'tx': 1, 'rx': 1}}}}}
+        self.core.apply_sample(state, 'hysteria', 'E2', {}, '2026-10-29T00:00:00+00:00')
+        self.assertEqual(state['sources']['hysteria']['epoch'], 'E2')
+
+    def test_corrupt_previous_type_does_not_raise(self):
+        state = {'sources': {'hysteria': 'garbage'}}
+        self.core.apply_sample(state, 'hysteria', 'E2', {}, '2026-10-29T00:00:00+00:00')
+        self.assertEqual(state['sources']['hysteria']['epoch'], 'E2')
+
+
+class SourceFreshTests(unittest.TestCase):
+    def setUp(self):
+        self.runtime = _load('usage-meter-runtime-20261007-v1.py')
+
+    def test_missing_or_bad_timestamp_is_not_fresh(self):
+        for entry in ({}, {'ok': True}, {'ok': True, 'sampled_at': ''},
+                      {'ok': True, 'sampled_at': 'not-a-date'}, 'garbage'):
+            with self.subTest(entry=entry):
+                self.assertFalse(self.runtime._source_fresh({'hysteria': entry}, 'hysteria'))
+
+    def test_ok_and_recent_is_fresh(self):
+        now = datetime.now(timezone.utc).isoformat()
+        self.assertTrue(self.runtime._source_fresh(
+            {'hysteria': {'ok': True, 'sampled_at': now}}, 'hysteria'))
+
+
 class AwgEndpointRenderTests(unittest.TestCase):
     """Endpoint 已带端口时不能再拼一次（awgctl.sh）。"""
 

@@ -297,6 +297,34 @@ class VlessEncryptionTests(unittest.TestCase):
         self.assertEqual(out['encryption'], self.CFG['encryption'])
 
 
+class WarpToggleAclTests(unittest.TestCase):
+    """关闭 WARP 不能把内网拦截一起删掉（2026-10-29 修复）。"""
+
+    BASE = ("listen: :443\ntls:\n  cert: /c\n  key: /k\nobfs:\n  type: salamander\n")
+
+    def _state(self, **kw):
+        st = {'warp_enabled': False, 'warp_rules': [], 'custom_outbounds': [],
+              'outbound_mode': 'rules'}
+        st.update(kw)
+        return st
+
+    def test_disabling_warp_keeps_private_rejects(self):
+        out = portal.render_egress_config(self.BASE, self._state())
+        self.assertIn('acl:', out)
+        for cidr in portal.PRIVATE_REJECT_RULES:
+            self.assertIn('reject(%s)' % cidr, out)
+
+    def test_obfs_section_survives(self):
+        out = portal.render_egress_config(self.BASE, self._state())
+        self.assertIn('salamander', out)
+
+    def test_rule_referencing_missing_outbound_falls_back_to_direct(self):
+        out = portal.render_egress_config(
+            self.BASE, self._state(warp_rules=[{'domain': 'x.com', 'outbound': 'gone'}]))
+        self.assertIn('- direct(suffix:x.com)', out)
+        self.assertNotIn('warp_socks(suffix:x.com)', out)
+
+
 class PortSelectionSafetyTests(unittest.TestCase):
     """端口选择的安全边界（2026-10-24 修复的真实缺陷）。"""
 
