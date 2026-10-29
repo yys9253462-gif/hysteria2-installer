@@ -935,7 +935,53 @@ install_binary() {
 }
 
 # 3. 证书处理模块（自签名 / 自有证书 / ACME 域名证书）
+# 已装机时从现有 config.yaml 还原证书配置，供 CLI 重装（bash install.sh install）复用。
+#
+# 🔴 为什么必须有（2026-10-29 修）：`install` 子命令不询问证书方式，旧实现
+# 在无终端时 read 走默认 1 → 重新生成自签证书并把 SNI 改成 www.bing.com，
+# 端口也重新随机。一次「升级」就把正式证书降级成自签、换掉端口，
+# 已发放的客户端配置全部失效，而脚本一路显示正常完成。
+reuse_existing_cert_config() {
+    [[ -f "$HY2_CONFIG" ]] || return 1
+    local txt cert key dom email mt insecure
+    txt="$(cat "$HY2_CONFIG" 2>/dev/null || true)"
+    [[ -n "$txt" ]] || return 1
+    mt="$(jq -r '.cert_type // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    insecure="$(jq -r '.is_insecure // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+
+    if grep -q '^acme:' <<<"$txt"; then
+        dom="$(awk '/^acme:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*-[[:space:]]/{sub(/^[[:space:]]*-[[:space:]]*/,"");gsub(/"/,"");print;exit}' <<<"$txt")"
+        email="$(awk '/^[[:space:]]*email:/{sub(/^[[:space:]]*email:[[:space:]]*/,"");gsub(/"/,"");print;exit}' <<<"$txt")"
+        CERT_TYPE="acme"
+        SERVER_NAME="${SERVER_NAME:-$dom}"
+        ACME_EMAIL="${ACME_EMAIL:-$email}"
+        IS_INSECURE="false"
+    else
+        cert="$(awk '/^tls:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*cert:/{sub(/^[[:space:]]*cert:[[:space:]]*/,"");gsub(/^"|"$/,"");print;exit}' <<<"$txt")"
+        key="$(awk '/^tls:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*key:/{sub(/^[[:space:]]*key:[[:space:]]*/,"");gsub(/^"|"$/,"");print;exit}' <<<"$txt")"
+        [[ -n "$cert" && -n "$key" && -f "$cert" && -f "$key" ]] || return 1
+        CERT_FILE="$cert"
+        KEY_FILE="$key"
+        if [[ "$mt" == "self_signed" || "$insecure" == "true" ]]; then
+            CERT_TYPE="self_signed"
+            IS_INSECURE="true"
+        else
+            CERT_TYPE="custom"
+            IS_INSECURE="false"
+        fi
+    fi
+    if [[ -z "${SERVER_NAME:-}" ]]; then
+        SERVER_NAME="$(jq -r '.server_name // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
+    return 0
+}
+
 setup_certificates() {
+    # CLI 重装且未显式指定 HY2_CERT_TYPE 时，调用方会先 restore 现有配置并置位。
+    if [[ "${HY2_CERT_REUSE:-0}" == "1" ]]; then
+        log_info "沿用现有证书配置（${CERT_TYPE}${SERVER_NAME:+ · ${SERVER_NAME}}），不重新签发。"
+        return 0
+    fi
     mkdir -p "$HY2_CERT_DIR"
     # 迁移准备阶段复用已验证的证书，不提前切换DNS来申请新证书。
     if [[ -n "${HY2_CUSTOM_CERT_FILE:-}" || -n "${HY2_CUSTOM_KEY_FILE:-}" ]]; then
@@ -1614,10 +1660,9 @@ setup_acme_certificate() {
                         CERT_FILE="${ck%%|*}"
                         KEY_FILE="${ck#*|}"
                         IS_INSECURE="false"
-                        # 🔴 关键：SNI 必须是真实域名。
-                        # 自签模式下 SERVER_NAME 被伪装成 www.bing.com，
-                        # 若沿用会让客户端拿 bing 的 SNI 去连，必然握手失败。
-                        SERVER_NAME="$SERVER_NAME"
+                        # SERVER_NAME 在 setup_acme_certificate 开头已置为真实域名；
+                        # 这里不再做无意义的自赋值（旧代码的 SERVER_NAME="$SERVER_NAME"
+                        # 是死代码，注释描述的「自签伪装」在当前顺序下不会发生）。
                         log_info "已改为使用 Caddy 签发的正式证书: ${CERT_FILE}"
                         log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
                         return 0
@@ -1641,8 +1686,7 @@ setup_acme_certificate() {
                     CERT_FILE="${_ngpair%%|*}"
                     KEY_FILE="${_ngpair#*|}"
                     IS_INSECURE="false"
-                    # SNI 必须是真实域名：自签模式下它被伪装成 www.bing.com，沿用会握手失败
-                    SERVER_NAME="$SERVER_NAME"
+                    # SERVER_NAME 已是真实域名（见 setup_acme_certificate 开头）。
                     log_info "已使用借 Nginx 签发的正式证书: ${CERT_FILE}"
                     log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
                     return 0
@@ -1665,8 +1709,7 @@ setup_acme_certificate() {
             CERT_FILE="${_dnspair%%|*}"
             KEY_FILE="${_dnspair#*|}"
             IS_INSECURE="false"
-            # SNI 必须是真实域名：自签模式下它被伪装成 www.bing.com，沿用会握手失败
-            SERVER_NAME="$SERVER_NAME"
+            # SERVER_NAME 已是真实域名（见 setup_acme_certificate 开头）。
             log_info "已使用 DNS API 签发的正式证书: ${CERT_FILE}"
             log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
             log_info "续期：acme.sh --cron 需常驻，建议 crontab -e 加入："
@@ -1776,6 +1819,16 @@ setup_ports_and_obfs() {
     while (( DEFAULT_PORT >= 20000 && DEFAULT_PORT <= 40000 )); do
         DEFAULT_PORT=$((RANDOM % 40000 + 10000))
     done
+    # 已装机的节点沿用现有端口作为默认值（2026-10-29 修）：
+    # 旧实现给的是随机新端口，用户只想改证书、在端口提示处直接回车，
+    # 端口就被换掉，所有已发放的客户端配置当场失效。
+    if [[ -z "${HY2_PORT:-}" && -f "$HY2_META_FILE" ]]; then
+        local _cur_port
+        _cur_port="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+        if is_valid_port "${_cur_port:-}"; then
+            DEFAULT_PORT="$_cur_port"
+        fi
+    fi
 
     # 端口合法性校验：原来不做任何校验，输错（abc / 99999 / 0）会一路写进配置，
     # 装完表现为「显示安装成功但服务起不来」，新手根本想不到是自己打错了。
@@ -2017,6 +2070,16 @@ setup_system_firewall() {
 backup_state_before_reconfigure() {
     local ts saved=0 f
     ts="$(date +%Y%m%d-%H%M%S)"
+    # 每个文件只保留最近 5 份快照：portal.json 含全部用户密码与 API Key，
+    # 每次重装都留一份会让 /etc/hysteria 无限增长（也扩大泄露面，2026-10-29 修）。
+    # 只清理本函数生成的那四种 *.bak-<时间戳>，不碰其它备份（如手工部署的
+    # portal.py.bak-*）。
+    local _old
+    for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" "$HY2_CONFIG"; do
+        while IFS= read -r _old; do
+            [[ -n "$_old" ]] && rm -f "$_old" 2>/dev/null || true
+        done < <(ls -1t "${f}".bak-* 2>/dev/null | tail -n +6)
+    done
     for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" "$HY2_CONFIG"; do
         [[ -f "$f" ]] || continue
         if cp -a "$f" "${f}.bak-${ts}" 2>/dev/null; then
@@ -2138,6 +2201,19 @@ setup_iptables_port_hopping() {
     local s_port="$2"
     local e_port="$3"
     
+    # 没有 iptables 命令（极简镜像 / 纯 nftables 主机）时直接跳过：
+    # 旧实现会在 set -e 下以 127 退出，安装停在「二进制与证书已就位、
+    # 配置与门户还没写」的半成品状态，还会留下一个开机必失败的
+    # hy2-iptables.service（2026-10-29 修）。
+    if ! command -v iptables >/dev/null 2>&1; then
+        log_warn "本机没有 iptables 命令，跳过端口跳跃（${s_port}-${e_port} -> ${l_port}）。"
+        log_warn "如需端口跳跃，请安装 iptables 后重新执行，或自行用 nftables 配置等价的 UDP 重定向。"
+        log_warn "其余功能（Hy2 / Reality / VMess / AnyTLS 等）不受影响。"
+        systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
+        return 0
+    fi
+
     log_step "配置 iptables 端口跳跃转发规则 (${s_port}-${e_port} -> ${l_port})..."
     
     clear_all_hopping_rules
@@ -2183,10 +2259,15 @@ EOF
 generate_server_config() {
     log_step "生成 Hysteria 2 服务端配置: ${HY2_CONFIG}..."
     mkdir -p "$HY2_DIR"
-    command -v python3 >/dev/null && command -v qrencode >/dev/null || install_dependencies
+    # 只在缺 python3 时重装依赖（缺它门户起不来）。qrencode 缺失只影响
+    # 二维码，旧写法会让每次生成配置都跑一遍 apt-get update（2026-10-29 修）。
+    command -v python3 >/dev/null 2>&1 || install_dependencies
+    command -v qrencode >/dev/null 2>&1 || log_warn "未安装 qrencode，二维码将不可用（其余功能正常）。"
     python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "需要 Python 3.9+")'
     local systemd_version
-    systemd_version=$(systemctl --version | awk 'NR==1 {print $2}')
+    # 非 systemd 环境（容器/极简镜像）下 systemctl 不存在，直接取会让
+    # set -e 终止，用户看不到下面那条「需要 systemd 247+」的说明。
+    systemd_version=$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}') || systemd_version="" 
     if [[ ! "$systemd_version" =~ ^[0-9]+$ ]] || (( systemd_version < 247 )); then
         log_err "私密网页需要 systemd 247+ 的凭据隔离功能。"
         return 1
@@ -2220,8 +2301,8 @@ EOF
     else
         cat >> "$HY2_CONFIG" <<EOF
 tls:
-  cert: ${CERT_FILE}
-  key: ${KEY_FILE}
+  cert: "${CERT_FILE}"
+  key: "${KEY_FILE}"
 EOF
     fi
 
@@ -2791,7 +2872,9 @@ EOF
 
     systemctl daemon-reload
     systemctl enable hysteria-server >/dev/null 2>&1
-    systemctl restart hysteria-server
+    # 必须 || true：restart 失败时若被 set -e 直接终止，下面那段
+    # 「请看 journalctl」的提示永远到不了用户眼前（2026-10-29 修）。
+    systemctl restart hysteria-server || true
     
     sleep 2
     if systemctl is-active hysteria-server >/dev/null 2>&1; then
@@ -3328,8 +3411,12 @@ refresh_portal() {
     sync_cert_meta
     # 老装机此前没有证书自愈单元 —— 借着刷新顺带补齐（幂等，重复调用无副作用）。
     setup_cert_selfheal >/dev/null 2>&1 || true
-    python3 "$HY2_DIR/portal.py" refresh "$HY2_META_FILE"
-    systemctl restart hysteria-portal
+    python3 "$HY2_DIR/portal.py" refresh "$HY2_META_FILE" || true
+    systemctl restart hysteria-portal || true
+    if ! systemctl is-active --quiet hysteria-portal; then
+        log_err "门户重启失败（Hy2 鉴权后端不可用），请运行 'journalctl -u hysteria-portal -e' 查看日志。"
+        return 1
+    fi
     log_info "网页已更新，节点参数和登录凭据保持不变。"
 }
 
@@ -3338,10 +3425,21 @@ setup_portal() {
     if [[ "${PRESERVE_PORTAL:-0}" == "1" && -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]]; then
         # 沿用现有门户：token、门户账号密码、API Key、全部用户与代理服务都保留，
         # Teyir 控制台保存的凭据继续有效（见 portal.py adopt）。
-        python3 "$HY2_DIR/portal.py" adopt "$HY2_META_FILE" "$PORTAL_LOCAL_PORT" "$NODE_API_KEY"
+        # 检查返回码：prepare/adopt 失败时若被 set -e 打断，脚本会停在
+        # 「portal.py 已就位、systemd 单元还没写」的半成品状态，而门户
+        # 就是 Hy2 的鉴权后端（2026-10-29 修）。
+        if ! python3 "$HY2_DIR/portal.py" adopt "$HY2_META_FILE" "$PORTAL_LOCAL_PORT" "$NODE_API_KEY"; then
+            log_err "沿用现有门户失败（portal.py adopt 返回非零），安装中止。"
+            log_err "请检查 ${HY2_DIR}/portal.json 是否完整；必要时从备份恢复后重试。"
+            return 1
+        fi
         log_info "已沿用现有门户的登录凭据、API Key 与全部用户。"
     else
-        python3 "$HY2_DIR/portal.py" prepare "$HY2_META_FILE" "$PORTAL_LOCAL_PORT" "$NODE_API_KEY"
+        if ! python3 "$HY2_DIR/portal.py" prepare "$HY2_META_FILE" "$PORTAL_LOCAL_PORT" "$NODE_API_KEY"; then
+            log_err "初始化门户失败（portal.py prepare 返回非零），安装中止。"
+            log_err "未写入 systemd 单元，现有服务不受影响。"
+            return 1
+        fi
     fi
     cat > /etc/systemd/system/hysteria-portal.service <<EOF
 [Unit]
@@ -4923,6 +5021,11 @@ if [[ $# -gt 0 ]]; then
             install_dependencies
             get_public_ip || exit 1
             install_binary
+            # 已装机且没有显式指定证书方式时，沿用现有证书 —— 绝不在
+            # 「升级」里把正式证书降级成自签、或换掉端口（2026-10-29 修）。
+            if [[ -z "${HY2_CERT_TYPE:-}" ]] && reuse_existing_cert_config; then
+                HY2_CERT_REUSE=1
+            fi
             setup_certificates
             setup_ports_and_obfs
             generate_server_config

@@ -9714,12 +9714,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     #      否则知道门户 token 的人可以逐个试出哪些 user_id 存在；
                     #   2. hmac.compare_digest 遇到非 ASCII 的 str 会抛 TypeError
                     #      （do_GET 没有兜底，连接直接被重置），所以先挡非 ASCII。
-                    ok_key = bool(k_val) and k_val.isascii() and u_copy is not None                         and hmac.compare_digest(k_val, expected_k)
+                    ok_key = (bool(k_val) and k_val.isascii() and u_copy is not None
+                              and hmac.compare_digest(k_val, expected_k))
                     if not ok_key:
                         return self.reply(403, b'Access denied: invalid key')
                 elif u_copy is None:
                     return self.reply(404, b'User not found')
-                if not user_share_available(u_copy):
+                # 管理员已通过登录鉴权时可以查看任意用户（包括已停用的）：
+                # 核对配置、重发凭据都是正当操作，页面本身也会标明账号状态。
+                # 只有走分享链接（未鉴权）的访问才需要拦。
+                if not authed and not user_share_available(u_copy):
                     # 区分原因，给一条人能看懂的说明（旧实现只有一行英文 403）。
                     now_ts = int(time.time())
                     limit_b = int(u_copy.get('limit_bytes', 0) or 0)
