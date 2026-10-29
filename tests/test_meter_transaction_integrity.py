@@ -132,6 +132,20 @@ class MeterTransactionIntegrityTests(unittest.TestCase):
         self.assertNotIn('sources', self.data['usage_meter'])
         self.assertEqual(self.data['users']['u']['used_bytes'], 0)
 
+    def test_corrupt_user_container_keeps_sampling_and_summary_alive(self):
+        # users 被手工改成 null/list/str 时，采样线程与 summary 都不能抛异常：
+        # 前者一退出就再也不计量，后者让控制台所有用量显示 500。
+        for bad in (None, ['u'], 'oops', 7):
+            with self.subTest(bad=bad):
+                meter = self.make_meter()
+                self.data['users'] = bad
+                self.counters['u']['tx'] = 25
+                meter.poll()
+                meter.poll()
+                self.assertEqual(self.data['users'], bad)
+                self.assertIsNotNone(meter.summary('u')['measured_bytes'])
+                self.assertIsNotNone(meter.hot_summary('u')['measured_bytes'])
+
     def test_corrupt_totals_container_keeps_last_known_account_usage(self):
         for bad in (None, [], 'broken', 7):
             with self.subTest(bad=bad):

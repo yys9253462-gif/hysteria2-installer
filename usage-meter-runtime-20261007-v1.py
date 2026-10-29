@@ -84,6 +84,17 @@ def _recent_gaps(m, window_seconds=86400):
     _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=recent)
     return recent
 
+def _users_view(data):
+    """门户的用户表；损坏（null/list/str）时按空表处理。
+
+    这个模块每个采样周期都会遍历用户表更新 used_bytes，summary/hot_summary
+    也会读它。users 被手工改坏时旧写法直接 `.items()` / `.get()` 抛
+    AttributeError —— 采样线程退出、控制台所有用量显示 500。
+    """
+    users=data.get('users') if isinstance(data,dict) else None
+    return users if isinstance(users,dict) else {}
+
+
 def _measurement_total(meter, enabled, uid):
     sources=meter.get('sources')
     if not enabled or not isinstance(sources,dict):
@@ -191,7 +202,8 @@ class PortalMeter:
                     # 每个账户首次基线：不将已存在、未归属新窗口的进程计数混入。
                     # 注意：registered_users 只用于诊断（首次接入时记录当时的账户集合），
                     # 计量准入完全由 totals/sources 决定，没有任何代码读取它。
-                    meter.setdefault('registered_users', list(self.data.get('users',{})))
+                    users_view=_users_view(self.data)
+                    meter.setdefault('registered_users', list(users_view))
                     # 已存在客户在后续才第一次出现在计数器中时，core 从零累加是有效的：
                     # 当前服务为所有用户保持单调累计，且初始窗口无计数表示0。
                     outcome = core.apply_sample(meter,source,before,counters,now)
@@ -203,9 +215,9 @@ class PortalMeter:
                     user_changes=[]
                     # 先验证所有待写账户，后面的损坏累计不能让前面的账户半提交。
                     measured={uid: core.total_bytes(meter, uid)
-                              for uid, user in self.data.get('users', {}).items()
+                              for uid, user in users_view.items()
                               if isinstance(user, dict)}
-                    for uid, user in self.data.get('users', {}).items():
+                    for uid, user in users_view.items():
                         if not isinstance(user, dict):
                             continue
                         user_before={k: user[k] for k in ('used_bytes', 'legacy_auth_value') if k in user}
@@ -226,7 +238,7 @@ class PortalMeter:
                         # 锁外写盘期间用户可能已被删除、停用或重新创建。只撤销
                         # 本次仍未被改动的计量字段，不能用旧快照替换整张用户表。
                         for uid, user, before, after in user_changes:
-                            if self.data.get('users', {}).get(uid) is not user:
+                            if _users_view(self.data).get(uid) is not user:
                                 continue
                             for key, value in after.items():
                                 if key not in user or user[key] != value:
@@ -288,7 +300,7 @@ class PortalMeter:
             fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
             measured=_measurement_total(m,enabled,uid)
             initialized=measured is not None
-            user=self.data.get('users',{}).get(uid,{})
+            user=_users_view(self.data).get(uid,{})
             legacy=user.get('legacy_auth_value',user.get('used_bytes',0)) if isinstance(user,dict) else None
             return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),

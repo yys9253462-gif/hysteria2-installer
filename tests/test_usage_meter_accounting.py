@@ -188,6 +188,10 @@ class MeterAccountingTest(unittest.TestCase):
         # fixture 同步提供两个入口，行为与 meter.hot_summary / meter.summary 对齐。
         env = {'time': time, 'data_lock': threading.RLock(), 'speed_tracker': {},
                'SPEED_WINDOW_SECONDS': 15, 'data': self.data,
+               'user_table': lambda data: (data.get('users')
+                   if isinstance(data.get('users'), dict) else {}),
+               'users_list_rows': lambda users: list(users.items())
+                   if isinstance(users, dict) else [],
                'usage_summary': lambda uid: self.meter.summary(uid),
                'usage_hot_summary': lambda uid: self.meter.hot_summary(uid)}
         exec(compile(ast.Module(body=functions, type_ignores=[]), 'portal-speed', 'exec'), env)
@@ -222,6 +226,8 @@ class MeterAccountingTest(unittest.TestCase):
         fn = ast.parse('def handle(self):\n    pass').body[0]
         fn.body = [auth]
         env = {'json': json, 'time': time, 'hmac': __import__('hmac'), 'ipaddress': __import__('ipaddress'), 'live_online_ips': lambda uid: set(), 'data_lock': threading.RLock(), 'data': self.data,
+               'user_table': lambda data: (data.get('users')
+                   if isinstance(data.get('users'), dict) else {}),
                'user_access_denial': portal.user_access_denial}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth-quota', 'exec'), env)
         body = json.dumps({'auth': 'unchanged', 'addr': '127.0.0.1:1234'}).encode()

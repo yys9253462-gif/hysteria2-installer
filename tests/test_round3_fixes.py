@@ -8,8 +8,10 @@
 - awgctl 修改类命令互斥
 """
 import ast
+import copy
 import io
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -41,9 +43,20 @@ class SuspensionResumeTest(unittest.TestCase):
             ok = not (cmd[1] == 'start' and cmd[2] in failing)
             return SimpleNamespace(returncode=0 if ok else 1, stdout='active\n')
         env = {'data': data, 'data_lock': threading.RLock(), 'save_data': mock.Mock(),
-               'subprocess': SimpleNamespace(run=run), 'time': time,
+               're': re, 'subprocess': SimpleNamespace(run=run), 'time': time,
                'TRAFFIC_SUSPEND_UNITS': ('hysteria-server', 'xray', 'gost', 'amneziawg-server'),
                '_unit_active': lambda unit: True}
+        # 生产代码现在用模块级 suspend_state + 服务名正则清洗状态，
+        # 提取闭包时要把这两个名字一并带进命名空间。
+        for node in TREE.body:
+            if isinstance(node, ast.FunctionDef) and node.name == 'suspend_state':
+                exec(compile(ast.Module(body=[copy.deepcopy(node)], type_ignores=[]),
+                             'suspend-state', 'exec'), env)
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == 'TRAFFIC_SUSPEND_UNIT_RE'
+                    for t in node.targets):
+                exec(compile(ast.Module(body=[copy.deepcopy(node)], type_ignores=[]),
+                             'suspend-re', 'exec'), env)
         fn = nested_function('_set_traffic_suspension')
         exec(compile(ast.Module(body=[fn], type_ignores=[]), 'suspend', 'exec'), env)
         return env['_set_traffic_suspension'], calls
@@ -133,6 +146,8 @@ class LiveIpLimitTest(unittest.TestCase):
                'ipaddress': __import__('ipaddress'), 'data_lock': threading.RLock(),
                'data': data, 'ip_tracker': {}, 'IP_TIMEOUT_SECONDS': 180,
                'user_access_denial': portal.user_access_denial,
+               'user_table': lambda data: (data.get('users')
+                   if isinstance(data.get('users'), dict) else {}),
                'live_online_ips': lambda uid: set(live_ips),
                'reality_live_ips': lambda uid: set(reality_ips)}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth', 'exec'), env)

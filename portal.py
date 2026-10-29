@@ -1745,7 +1745,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
                  f'<button class="button" type="button" data-copy="api-pin-val" data-orig="复制指纹">复制指纹</button></div>') if pin_sha256 else ''
     listen_port = m.get("listen_port", 19984)
     obfs_pw = m.get("obfs_password", "")
-    users = users or {}
+    # 非 dict 的 users（null / list / 截断写入）按空表渲染：下面多处用
+    # len(users) 与 users.items()，任一抛异常都会让整页 500。
+    users = users if isinstance(users, dict) else {}
     now_ts = int(time.time())
     
     user_rows = []
@@ -1754,7 +1756,11 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     # 排序键必须能比较：某条记录的 created_at 被改成字符串时，
     # 旧写法会让整张用户表 500（2026-10-30 修）。
-    for uid, u in sorted(users.items(), key=lambda x: _safe_int(x[1].get("created_at") or 0),
+    # 单条记录不是 dict（手工编辑 / 截断写入）时跳过该行；`users` 整体不是
+    # dict 时按空表渲染 —— 页面是 /auth 与所有管理操作的必经路径，
+    # 这里抛异常等于整个控制台白屏，而两个服务仍然 active。
+    rows = [(uid, u) for uid, u in users.items() if isinstance(u, dict)]
+    for uid, u in sorted(rows, key=lambda x: _safe_int(x[1].get("created_at") or 0),
                          reverse=True):
         used_bytes = _safe_int(u.get("used_bytes") or 0)
         limit_bytes = _safe_int(u.get("limit_bytes") or 0)
@@ -1782,9 +1788,12 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             status_html = '<span class="status-pill active">正常</span>'
 
         expires_str = _expiry_text(u.get("expires_at"))
-        ip_limit = u.get("ip_limit", 0)
+        # 设备上限与在线数可能是 `"5"`、None 或旧格式（在线 IP 存成数字）。
+        # 直接比较 `> 0` / `len(...)` 会让整页 500 —— 与 created_at 同一类问题。
+        ip_limit = _safe_int(u.get("ip_limit") or 0)
         ip_limit_str = f"{ip_limit} IP" if ip_limit > 0 else "不限"
-        online_ips = len(u.get("online_ips", {}))
+        online_raw = u.get("online_ips")
+        online_ips = len(online_raw) if isinstance(online_raw, (dict, list)) else _safe_int(online_raw or 0)
         online_str = f'<span class="badge-count" style="font-size:11px;">{online_ips} 在线</span>' if online_ips > 0 else '<span style="color:var(--muted)">0</span>'
         
         # 流量展示与进度条
@@ -3698,6 +3707,137 @@ def reality_uuid_for_user(user_id):
     return str(uuid.uuid5(uuid.NAMESPACE_URL, 'hy2-portal-reality:' + str(user_id)))
 
 
+def drop_meter_totals(data, user_id):
+    """删除用户时清掉它的累计用量；计量状态损坏时保留原件，不能连注销一起失败。
+
+    计量容器可能是旧备份、截断写入或人工编辑留下的 None / list / str。
+    旧写法 `(data.get('usage_meter') or {}).get('totals', {}).pop(...)` 在
+    这些形态下抛 AttributeError/TypeError，位置又在 del users 之后、save_data
+    之前 —— 用户已从内存删除、磁盘没保存、访问也没撤销，重启后「已删用户」
+    原地复活并继续能连。注销必须优先完成，计量清理只是附带动作。
+    """
+    meter = data.get('usage_meter')
+    if not isinstance(meter, dict):
+        return False
+    totals = meter.get('totals')
+    if not isinstance(totals, dict):
+        return False
+    totals.pop(user_id, None)
+    return True
+
+
+def user_table(data):
+    """取用户表；整表被改成 null/list/str 时当空表。
+
+    /auth 是按密码遍历 users 的：`data['users']` 被手工改成 null 时
+    `users.items()` 抛 AttributeError，而那段代码不在 try 里 —— 异常穿透
+    do_POST，连接直接被掐断。Hysteria 只会看到鉴权连接中断并反复重试，
+    面板日志里也没有「用户表坏了」这类可读线索。损坏时按空表处理，
+    照常返回 ok:false，让客户端拿到明确的鉴权失败。
+    """
+    users = data.get('users') if isinstance(data, dict) else None
+    return users if isinstance(users, dict) else {}
+
+
+def legacy_used_bytes(data, uid):
+    """计量模块缺失时的旧用量回退；记录损坏时给 0，不能让接口 500。"""
+    user = user_table(data).get(uid)
+    if not isinstance(user, dict):
+        return 0
+    value = user.get('used_bytes', 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+TRAFFIC_SUSPEND_UNIT_RE = re.compile(r'^[a-z0-9][a-z0-9@._-]{0,127}$')
+
+
+def suspend_state(data):
+    """读取整机超额停用状态；损坏值按「未停用」处理，units 必须是合法服务名列表。
+
+    旧写法 `dict(data.get('traffic_suspend') or {})` 在状态被写成 7 / "broken"
+    时抛 TypeError/ValueError —— 主控制台判定超额后调用 node/suspend 直接 500，
+    一台服务都没停，用户继续超量使用。units 是字符串时更糟：`u in units`
+    变成子串匹配，逐字符 systemctl stop，既停不掉又留下错误停用记录。
+    """
+    state = data.get('traffic_suspend') if isinstance(data, dict) else None
+    # 只有明确的 True 才算停用：1 / 'yes' / 非空列表都不能当作已停用，
+    # 否则恢复流程会跳过真正的启动动作。
+    if not isinstance(state, dict) or state.get('suspended') is not True:
+        return {}
+    clean = dict(state)
+    units = clean.get('units')
+    clean['units'] = ([u for u in units
+                       if isinstance(u, str) and TRAFFIC_SUSPEND_UNIT_RE.match(u)]
+                      if isinstance(units, list) else [])
+    return clean
+
+
+def proxy_services(data):
+    """代理服务列表；容器被改坏时返回空表，条目必须是 dict。
+
+    gost 配置生成与端口核对都遍历它。容器是 null/str/int 时旧写法
+    `for ... in data.get('proxy_services', [])` 抛 TypeError，reload_gost
+    一律失败 —— 表现成「新增代理永远应用失败」，而日志只有一句
+    「GOST 配置未成功应用」，看不出是数据坏了。
+    """
+    services = data.get('proxy_services') if isinstance(data, dict) else None
+    if not isinstance(services, list):
+        return []
+    return [item for item in services if isinstance(item, dict)]
+
+
+def users_list_rows(users):
+    """遍历用户表；整表被改成 list/None/str 时按空表处理而不是抛异常。"""
+    if not isinstance(users, dict):
+        return []
+    return list(users.items())
+
+
+def active_online_ips(tracker, uid, now_ts, timeout):
+    """某用户的在线 IP 列表；traker 条目损坏时返回空表而不是让整个列表接口 500。"""
+    row = tracker.get(uid) if isinstance(tracker, dict) else None
+    if not isinstance(row, dict):
+        return []
+    rows = []
+    for ip, seen in row.items():
+        if isinstance(seen, bool):
+            continue
+        try:
+            seen = int(seen)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if now_ts - seen < timeout:
+            rows.append({'ip': str(ip), 'last_seen': seen})
+    return sorted(rows, key=lambda row: row['ip'])
+
+
+def users_list_entry(uid, info, tracker, now_ts, summary, ip_timeout):
+    """users/list 的一行；损坏账户返回 None，不能拖垮整张对账列表。
+
+    两侧（Web/API 的 GET 与 REST POST）共用这一个构造器。旧实现直接
+    `info.get(...)`、`ip_tracker.get(uid, {}).items()`：只要有一份用户记录被
+    手工改成字符串，或者 ip_tracker 里残留旧格式的列表，整个 users/list 就抛
+    AttributeError → 500，控制台对账/同步/开户全部失败，而 /auth 仍然正常，
+    表面看只像「控制台坏了」。
+    """
+    if not isinstance(info, dict):
+        return None
+    return {
+        'user_id': uid,
+        'expires_at': info.get('expires_at', 0),
+        'active': user_access_allowed(info, now_ts),
+        'status': info.get('status', 'active'),
+        'traffic_limit_bytes': info.get('limit_bytes', 0),
+        'traffic_used_bytes': info.get('used_bytes', 0),
+        'limit_bytes': info.get('limit_bytes', 0),
+        'used_bytes': info.get('used_bytes', 0),
+        **summary,
+        'online_ips': active_online_ips(tracker, uid, now_ts, ip_timeout),
+        'ip_limit': info.get('ip_limit', 0),
+        'created_at': info.get('created_at', now_ts),
+    }
+
+
 def reality_registry(data):
     """从 portal.json 的 data 里取出「user_id → UUID」的 Reality 账号表。
 
@@ -3707,14 +3847,17 @@ def reality_registry(data):
     reg = data.get('reality_users')
     if not isinstance(reg, dict):
         reg = {}
+    # data['users'] 被手工改成 null/list 时，`.keys()` 会抛 AttributeError；
+    # 这条路径在同步 Xray clients 的锁内，异常会让停用/到期撤销半途中断。
+    users = user_table(data)
     changed = False
-    for uid in list(data.get('users', {}).keys()):
+    for uid in list(users.keys()):
         if uid not in reg:
             reg[uid] = reality_uuid_for_user(uid)
             changed = True
     # 清理已不存在用户的条目 —— 避免 xray clients 无限增长
     for uid in list(reg.keys()):
-        if uid not in data.get('users', {}):
+        if uid not in users:
             del reg[uid]
             changed = True
     if changed:
@@ -3820,7 +3963,7 @@ def vmess_clients(data):
       2. 空表同样要给占位 client —— 与 Reality 同理，Xray 的 VMess 入站
          clients 为空时同样不接受任何连接，而服务状态仍是 active。
     """
-    users = data.get('users', {}) or {}
+    users = user_table(data)
     clients = []
     for uid in sorted(users):
         if not user_access_allowed(users.get(uid) or {}):
@@ -3915,7 +4058,7 @@ def anytls_users(data):
     secret = (data.get('anytls_config') or {}).get('secret') or ''
     users = []
     if secret:
-        all_users = data.get('users', {}) or {}
+        all_users = user_table(data)
         for uid in sorted(all_users):
             if user_access_allowed(all_users.get(uid) or {}):
                 users.append({'name': uid, 'password': anytls_password_for_user(secret, uid)})
@@ -4279,7 +4422,7 @@ def vlessenc_clients(data):
     与 Reality 用**同一个** UUID 派生（同一用户同一身份），
     但**不带 flow**：xtls-rprx-vision 是 Reality 专用，VLESS Encryption 不能带。
     """
-    users = data.get('users', {}) or {}
+    users = user_table(data)
     clients = []
     for uid in sorted(users):
         if not user_access_allowed(users.get(uid) or {}):
@@ -4811,7 +4954,7 @@ def reality_clients(data):
     所以宁可给一个随机占位 UUID，也不要让 clients 空着。
     """
     reg = reality_registry(data)
-    users = data.get('users', {}) or {}
+    users = user_table(data)
     clients = []
     for uid, uid_uuid in sorted(reg.items()):
         info = users.get(uid) or {}
@@ -5690,7 +5833,10 @@ def serve(path):
     last_enforced_blocked = None
 
     def blocked_user_ids():
-        return frozenset(uid for uid, u in data.get('users', {}).items() if not user_access_allowed(u))
+        # users 容器损坏时按空表处理：这里每 5 秒被撤销 worker 调用一次，
+        # 抛异常会让停用/到期用户永久保持在线。
+        return frozenset(uid for uid, u in user_table(data).items()
+                         if not user_access_allowed(u))
 
     def apply_access(force_ids=()):
         # access_apply_lock 串行化收回流程；data_lock 只在拍快照和写回结果时短暂持有。
@@ -5810,10 +5956,14 @@ def serve(path):
     traffic_suspend_lock = threading.Lock()
 
     def unit_suspended(unit):
-        """该服务是否因整机流量超额被停用中 —— 停用期间任何流程都不能把它拉起来。"""
+        """该服务是否因整机流量超额被停用中 —— 停用期间任何流程都不能把它拉起来。
+
+        状态损坏时按「未停用」处理：这里只读一次快照，抛异常会让
+        「停用期间不得重启」这项保护变成 HTTP 500，反而更危险。
+        """
         with data_lock:
-            state = data.get('traffic_suspend') or {}
-            return bool(state.get('suspended')) and unit in (state.get('units') or [])
+            state = suspend_state(data)
+        return state.get('suspended') is True and unit in state['units']
 
     global _unit_suspended
     _unit_suspended = unit_suspended
@@ -5824,7 +5974,9 @@ def serve(path):
 
     def _set_traffic_suspension(suspend):
         with data_lock:
-            state = dict(data.get('traffic_suspend') or {})
+            # 状态被写成 7 / 字符串时 `dict(...)` 抛异常，超额停用直接 500，
+            # 一台服务都没停。这里统一走 suspend_state 的清洗规则。
+            state = suspend_state(data)
         results = {}
         if suspend:
             units = state.get('units') if state.get('suspended') else None
@@ -5965,7 +6117,7 @@ def serve(path):
                     ready = True
                     enable_retry_at = 0.0
                 with data_lock:
-                    limits = active_ip_limits(data.get('users', {}))
+                    limits = active_ip_limits(user_table(data))
                     now_ts = time.time()
                     hy2 = {uid: {ip for ip, t in ip_tracker.get(uid, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
                            for uid in limits}
@@ -6004,7 +6156,7 @@ def serve(path):
         return {'measured_bytes': None, 'measurement_ok': False,
                 'measurement_scope': 'unavailable', 'measurement_sources': {},
                 'measurement_started_at': None, 'measurement_gaps': [],
-                'legacy_auth_value': data.get('users', {}).get(uid, {}).get('used_bytes', 0)}
+                'legacy_auth_value': legacy_used_bytes(data, uid)}
 
     def usage_list_summary(uid):
         """users/list 用的 usage_summary：measurement_gaps 不再逐用户复制（2026-10-28 修）。
@@ -6046,9 +6198,20 @@ def serve(path):
         gost_cfg_path = portal_path.parent / 'gost.yml'
         services = []
         with data_lock:
-            for idx, svc in enumerate(data.get('proxy_services', [])):
-                ptype = svc.get('type', 'socks5')
-                port = int(svc.get('port', 0))
+            # 单条代理记录被改坏（null / 字符串 / 端口非数字）时跳过它：
+            # 旧写法在这里抛异常，reload_gost 一律返回 False，
+            # 「新增代理」永久失败，而错误信息只说「配置未成功应用」。
+            for idx, svc in enumerate(proxy_services(data)):
+                if not isinstance(svc, dict):
+                    continue
+                ptype = svc.get('type') if isinstance(svc.get('type'), str) else 'socks5'
+                raw_port = svc.get('port')
+                if isinstance(raw_port, bool):
+                    continue
+                try:
+                    port = int(raw_port or 0)
+                except (TypeError, ValueError, OverflowError):
+                    continue
                 if port <= 0 or port > 65535:
                     continue
                 handler_type = 'socks5' if ptype == 'socks5' else 'http'
@@ -6079,7 +6242,7 @@ def serve(path):
             # 容错：数据里某条记录的 port 被改坏时，跳过它而不是让整个
             # reload 因 ValueError 失败（2026-10-29 修）。
             ports = []
-            for item in data.get('proxy_services', []):
+            for item in proxy_services(data):
                 try:
                     ports.append(int(item['port']))
                 except (KeyError, TypeError, ValueError):
@@ -6587,14 +6750,22 @@ if __name__ == '__main__':
         # 持锁渲染会短暂阻塞新连接鉴权；而渲染本身不依赖锁。
         with data_lock:
             # 清理离线已久的 ip_tracker 键
-            dead_uids = [u for u, tr in ip_tracker.items() if not any(now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())]
+            dead_uids = [u for u, tr in ip_tracker.items()
+                         if not isinstance(tr, dict)
+                         or not any(now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())]
             for du in dead_uids:
-                del ip_tracker[du]
+                ip_tracker.pop(du, None)
 
-            for uid, uinfo in data.get('users', {}).items():
+            for uid, uinfo in users_list_rows(user_table(data)):
+                # 单条记录被手工改坏时跳过这一行，不能让整页渲染失败
+                # （regenerate_page 在 /auth 常见路径上，抛异常等于面板白屏）。
+                if not isinstance(uinfo, dict):
+                    continue
                 u_copy = dict(uinfo)
-                user_ips = {ip: t for ip, t in ip_tracker.get(uid, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
-                u_copy['online_ips'] = user_ips
+                tracked = ip_tracker.get(uid)
+                u_copy['online_ips'] = ({ip: t for ip, t in tracked.items()
+                                         if now_ts - t < IP_TIMEOUT_SECONDS}
+                                        if isinstance(tracked, dict) else {})
                 display_users[uid] = u_copy
             _api_key = data.get('api_key')
             _token = data['token']
@@ -7121,7 +7292,7 @@ if __name__ == '__main__':
                 # 连接超时），期间所有请求都在排队，包括新的鉴权。
                 deny = None
                 with data_lock:
-                    users = data.get('users', {})
+                    users = user_table(data)
                     matched_uid, matched_user = None, None
                     for uid, uinfo in users.items():
                         if not isinstance(uinfo, dict):
@@ -7488,7 +7659,7 @@ if __name__ == '__main__':
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
-                            (data.get('usage_meter') or {}).get('totals', {}).pop(user_id, None)
+                            drop_meter_totals(data, user_id)
                             if user_id in ip_tracker:
                                 del ip_tracker[user_id]
                             # 速率样本同理：不删的话，同名用户重建后第一轮
@@ -7563,40 +7734,12 @@ if __name__ == '__main__':
                     node_gaps = []
                     node_sources = {}
                     with data_lock:
-                        for uid, info in data.get('users', {}).items():
+                        for uid, info in users_list_rows(data.get('users')):
                             summary, node_gaps, node_sources = usage_list_summary(uid)
-                            entry = {
-                                'user_id': uid,
-                                'expires_at': info.get('expires_at', 0),
-                                # ⚠️ active 必须**同时**看 status 与到期：
-                                # 鉴权回调判的是 status（见 handle_auth），
-                                # 而这里原实现只看 expires_at —— 两者不一致的后果是
-                                # "停用后列表仍报 active，但客户端连不上"，
-                                # 那是最难排查的一类矛盾。两者必须同源。
-                                'active': user_access_allowed(info, now_ts),
-                                'status': info.get('status', 'active'),
-                                'traffic_limit_bytes': info.get('limit_bytes', 0),
-                                'traffic_used_bytes': info.get('used_bytes', 0),
-                                # 与 users/get 同名的原始字段（2026-10-29 补）：
-                                # 两个端点此前一套叫 traffic_*、一套叫原始名，
-                                # 调用方按其中一个写就会取到 undefined。
-                                # 两套并存，谁都不用改。
-                                'limit_bytes': info.get('limit_bytes', 0),
-                                'used_bytes': info.get('used_bytes', 0),
-                                **summary,
-                                # 真实在线 IP：来自鉴权时更新的 ip_tracker，
-                                # 窗口与限流判定同一个 IP_TIMEOUT_SECONDS。
-                                # 内存态 —— portal 重启后为空，这是真实语义：
-                                # 重启后确实要等客户端重新认证才知道谁在线。
-                                'online_ips': [
-                                    {'ip': ip, 'last_seen': int(t)}
-                                    for ip, t in sorted(ip_tracker.get(uid, {}).items())
-                                    if now_ts - t < IP_TIMEOUT_SECONDS
-                                ],
-                                'ip_limit': info.get('ip_limit', 0),
-                                'created_at': info.get('created_at', now_ts),
-                            }
-                            users_out.append(entry)
+                            entry = users_list_entry(uid, info, ip_tracker, now_ts,
+                                                     summary, IP_TIMEOUT_SECONDS)
+                            if entry is not None:
+                                users_out.append(entry)
                     return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out,
                                                  'measurement_gaps': node_gaps,
                                                  'measurement_sources': node_sources})
@@ -7613,7 +7756,7 @@ if __name__ == '__main__':
 
                 elif sub == 'proxy-services/list':
                     with data_lock:
-                        items = list(data.get('proxy_services', []))
+                        items = proxy_services(data)
                     m = read_meta_file(meta_path)
                     host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
                     # 不脱敏 password, 调用方是受信 API key
@@ -7933,7 +8076,10 @@ if __name__ == '__main__':
                 if not Path('/usr/local/bin/gost').exists():
                     return 409, {'ok': False, 'error': '请先安装 GOST，再创建代理服务'}
                 with data_lock:
+                    # 保留原始值用于回滚；工作副本只取合法条目，
+                    # 否则容器被改坏后追加/筛选都会抛异常。
                     previous = copy.deepcopy(data.get('proxy_services', []))
+                    working = proxy_services(data)
                 if action == 'create':
                     ptype = str(params.get('protocol') or params.get('type') or 'socks5').lower()
                     if ptype not in ('socks5', 'http', 'https'):
@@ -7999,13 +8145,13 @@ if __name__ == '__main__':
                              'username': username, 'password': password, 'created_at': int(time.time()),
                              'note': str(params.get('note') or '').strip()[:200]}
                     with data_lock:
-                        data.setdefault('proxy_services', []).append(entry)
+                        data['proxy_services'] = working + [entry]
                 else:
                     proxy_id = str(params.get('id') or '').strip()
                     if not proxy_id:
                         return 400, {'ok': False, 'error': 'Missing id'}
-                    remaining = [item for item in previous if item.get('id') != proxy_id]
-                    if len(remaining) == len(previous):
+                    remaining = [item for item in working if item.get('id') != proxy_id]
+                    if len(remaining) == len(working):
                         return 404, {'ok': False, 'error': 'Proxy service not found'}
                     with data_lock:
                         data['proxy_services'] = remaining
@@ -8018,7 +8164,7 @@ if __name__ == '__main__':
                     return 500, {'ok': False, 'applied': False,
                         'error': 'GOST 配置未成功应用或端口未监听，代理记录已恢复；请检查服务日志'}
                 if action == 'delete':
-                    for item in previous:
+                    for item in working:
                         if item.get('id') == proxy_id:
                             firewall_port(item.get('port'), 'tcp', open_=False)
                     return 200, {'ok': True, 'applied': True, 'message': 'Proxy service deleted'}
@@ -8984,7 +9130,7 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
                 if action == 'enable':
                     with data_lock:
-                        suspended = bool((data.get('traffic_suspend') or {}).get('suspended'))
+                        suspended = suspend_state(data).get('suspended') is True
                     if suspended:
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，请在控制台恢复节点后再启用 AnyTLS'})
@@ -9309,7 +9455,7 @@ if __name__ == '__main__':
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
-                            (data.get('usage_meter') or {}).get('totals', {}).pop(user_id, None)
+                            drop_meter_totals(data, user_id)
                             if user_id in ip_tracker:
                                 del ip_tracker[user_id]
                             # 速率样本同理：不删的话，同名用户重建后第一轮
@@ -9707,8 +9853,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'vlessenc': dict(data.get('vlessenc_config') or {}),
                             'anytls': dict(data.get('anytls_config') or {}),
                             'warp_enabled': bool(data.get('warp_enabled')),
-                            'users_count': len(data.get('users', {})),
-                            'proxy_services': list(data.get('proxy_services') or []),
+                            'users_count': len(user_table(data)),
+                            'proxy_services': proxy_services(data),
                         }
                     # 协议是否真的在服务，以 xray.json 里有没有托管入站为准 ——
                     # data 里的配置是「上次生成成功」的残留，停用后仍在。
@@ -9896,13 +10042,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     except Exception as e:
                         return self.reply_json(500, {'ok': False, 'error': 'read counters failed: ' + str(e)[:120]})
                     with data_lock:
-                        suspended = bool((data.get('traffic_suspend') or {}).get('suspended'))
+                        suspended = suspend_state(data).get('suspended') is True
                     counters.update({'ok': True, 'suspended': suspended, 'time': int(time.time())})
                     return self.reply_json(200, counters)
                 if sub == 'node/meta':
                     m = read_meta_file(meta_path)
                     with data_lock:
-                        users_count = len(data.get('users', {}))
+                        users_count = len(user_table(data))
                     # 🔴 白名单，2026-10-09 修（真实泄漏）：
                     # 原来直接把整个 client_meta.json 原样返回，而 install.sh 往里写了
                     # auth_password 与 obfs_password。api_key 是**低权限**凭据
@@ -9921,38 +10067,18 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     node_gaps = []
                     node_sources = {}
                     with data_lock:
-                        for uid, info in data.get('users', {}).items():
+                        for uid, info in users_list_rows(data.get('users')):
                             summary, node_gaps, node_sources = usage_list_summary(uid)
-                            users_out.append({
-                                'user_id': uid,
-                                'expires_at': info.get('expires_at', 0),
-                                # 与 API 通道同一判据（status + 到期），理由见那边注释。
-                                'active': user_access_allowed(info, now_ts),
-                                'status': info.get('status', 'active'),
-                                'traffic_limit_bytes': info.get('limit_bytes', 0),
-                                'traffic_used_bytes': info.get('used_bytes', 0),
-                                # 与 users/get 同名的原始字段（2026-10-29 补）：
-                                # 两个端点此前一套叫 traffic_*、一套叫原始名，
-                                # 调用方按其中一个写就会取到 undefined。
-                                # 两套并存，谁都不用改。
-                                'limit_bytes': info.get('limit_bytes', 0),
-                                'used_bytes': info.get('used_bytes', 0),
-                                **summary,
-                                # 见 POST 分支同一字段的注释。
-                                'online_ips': [
-                                    {'ip': ip, 'last_seen': int(t)}
-                                    for ip, t in sorted(ip_tracker.get(uid, {}).items())
-                                    if now_ts - t < IP_TIMEOUT_SECONDS
-                                ],
-                                'ip_limit': info.get('ip_limit', 0),
-                                'created_at': info.get('created_at', now_ts),
-                            })
+                            entry = users_list_entry(uid, info, ip_tracker, now_ts,
+                                                     summary, IP_TIMEOUT_SECONDS)
+                            if entry is not None:
+                                users_out.append(entry)
                     return self.reply_json(200, {'ok': True, 'count': len(users_out), 'users': users_out,
                                                  'measurement_gaps': node_gaps,
                                                  'measurement_sources': node_sources})
                 if sub == 'proxy-services/list':
                     with data_lock:
-                        items = list(data.get('proxy_services', []))
+                        items = proxy_services(data)
                     # 面板只看这条 API: 补齐 host 与 gost 运行状态,
                     # 否则列表显示不出主机名, 也无法区分"服务真的可用"和"条目存在".
                     m = read_meta_file(meta_path)
@@ -10291,12 +10417,23 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             user_speeds = {}
 
             with data_lock:
-                for uid, sources in list(speed_tracker.items()):
-                    if not isinstance(data.get('users', {}).get(uid), dict):
-                        speed_tracker.pop(uid, None)
+                # 内存里的速率样本可能是旧格式（列表）或半截元组；采样循环
+                # 内部也会写这个字典。任何一条坏样本都不能让 /traffic-speed
+                # 每 2 秒 500（控制台首页实时流量整块空白）。
+                # 整个字典被替换成非 dict 时只读本次的空视图，不回写。
+                tracker = speed_tracker if isinstance(speed_tracker, dict) else {}
+                for uid, sources in list(tracker.items()):
+                    if not isinstance(user_table(data).get(uid), dict):
+                        tracker.pop(uid, None)
                         continue
-                    recent = {source: sample for source, sample in sources.items()
-                              if cur_mono - sample[0] <= SPEED_WINDOW_SECONDS}
+                    recent = {}
+                    if isinstance(sources, dict):
+                        for source, sample in sources.items():
+                            if (isinstance(sample, (tuple, list)) and len(sample) >= 3
+                                    and all(isinstance(v, (int, float))
+                                            and not isinstance(v, bool) for v in sample[:3])
+                                    and cur_mono - sample[0] <= SPEED_WINDOW_SECONDS):
+                                recent[source] = sample
                     if recent:
                         speed_tracker[uid] = recent
                     else:
@@ -10309,7 +10446,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     total_tx_speed += u_tx_speed
                     total_rx_speed += u_rx_speed
                     user_speeds[uid] = {'tx': u_tx_speed, 'rx': u_rx_speed}
-                for uid, user in data.get('users', {}).items():
+                for uid, user in users_list_rows(user_table(data)):
                     if not isinstance(user, dict):
                         continue
                     entry = user_speeds.setdefault(uid, {'tx': 0, 'rx': 0})
@@ -10340,7 +10477,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
-                services = list(data.get('proxy_services', []))
+                services = proxy_services(data)
             m = read_meta_file(meta_path)
             host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
             return self.reply_json(200, {
@@ -11076,7 +11213,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # 超额停用要扛住重启：开机后 systemd 会把服务重新拉起来，这里再停一次。
     try:
         with data_lock:
-            _susp = dict(data.get('traffic_suspend') or {})
+            _susp = suspend_state(data)
         if _susp.get('suspended'):
             for _u in _susp.get('units') or []:
                 subprocess.run(['systemctl', 'stop', _u], capture_output=True, timeout=20)
