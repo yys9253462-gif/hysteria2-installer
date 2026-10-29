@@ -995,12 +995,32 @@ def resolve_update_ref(ref):
         return ref
     if ref != 'main':
         raise ValueError('Invalid immutable ref')
-    req = urllib.request.Request('https://api.github.com/repos/' + AWG_REPO + '/commits/main',
-                                 headers={'User-Agent': 'hysteria2-installer'})
-    with urllib.request.urlopen(req, timeout=8) as response:
-        value = json.loads(response.read().decode('utf-8')).get('sha', '')
+    value = ''
+    try:
+        req = urllib.request.Request('https://api.github.com/repos/' + AWG_REPO + '/commits/main',
+                                     headers={'User-Agent': 'hysteria2-installer'})
+        with urllib.request.urlopen(req, timeout=8) as response:
+            value = json.loads(response.read().decode('utf-8')).get('sha', '')
+    except Exception as exc:
+        _log_ignored('resolve_update_ref.github', exc)
     if not re.fullmatch(r'[0-9a-f]{40}', value):
-        raise RuntimeError('无法固定面板更新版本，未修改现有文件')
+        # GitHub API 匿名每 IP 60 次/小时，共享 IP 上被限流是常态。
+        # 退回仓库的 commits Atom feed（2026-10-29 修）：由 github.com 直接提供、
+        # 不计 API 额度，条目里带完整 commit，同样能锁定到具体提交。
+        # （jsDelivr 的 resolved 接口对分支返回 null，不能用作回退。）
+        try:
+            req = urllib.request.Request(
+                'https://github.com/' + AWG_REPO + '/commits/main.atom',
+                headers={'User-Agent': 'hysteria2-installer'})
+            with urllib.request.urlopen(req, timeout=8) as response:
+                feed = response.read().decode('utf-8', 'replace')
+            m = re.search(r'/commit/([0-9a-f]{40})', feed)
+            value = m.group(1) if m else ''
+        except Exception as exc:
+            _log_ignored('resolve_update_ref.atom', exc)
+    if not re.fullmatch(r'[0-9a-f]{40}', value):
+        raise RuntimeError('无法固定面板更新版本（GitHub API 与 commits.atom 均不可用），'
+                           '未修改现有文件')
     return value
 
 

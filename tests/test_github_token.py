@@ -95,6 +95,42 @@ class PortalTokenTest(unittest.TestCase):
 
 
 @unittest.skipUnless(BASH, 'requires bash')
+class UpdateRefFallbackTest(unittest.TestCase):
+    """自更新锁定 commit：API 被限流时必须退回 atom，而不是直接失败。"""
+
+    def test_falls_back_to_atom_when_api_is_rate_limited(self):
+        sha = 'b' * 40
+        calls = []
+
+        class Resp:
+            def __init__(self, body):
+                self.body = body
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+            def read(self):
+                return self.body
+
+        def fake_urlopen(req, timeout=8):
+            url = req.full_url if hasattr(req, 'full_url') else str(req)
+            calls.append(url)
+            if 'api.github.com' in url:
+                raise urllib.error.HTTPError(url, 403, 'rate limited', None, None)
+            return Resp(('<feed><entry><id>tag:github.com,2008:Grit::Commit/%s</id>'
+                         '<link href="https://github.com/x/y/commit/%s"/></entry></feed>'
+                         % (sha, sha)).encode())
+
+        with mock.patch.object(portal.urllib.request, 'urlopen', fake_urlopen):
+            self.assertEqual(portal.resolve_update_ref('main'), sha)
+        self.assertTrue(any('api.github.com' in c for c in calls))
+        self.assertTrue(any('commits/main.atom' in c for c in calls))
+
+    def test_pinned_ref_is_returned_verbatim(self):
+        sha = 'c' * 40
+        self.assertEqual(portal.resolve_update_ref(sha), sha)
+
+
 class InstallShTokenTest(unittest.TestCase):
     """install.sh 的 curl 包装：只给 api.github.com 加，且 token 不出现在参数里。"""
 

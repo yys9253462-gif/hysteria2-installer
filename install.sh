@@ -2991,12 +2991,32 @@ portal_fetch_py() {
     PORTAL_FETCH_ALL_VERIFY_FAILED=0
     # 只解析一次 main，防止下载过程中 main 前进导致整包跨版本。
     local PORTAL_FETCH_REF
-    PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/commits/main" |
-        python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha", ""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)')" || {
-        PORTAL_FETCH_ERR="无法固定门户版本，未下载或修改门户文件"; return 1;
-    }
+    # 先问 GitHub API；它被限流（匿名每 IP 60 次/小时，共享 IP 极常见）时
+    # 退回 jsDelivr 的 resolved 接口 —— 同样给出 main 对应的**具体 commit**，
+    # 于是「锁定一次提交、三源取同一份」的保证不变，又不会因为限流装不上。
+    PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/commits/main" 2>/dev/null |
+        python3 -c 'import json,re,sys
+try: s=json.load(sys.stdin).get("sha","")
+except Exception: s=""
+assert re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || PORTAL_FETCH_REF=""
     if [[ ! "$PORTAL_FETCH_REF" =~ ^[0-9a-f]{40}$ ]]; then
-        PORTAL_FETCH_ERR="无法固定门户版本，未下载或修改门户文件"; return 1
+        # 次选：仓库的 commits Atom feed。它由 github.com 直接提供、不计 API 额度，
+        # 且条目里带完整 40 位 commit —— 一样能锁定到具体提交。
+        # （jsDelivr 的 resolved 接口对分支名返回 null，不能用作回退。）
+        PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 "https://github.com/${repo}/commits/main.atom" 2>/dev/null |
+            python3 -c 'import re,sys
+m=re.search(r"/commit/([0-9a-f]{40})", sys.stdin.read())
+assert m; print(m.group(1))' 2>/dev/null)" || PORTAL_FETCH_REF=""
+    fi
+    if [[ ! "$PORTAL_FETCH_REF" =~ ^[0-9a-f]{40}$ ]]; then
+        PORTAL_FETCH_ERR="  [GitHub API] 无法取得 main 的 commit（通常是匿名 API 被限流）"$'
+'
+        PORTAL_FETCH_ERR+="  [commits.atom] 无法解析 main 的最新提交"$'
+'
+        PORTAL_FETCH_ERR+="  [jsDelivr / raw] 缺少可锁定的 commit，未下载"$'
+'
+        PORTAL_FETCH_ERR+="（提示：把只读 token 放到 /etc/hysteria/github-token 可解除 API 限流）"
+        return 1
     fi
     # 该 commit 下每个文件的 git blob 身份：下载后逐文件比对。
     # 🔴 只校验 marker + 语法挡不住"CDN 返回与所 pin commit 不符的内容"：
