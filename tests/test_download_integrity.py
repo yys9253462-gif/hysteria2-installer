@@ -809,7 +809,11 @@ class AcmeInstallTests(unittest.TestCase):
                     'hy2_acme_shebang_safe', 'hy2_acme_same_except_shebang',
                     'hy2_acme_verify_existing', 'hy2_acme_check_existing',
                     'hy2_acme_install_verified', 'hy2_acme_record_pin',
-                    'hy2_acme_read_pin')
+                    'hy2_acme_read_pin',
+                    # 2026-10-29：install 侧把「确保 acme.sh 可用」抽成了
+                    # hy2_acme_ensure，setup_cert_via_dns_api 会调用它。
+                    # 不一起提取的话，单函数测试会在调用处 command not found。
+                    'hy2_acme_ensure')
 
     # 假的上游安装器：把自身（改掉 shebang）装到 --home，并写一份带
     # AUTO_UPGRADE="1" 的 account.conf —— 与上游 install() 的关键行为一致。
@@ -1365,6 +1369,10 @@ done
     def test_dns_api_install_failure_returns_error_without_shell(self):
         """setup_cert_via_dns_api：校验安装失败时返回 1，绝不退回 curl|sh。"""
         fn = extract_install_fn('setup_cert_via_dns_api')
+        # 2026-10-29：确保 acme.sh 可用被抽成 hy2_acme_ensure。
+        # 只摘 setup_cert_via_dns_api 会让它在调用处 command not found，
+        # 测试反而把「真实代码」测成了「函数缺失」。
+        ensure = extract_install_fn('hy2_acme_ensure')
         src = INSTALL.read_text(encoding='utf-8')
         self.assertNotRegex(fn, r'get\.acme\.sh[^\n]*\|\s*(sh|bash)')
         with tempfile.TemporaryDirectory() as td:
@@ -1375,6 +1383,7 @@ HY2_CF_TOKEN="tok"; HY2_CF_EMAIL="a@b.c"
 log_info() {{ echo "INF: $*"; }}; log_warn() {{ echo "WRN: $*"; }}
 log_err() {{ echo "ERR: $*"; }}; log_step() {{ :; }}
 hy2_acme_install_verified() {{ echo "INSTALLER-CALLED"; return 1; }}
+{ensure}
 {fn}
 setup_cert_via_dns_api example.com || echo "RC=$?"
 '''
@@ -1388,6 +1397,7 @@ setup_cert_via_dns_api example.com || echo "RC=$?"
     def test_existing_acme_is_checked_not_reinstalled(self):
         """已有 acme.sh 且核验通过：走 check_existing，绝不调用安装器，继续签发。"""
         fn = extract_install_fn('setup_cert_via_dns_api')
+        ensure = extract_install_fn('hy2_acme_ensure')
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / 'home'
             (home / '.acme.sh').mkdir(parents=True)
@@ -1400,6 +1410,7 @@ log_info() {{ echo "INF: $*"; }}; log_warn() {{ echo "WRN: $*"; }}
 log_err() {{ echo "ERR: $*"; }}; log_step() {{ :; }}
 hy2_acme_install_verified() {{ echo "INSTALLER-CALLED"; return 0; }}
 hy2_acme_check_existing() {{ echo "CHECK-EXISTING"; return 0; }}
+{ensure}
 {fn}
 setup_cert_via_dns_api example.com || true
 '''
@@ -1411,6 +1422,7 @@ setup_cert_via_dns_api example.com || true
     def test_existing_acme_verification_failure_blocks_issue(self):
         """已有 acme.sh 核验失败：setup_cert_via_dns_api 必须返回 1 且不签发。"""
         fn = extract_install_fn('setup_cert_via_dns_api')
+        ensure = extract_install_fn('hy2_acme_ensure')
         with tempfile.TemporaryDirectory() as td:
             home = Path(td) / 'home'
             (home / '.acme.sh').mkdir(parents=True)
@@ -1424,6 +1436,7 @@ log_info() {{ echo "INF: $*"; }}; log_warn() {{ echo "WRN: $*"; }}
 log_err() {{ echo "ERR: $*"; }}; log_step() {{ :; }}
 hy2_acme_install_verified() {{ echo "INSTALLER-CALLED"; return 0; }}
 hy2_acme_check_existing() {{ echo "CHECK-EXISTING"; return 1; }}
+{ensure}
 {fn}
 rc=0; setup_cert_via_dns_api example.com || rc=$?
 echo "RC=$rc"
@@ -1438,10 +1451,15 @@ echo "RC=$rc"
     def test_existing_acme_wiring_uses_verification_and_hard_fails(self):
         """控制流反例：调用点不得再用 `|| true` 吞掉核验失败。"""
         fn = extract_install_fn('setup_cert_via_dns_api')
-        self.assertRegex(fn, r'if\s*!\s*hy2_acme_check_existing')
-        self.assertNotRegex(fn, r'hy2_acme_check_existing[^\n]*\|\|\s*true')
+        # 2026-10-29：核验逻辑移到了 hy2_acme_ensure，签发函数只负责调用它。
+        # 断言随之分成两处：ensure 里做核验，签发处必须硬失败地调用 ensure。
+        ensure = extract_install_fn('hy2_acme_ensure')
+        self.assertRegex(ensure, r'if\s*!\s*hy2_acme_check_existing')
+        self.assertNotRegex(ensure, r'hy2_acme_check_existing[^\n]*\|\|\s*true')
+        self.assertIn('hy2_acme_ensure || return 1', fn)
+        self.assertNotRegex(fn, r'hy2_acme_ensure[^\n]*\|\|\s*true')
         # 核验失败必须在签发（"使用 ... DNS API 签发"）之前返回
-        self.assertLess(fn.index('hy2_acme_check_existing'), fn.index('使用 ${provider} DNS API 签发'))
+        self.assertLess(fn.index('hy2_acme_ensure'), fn.index('使用 ${provider} DNS API 签发'))
         # 检查函数自身必须是 fail-closed 且核验失败时不写配置
         chk = extract_install_fn('hy2_acme_check_existing')
         self.assertIn('hy2_acme_verify_existing', chk)
