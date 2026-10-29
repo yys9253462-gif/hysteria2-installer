@@ -36,6 +36,17 @@ class PortalTokenTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         portal._github_token_cache.update(mtime=None, token='')
 
+    def write_token(self, value):
+        """写 token 文件并设成 600 —— 生产要求的最小权限。
+
+        portal 会拒绝权限过宽的文件（POSIX），测试必须按真实部署来写。
+        """
+        self.file.write_text(value, encoding='utf-8')
+        try:
+            self.file.chmod(0o600)
+        except OSError:
+            pass
+
     def auth_for(self, url):
         req = urllib.request.Request(url)
         portal.GitHubTokenHandler().https_request(req)
@@ -53,7 +64,7 @@ class PortalTokenTest(unittest.TestCase):
 
     def test_token_is_not_forwarded_on_redirect(self):
         """unredirected header：GitHub 跳转到下载主机时不能把 token 一起带过去。"""
-        self.file.write_text(TOKEN, encoding='utf-8')
+        self.write_token(TOKEN)
         req = urllib.request.Request('https://api.github.com/repos/a/b/tarball')
         portal.GitHubTokenHandler().https_request(req)
         self.assertNotIn('Authorization', req.headers)

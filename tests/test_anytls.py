@@ -200,5 +200,59 @@ class AnytlsPanelTest(unittest.TestCase):
         self.assertIn('id="btn-toggle-anytls"', page)
 
 
+class AnytlsRobustnessTests(unittest.TestCase):
+    """2026-10-29 修复的健壮性缺口。"""
+
+    def test_corrupt_config_does_not_raise(self):
+        """anytls.json 损坏时只跳过同步，不能让开户/删除全部 503。"""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'anytls.json').write_text('{"inbounds": [', encoding='utf-8')
+            self.assertFalse(portal.sync_anytls_users(root, snapshot([('u1', True)])))
+
+    def test_placeholder_password_is_stable_without_secret(self):
+        """secret 缺失时占位密码也必须稳定，否则每轮同步都重启 sing-box。"""
+        data = {'anytls_config': {}, 'users': {'u1': {'status': 'active',
+                                                       'expires_at': 2085974400}}}
+        self.assertEqual(portal.anytls_users(data), portal.anytls_users(data))
+
+    def test_subscription_survives_corrupt_port(self):
+        """端口被改坏时跳过该节点，而不是让整页/整份订阅抛异常。"""
+        for key, cfg in (('vmess', {'port': 'x', 'domain': 'd', 'ws_path': '/p'}),
+                         ('vlessenc', {'port': 'x', 'domain': 'd', 'encryption': 'e'}),
+                         ('anytls', {'port': 'x', 'domain': 'd', 'secret': SECRET})):
+            with self.subTest(key=key):
+                _, clash, _ = portal.artifacts(META, user_id='u1', **{key: cfg})
+                types = [p['type'] for p in json.loads(clash)['proxies']]
+                self.assertNotIn(key, types)
+
+    def test_clash_fingerprint_key_matches_mihomo(self):
+        """mihomo 的字段名是 client-fingerprint（连字符），不是下划线。"""
+        _, clash, _ = portal.artifacts(
+            META, user_id='u1',
+            reality={'port': 2053, 'dest_sni': 'a', 'public_key': 'k', 'short_id': 's'},
+            vmess={'port': 2087, 'domain': 'd', 'ws_path': '/p'},
+            vlessenc={'port': 2088, 'domain': 'd', 'encryption': 'e'},
+            anytls=dict(ACFG))
+        for node in json.loads(clash)['proxies']:
+            if node['type'] == 'hysteria2':
+                continue
+            self.assertIn('client-fingerprint', node, node['type'])
+            self.assertNotIn('client_fingerprint', node, node['type'])
+
+    def test_valid_port_helper(self):
+        self.assertEqual(portal._valid_port('2087'), 2087)
+        for bad in ('x', None, True, 0, 70000, 2087.5, ''):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal._valid_port(bad), 0)
+
+
+class XrayPinnedVersionTests(unittest.TestCase):
+    def test_version_tuple_ordering(self):
+        self.assertGreater(portal._version_tuple('26.10.1'),
+                           portal._version_tuple(portal.XRAY_PINNED_VERSION))
+        self.assertEqual(portal._version_tuple('v26.3.27'), (26, 3, 27))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

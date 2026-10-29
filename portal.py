@@ -72,6 +72,19 @@ def github_token():
         _github_token_cache.update(mtime=None, token='')
         return ''
     if mtime != _github_token_cache['mtime']:
+        # 权限必须足够严：token 等同于账号凭据，0644 时同机其它用户可以读走。
+        # 之前只校验字符集，权限过宽的文件照常被使用（2026-10-29 修）。
+        try:
+            mode = GITHUB_TOKEN_FILE.stat().st_mode & 0o777
+        except OSError:
+            mode = 0
+        # 只在 POSIX 上检查：Windows 没有对应的权限位语义，
+        # stat() 恒返回 0666，照此判断会让所有 Windows 环境都无法使用 token。
+        if os.name == 'posix' and mode and mode & 0o077:
+            print('[portal] %s 权限为 %o，应改为 600；本次忽略该 token'
+                  % (GITHUB_TOKEN_FILE, mode), file=sys.stderr)
+            _github_token_cache.update(mtime=mtime, token='')
+            return ''
         try:
             value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
         except OSError:
@@ -3614,6 +3627,9 @@ WantedBy=multi-user.target
 '''
 # anytls.json 的读-改-写与启停都在这把锁内，规则同 reality_apply_lock。
 anytls_apply_lock = threading.Lock()
+# 核心安装/卸载串行化：两个并发 install-core 会同时写 xray.new / sing-box.new，
+# 后完成者覆盖前者；与 uninstall 并发时还可能「刚装好就被删」（2026-10-29 加）。
+core_operation_lock = threading.Lock()
 
 
 def anytls_password_for_user(secret, user_id):
@@ -3638,8 +3654,12 @@ def anytls_users(data):
             if user_access_allowed(all_users.get(uid) or {}):
                 users.append({'name': uid, 'password': anytls_password_for_user(secret, uid)})
     if not users:
+        # 占位密码必须**稳定**：secret 缺失时旧实现每次用随机数，导致
+        # sync_anytls_users 每轮都认为名单变了 → 反复重写配置并重启 sing-box
+        # （2026-10-29 修）。secret 正常一定存在；这里用固定串兜底，
+        # 保证最坏情况下也只是「没人能连」，而不是重启风暴。
         users = [{'name': 'placeholder',
-                  'password': anytls_password_for_user(secret or secrets.token_hex(16), 'placeholder')}]
+                  'password': anytls_password_for_user(secret or 'anytls-placeholder', 'placeholder')}]
     return users
 
 
@@ -3736,7 +3756,16 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None):
     if service_active is None:
         service_active = lambda: _systemd_state(ANYTLS_SERVICE) == 'active'  # noqa: E731
     with anytls_apply_lock:
-        config = json.loads(path.read_text(encoding='utf-8'))
+        # ⚠️ 2026-10-29 修：这里原来是裸 json.loads，anytls.json 被截断或手工
+        # 改坏时抛 JSONDecodeError，而本函数在 enforce_node_access 顶部调用 ——
+        # 一个坏文件就让开户/续费/停用/删除全部返回 503，报错还写成
+        # "Reality sync failed"，完全指不到真正的文件。
+        try:
+            config = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            print('[portal] anytls.json unreadable, skip sync: ' + type(exc).__name__,
+                  file=sys.stderr)
+            return False
         wanted = anytls_users(snapshot)
         inbound = next((i for i in config.get('inbounds') or []
                         if isinstance(i, dict) and i.get('tag') == ANYTLS_INBOUND_TAG), None)
@@ -3782,6 +3811,25 @@ def write_xray_unit():
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
 
 
+
+XRAY_PINNED_VERSION = '26.3.27'
+
+
+def _version_tuple(value):
+    """把 '26.3.27' / 'v26.3.27' 转成可比较的整数元组；无法解析时返回 ()。"""
+    parts = re.findall(r'\d+', str(value or ''))
+    return tuple(int(p) for p in parts[:4]) if parts else ()
+
+
+def _xray_version(binary='/usr/local/bin/xray', run=subprocess.run):
+    """返回已安装 Xray 的版本字符串（如 '26.3.27'）；读不出来返回 ''。"""
+    try:
+        out = run([binary, 'version'], capture_output=True, text=True, timeout=5)
+    except Exception:
+        return ''
+    m = re.search(r'Xray\s+v?(\d+(?:\.\d+)+)', (out.stdout or '') + (out.stderr or ''))
+    return m.group(1) if m else ''
+
 def install_xray_binary():
     """下载官方 Xray-core 并校验 SHA2-256 后装到 /usr/local/bin/xray，返回 (ok, message)。
 
@@ -3800,7 +3848,15 @@ def install_xray_binary():
     else:
         return False, '不支持的 CPU 架构，无法选择 Xray 资产: %s' % machine
     xasset = f"Xray-linux-{xarch}.zip"
-    xbase = 'https://github.com/XTLS/Xray-core/releases/download/v26.3.27/'
+    # 固定版本是有意的（配合 .dgst 校验），但「重新安装 / 修复」按钮不能
+    # 静默把更高版本降回来（2026-10-29 修）。当前版本更高时明确拒绝，
+    # 由用户决定是否降级（例如手工换二进制）。
+    current = _xray_version()
+    if current and _version_tuple(current) > _version_tuple(XRAY_PINNED_VERSION):
+        return False, ('当前 Xray 版本 %s 高于本脚本内置的 %s。为避免静默降级，'
+                       '已放弃安装；如确需降级请手动替换二进制'
+                       % (current, XRAY_PINNED_VERSION))
+    xbase = 'https://github.com/XTLS/Xray-core/releases/download/v%s/' % XRAY_PINNED_VERSION
     # 先取官方 `.dgst` 并只认 SHA2-256；取不到就不装。
     expected = fetch_expected_sha256(xbase + xasset + '.dgst', None,
                                      parser=parse_xray_dgst)
@@ -4477,9 +4533,16 @@ def managed_inbound_active(config, tag):
         return False
     # 已运行服务仍需对应端口监听；非 systemd 环境同样沿用只读探测。
     try:
-        return int(inbound.get('port', 0)) in _listening_ports()
+        port = int(inbound.get('port', 0))
     except (TypeError, ValueError):
         return False
+    listening = _listening_ports()
+    # ss 完全不可用时无法证实端口，但服务是 active（或环境里没有 systemd，
+    # state 为空）且配置里有该入站 —— 宁可继续下发节点，
+    # 也不能把「探测不了」当成「没在运行」。
+    if globals().get('_LISTEN_PROBE_OK', True) is False and state in ('active', ''):
+        return True
+    return port in listening
 
 
 def _listening_ports():
@@ -4495,13 +4558,30 @@ def _listening_ports():
     调用方据此退回到「只避开内置黑名单」，而不是直接失败。
     （宁可少避开一个端口，也不该让整个 Reality 配置生成不出来。）
     """
+    ports, ok = _listening_ports_detail()
+    # 记录本次探测是否真的成功：调用方据此区分「没有端口在监听」与
+    # 「ss 不可用读不到」。用模块级变量而不是改返回值，保持既有调用方不变。
+    global _LISTEN_PROBE_OK
+    _LISTEN_PROBE_OK = ok
+    return ports
+
+
+def _listening_ports_detail():
+    """返回 (端口集合, 是否至少有一个 ss 调用成功)。
+
+    区分「真的没有端口在监听」与「ss 不可用读不到」很重要：
+    前者应当如实反映，后者如果当成空集，会让订阅生成把**所有** Xray 协议
+    判成未运行、静默只下发 Hy2（2026-10-29 修）。
+    """
     ports = set()
+    ok = False
     for flag in ('-lntH', '-lunH'):
         try:
             out = subprocess.run(['ss', flag], capture_output=True, text=True,
                                  timeout=5).stdout
         except Exception:
             continue
+        ok = True
         for line in out.splitlines():
             parts = line.split()
             if len(parts) < 4:
@@ -4513,7 +4593,7 @@ def _listening_ports():
             tail = addr.rsplit(':', 1)[1]
             if tail.isdigit():
                 ports.add(int(tail))
-    return ports
+    return ports, ok
 
 
 # Reality 自动选端口时**永不使用**的端口。
@@ -4659,6 +4739,24 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
             f"&sni={dest_sni}&sid={short_id}#{quote(tag)}")
 
 
+
+def _valid_port(value):
+    """把配置里的端口值转成合法 int；非法返回 0。
+
+    artifacts() 会用它决定是否下发某个协议节点：配置被改坏时
+    宁可少下发一个节点，也不能让整个页面/订阅生成抛异常 ——
+    该函数在每次页面渲染时都会调用。
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, float) and not value.is_integer():
+        return 0
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return port if 1 <= port <= 65535 else 0
+
 def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
               vmess=None, vlessenc=None, anytls=None):
     """生成 hy2:// 直链 + Clash / Sing-box 配置。
@@ -4748,7 +4846,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                                  servername=r_sni,
                                  reality_opts=dict(public_key=r_pbk,
                                                    short_id=r_sid),
-                                 client_fingerprint='chrome')
+                                 **{'client-fingerprint': 'chrome'})
             reality_sing = dict(type='vless', tag=rname, server=public_ip,
                                server_port=r_port, uuid=r_uuid,
                                flow='xtls-rprx-vision',
@@ -4765,20 +4863,21 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 握手，VMess 必须真的出示证书。因此只在启用且拿到域名时才追加。
     vmess_proxy = None
     vmess_sing = None
-    if vmess and user_id and vmess.get('domain') and vmess.get('port'):
+    if vmess and user_id and vmess.get('domain') and _valid_port(vmess.get('port')):
         v_name = name + '-VMess'
         v_uuid = vmess_uuid_for_user(user_id)
         v_host = vmess['domain']
         v_sni = vmess.get('sni') or v_host
         v_path = vmess.get('ws_path') or '/'
+        v_port = _valid_port(vmess.get('port'))
         vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
-                           port=int(vmess['port']), uuid=v_uuid, alterId=0,
+                           port=v_port, uuid=v_uuid, alterId=0,
                            cipher='auto', udp=True, tls=True, servername=v_sni,
                            network='ws', **{'ws-opts': {'path': v_path,
                                                         'headers': {'Host': v_sni}}},
-                           client_fingerprint='chrome')
+                           **{'client-fingerprint': 'chrome'})
         vmess_sing = dict(type='vmess', tag=v_name, server=v_host,
-                          server_port=int(vmess['port']), uuid=v_uuid,
+                          server_port=v_port, uuid=v_uuid,
                           security='auto', alter_id=0,
                           transport=dict(type='ws', path=v_path,
                                          headers={'Host': v_sni}),
@@ -4789,20 +4888,21 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 同样是 TCP + 自有证书，但比 VMess 多了后量子密钥交换。
     vlessenc_proxy = None
     vlessenc_sing = None
-    if vlessenc and user_id and vlessenc.get('domain') and vlessenc.get('port') \
-            and vlessenc.get('encryption'):
+    if vlessenc and user_id and vlessenc.get('domain') \
+            and _valid_port(vlessenc.get('port')) and vlessenc.get('encryption'):
         e_name = name + '-VLESS-Enc'
         e_uuid = reality_uuid_for_user(user_id)
         e_host = vlessenc['domain']
         e_sni = vlessenc.get('sni') or e_host
         e_enc = vlessenc['encryption']
+        e_port = _valid_port(vlessenc.get('port'))
         vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
-                              port=int(vlessenc['port']), uuid=e_uuid, udp=True,
+                              port=e_port, uuid=e_uuid, udp=True,
                               tls=True, servername=e_sni, network='tcp',
                               encryption=e_enc,
-                              client_fingerprint='chrome')
+                              **{'client-fingerprint': 'chrome'})
         vlessenc_sing = dict(type='vless', tag=e_name, server=e_host,
-                             server_port=int(vlessenc['port']), uuid=e_uuid,
+                             server_port=e_port, uuid=e_uuid,
                              encryption=e_enc,
                              tls=dict(enabled=True, server_name=e_sni,
                                       utls=dict(enabled=True, fingerprint='chrome')))
@@ -4811,17 +4911,18 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
     anytls_proxy = None
     anytls_sing = None
-    if anytls and user_id and anytls.get('domain') and anytls.get('port') \
-            and anytls.get('secret'):
+    if anytls and user_id and anytls.get('domain') \
+            and _valid_port(anytls.get('port')) and anytls.get('secret'):
         a_name = name + '-AnyTLS'
         a_host = anytls['domain']
         a_sni = anytls.get('sni') or a_host
         a_pwd = anytls_password_for_user(anytls['secret'], user_id)
+        a_port = _valid_port(anytls.get('port'))
         anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
-                            port=int(anytls['port']), password=a_pwd, udp=True,
+                            port=a_port, password=a_pwd, udp=True,
                             sni=a_sni, **{'client-fingerprint': 'chrome'})
         anytls_sing = dict(type='anytls', tag=a_name, server=a_host,
-                           server_port=int(anytls['port']), password=a_pwd,
+                           server_port=a_port, password=a_pwd,
                            tls=dict(enabled=True, server_name=a_sni,
                                     utls=dict(enabled=True, fingerprint='chrome')))
 
@@ -6025,7 +6126,14 @@ if __name__ == '__main__':
             data['page'] = page
             # 与 refresh() 同理：二维码/下载配置必须跟着 uri 一起更新，
             # 否则自愈换了 sni 之后，页面文本框是对的、二维码仍是旧节点。
+            # ⚠️ 2026-10-29 修：sync_download_artifacts 也会改 clash/sing/qr，
+            # 而这些不在 page 里（二维码是单独生成的）。只看 page 是否变化
+            # 会漏保存：例如 qrencode 从不可用变成可用时，新二维码只留在内存里，
+            # 重启后下载按钮又回到旧图。
+            before_downloads = (data.get('clash'), data.get('sing'), data.get('qr'))
             sync_download_artifacts(data, uri, clash, sing)
+            after_downloads = (data.get('clash'), data.get('sing'), data.get('qr'))
+            changed = changed or before_downloads != after_downloads
         if changed:
             save_data()
 
@@ -8087,14 +8195,15 @@ if __name__ == '__main__':
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
-                if name == 'xray':
-                    ok, msg = install_xray_binary()
-                    if ok:
-                        write_xray_unit()
-                elif name == 'sing-box':
-                    ok, msg = install_singbox()
-                else:
+                if name not in ('xray', 'sing-box'):
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里安装该核心'})
+                with core_operation_lock:
+                    if name == 'xray':
+                        ok, msg = install_xray_binary()
+                        if ok:
+                            write_xray_unit()
+                    else:
+                        ok, msg = install_singbox()
                 return self.reply_json(200 if ok else 500, {'ok': ok, ('message' if ok else 'error'): msg})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -8105,8 +8214,14 @@ if __name__ == '__main__':
                 return ['AnyTLS'] if _active_anytls_config() else []
             try:
                 cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-            except (OSError, ValueError):
+            except FileNotFoundError:
+                # 没有配置文件 = 确实没有任何 Xray 协议在用，可以卸载。
                 return []
+            except (OSError, ValueError):
+                # 配置存在但读不出来时**不能**当成「没人用」：旧实现返回 []，
+                # 于是卸载会直接停服务删二进制，所有 Reality/VMess/VLESS-Enc
+                # 用户当场断线且无法自愈（2026-10-29 修，fail-closed）。
+                return ['（xray.json 无法解析，请先修复）']
             labels = {REALITY_INBOUND_TAG: 'VLESS-Reality', VMESS_INBOUND_TAG: 'VMess',
                       VLESSENC_INBOUND_TAG: 'VLESS Encryption'}
             return [labels[tag] for tag in MANAGED_INBOUND_TAGS if has_managed_inbound(cfg, tag)]
@@ -8133,11 +8248,12 @@ if __name__ == '__main__':
                     return self.reply_json(409, {'ok': False, 'error':
                         '以下协议仍在使用 %s：%s。请先到对应协议页关闭后再卸载' % (name, '、'.join(in_use))})
                 unit, binary = units[name]
-                subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
-                Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
-                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
-                subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
-                Path(binary).unlink(missing_ok=True)
+                with core_operation_lock:
+                    subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
+                    Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
+                    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
+                    Path(binary).unlink(missing_ok=True)
                 return self.reply_json(200, {'ok': True, 'message': '%s 已卸载' % name})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -8179,10 +8295,14 @@ if __name__ == '__main__':
             if not unit_path.exists() or unit_path.read_text(encoding='utf-8') != ANYTLS_UNIT_CONTENT:
                 unit_path.write_text(ANYTLS_UNIT_CONTENT, encoding='utf-8')
                 subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
-            subprocess.run(['systemctl', 'enable', ANYTLS_SERVICE], capture_output=True, timeout=30)
             with anytls_apply_lock:
                 apply_anytls_config(build_anytls_config(new_cfg, users, cert_file, key_file),
                                     portal_path.parent / ANYTLS_CONFIG_NAME, restart=True)
+                # 配置预检 + 启动成功之后再 enable（2026-10-29 修）。
+                # 旧实现先 enable 再校验：证书缺失时单元已被设为开机自启，
+                # 之后每次开机 sing-box 都会每 3 秒失败重启一次。
+                subprocess.run(['systemctl', 'enable', ANYTLS_SERVICE],
+                               capture_output=True, timeout=30)
             with data_lock:
                 data['anytls_config'] = new_cfg
             save_data()
@@ -8218,6 +8338,14 @@ if __name__ == '__main__':
                 with anytls_apply_lock:
                     subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
                                    capture_output=True, timeout=30)
+                    # 必须确认真的停了再删配置（2026-10-29 修）。
+                    # stop 失败（进程卡住 / D-Bus 超时）时，sing-box 仍带着旧
+                    # 用户表运行：被停用的用户照样能连，界面却显示「已关闭」。
+                    state = _systemd_state(ANYTLS_SERVICE)
+                    if state == 'active':
+                        return self.reply_json(500, {'ok': False, 'error':
+                            'AnyTLS 服务未能停止，配置已保留，请重试或查看 systemctl status %s'
+                            % ANYTLS_SERVICE})
                     (portal_path.parent / ANYTLS_CONFIG_NAME).unlink(missing_ok=True)
                 with data_lock:
                     acfg = dict(data.get('anytls_config') or {})
@@ -8902,6 +9030,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'reality': dict(data.get('reality_config') or {}),
                             'vmess': dict(data.get('vmess_config') or {}),
                             'vlessenc': dict(data.get('vlessenc_config') or {}),
+                            'anytls': dict(data.get('anytls_config') or {}),
                             'warp_enabled': bool(data.get('warp_enabled')),
                             'users_count': len(data.get('users', {})),
                             'proxy_services': list(data.get('proxy_services') or []),
@@ -9027,6 +9156,22 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                    if d_snap['vlessenc'].get('domain') else {}),
                                 **({'sni': d_snap['vlessenc']['sni']}
                                    if d_snap['vlessenc'].get('sni') else {}),
+                            ),
+                            # AnyTLS（2026-10-29 补）：由独立的 sing-box 进程承载，
+                            # 所以 installed 看 sing-box、active 看 hy2-anytls 服务。
+                            # 同样只给客户端公开参数，secret（服务端派生密钥）不外泄。
+                            'anytls': dict(
+                                {
+                                    'installed': bool(_singbox_version()),
+                                    'active': _svc_active(ANYTLS_SERVICE),
+                                    'configured': bool(d_snap['anytls'].get('domain')),
+                                },
+                                **({'port': int(d_snap['anytls'].get('port') or 0)}
+                                   if d_snap['anytls'].get('port') else {}),
+                                **({'domain': d_snap['anytls']['domain']}
+                                   if d_snap['anytls'].get('domain') else {}),
+                                **({'sni': d_snap['anytls']['sni']}
+                                   if d_snap['anytls'].get('sni') else {}),
                             ),
                         },
                         'extras': {
@@ -10149,6 +10294,18 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                       file=sys.stderr)
     except Exception as e:
         print('[portal] 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
+
+    # AnyTLS 跑在独立的 sing-box 进程里，不在上面那段 xray.json 的兜底范围内。
+    # 只开 AnyTLS、从未启用过 Xray 协议的节点根本没有 xray.json，
+    # 不单独对一次的话，重启后 anytls.json 的用户表会与 data 长期不一致
+    # （2026-10-29 修）。
+    try:
+        with data_lock:
+            _any_snapshot = copy.deepcopy(data)
+        if sync_anytls_users(portal_path.parent, _any_snapshot):
+            print('[portal] 启动时补同步了 AnyTLS users', file=sys.stderr)
+    except Exception as e:
+        print('[portal] AnyTLS 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
 
     # 超额停用要扛住重启：开机后 systemd 会把服务重新拉起来，这里再停一次。
     try:
