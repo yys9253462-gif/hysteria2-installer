@@ -432,44 +432,56 @@ function showToast(msg, type = 'info') {
   }, 2800);
 }
 
+let confirmOpen = false;
 function showConfirm(options = {}) {
+  // 弹窗已经打开时忽略新的请求（返回 false）。
+  // 旧实现每次调用都往同一组按钮上再加一对监听：连续两次提交会让
+  // 一次「确定」同时 resolve 两个 Promise，同一个操作被执行两遍
+  // （2026-10-29 修）。
+  if (confirmOpen) return Promise.resolve(false);
+
+  const modal = document.getElementById('custom-confirm-modal');
+  const titleEl = document.getElementById('confirm-title');
+  const textEl = document.getElementById('confirm-text');
+  const iconEl = document.getElementById('confirm-icon');
+  const okBtn = document.getElementById('confirm-btn-ok');
+  const cancelBtn = document.getElementById('confirm-btn-cancel');
+
+  if (!modal || !titleEl || !textEl || !okBtn || !cancelBtn) {
+    return Promise.resolve(confirm(options.text || '确定执行吗？'));
+  }
+
+  titleEl.textContent = options.title || '操作确认';
+  textEl.textContent = options.text || '确定要继续执行吗？';
+  if (iconEl) {
+    iconEl.textContent = options.icon || '💡';
+    iconEl.className = 'confirm-icon-box ' + (options.isDanger ? 'danger' : (options.isWarn ? 'warn' : ''));
+  }
+  okBtn.textContent = options.confirmText || '确定执行';
+  okBtn.className = 'confirm-btn ' + (options.isDanger ? 'danger' : 'primary');
+  modal.classList.add('show');
+  confirmOpen = true;
+
   return new Promise((resolve) => {
-    const modal = document.getElementById('custom-confirm-modal');
-    const titleEl = document.getElementById('confirm-title');
-    const textEl = document.getElementById('confirm-text');
-    const iconEl = document.getElementById('confirm-icon');
-    const okBtn = document.getElementById('confirm-btn-ok');
-    const cancelBtn = document.getElementById('confirm-btn-cancel');
-
-    if (!modal || !titleEl || !textEl || !okBtn || !cancelBtn) {
-      resolve(confirm(options.text || '确定执行吗？'));
-      return;
-    }
-
-    titleEl.textContent = options.title || '操作确认';
-    textEl.textContent = options.text || '确定要继续执行吗？';
-    if (iconEl) {
-      iconEl.textContent = options.icon || '💡';
-      iconEl.className = 'confirm-icon-box ' + (options.isDanger ? 'danger' : (options.isWarn ? 'warn' : ''));
-    }
-
-    okBtn.textContent = options.confirmText || '确定执行';
-    okBtn.className = 'confirm-btn ' + (options.isDanger ? 'danger' : 'primary');
-
-    modal.classList.add('show');
-
     function cleanup(result) {
       modal.classList.remove('show');
       okBtn.removeEventListener('click', onOk);
       cancelBtn.removeEventListener('click', onCancel);
+      document.removeEventListener('keydown', onKey);
+      modal.removeEventListener('click', onBackdrop);
+      confirmOpen = false;
       resolve(result);
     }
-
     function onOk() { cleanup(true); }
     function onCancel() { cleanup(false); }
-
+    // Esc 关闭：纯键盘用户此前只能用 Tab 逐个跳到按钮。
+    function onKey(e) { if (e.key === 'Escape') cleanup(false); }
+    // 点背板关闭：与用户弹窗行为一致（此前确认弹窗只能点按钮）。
+    function onBackdrop(e) { if (e.target === modal) cleanup(false); }
     okBtn.addEventListener('click', onOk);
     cancelBtn.addEventListener('click', onCancel);
+    modal.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey);
   });
 }
 
@@ -520,9 +532,14 @@ function switchTab(tabId, subId) {
   const subs = pane.querySelectorAll('.subtab-btn');
   if (subs.length) {
     const wanted = subId && pane.querySelector('[data-subtab="' + subId + '"]');
-    switchSubtab(tabId, wanted ? subId : subs[0].dataset.subtab);
+    // 用实际生效的子页写哈希：传入的 subId 不存在时 switchSubtab 会回退到
+    // 第一个子页，旧实现却把不存在的 id 写进 URL，刷新后显示与地址不一致。
+    const effective = wanted ? subId : subs[0].dataset.subtab;
+    switchSubtab(tabId, effective);
+    history.replaceState(null, null, '#' + tabId + '/' + effective);
+  } else {
+    history.replaceState(null, null, '#' + tabId);
   }
-  history.replaceState(null, null, '#' + tabId + (subs.length ? '/' + (subId || subs[0].dataset.subtab) : ''));
 }
 
 document.querySelectorAll('[data-tab]').forEach(btn => {
@@ -565,6 +582,8 @@ if (location.hash) {
       checkRealityStatus();
       checkVmessStatus();
       checkVlessencStatus();
+      // 深链接路径此前漏了 AnyTLS：书签进入时卡片会停在首屏旧状态。
+      checkAnytlsStatus();
     }
   }
 }
@@ -654,6 +673,8 @@ async function addWarpRule(domain) {
     if (json.ok) {
       if (inputWarpDomain) inputWarpDomain.value = '';
       if (Array.isArray(json.rules)) renderWarpRules(json.rules);
+      // 与删除路径一致：新增后也要刷新状态，「N 个生效中」与徽章才会更新。
+      await checkWarpStatus();
     } else {
       alert(json.error || '添加失败');
     }
@@ -679,7 +700,6 @@ async function delWarpRule(domain) {
     alert('请求异常: ' + e.message);
   }
 }
-window.delWarpRule = delWarpRule;
 
 async function checkWarpStatus() {
   if (!warpBadge) return;
@@ -1346,14 +1366,38 @@ if (btnResetRealityKeys) {
   });
 }
 
+
+// 复制到剪贴板：统一处理失败。
+// navigator.clipboard 在非 HTTPS、权限被拒、旧浏览器下会 reject；
+// 旧实现只有 .then 没有 .catch，失败时按钮毫无反应，看起来像点坏了。
+// 失败时退回「选中文本」并提示手动复制（与页面通用 [data-copy] 处理器一致）。
+function copyWithFeedback(text, button, doneText) {
+  const orig = button.textContent;
+  const ok = () => {
+    button.textContent = doneText;
+    setTimeout(() => { button.textContent = orig; }, 1500);
+  };
+  const fallback = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    let copied = false;
+    try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
+    ta.remove();
+    if (copied) ok();
+    else alert('复制失败，请手动选中后复制');
+  };
+  if (!navigator.clipboard || !navigator.clipboard.writeText) { fallback(); return; }
+  navigator.clipboard.writeText(text).then(ok).catch(fallback);
+}
+
 if (btnCopyRealityUri) {
   btnCopyRealityUri.addEventListener('click', () => {
     if (realityUriVal && realityUriVal.value) {
-      navigator.clipboard.writeText(realityUriVal.value).then(() => {
-        const orig = btnCopyRealityUri.textContent;
-        btnCopyRealityUri.textContent = '✓ 已复制直链';
-        setTimeout(() => btnCopyRealityUri.textContent = orig, 1500);
-      });
+      copyWithFeedback(realityUriVal.value, btnCopyRealityUri, '✓ 已复制直链');
     }
   });
 }
@@ -1459,11 +1503,7 @@ if (btnToggleVmess) {
 if (btnCopyVmessUri) {
   btnCopyVmessUri.addEventListener('click', () => {
     if (vmessUriVal && vmessUriVal.value) {
-      navigator.clipboard.writeText(vmessUriVal.value).then(() => {
-        const orig = btnCopyVmessUri.textContent;
-        btnCopyVmessUri.textContent = '✓ 已复制直链';
-        setTimeout(() => btnCopyVmessUri.textContent = orig, 1500);
-      });
+      copyWithFeedback(vmessUriVal.value, btnCopyVmessUri, '✓ 已复制直链');
     }
   });
 }
@@ -1559,11 +1599,7 @@ if (btnToggleVlessenc) {
 if (btnCopyVlessencUri) {
   btnCopyVlessencUri.addEventListener('click', () => {
     if (vlessencUriVal && vlessencUriVal.value) {
-      navigator.clipboard.writeText(vlessencUriVal.value).then(() => {
-        const orig = btnCopyVlessencUri.textContent;
-        btnCopyVlessencUri.textContent = '✓ 已复制直链';
-        setTimeout(() => btnCopyVlessencUri.textContent = orig, 1500);
-      });
+      copyWithFeedback(vlessencUriVal.value, btnCopyVlessencUri, '✓ 已复制直链');
     }
   });
 }
@@ -1658,11 +1694,7 @@ if (btnToggleAnytls) {
 if (btnCopyAnytlsUri) {
   btnCopyAnytlsUri.addEventListener('click', () => {
     if (anytlsUriVal && anytlsUriVal.value) {
-      navigator.clipboard.writeText(anytlsUriVal.value).then(() => {
-        const orig = btnCopyAnytlsUri.textContent;
-        btnCopyAnytlsUri.textContent = '✓ 已复制直链';
-        setTimeout(() => btnCopyAnytlsUri.textContent = orig, 1500);
-      });
+      copyWithFeedback(anytlsUriVal.value, btnCopyAnytlsUri, '✓ 已复制直链');
     }
   });
 }
@@ -2290,8 +2322,12 @@ async function pollTrafficSpeed() {
     document.querySelectorAll('[data-user-usage]').forEach(el => {
       const u = (json.users || {})[el.dataset.userUsage];
       if (!u) return;
-      el.textContent = u.measured_bytes === null ? '计量未就绪' : fmtUsage(u.used_bytes);
-      el.title = u.measurement_ok ? '真实累计用量（自计量开始）' : '计量异常或存在统计缺口；保留最近累计值';
+      // 首屏由服务端渲染的是 used_bytes，这里保持一致：
+      // 计量未就绪时旧实现会把它换成「计量未就绪」，数字凭空消失。
+      el.textContent = fmtUsage(u.used_bytes);
+      el.title = u.measured_bytes === null
+        ? '计量未就绪，显示的是已记录用量'
+        : (u.measurement_ok ? '真实累计用量（自计量开始）' : '计量异常或存在统计缺口；保留最近累计值');
     });
 
     // 更新各个用户的实时速率标签
@@ -2320,7 +2356,6 @@ const proxyTbody = document.getElementById('proxy-tbody');
 const btnInstallGost = document.getElementById('btn-install-gost');
 const proxyModal = document.getElementById('proxy-modal');
 const pmClose = document.getElementById('pm-close');
-const resPType = document.getElementById('res-ptype-badge');
 const resPHost = document.getElementById('res-phost');
 const resPPort = document.getElementById('res-pport');
 const resPUser = document.getElementById('res-puser');
@@ -2658,10 +2693,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
           const target = document.getElementById(b.dataset.modalCopy);
           if (!target) return;
           const text = target.value || target.textContent || '';
-          await navigator.clipboard.writeText(text);
-          const orig = b.textContent;
-          b.textContent = '已复制 ✓';
-          setTimeout(() => { b.textContent = orig; }, 1800);
+          // 用户弹窗里同样要处理失败：非 HTTPS 或权限被拒时会 reject，
+          // 旧实现没有 catch，按钮静默无反应且控制台报未处理 rejection。
+          copyWithFeedback(text, b, '已复制 ✓');
         });
       });
       

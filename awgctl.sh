@@ -79,7 +79,10 @@ require_jq() {
 awg_rand() {
     local min="$1" max="$2" span r
     span=$(( max - min + 1 ))
-    r=$(od -An -N4 -tu4 /dev/urandom | tr -d ' \n')
+    (( span > 0 )) || return 1
+    # od 不可用时（极简镜像）会得到空串，直接参与算术会语法错误。
+    r=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [[ "$r" =~ ^[0-9]+$ ]] || r="${RANDOM:-0}"
     echo $(( min + r % span ))
 }
 
@@ -133,7 +136,15 @@ detect_wan_iface() {
     local wan
     wan="$(ip -4 route show default 2>/dev/null \
         | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-    echo "${wan:-eth0}"
+    if [[ -n "$wan" && -d "/sys/class/net/$wan" ]]; then
+        echo "$wan"; return 0
+    fi
+    # 探测失败时**不能**静默回退到 eth0：现代发行版普遍是 ens3/enp0s3，
+    # 那条 MASQUERADE 规则会静默不生效 —— 表现是客户端握手成功、
+    # 隧道也通，但上不了网，属于最难排查的一类故障（2026-10-29 修）。
+    log_err "无法确定默认出口网卡（ip route 输出为空或网卡不存在）。"
+    log_err "请用 --wan <网卡名> 指定，或确认本机存在默认路由。"
+    return 1
 }
 
 # 找一个可用的 UDP 端口（必须避开 Hysteria2 的端口跳跃区间）
@@ -260,12 +271,19 @@ download_binaries() {
     log_info "SHA256 校验通过"
 
     # 拒绝含绝对路径 / `..` 的成员，防止以 root 写出临时目录之外。
-    local member
+    # ⚠️ 必须先把清单读出来并检查 tar 的返回码：旧写法用进程替换，
+    # `tar -t` 失败时循环一次都不执行，检查被当成「通过」（fail-open，
+    # 2026-10-29 修）。install.sh 的同名逻辑一直是 fail-closed。
+    local member listing
+    if ! listing="$(tar -tzf "${tmpd}/awg.tar.gz" 2>/dev/null)"; then
+        rm -rf "$tmpd"; log_err "无法读取安装包清单（包可能已损坏），已放弃安装"; return 1
+    fi
+    [ -n "$listing" ] || { rm -rf "$tmpd"; log_err "安装包为空，已放弃安装"; return 1; }
     while IFS= read -r member; do
         case "$member" in
             /*|..|../*|*/../*|*/..) rm -rf "$tmpd"; log_err "安装包内含不安全路径成员，已放弃安装"; return 1 ;;
         esac
-    done < <(tar -tzf "${tmpd}/awg.tar.gz" 2>/dev/null)
+    done <<< "$listing"
 
     if ! tar -xzf "${tmpd}/awg.tar.gz" -C "$tmpd" 2>/dev/null; then
         rm -rf "$tmpd"; log_err "解压失败（包可能已损坏）"; return 1
@@ -279,14 +297,37 @@ download_binaries() {
     done
 
     mkdir -p "$AWG_DIR"
-    install -m 0755 "${tmpd}/amneziawg-go" "$AWG_GO_BIN"
-    install -m 0755 "${tmpd}/awg"          "$AWG_BIN"
-    install -m 0755 "${tmpd}/awg-quick"    "$AWG_QUICK_BIN"
+    # 覆盖现役二进制前先备份，装完立刻验证新文件真的能执行；
+    # 任一步失败就整组恢复。旧实现直接覆盖，新版架构不符或损坏时
+    # 旧版本已经没了，AWG 直接不可用、只能重装（2026-10-29 修）。
+    local bakd dst f
+    bakd="$(mktemp -d "${AWG_DIR}/.binbak.XXXXXX")"
+    for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
+        [[ -e "$f" ]] && cp -a "$f" "$bakd/$(basename "$f")"
+    done
+    _restore_bins() {
+        for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
+            [[ -e "$bakd/$(basename "$f")" ]] && install -m 0755 "$bakd/$(basename "$f")" "$f"
+        done
+        rm -rf "$bakd"
+    }
+    if ! install -m 0755 "${tmpd}/amneziawg-go" "$AWG_GO_BIN"        || ! install -m 0755 "${tmpd}/awg"          "$AWG_BIN"        || ! install -m 0755 "${tmpd}/awg-quick"    "$AWG_QUICK_BIN"; then
+        _restore_bins; rm -rf "$tmpd"
+        log_err "写入二进制失败，已恢复原有版本"
+        return 1
+    fi
+    # 冒烟：新二进制必须至少能跑起来（--version / version 任一成功即可）。
+    if ! { "$AWG_BIN" --version >/dev/null 2>&1 || "$AWG_BIN" version >/dev/null 2>&1; }; then
+        _restore_bins; rm -rf "$tmpd"
+        log_err "新二进制无法执行（架构不符或文件损坏），已恢复原有版本"
+        return 1
+    fi
     if [[ -f "${tmpd}/VERSION" ]]; then
         cp -f "${tmpd}/VERSION" "$AWG_VERSION_FILE"
         chmod 600 "$AWG_VERSION_FILE"
     fi
-    rm -rf "$tmpd"
+    rm -rf "$bakd" "$tmpd"
+    unset -f _restore_bins
     log_info "已安装: ${AWG_GO_BIN} / ${AWG_BIN} / ${AWG_QUICK_BIN}"
 }
 
@@ -379,7 +420,7 @@ render_server_config() {
     port="$(meta_get port)"
     priv="$(meta_get server_private_key)"
     hp="$(meta_get HeaderProtectionKey)"
-    wan="$(detect_wan_iface)"
+    wan="$(detect_wan_iface)" || die "无法确定出口网卡，AWG 配置未生成"
 
     [[ -n "$port" ]] || die "meta 中缺少 port，无法渲染配置"
     [[ -n "$priv" ]] || die "meta 中缺少 server_private_key，无法渲染配置"
@@ -812,7 +853,9 @@ cmd_install() {
 
     log_step "安装 AmneziaWG（协议线 AWG ${line}.x，架构 ${arch}，UDP ${port}）"
 
-    download_binaries "$line" "$arch"
+    # 失败时 download_binaries 已回滚旧二进制；不检查返回码会继续重启服务、
+    # 误报安装/更新成功（2026-10-29 修）。
+    download_binaries "$line" "$arch" || die "二进制安装失败，现有版本保持不变"
     preflight_binaries || exit 1
 
     # 服务端密钥（已存在则保留，避免让全部客户端失效）
@@ -1044,7 +1087,9 @@ cmd_update() {
     local old_line
     old_line="$(version_line)"
 
-    download_binaries "$line" "$arch"
+    # 失败时 download_binaries 已回滚旧二进制；不检查返回码会继续重启服务、
+    # 误报安装/更新成功（2026-10-29 修）。
+    download_binaries "$line" "$arch" || die "二进制安装失败，现有版本保持不变"
     preflight_binaries || exit 1
     meta_set arch "$arch"
 

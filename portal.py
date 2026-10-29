@@ -1802,7 +1802,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
         <div class="form-field">
           <label for="f_days">服务有效期 (天) <span>默认 30</span></label>
-          <input id="f_days" name="duration_days" type="number" min="1" max="3650" value="30" placeholder="默认 30 天">
+          <input id="f_days" name="duration_days" type="number" min="1" max="36500" value="30" placeholder="默认 30 天">
           <small>从创建时间起算的有效天数</small>
         </div>
 
@@ -1814,7 +1814,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
         <div class="form-field">
           <label for="f_iplimit">同时在线网络数 <span>按公网 IP 计，0 为不限</span></label>
-          <input id="f_iplimit" name="ip_limit" type="number" min="0" max="100" value="0" placeholder="例如填 1 或 2">
+          <input id="f_iplimit" name="ip_limit" type="number" min="0" max="1000" value="0" placeholder="例如填 1 或 2">
           <small>限制单人或单家庭设备同时使用</small>
         </div>
 
@@ -1831,7 +1831,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     </details>
 
     <div class="user-toolbar">
-      <input id="user-search" type="search" placeholder="搜索用户标识 / 备注 / 订单号" autocomplete="off">
+      <input id="user-search" type="search" aria-label="搜索用户" placeholder="搜索用户标识 / 备注 / 订单号" autocomplete="off">
       <select id="user-filter" aria-label="按状态筛选">
         <option value="all">全部状态</option>
         <option value="active">仅正常</option>
@@ -1881,7 +1881,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <details style="display:inline-block">
           <summary style="font-size:12px;color:var(--accent);cursor:pointer;font-weight:600">高级指定端口 ▾</summary>
           <div style="margin-top:8px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;display:flex;gap:8px;align-items:center">
-            <input id="custom-proxy-port" type="number" min="1" max="65535" placeholder="输入自定义端口(留空则随机)" style="width:200px;height:34px;padding:0 10px;border:1px solid var(--line);border-radius:6px;font-size:12px">
+            <input id="custom-proxy-port" type="number" aria-label="自定义端口" min="1" max="65535" placeholder="输入自定义端口(留空则随机)" style="width:200px;height:34px;padding:0 10px;border:1px solid var(--line);border-radius:6px;font-size:12px">
             <span style="font-size:11px;color:var(--muted)">选填，留空自动分配</span>
           </div>
         </details>
@@ -2737,7 +2737,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
 
 <!-- 全局高颜值自定义确认弹窗 -->
-<div class="modal-backdrop" id="custom-confirm-modal">
+<div class="modal-backdrop" id="custom-confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirm-title" aria-describedby="confirm-text">
   <div class="confirm-card">
     <div class="confirm-icon-box" id="confirm-icon">🚀</div>
     <div class="confirm-title" id="confirm-title">请确认操作</div>
@@ -8019,6 +8019,9 @@ if __name__ == '__main__':
             with data_lock:
                 data['vmess_config'] = new_cfg
             save_data()
+            # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
+            # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
+            regenerate_page()
             firewall_port(listen_port, 'tcp', open_=True)
             return new_cfg
 
@@ -8097,6 +8100,9 @@ if __name__ == '__main__':
             with data_lock:
                 data['vlessenc_config'] = new_cfg
             save_data()
+            # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
+            # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
+            regenerate_page()
             firewall_port(listen_port, 'tcp', open_=True)
             return new_cfg
 
@@ -8150,6 +8156,8 @@ if __name__ == '__main__':
                 with data_lock:
                     data.pop('vmess_config', None)
                 save_data()
+                # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
+                regenerate_page()
                 if closed_port:
                     firewall_port(closed_port, 'tcp', open_=False)
                 return self.reply_json(200, {'ok': True, 'active': False})
@@ -8369,6 +8377,9 @@ if __name__ == '__main__':
             with data_lock:
                 data['anytls_config'] = new_cfg
             save_data()
+            # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
+            # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
+            regenerate_page()
             firewall_port(listen_port, 'tcp', open_=True)
             return new_cfg
 
@@ -8417,6 +8428,8 @@ if __name__ == '__main__':
                     acfg['enabled'] = False
                     data['anytls_config'] = acfg
                 save_data()
+                # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
+                regenerate_page()
                 if closed_port:
                     firewall_port(closed_port, 'tcp', open_=False)
                 return self.reply_json(200, {'ok': True, 'active': False})
@@ -8504,6 +8517,8 @@ if __name__ == '__main__':
                 with data_lock:
                     data.pop('vlessenc_config', None)
                 save_data()
+                # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
+                regenerate_page()
                 if closed_port:
                     firewall_port(closed_port, 'tcp', open_=False)
                 return self.reply_json(200, {'ok': True, 'active': False})

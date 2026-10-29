@@ -2079,11 +2079,21 @@ PYPORT
         log_err "请释放部分端口后重试，或检查 python3 是否已安装。"
         return 1
     fi
-    PORTAL_LOCAL_PORT=$(python3 - <<'PYPORT'
-import socket
-with socket.socket() as sock:
-    sock.bind(('127.0.0.1', 0))
-    print(sock.getsockname()[1])
+    # 本地端口必须避开刚选中的订阅端口：上一个 bind 成功后 socket 已关闭，
+    # 内核完全可能把同一个端口再分给 127.0.0.1 的绑定。那样 Hysteria 的
+    # masquerade 与门户会抢同一个端口，装完直接起不来（2026-10-29 修）。
+    PORTAL_LOCAL_PORT=$(python3 - "${HY2_SUB_PORT}" <<'PYPORT'
+import socket, sys
+avoid = {int(sys.argv[1])} if sys.argv[1].isdigit() else set()
+for _ in range(20):
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+    if port not in avoid:
+        print(port)
+        break
+else:
+    raise SystemExit('no free loopback port')
 PYPORT
     ) || PORTAL_LOCAL_PORT=""
     if ! is_valid_port "${PORTAL_LOCAL_PORT:-}"; then
