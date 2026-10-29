@@ -42,6 +42,15 @@ class ArtifactsPasswordBoundaryTests(unittest.TestCase):
         self.assertIn('user-pw', uri)
         self.assertNotIn('master-secret-only', uri)
 
+    def test_corrupt_meta_strings_do_not_break_generation(self):
+        for extra in ({'pin_sha256': 123}, {'pin_sha256': ['a']},
+                      {'obfs_password': 123}, {'obfs_password': ['a']},
+                      {'hop_port_range': 123}, {'hop_port_range': ['a']}):
+            with self.subTest(extra=extra):
+                uri, clash, sing = portal.artifacts(
+                    dict(META, **extra), auth_override='user-pw', name_override='Hy2-u')
+                self.assertTrue(uri.startswith('hysteria2://user-pw@'))
+
     def test_master_password_still_used_when_no_override(self):
         # 节点主页面的默认订阅链接确实该用主密码 —— 那条链接属于机主本人。
         uri, _, _ = portal.artifacts(META, name_override='Hy2-node')

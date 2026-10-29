@@ -1696,13 +1696,12 @@ def resolve_subscription_port(m, config_path='/etc/hysteria/config.yaml'):
     返回 (port, source)，source 用于日志/排障时说明端口来自哪里。
     """
     explicit = m.get('subscription_port') if isinstance(m, dict) else None
-    if explicit:
-        try:
-            value = int(explicit)
-            if 1 <= value <= 65535:
-                return value, 'client_meta'
-        except (TypeError, ValueError):
-            pass
+    # 与 artifacts() 同一套校验：True 会变成端口 1、1.5 被截成 1、
+    # inf 抛 OverflowError。这些值都会生成一条指向**没人监听**端口的订阅链接，
+    # 客户端只报「订阅导入失败」，看不出是配置坏了（2026-10-30 修）。
+    value = _valid_port(explicit)
+    if value:
+        return value, 'client_meta'
 
     detected = read_masquerade_port(config_path)
     if detected:
@@ -4013,7 +4012,9 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     if not vcfg:
         return ''
     host = vcfg.get('domain') or public_ip
-    port = vcfg.get('port')
+    # 与 VLESS-Reality 同一套端口校验：`"abc"` / True / 70000 会生成一条
+    # 客户端无法解析的链接（admin 面板仍显示成功）。
+    port = _valid_port(vcfg.get('port'))
     path = vcfg.get('ws_path') or '/'
     if not (host and port and path):
         return ''
@@ -4471,7 +4472,8 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     if not vcfg:
         return ''
     host = vcfg.get('domain') or public_ip
-    port = vcfg.get('port')
+    # 同 Reality / VMess：非整数端口会让客户端解析失败。
+    port = _valid_port(vcfg.get('port'))
     enc = vcfg.get('encryption', '')
     if not (host and port and enc):
         return ''
@@ -5258,9 +5260,12 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
         return ''
     short_id = rcfg.get('short_id', '')
     dest_sni = rcfg.get('dest_sni', 'www.apple.com')
-    port = rcfg.get('port', 443)
     pub_key = rcfg.get('public_key', '')
-    if not (short_id and dest_sni and pub_key):
+    # 端口必须是合法整数：被改成 "abc" / None / 70000 时链路会拼出
+    # `vless://...#:abc` 这种所有客户端都拒绝的地址，而页面照样显示成功
+    # （与 VMess 分支同一套 _valid_port 校验，2026-10-30 修）。
+    port = _valid_port(rcfg.get('port', 443))
+    if not (short_id and dest_sni and pub_key and port):
         return ''
     uid_uuid = reality_uuid_for_user(user_id)
     tag = label or ('VLESS-Reality-' + str(user_id))
@@ -5319,7 +5324,9 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     server_name = m.get('server_name') or m.get('public_ip', 'localhost')
     public_ip = m.get('public_ip', server_name)
     host = public_ip if is_insecure else server_name
-    name = name_override or ('Hy2-' + host)
+    # 标签会进 quote() 与客户端配置；非字符串（调用方传错或数据被改坏）
+    # 会抛 TypeError，把整页渲染和订阅下载一起打断。
+    name = name_override if isinstance(name_override, str) and name_override else ('Hy2-' + str(host))
     # 🔴 只有「没有覆盖」才回落节点主密码（auth_override is None）。
     # 旧写法 `auth_override or ...` 把用户密码的空串/0/None 也当成「未指定」，
     # 于是密码被清空或改坏的用户，分享链接里会直接出现**机主密码**。
@@ -5342,8 +5349,15 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     #       写 base64 会触发 `encoding/hex: invalid byte` 导致配置构建失败（这正是上一版扫码连不上的根因）；
     #       v2rayNG 源码仅在 pin 为空时才输出 allowInsecure，故两者并存既不报错，又能让只认 insecure 的
     #       sing-box / NekoBox / Clash / 官方 hysteria 正常跳过校验。
-    raw_pin = (m.get('pin_sha256') or '').strip().lower()
+    # meta 被手工改坏时这类字段可能是数字/列表：.strip() / 字符串拼接都会抛异常，
+    # 而 artifacts() 在每次页面渲染和订阅下载都会调用。
+    raw_pin = m.get('pin_sha256')
+    raw_pin = raw_pin.strip().lower() if isinstance(raw_pin, str) else ''
     pin_sha256 = raw_pin if len(raw_pin) == 64 and all(c in '0123456789abcdef' for c in raw_pin) else ''
+    if not isinstance(obfs_password, str):
+        obfs_password = ''
+    if not isinstance(hop_port_range, str):
+        hop_port_range = ''
     params = {'sni': server_name}
     if is_insecure:
         params['insecure'] = '1'
@@ -5381,11 +5395,11 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         ruri = reality_uri_for_user(reality, user_id, public_ip,
                                     label=(name + '-Reality'))
         r_uuid = reality_uuid_for_user(user_id)
-        r_port = reality.get('port', 443)
+        r_port = _valid_port(reality.get('port', 443))
         r_sni = reality.get('dest_sni', 'www.apple.com')
         r_pbk = reality.get('public_key', '')
         r_sid = reality.get('short_id', '')
-        if ruri and r_pbk and r_sid:
+        if ruri and r_pbk and r_sid and r_port:
             rname = name + '-Reality'
             reality_proxy = dict(name=rname, type='vless', server=public_ip,
                                  port=r_port, uuid=r_uuid, udp=True,

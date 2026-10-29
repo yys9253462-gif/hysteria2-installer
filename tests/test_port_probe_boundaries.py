@@ -39,6 +39,19 @@ class PortProbeBoundaries(unittest.TestCase):
                 doc = json.loads(sing)
                 self.assertEqual(doc['outbounds'][0]['server_port'], 19984)
 
+    def test_corrupt_subscription_port_is_not_used_for_links(self):
+        """订阅端口 True/1.5/inf 不能被当成 1 或截断，否则链接指向没人监听的端口。"""
+        for bad in (True, 1.5, float('inf'), 70000, -1):
+            with self.subTest(bad=bad):
+                port, source = portal.resolve_subscription_port(
+                    {'subscription_port': bad}, '/nonexistent/config.yaml')
+                self.assertEqual(source, 'fallback')
+                self.assertEqual(port, 443)
+
+    def test_numeric_string_subscription_port_still_honoured(self):
+        self.assertEqual(portal.resolve_subscription_port(
+            {'subscription_port': '2053'}, '/nonexistent/config.yaml'), (2053, 'client_meta'))
+
 
 if __name__ == '__main__':
     unittest.main()
