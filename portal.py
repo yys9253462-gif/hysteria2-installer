@@ -124,6 +124,9 @@ MASTER_USER_ID = 'admin_master'
 # 若允许真实用户叫这个名字，其流量会与占位记录聚合到同一 email，
 # 统计串号、按 email 收回时也会误伤。与机主账号同样禁止。
 RESERVED_USER_IDS = frozenset({MASTER_USER_ID, 'placeholder'})
+# user_id 的唯一格式定义。serve() 内沿用同名局部变量指向它，
+# 模块级辅助函数（撤销队列清洗等）也用它，避免两套规则漂移。
+USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
 # 面板自更新与 AWG 资源的来源仓库（模块级：resolve_update_ref 也要用）。
 AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 
@@ -1600,6 +1603,15 @@ def _expiry_text(value):
     except (OverflowError, OSError, ValueError):
         return '永久有效'
 
+def user_note_text(value):
+    """账户备注的展示文本；非字符串（手工编辑/旧格式）一律显示占位符。
+
+    备注会进 html.escape()，它对非字符串调用 .replace() 直接抛
+    AttributeError —— 单条坏备注会让整个总览页/客户页 500。
+    """
+    return value if isinstance(value, str) and value else '-'
+
+
 def format_bytes(b):
     # 负数只可能来自计数器回退或手工改坏的数据；直接展示 "-1 B" 会让人
     # 以为用量是负的。归零并保留原语义（调用方另有 used_bytes 原始值）。
@@ -1805,11 +1817,11 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         else:
             traffic_display = f"""<div><span data-user-usage="{html.escape(uid)}">{format_bytes(used_bytes)}</span> <span style="font-size:11px;color:var(--muted)">(不限)</span></div>"""
 
-        note = u.get("note") or "-"
+        note = user_note_text(u.get("note"))
         user_key = user_view_key(session_secret, uid, u.get('view_nonce', '')) if session_secret else ""
-        
+
         row_state = "active" if is_active else "inactive"
-        row_search = html.escape((uid + " " + (u.get("note") or "")).lower())
+        row_search = html.escape((uid + " " + ("-" if note == "-" else note)).lower())
         user_rows.append(f"""<tr data-user-row data-state="{row_state}" data-search="{row_search}">
           <td class="uid-cell"><strong title="{html.escape(uid)}">{html.escape(uid)}</strong><div class="uid-note" title="{html.escape(note)}">{html.escape(note)}</div></td>
           <td>{status_html}</td>
@@ -3040,7 +3052,8 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
         status_html = '<span class="status-pill active">运行正常</span>'
 
     expires_str = _expiry_text(uinfo.get("expires_at"))
-    ip_limit = uinfo.get("ip_limit", 0)
+    # 与总览页同一处理：设备上限可能是 "5" / None（手工编辑或旧格式）。
+    ip_limit = _safe_int(uinfo.get("ip_limit") or 0)
     # 按公网 IP 计：同一 Wi-Fi 下多台设备只占 1 个名额，文案不能写成「台设备」。
     ip_limit_str = f"{ip_limit} 个网络（同一网络下设备不限）" if ip_limit > 0 else "不限制"
 
@@ -3052,7 +3065,9 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     else:
         traffic_display = f"""<div>{format_bytes(used_bytes)} <span style="font-size:12px;color:var(--muted)">(不限制总流量)</span></div>"""
 
-    note = uinfo.get("note") or "-"
+    # 备注来自请求体或手工编辑，可能是数字/列表；html.escape 会调 .replace()，
+    # 非字符串直接让客户页 500。
+    note = user_note_text(uinfo.get("note"))
     # 🔴 订阅端口来自**节点 meta**，不是用户对象 —— 用户对象里从来没有这个键。
     # 调用方应从 meta 传入真实端口；若未传，则按权威来源解析，
     # **绝不兜底成伪造的 8443**（8443 在本项目里是被主动避开的黑名单端口）。
@@ -3770,6 +3785,20 @@ def suspend_state(data):
                        if isinstance(u, str) and TRAFFIC_SUSPEND_UNIT_RE.match(u)]
                       if isinstance(units, list) else [])
     return clean
+
+
+def pending_revocations(data):
+    """待撤销用户集合；损坏值按空集处理，且只保留合法 user_id。
+
+    旧写法 `set(data.get('_pending_revocations', []))` 在字段被写成数字时抛
+    TypeError，在写成字符串时把 `"abc"` 拆成 a/b/c 三个假 user_id —— 撤销
+    worker 每 5 秒重试一次，前一种让撤销永久失败，后一种会往 xray 里写
+    不存在的账号。
+    """
+    raw = data.get('_pending_revocations') if isinstance(data, dict) else None
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return set()
+    return {uid for uid in raw if isinstance(uid, str) and USER_ID_RE.match(uid)}
 
 
 def proxy_services(data):
@@ -4736,14 +4765,22 @@ def password_taken(users, pwd, owner_uid):
     /auth 按密码找用户、命中第一个就停：两人同密码时，后者的流量、限额、
     到期都会算到前者头上；撞上机主密码则直接拿到不限量的永久账号。
     """
-    return any(uid != owner_uid and str(u.get('password', '')) == str(pwd)
+    if not isinstance(users, dict):
+        return False
+    return any(uid != owner_uid and isinstance(u, dict)
+               and str(u.get('password', '')) == str(pwd)
                for uid, u in users.items())
 
 def enforce_node_access(root, snapshot, force_ids=()):
     """确认旧会话和 Reality 核心都已收回；失败不伪造销户成功。"""
     root = Path(root)
-    blocked = sorted(set(force_ids) | {uid for uid, info in snapshot.get('users', {}).items()
-                                      if not user_access_allowed(info)})
+    # 快照里的 users 可能是 null/list（手工编辑或截断写入）：直接 .items()
+    # 抛 AttributeError，撤销流程每 5 秒重试失败，停用/到期用户保持在线。
+    users = snapshot.get('users') if isinstance(snapshot, dict) else None
+    users = users if isinstance(users, dict) else {}
+    blocked = sorted({str(uid) for uid in force_ids}
+                     | {uid for uid, info in users.items()
+                        if not user_access_allowed(info)})
     cfg_path = root / 'usage-meter-config.json'
     cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
     if blocked:
@@ -5283,7 +5320,15 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     public_ip = m.get('public_ip', server_name)
     host = public_ip if is_insecure else server_name
     name = name_override or ('Hy2-' + host)
-    password = auth_override or m.get('auth_password', '')
+    # 🔴 只有「没有覆盖」才回落节点主密码（auth_override is None）。
+    # 旧写法 `auth_override or ...` 把用户密码的空串/0/None 也当成「未指定」，
+    # 于是密码被清空或改坏的用户，分享链接里会直接出现**机主密码**。
+    password = m.get('auth_password', '') if auth_override is None else auth_override
+    # 密码来自用户记录，可能是数字/列表（手工编辑、旧格式）。quote() 只接受
+    # 字符串，非字符串会让整个订阅/分享页 500；退回空串等于「这条链接不可用」，
+    # 但仍能渲染页面并提示检查账号。
+    if not isinstance(password, str):
+        password = ''
     # 端口必须落成合法整数（2026-10-25 修）：meta 被改坏时 listen_port 可能是
     # None / 字符串，旧代码会原样拼出 `hysteria2://...:None` 这种所有客户端
     # 都会拒绝的链接，而且没有任何报错提示。这里退回默认端口。
@@ -5781,7 +5826,20 @@ def serve(path):
                          % ', '.join(_missing))
     # 与 prepare() 同一条规则：空串/None 不能当密钥用（.get 的默认值只在
     # 键缺失时生效，手工改坏或截断写入会留下空串）。
-    session_secret = data.get('session_secret') or data['auth_hash']
+    # 🔴 两者都必须是字符串：hmac.new(...encode()) 在数字/None 上抛异常，
+    # 而这一段在 serve() 顶部 —— 门户直接起不来（Hy2 鉴权后端随之全挂）。
+    # auth_hash 损坏时不替机主编一个新密码（会静默改掉登录凭据），
+    # 与缺失字段同样给明确错误并退出。
+    if not isinstance(data.get('auth_hash'), str) or not data['auth_hash']:
+        raise SystemExit('[portal] portal.json 的 auth_hash 已损坏。'
+                         '请从备份恢复 portal.json 或重新执行安装。')
+    session_secret = data.get('session_secret')
+    if not isinstance(session_secret, str) or not session_secret:
+        # 回落到 auth_hash 是旧行为；但**必须写回 data**，否则后续
+        # regenerate_page() 仍从 data 读空值，用户分享链接的 k 变成空串，
+        # 所有已发出去的链接都会失效。
+        session_secret = data['auth_hash']
+        data['session_secret'] = session_secret
     # api_key 与 session_secret 同理：空串会让 Bearer 校验退化成常量比较。
     # 重新生成后要**落盘**（portal.json 与 portal-access.json 两处），
     # 否则每次重启都换一个新 key，控制台永远对不上。
@@ -5808,12 +5866,19 @@ def serve(path):
     gost_operation_lock = threading.RLock()
     for key in ('warp_applying', 'egress_applying', '_egress_pending'):
         data.pop(key, None)  # pending worker threads cannot survive a process restart
-    if (data.get('core_upgrade') or {}).get('state') == 'running':
-        data['core_upgrade'] = dict(data['core_upgrade'], state='interrupted',
+    # core_upgrade 被手工改成 7 / "x" 时 `.get` 抛 AttributeError，门户直接起不来
+    # —— 而门户同时是 Hy2 鉴权后端。非 dict 一律视为没有进行中的任务。
+    _core_job = data.get('core_upgrade')
+    if not isinstance(_core_job, dict):
+        _core_job = None
+    if _core_job is not None and _core_job.get('state') == 'running':
+        data['core_upgrade'] = dict(_core_job, state='interrupted',
             error='门户重启打断更新任务，请核对当前核心版本后重试')
+    elif _core_job is None and 'core_upgrade' in data:
+        data.pop('core_upgrade', None)
     ip_tracker = {}
     IP_TIMEOUT_SECONDS = 180
-    VALID_USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
+    VALID_USER_ID_RE = USER_ID_RE
     # AmneziaWG 客户端名称：与 awgctl.sh 中的校验保持一致
     VALID_AWG_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,32}$')
     # AmneziaWG 连接地址（endpoint）：域名或 IP 字面量，可带可选端口。
@@ -5847,20 +5912,20 @@ def serve(path):
         nonlocal last_enforced_blocked
         with access_apply_lock:
             with data_lock:
-                pending=set(data.get('_pending_revocations', [])) | set(force_ids)
+                pending=pending_revocations(data) | set(force_ids)
                 snapshot=copy.deepcopy(data)
                 blocked=blocked_user_ids()
             try:
                 enforce_node_access(portal_path.parent,snapshot,pending)
             except Exception as exc:
                 with data_lock:
-                    data['_pending_revocations']=sorted(set(data.get('_pending_revocations', [])) | pending)
+                    data['_pending_revocations']=sorted(pending_revocations(data) | pending)
                     save_data()
                 print('[expiry] access enforcement failed: '+type(exc).__name__,file=sys.stderr)
                 return False
             with data_lock:
                 # 收回期间新排进来的待撤销项要保留，只清掉本轮已确认的。
-                remaining=set(data.get('_pending_revocations', [])) - pending
+                remaining=pending_revocations(data) - pending
                 if remaining:
                     data['_pending_revocations']=sorted(remaining)
                 else:
@@ -5872,7 +5937,7 @@ def serve(path):
         while True:
             try:
                 with data_lock:
-                    needed=bool(data.get('_pending_revocations')) or blocked_user_ids()!=(last_enforced_blocked or frozenset())
+                    needed=bool(pending_revocations(data)) or blocked_user_ids()!=(last_enforced_blocked or frozenset())
                 if needed:apply_access()
             except Exception as exc:
                 print('[expiry] worker retry: '+type(exc).__name__,file=sys.stderr)
@@ -7653,7 +7718,7 @@ if __name__ == '__main__':
                     if user_id == MASTER_USER_ID:
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot delete the master account'})
                     with data_lock:
-                        data['_pending_revocations']=sorted(set(data.get('_pending_revocations',[])) | {user_id})
+                        data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
                         if user_id in data.get('users', {}):
                             del data['users'][user_id]
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
@@ -8043,7 +8108,8 @@ if __name__ == '__main__':
                 # 与 raw 的 CDN 缓存无关。
                 allow_custom = form.get('allow_custom', ['0'])[0] == '1'
                 with data_lock:
-                    if (data.get('core_upgrade') or {}).get('state') == 'running':
+                    _job_now = data.get('core_upgrade')
+                    if isinstance(_job_now, dict) and _job_now.get('state') == 'running':
                         return self.reply_json(409, {'ok': False, 'error': '核心更新仍在运行，请等待完成'})
                     data['core_upgrade'] = {'state': 'running', 'started_at': int(time.time())}
                 save_data()
@@ -9450,7 +9516,7 @@ if __name__ == '__main__':
                         if user_id not in data.get('users', {}):
                             return self.reply(404, b'User not found')
                         if user_id in data.get('users', {}):
-                            data['_pending_revocations']=sorted(set(data.get('_pending_revocations',[])) | {user_id})
+                            data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
                             del data['users'][user_id]
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
@@ -10163,7 +10229,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply(503, share_unavailable_html(
                         '节点元信息缺失或损坏，请联系管理员检查 client_meta.json').encode('utf-8'),
                         'text/html; charset=utf-8')
-                pwd = u_copy.get('password', '')
+                # 密码缺失/被改坏时不能生成链接：空密码会拼出
+                # `hysteria2://@host`，客户端导入即失败，页面却显示成功。
+                pwd = u_copy.get('password')
+                if not isinstance(pwd, str) or not pwd:
+                    return self.reply(503, share_unavailable_html(
+                        '该账号的密码为空或已损坏，请联系管理员重置密码').encode('utf-8'),
+                        'text/html; charset=utf-8')
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
@@ -10227,7 +10299,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not self.is_authenticated():
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
                 with data_lock:
-                    job = dict(data.get('core_upgrade', {}) or {})
+                    _job_now = data.get('core_upgrade')
+                    job = dict(_job_now) if isinstance(_job_now, dict) else {}
                 return self.reply_json(200, {'ok': True, 'job': job})
 
             if subpath == 'warp-status':
@@ -10263,7 +10336,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     u_copy = dict(u)
 
                 m = read_meta_file(meta_path)
-                pwd = u_copy.get('password', '')
+                pwd = u_copy.get('password')
+                if not isinstance(pwd, str) or not pwd:
+                    return self.reply_json(503, {'ok': False,
+                        'error': '该账号的密码为空或已损坏，请先重置密码再导出配置'})
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,

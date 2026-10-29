@@ -29,7 +29,7 @@ class ExpiryTests(unittest.TestCase):
   source=pathlib.Path(portal.__file__).read_text(encoding='utf-8');tree=ast.parse(source)
   branch=next(n for n in ast.walk(tree) if isinstance(n,ast.If) and isinstance(n.test,ast.Compare) and any(isinstance(v,ast.Constant) and v.value=='users/delete' for v in n.test.comparators))
   f=ast.parse('def delete(self,params):\n pass').body[0];f.body=branch.body
-  state={'users':{'probe':{'status':'active'}}};env={'data':state,'data_lock':threading.RLock(),'regenerate_page':lambda:None,'reality_registry':portal.reality_registry,'VALID_USER_ID_RE':re.compile('^[a-z]+$'),'MASTER_USER_ID':'admin_master','ip_tracker':{},'speed_tracker':{},'drop_meter_totals':portal.drop_meter_totals,'apply_access':lambda ids:False}
+  state={'users':{'probe':{'status':'active'}}};env={'data':state,'data_lock':threading.RLock(),'regenerate_page':lambda:None,'reality_registry':portal.reality_registry,'VALID_USER_ID_RE':re.compile('^[a-z]+$'),'MASTER_USER_ID':'admin_master','ip_tracker':{},'speed_tracker':{},'drop_meter_totals':portal.drop_meter_totals,'pending_revocations':portal.pending_revocations,'apply_access':lambda ids:False}
   exec(compile(ast.fix_missing_locations(ast.Module(body=[f],type_ignores=[])),'branch','exec'),env)
   class Fake:
    def reply_json(self,status,body):return status,body

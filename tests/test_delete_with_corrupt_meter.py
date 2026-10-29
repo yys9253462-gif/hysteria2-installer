@@ -44,6 +44,7 @@ def run_api_delete(usage_meter, user='probe'):
                ip_tracker={user: {'1.1.1.1'}} if user != 'admin_master' else {},
                speed_tracker={user: [1]} if user != 'admin_master' else {},
                drop_meter_totals=portal.drop_meter_totals,
+               pending_revocations=portal.pending_revocations,
                apply_access=lambda ids: calls.append(('revoke', ids)) or True)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
                  '<delete>', 'exec'), env)
@@ -65,6 +66,7 @@ def run_web_delete(usage_meter):
     ns = dict(portal.__dict__, data=state, data_lock=threading.RLock(),
               ip_tracker={'probe': {'1.1.1.1'}}, speed_tracker={'probe': [1]},
               drop_meter_totals=portal.drop_meter_totals,
+              pending_revocations=portal.pending_revocations,
               save_data=lambda: calls.append('save'),
               regenerate_page=lambda: calls.append('page'),
               MASTER_USER_ID='admin_master',

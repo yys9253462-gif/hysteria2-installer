@@ -44,6 +44,17 @@ class RenderCorruptStateTests(unittest.TestCase):
                 self.assertIn('<!doctype html', page.lower())
                 self.assertIn('u', page)
 
+    def test_user_page_tolerates_odd_fields(self):
+        base = {'status': 'active', 'expires_at': 2085974400, 'limit_bytes': 0,
+                'used_bytes': 0}
+        for extra in ({'note': 123}, {'note': ['a']}, {'note': ''},
+                      {'ip_limit': '5'}, {'ip_limit': None}, {'ip_limit': 2.5}):
+            with self.subTest(extra=extra):
+                page = portal.user_page_html(
+                    'h.example.com', '1.2.3.4', 443, '', 'u', dict(base, **extra),
+                    'hysteria2://x@h:1/', 'clash', 'sing', '', 'tok', 'k', sub_port=8443)
+                self.assertIn('<!doctype html', page.lower())
+
     def test_page_html_tolerates_non_dict_user_table(self):
         meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com',
                 'subscription_port': 8443, 'listen_port': 1, 'hop_port_range': '',
