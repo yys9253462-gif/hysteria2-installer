@@ -3980,7 +3980,14 @@ def managed_inbound_index(config, tag):
     兜底只对 Reality 生效：旧版配置里的 Reality 入站没有 tag，
     但 VMess 是本版本才引入的，不存在无 tag 的历史配置。
     """
+    # config 来自 xray.json：被截断/改坏时可能是 list 或字符串。
+    # 旧写法 `.get` 抛 AttributeError，而这里在撤销、启停、能力清单三条路径上
+    # —— 异常会让「停用/到期用户收回」整轮失败。
+    if not isinstance(config, dict):
+        return -1, None
     inbounds = config.get('inbounds') or []
+    if not isinstance(inbounds, list):
+        return -1, None
     for i, item in enumerate(inbounds):
         if isinstance(item, dict) and item.get('tag') == tag:
             return i, item
@@ -4005,6 +4012,10 @@ def upsert_managed_inbound(config, tag, inbound):
     在只有一种协议时没问题；加入 VMess 后那样会**丢掉 VMess 入站**。
     这里只动自己那一个元素，别的原样保留。
     """
+    # config 本身也可能是 list/str（xray.json 被截断或整份改坏）；
+    # 旧写法 config.get 抛 AttributeError，启停/重生成整条路径失败。
+    if not isinstance(config, dict):
+        config = {}
     # inbounds 可能是 None（手工改坏 / 旧版写出），setdefault 不会覆盖
     # 已存在的 None，随后 .append 直接 AttributeError。先归一化成列表。
     if not isinstance(config.get('inbounds'), list):
