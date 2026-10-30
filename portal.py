@@ -295,6 +295,10 @@ def strip_acl_block(text):
     acl 块的范围：从顶格的 `acl:` 起，到下一个顶格（非空、非注释）行之前为止。
     """
     out, i = [], 0
+    # config.yaml 读取失败或调用方传错时 text 可能不是字符串：
+    # split 抛 AttributeError，而这条路径在「应用出站配置」上。
+    if not isinstance(text, str):
+        return ''
     lines = text.split('\n')
     n = len(lines)
     while i < n:

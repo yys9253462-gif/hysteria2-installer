@@ -133,6 +133,31 @@ class AclBlockTests(unittest.TestCase):
         self.assertNotIn('gone(', missing)
 
 
+class AclTextHelperTests(unittest.TestCase):
+    """acl 文本助手对非字符串输入不能抛异常（同样在「应用配置」路径上）。"""
+
+    def test_strip_acl_block_tolerates_non_string(self):
+        for bad in (None, 7, ['x'], {'a': 1}, True):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal.strip_acl_block(bad), '')
+
+    def test_build_warp_acl_config_tolerates_non_string(self):
+        for bad in (None, 7, ['x'], True):
+            with self.subTest(bad=bad):
+                block = portal.build_warp_acl_config(bad, False, [])
+                self.assertIn('reject(127.0.0.0/8)', block)
+                self.assertIn('(all)', block)
+
+    def test_strip_acl_block_keeps_obfs_after_acl(self):
+        # 真实事故：把 acl 之后的 obfs 段一起删掉，客户端仍带混淆 → 连上没网。
+        text = ('listen: :443\n'
+                'acl:\n  inline:\n    - direct(all)\n'
+                'obfs:\n  type: salamander\n  salamander:\n    password: x\n')
+        stripped = portal.strip_acl_block(text)
+        self.assertNotIn('acl:', stripped)
+        self.assertIn('obfs:', stripped)
+
+
 class RoutingStateTests(unittest.TestCase):
     def test_corrupt_state_degrades_to_empty_lists(self):
         for data in ({'custom_outbounds': 7, 'warp_rules': 7, 'outbound_mode': 5},
