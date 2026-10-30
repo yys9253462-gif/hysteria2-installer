@@ -145,6 +145,7 @@ class LiveIpLimitTest(unittest.TestCase):
         env = {'json': json, 'time': time, 'hmac': __import__('hmac'),
                'ipaddress': __import__('ipaddress'), 'data_lock': threading.RLock(),
                'data': data, 'ip_tracker': {}, 'IP_TIMEOUT_SECONDS': 180,
+               'global_ip_deny': {}, 'active_ip_deny': portal.active_ip_deny,
                'user_access_denial': portal.user_access_denial,
                'user_table': lambda data: (data.get('users')
                    if isinstance(data.get('users'), dict) else {}),
