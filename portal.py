@@ -5932,7 +5932,9 @@ def sync_download_artifacts(data, uri, clash, sing, qr=_QR_UNSET):
     data['sing'] = sing
     if qr is _QR_UNSET:
         qr = qr_svg_for(uri)   # 调用方没预先算，就在这里算（prepare 阶段）
-    if qr:
+    # qr 可能是调用方传进来的非字符串（旧调用点/测试）；下载端点会
+    # `.encode()` 它，非字符串会让「下载配置」掐断连接。
+    if isinstance(qr, str) and qr:
         data['qr'] = qr
     return data
 

@@ -67,6 +67,26 @@ class RenderCorruptStateTests(unittest.TestCase):
                 self.assertIn('<!doctype html', page.lower())
 
 
+class DownloadArtifactTests(unittest.TestCase):
+    """sync_download_artifacts 只写字符串二维码。
+
+    下载端点会对 data['qr'] 调 .encode()：非字符串会让「下载配置」掐断连接。
+    """
+
+    def test_non_string_qr_is_not_stored(self):
+        for bad in (['a'], 123, {'x': 1}, None, ''):
+            with self.subTest(bad=bad):
+                data = {}
+                portal.sync_download_artifacts(data, 'u', 'clash', 'sing', qr=bad)
+                self.assertNotIn('qr', data)
+                self.assertEqual((data['clash'], data['sing']), ('clash', 'sing'))
+
+    def test_string_qr_is_stored(self):
+        data = {}
+        portal.sync_download_artifacts(data, 'u', 'clash', 'sing', qr='<svg/>')
+        self.assertEqual(data['qr'], '<svg/>')
+
+
 class LoginPageEscapingTests(unittest.TestCase):
     """登录页的 token 与错误提示必须被转义/兜底。
 
