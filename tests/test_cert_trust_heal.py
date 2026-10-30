@@ -692,6 +692,18 @@ class CertStatusInputTests(unittest.TestCase):
         self.assertIn('warn_level', info)
         self.assertIn('expires_in_days', info)
 
+    def test_heal_record_tolerates_corrupt_snapshots(self):
+        # before/after 是 meta 快照；非 dict 时旧写法 `.get` 抛 AttributeError，
+        # 而 record_cert_heal 在自愈主流程里。
+        for before, after in (({}, None), ({}, 7), ({}, [None]),
+                              ({}, {'pin_sha256': 123}), (7, {'a': 1})):
+            with self.subTest(before=before, after=after):
+                root = Path(tempfile.mkdtemp())
+                self.portal.record_cert_heal(root, {}, before, after)
+                written = json.loads((root / 'cert-selfheal.json').read_text())
+                self.assertIsInstance(written['last_pin'], str)
+                self.assertEqual(written['heal_count'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

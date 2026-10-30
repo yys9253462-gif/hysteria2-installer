@@ -3680,12 +3680,18 @@ def record_cert_heal(root, state, before, after):
                 prev_count = int(json.loads(state_path.read_text(encoding='utf-8')).get('heal_count') or 0)
             except Exception:
                 prev_count = 0
+        # before/after 是 meta 快照；被改成数字/列表时 `.get` 抛 AttributeError，
+        # 而 record_cert_heal 在自愈主流程里 —— 一次坏 meta 就让自愈痕迹写不下来
+        # （或直接打断自愈）。
+        before = before if isinstance(before, dict) else {}
+        after = after if isinstance(after, dict) else {}
+        last_pin = after.get('pin_sha256')
         payload = {
             'healed_at': int(time.time()),
             'heal_count': prev_count + 1,
-            'last_pin': (after or {}).get('pin_sha256', ''),
+            'last_pin': last_pin if isinstance(last_pin, str) else '',
             'fields': [k for k in ('cert_type', 'server_name', 'is_insecure', 'pin_sha256')
-                       if (before or {}).get(k) != (after or {}).get(k)],
+                       if before.get(k) != after.get(k)],
         }
         tmp = state_path.with_suffix('.tmp')
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
@@ -3838,6 +3844,18 @@ def drop_meter_totals(data, user_id):
         return False
     totals.pop(user_id, None)
     return True
+
+
+def config_section(data, key):
+    """取 data[key] 里的协议配置；值不是 dict 时返回空表。
+
+    所有协议配置（reality / vmess / vlessenc / anytls）都走这里：
+    旧代码 `dict(data.get(key) or {})` 在值被改成数字时抛 TypeError，
+    而这些调用点分布在订阅生成、协议启停、能力清单与状态卡片上 ——
+    一条坏配置会让整块功能 500。
+    """
+    value = data.get(key) if isinstance(data, dict) else None
+    return value if isinstance(value, dict) else {}
 
 
 def user_table(data):
@@ -7318,7 +7336,7 @@ if __name__ == '__main__':
             客户端的 pbk（公钥）需要更新。
             """
             with data_lock:
-                rcfg_old = dict(data.get('reality_config', {}) or {})
+                rcfg_old = dict(config_section(data, 'reality_config'))
 
             priv_key = '' if force else rcfg_old.get('private_key', '')
             pub_key = '' if force else rcfg_old.get('public_key', '')
@@ -7909,9 +7927,9 @@ if __name__ == '__main__':
                             # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
                             # 对应一个 VLESS UUID，开户即生效。
                             reality_registry(data)
-                            rcfg = dict(data.get('reality_config', {}) or {})
-                            vcfg_active = dict(data.get('vmess_config') or {})
-                            ecfg_active = dict(data.get('vlessenc_config') or {})
+                            rcfg = dict(config_section(data, 'reality_config'))
+                            vcfg_active = dict(config_section(data, 'vmess_config'))
+                            ecfg_active = dict(config_section(data, 'vlessenc_config'))
                     if conflict is not None:
                         # 锁已释放，现在才写响应。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
@@ -9182,8 +9200,8 @@ if __name__ == '__main__':
                 raise RuntimeError('VMess 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain)
             with data_lock:
-                old = dict(data.get('vmess_config') or {})
-                reality_port = (data.get('reality_config') or {}).get('port')
+                old = dict(config_section(data, 'vmess_config'))
+                reality_port = config_section(data, 'reality_config').get('port')
             # 必须显式避开 Reality 的端口：它可能刚写进配置、尚未重启，
             # 监听表里还看不到，只靠 ss 探测会让两者撞同一个端口。
             try:
@@ -9262,7 +9280,7 @@ if __name__ == '__main__':
                 raise RuntimeError('VLESS Encryption 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain, 'VLESS Encryption')
             with data_lock:
-                old = dict(data.get('vlessenc_config') or {})
+                old = dict(config_section(data, 'vlessenc_config'))
                 blocked_ports = {
                     m.get('listen_port'), m.get('subscription_port'),
                     (data.get('reality_config') or {}).get('port'),
@@ -9571,7 +9589,7 @@ if __name__ == '__main__':
             if not version or version < ANYTLS_MIN_SINGBOX:
                 raise RuntimeError('sing-box 核心未安装或版本低于 1.12，请先在「核心管理」中安装')
             with data_lock:
-                old = dict(data.get('anytls_config') or {})
+                old = dict(config_section(data, 'anytls_config'))
                 _data_now = dict(data)
             try:
                 _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
@@ -9649,7 +9667,7 @@ if __name__ == '__main__':
                             % ANYTLS_SERVICE})
                     (portal_path.parent / ANYTLS_CONFIG_NAME).unlink(missing_ok=True)
                 with data_lock:
-                    acfg = dict(data.get('anytls_config') or {})
+                    acfg = dict(config_section(data, 'anytls_config'))
                     closed_port = int(acfg.get('port') or 0)
                     # secret 与端口保留：再次启用时沿用，已下发的订阅不失效。
                     acfg['enabled'] = False
@@ -10361,10 +10379,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     m = read_meta_file(meta_path)
                     with data_lock:
                         d_snap = {
-                            'reality': dict(data.get('reality_config') or {}),
-                            'vmess': dict(data.get('vmess_config') or {}),
-                            'vlessenc': dict(data.get('vlessenc_config') or {}),
-                            'anytls': dict(data.get('anytls_config') or {}),
+                            'reality': dict(config_section(data, 'reality_config')),
+                            'vmess': dict(config_section(data, 'vmess_config')),
+                            'vlessenc': dict(config_section(data, 'vlessenc_config')),
+                            'anytls': dict(config_section(data, 'anytls_config')),
                             'warp_enabled': bool(data.get('warp_enabled')),
                             'users_count': len(user_table(data)),
                             'proxy_services': proxy_services(data),
@@ -11110,7 +11128,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     is_active = False
 
             with data_lock:
-                rcfg = dict(data.get('reality_config', {}))
+                rcfg = dict(config_section(data, 'reality_config'))
 
             qr_svg = ''
             if rcfg.get('uri'):

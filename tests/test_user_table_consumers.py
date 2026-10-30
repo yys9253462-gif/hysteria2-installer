@@ -36,6 +36,27 @@ class UserTableConsumersTests(unittest.TestCase):
         self.assertEqual(portal.vlessenc_clients({'users': users})[0]['email'], 'good')
 
 
+class ConfigSectionTests(unittest.TestCase):
+    """协议配置读取统一走 config_section：非 dict 一律当空表。"""
+
+    def test_non_dict_section_is_empty(self):
+        for bad in (None, 7, 'x', [None], True):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal.config_section({'vmess_config': bad}, 'vmess_config'), {})
+        self.assertEqual(portal.config_section(None, 'reality_config'), {})
+
+    def test_healthy_section_is_returned_as_is(self):
+        good = {'port': 2087}
+        self.assertIs(portal.config_section({'vmess_config': good}, 'vmess_config'), good)
+
+    def test_protocol_endpoints_survive_corrupt_sections(self):
+        # 这些调用点遍布订阅生成、启停与能力清单：旧写法 dict(7) 直接 TypeError。
+        for key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
+            with self.subTest(key=key):
+                data = {key: 7, 'users': {}}
+                self.assertEqual(portal.config_section(data, key), {})
+
+
 class RealityRegistryValueTests(unittest.TestCase):
     """reality_users 里的值必须是合法 UUID。
 
