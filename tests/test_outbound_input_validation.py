@@ -133,6 +133,22 @@ class AclBlockTests(unittest.TestCase):
         self.assertNotIn('gone(', missing)
 
 
+class WarpAclRuleTests(unittest.TestCase):
+    """WARP ACL 的规则容器损坏时不能抛异常（开关/应用配置的必经路径）。"""
+
+    def test_corrupt_rule_container_does_not_raise(self):
+        for rules in (7, 'x', [None], ['x'], True):
+            with self.subTest(rules=rules):
+                block = portal.build_warp_acl_config('listen: :443\n', True, rules)
+                self.assertIn('reject(127.0.0.0/8)', block)
+                self.assertIn('(all)', block)
+
+    def test_custom_rule_is_rendered(self):
+        block = portal.build_warp_acl_config(
+            'listen: :443\n', True, [{'domain': 'a.com', 'outbound': 'warp_socks'}])
+        self.assertIn('warp_socks(suffix:a.com)', block)
+
+
 class AclTextHelperTests(unittest.TestCase):
     """acl 文本助手对非字符串输入不能抛异常（同样在「应用配置」路径上）。"""
 

@@ -718,7 +718,10 @@ def outbound_target_exists(target, outbounds=None, existing_names=None):
 def build_warp_acl_config(original, enabled, rules):
     """Render WARP domain ACL over the existing Hysteria config."""
     text = strip_acl_block(original)
-    custom_rules = [r for r in (rules or ()) if isinstance(r, dict)
+    # rules 可能是数字（旧快照被改坏）：`for r in 7` 抛 TypeError，
+    # 而这里是 WARP 开关/应用配置的必经路径。
+    rows = rules if isinstance(rules, (list, tuple)) else ()
+    custom_rules = [r for r in rows if isinstance(r, dict)
                     and r.get('outbound') not in ('', None, 'warp', 'warp_socks')]
     if not enabled and not custom_rules:
         tail0 = 'direct_ipv4' if re.search(r'^\s*-\s*name:\s*direct_ipv4\s*$', text, re.M) else 'direct'
@@ -740,7 +743,7 @@ def build_warp_acl_config(original, enabled, rules):
         text = text.rstrip('\n') + '\n\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443\n  udpPorts: 443\n'
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
     lines = _acl_head()
-    for rule in (rules or ()) if enabled else custom_rules:
+    for rule in rows if enabled else custom_rules:
         domain = rule.get('domain', '') if isinstance(rule, dict) else rule
         target = rule.get('outbound') or warp_name if isinstance(rule, dict) else warp_name
         if target not in set(existing) | {'direct', 'reject'}:
