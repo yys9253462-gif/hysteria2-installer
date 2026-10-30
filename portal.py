@@ -1678,10 +1678,17 @@ def _expiry_text(value):
     """
     if value is None:
         return '永久有效'
+    if isinstance(value, bool):
+        # True 会被 float() 变成 1.0 → 渲染成 1970 年的日期，而准入判据
+        # 认为它已过期。这类值只可能是数据坏掉，统一按无效处理。
+        return '到期时间无效'
     try:
         ts = float(value)
     except (TypeError, ValueError):
-        return '永久有效'
+        # 无法解析 ≠ 永久。user_access_denial 对同样的值返回
+        # 'Invalid user record' 并拒绝连接；面板却写「永久有效」，
+        # 于是「显示永久、实际连不上」——最难排查的一类矛盾状态。
+        return '到期时间无效'
     if ts <= 0:
         return '已过期'
     if ts > 253402300799:       # 9999-12-31，防御性上限

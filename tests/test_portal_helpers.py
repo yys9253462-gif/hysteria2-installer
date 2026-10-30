@@ -24,8 +24,16 @@ class ExpiryTextTests(unittest.TestCase):
     def test_zero_is_expired(self):
         self.assertEqual(portal._expiry_text(0), '已过期')
 
-    def test_garbage_falls_back_to_permanent(self):
-        self.assertEqual(portal._expiry_text('not-a-time'), '永久有效')
+    def test_garbage_is_not_reported_as_permanent(self):
+        # user_access_denial 对同样的值返回 'Invalid user record' 并拒绝连接；
+        # 显示成「永久有效」会造成「显示永久、实际连不上」的矛盾状态。
+        for bad in ('not-a-time', [1], {'a': 1}, True):
+            with self.subTest(bad=bad):
+                text = portal._expiry_text(bad)
+                self.assertNotEqual(text, '永久有效')
+                self.assertIn('无效', text)
+                self.assertFalse(portal.user_access_allowed(
+                    {'status': 'active', 'expires_at': bad}, 1000))
 
 
 class YamlNameTests(unittest.TestCase):
