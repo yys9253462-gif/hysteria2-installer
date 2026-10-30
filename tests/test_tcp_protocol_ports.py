@@ -47,6 +47,15 @@ class TcpProtocolPortTests(unittest.TestCase):
                        'encryption': 'mlkem768x25519plus.native.600s.x'}
                 self.assertEqual(portal.vlessenc_uri_for_user(cfg, 'u1', '203.0.113.10'), '')
 
+    def test_uri_builders_reject_non_dict_config(self):
+        # 配置来自 portal.json，被改成数字/列表时旧写法直接 AttributeError，
+        # 用户整份订阅生成失败（连其它协议节点也拿不到）。
+        for bad in (7, 'x', [None], None):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal.reality_uri_for_user(bad, 'u1', '203.0.113.10'), '')
+                self.assertEqual(portal.vmess_uri_for_user(bad, 'u1', '203.0.113.10'), '')
+                self.assertEqual(portal.vlessenc_uri_for_user(bad, 'u1', '203.0.113.10'), '')
+
     def test_artifacts_omit_nodes_with_invalid_port(self):
         for key, cfg in (
                 ('reality', {'port': 'abc', 'public_key': 'k', 'short_id': 's',

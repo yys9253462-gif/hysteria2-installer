@@ -372,7 +372,12 @@ def validate_outbound(entry):
     校验失败必须给出**可执行**的提示，而不是"参数错误"这种废话——
     用户是自己填的，得告诉他哪一栏不对、正确格式是什么。
     """
-    otype = (entry.get('type') or '').strip().lower()
+    # 表单/JSON 里的字段可能是数字或列表：`.strip()` 直接抛 AttributeError，
+    # 而调用点没有兜底 —— 一次手滑填成数字就让「保存出站」500，提示也没有。
+    if not isinstance(entry, dict):
+        return False, None, "出站配置必须是一个对象"
+    raw_type = entry.get('type')
+    otype = raw_type.strip().lower() if isinstance(raw_type, str) else ''
     if otype not in OUTBOUND_TYPES:
         return False, None, "类型只能是 direct / socks5 / http 之一"
     name = sanitize_outbound_name(entry.get('name'))
@@ -384,7 +389,8 @@ def validate_outbound(entry):
     cleaned = {'name': name, 'type': otype}
 
     if otype == 'socks5':
-        addr = (entry.get('addr') or '').strip()
+        raw_addr = entry.get('addr')
+        addr = raw_addr.strip() if isinstance(raw_addr, str) else ''
         # 必须带端口；只给域名或IP 是不够的
         if not re.match(r'^[^\s:]+:\d{1,5}$', addr):
             return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
@@ -397,13 +403,20 @@ def validate_outbound(entry):
         # 只放行代理凭据实际会用到的可见 ASCII，其余一律拒绝并说明。
         for field in ('username', 'password'):
             if entry.get(field):
-                value = str(entry[field]).strip()
+                # 必须是字符串：列表/数字被 str() 成 "['x']" / "123" 之后同样
+                # 满足可见 ASCII 校验，于是面板显示 password 已保存，客户端却
+                # 拿着完全不同的凭据去握手 —— 只报鉴权失败，查不出原因。
+                raw = entry[field]
+                if not isinstance(raw, str):
+                    return False, None, '%s 必须是字符串' % field
+                value = raw.strip()
                 if not re.fullmatch(r'[!-~]{1,128}', value):
                     return False, None, '%s 只能包含可见 ASCII 字符（不含空格与换行），长度 1-128' % field
                 cleaned[field] = value
 
     elif otype == 'http':
-        url = (entry.get('url') or '').strip()
+        raw_url = entry.get('url')
+        url = raw_url.strip() if isinstance(raw_url, str) else ''
         # 路径里也不允许空白：旧正则的 `.*` 允许空格，带空格的 URL
         # curl 会直接拒绝，而配置照样写进 YAML（2026-10-30 修）。
         if not re.match(r'^https?://[^\s/]+(?:/.*)?$', url, re.I) or re.search(r'\s', url):
@@ -413,7 +426,12 @@ def validate_outbound(entry):
         cleaned['insecure'] = str(entry.get('insecure', '')).strip().lower() in ('1', 'true', 'yes', 'on')
 
     else:  # direct
-        mode = (entry.get('mode') or '').strip()
+        raw_mode = entry.get('mode')
+        if raw_mode not in (None, '') and not isinstance(raw_mode, str):
+            # 数字 5 被静默当成 auto，用户以为限定了 IPv4/IPv6 家族，
+            # 实际按 auto 出去 —— 与「已保存」的提示矛盾。
+            return False, None, "direct 模式必须是字符串"
+        mode = raw_mode.strip() if isinstance(raw_mode, str) else ''
         if mode and mode not in ('auto', '64', '46', '6', '4'):
             return False, None, "direct 模式只能是 auto / 64 / 46 / 6 / 4 之一"
         if mode:
@@ -666,7 +684,10 @@ def outbound_target_exists(target, outbounds=None, existing_names=None):
     target = str(target or '').strip()
     if target in ('direct', 'reject'):
         return True
-    custom = {str(o.get('name') or '') for o in (outbounds or []) if isinstance(o, dict)}
+    # 容器被改成数字时 `for o in 7` 抛 TypeError，位置在 rule-add 的锁内，
+    # 用户点「添加规则」会直接 500。
+    rows = outbounds if isinstance(outbounds, (list, tuple)) else ()
+    custom = {str(o.get('name') or '') for o in rows if isinstance(o, dict)}
     configured = set(_existing_outbound_names() if existing_names is None else existing_names)
     return bool(target) and target in custom | configured
 
@@ -726,10 +747,24 @@ def normalize_route_rules(rules):
 
 
 def routing_state(data):
+    """出站/分流状态快照；损坏的容器一律降级成空表。
+
+    这个快照会直接进 render_egress_config 与 capabilities 响应：
+    custom_outbounds 是数字时渲染抛异常（WARP 保存永久失败），
+    warp_rules 是数字时 normalize_route_rules 之前就会在 deepcopy 后炸，
+    面板拿不到能力清单。
+    """
+    rules = data.get('warp_rules')
+    if not isinstance(rules, (list, tuple)):
+        rules = DEFAULT_WARP_DOMAINS if data.get('warp_enabled') else []
+    outbounds = data.get('custom_outbounds')
+    if not isinstance(outbounds, (list, tuple)):
+        outbounds = []
+    mode = data.get('outbound_mode')
     return {'warp_enabled': bool(data.get('warp_enabled', False)),
-            'warp_rules': copy.deepcopy(data.get('warp_rules', DEFAULT_WARP_DOMAINS if data.get('warp_enabled') else [])),
-            'custom_outbounds': copy.deepcopy(data.get('custom_outbounds', [])),
-            'outbound_mode': data.get('outbound_mode', 'rules')}
+            'warp_rules': copy.deepcopy(list(rules)),
+            'custom_outbounds': copy.deepcopy(list(outbounds)),
+            'outbound_mode': mode if isinstance(mode, str) else 'rules'}
 
 
 def render_egress_config(original, state):
@@ -4028,7 +4063,9 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     字段名必须用小写 `v`/`ps` 等老字段：v2rayN 与 Shadowrocket 都按这套解析，
     新版 `vmess://` URI 草案（带 path 查询串）支持面反而更窄。
     """
-    if not vcfg:
+    # 配置来自 portal.json：被改成数字/列表时 `.get` 直接抛 AttributeError，
+    # 而调用点在用户订阅生成路径上 —— 一条坏配置让整份订阅 500。
+    if not isinstance(vcfg, dict):
         return ''
     host = vcfg.get('domain') or public_ip
     # 与 VLESS-Reality 同一套端口校验：`"abc"` / True / 70000 会生成一条
@@ -4097,6 +4134,17 @@ def anytls_password_for_user(secret, user_id):
                     hashlib.sha256).hexdigest()[:32]
 
 
+def anytls_config(data):
+    """AnyTLS 配置字典；被改成数字/字符串时按未配置处理。
+
+    这些值来自 portal.json（旧版本可直接编辑）。`anytls_users` 在同步
+    sing-box 用户表的路径上，`.get` 抛 AttributeError 会让同步整轮失败，
+    而界面只显示「启用失败」。
+    """
+    cfg = data.get('anytls_config') if isinstance(data, dict) else None
+    return cfg if isinstance(cfg, dict) else {}
+
+
 def anytls_users(data):
     """AnyTLS 入站的 users —— 与其它协议同一套准入判据 user_access_allowed。
 
@@ -4104,7 +4152,8 @@ def anytls_users(data):
     占位密码也由 secret 派生（而不是随机），否则每轮收回都会算出不同的
     配置、触发一次无谓的重启。
     """
-    secret = (data.get('anytls_config') or {}).get('secret') or ''
+    secret = anytls_config(data).get('secret')
+    secret = secret if isinstance(secret, str) else ''
     users = []
     if secret:
         all_users = user_table(data)
@@ -4155,13 +4204,18 @@ def build_anytls_config(acfg, users, cert_file, key_file):
 
 def anytls_uri_for_user(acfg, user_id, label=None):
     """anytls:// 直链（mihomo / sing-box 系 / Shadowrocket 通用格式）。"""
-    if not acfg or not acfg.get('secret'):
+    # 配置可能是数字/字符串（旧版本可直编 portal.json），端口也可能是
+    # "abc"/True —— 旧写法 int(port) 抛 ValueError，整份订阅生成失败。
+    if not isinstance(acfg, dict):
+        return ''
+    secret = acfg.get('secret')
+    if not isinstance(secret, str) or not secret:
         return ''
     host = acfg.get('domain')
-    port = acfg.get('port')
+    port = _valid_port(acfg.get('port'))
     if not (host and port):
         return ''
-    pwd = anytls_password_for_user(acfg['secret'], user_id)
+    pwd = anytls_password_for_user(secret, user_id)
     params = urlencode({'sni': acfg.get('sni') or host})
     return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
 
@@ -4488,7 +4542,7 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     ⚠️ encryption 必须逐字照抄客户端密钥（含 `.` 分隔的各段），
     任何字符被 URL 编码或截断都会导致握手失败。
     """
-    if not vcfg:
+    if not isinstance(vcfg, dict):
         return ''
     host = vcfg.get('domain') or public_ip
     # 同 Reality / VMess：非整数端口会让客户端解析失败。
@@ -5401,7 +5455,9 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     单用户的 rcfg 里存的是**旧版单账号**的 uuid —— 这里忽略它，
     改用该 user_id 派生出的 UUID（reality_uuid_for_user）。
     """
-    if not rcfg:
+    # 同 VMess / VLESS-Encryption：非 dict 配置在订阅路径上直接抛
+    # AttributeError，用户拿不到任何节点。
+    if not isinstance(rcfg, dict):
         return ''
     short_id = rcfg.get('short_id', '')
     dest_sni = rcfg.get('dest_sni', 'www.apple.com')
