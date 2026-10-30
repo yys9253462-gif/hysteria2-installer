@@ -36,6 +36,38 @@ class UserTableConsumersTests(unittest.TestCase):
         self.assertEqual(portal.vlessenc_clients({'users': users})[0]['email'], 'good')
 
 
+class RealityRegistryValueTests(unittest.TestCase):
+    """reality_users 里的值必须是合法 UUID。
+
+    被改成数字/None 时旧实现原样写进 xray clients，Xray 启动即失败
+    （client.id 必须是 UUID），而面板显示一切正常 —— 用户连不上也查不出原因。
+    """
+
+    def test_corrupt_uuid_is_regenerated(self):
+        for bad in (123, None, '', 'not-a-uuid', ['a']):
+            with self.subTest(bad=bad):
+                data = {'users': {'u': {'status': 'active'}},
+                        'reality_users': {'u': bad}}
+                reg = portal.reality_registry(data)
+                self.assertEqual(reg['u'], portal.reality_uuid_for_user('u'))
+                self.assertRegex(reg['u'], portal.REALITY_UUID_RE)
+
+    def test_valid_uuid_is_preserved(self):
+        good = '71c62a1b-b7c9-5f18-9850-41b2d019119f'
+        data = {'users': {'u': {'status': 'active'}}, 'reality_users': {'u': good}}
+        self.assertEqual(portal.reality_registry(data)['u'], good)
+
+    def test_disabled_user_mapping_is_left_alone(self):
+        # 停用用户不进 clients；重新启用时要沿用原身份，不能被改写。
+        data = {'users': {'u': {'status': 'disabled'}},
+                'reality_users': {'u': 'uuid-disabled'}}
+        self.assertEqual(portal.reality_registry(data)['u'], 'uuid-disabled')
+
+    def test_stale_user_entry_is_removed(self):
+        data = {'users': {}, 'reality_users': {'gone': '71c62a1b-b7c9-5f18-9850-41b2d019119f'}}
+        self.assertEqual(portal.reality_registry(data), {})
+
+
 class NetworkGuardTests(unittest.TestCase):
     """add_private_network_guard 对损坏的 api/routing 段不能抛异常。
 

@@ -3959,6 +3959,11 @@ def users_list_entry(uid, info, tracker, now_ts, summary, ip_timeout):
     }
 
 
+# 托管入站里 client.id 的合法形态（UUID v4/v5 文本）。
+REALITY_UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+                             r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+
 def reality_registry(data):
     """从 portal.json 的 data 里取出「user_id → UUID」的 Reality 账号表。
 
@@ -3976,10 +3981,21 @@ def reality_registry(data):
         if uid not in reg:
             reg[uid] = reality_uuid_for_user(uid)
             changed = True
-    # 清理已不存在用户的条目 —— 避免 xray clients 无限增长
+    # 清理已不存在用户的条目 —— 避免 xray clients 无限增长。
+    # 值也必须是合法 UUID 字符串：被改成数字/None 时它会原样写进 xray
+    # clients，Xray 启动即失败（`id` 必须是 UUID），而面板显示一切正常。
     for uid in list(reg.keys()):
+        value = reg[uid]
         if uid not in users:
             del reg[uid]
+            changed = True
+        elif (user_access_allowed(users[uid])
+              and (not isinstance(value, str) or not value
+                   or not REALITY_UUID_RE.match(value))):
+            # 用户还在且**会进 clients**、但 UUID 被改坏：重新派生（uuid5 是
+            # 确定性的，重建后与其他协议是同一个身份）。停用用户的映射保持
+            # 原样 —— 它不进 clients，且重新启用时要沿用原身份。
+            reg[uid] = reality_uuid_for_user(uid)
             changed = True
     if changed:
         data['reality_users'] = reg
