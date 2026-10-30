@@ -143,6 +143,7 @@ class PortalMeter:
         # 每个来源每个用户各调一次。
         self.on_speed=on_speed
         self.sample_times={}
+        self.failed_sources=set()
         self.online_counts=None
         self.online_sampled_at=0
         self.live_snapshot=None
@@ -153,8 +154,10 @@ class PortalMeter:
         sources=[s for s in ("hysteria", "reality") if self.config.get(s)]
         # 默认安装会写 Reality 配置，但未安装 xray 时不应阻塞 Hy2 计量。
         cfg=self.config.get("reality", {})
-        if self.read == self._read and "reality" in sources and not pathlib.Path(cfg.get("binary", "")).is_file():
-            sources.remove("reality")
+        if self.read == self._read and "reality" in sources and isinstance(cfg, dict):
+            binary = cfg.get("binary")
+            if isinstance(binary, str) and binary and not pathlib.Path(binary).is_file():
+                sources.remove("reality")
         return sources
 
     def _read(self, source, cfg):
@@ -250,6 +253,8 @@ class PortalMeter:
                             if old is None and not meter:
                                 self.data.pop('usage_meter',None)
                     raise
+                with self.lock:
+                    self.failed_sources.discard(source)
                 self.sample_times[source]=sampled
                 if self.on_speed is not None and interval > 0:
                     for uid, pair in deltas.items():
@@ -272,6 +277,9 @@ class PortalMeter:
                     old_entry=health.get(source,missing)
                     failure={'ok':False,'sampled_at':now,'error':type(exc).__name__}
                     health[source]=failure
+                    # 独立于持久化的运行时故障标记：磁盘写入失败时，不能把
+                    # 上一次成功的 health 当作本轮仍健康。
+                    self.failed_sources.add(source)
                 try:
                     self.save()
                 except Exception:
@@ -297,7 +305,7 @@ class PortalMeter:
             if not isinstance(health, dict):
                 health={}
             enabled=self.enabled_sources()
-            fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
+            fresh=bool(enabled) and all(s not in getattr(self, 'failed_sources', set()) and _source_fresh(health, s) for s in enabled)
             measured=_measurement_total(m,enabled,uid)
             initialized=measured is not None
             user=_users_view(self.data).get(uid,{})
@@ -336,7 +344,7 @@ class PortalMeter:
             if not isinstance(health, dict):
                 health={}
             enabled=self.enabled_sources()
-            fresh=bool(enabled) and all(_source_fresh(health, s) for s in enabled)
+            fresh=bool(enabled) and all(s not in getattr(self, 'failed_sources', set()) and _source_fresh(health, s) for s in enabled)
             measured=_measurement_total(m,enabled,uid)
             initialized=measured is not None
             return {'measured_bytes':measured,

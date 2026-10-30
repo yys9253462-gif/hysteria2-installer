@@ -22,6 +22,27 @@ class TestRealityClientSyncGuards(unittest.TestCase):
             self.assertTrue(portal.enforce_node_access(root,{'users':{}}))
             self.assertFalse((root/'xray.json').exists())
 
+    def test_anytls_failure_does_not_skip_xray_revocation(self):
+        from unittest.mock import patch
+        calls = []
+        with patch.object(portal, 'sync_anytls_users', side_effect=ValueError('broken')), \
+             patch.object(portal, '_enforce_node_access_xray_hy2', side_effect=lambda *a: calls.append(a) or True):
+            with self.assertRaises(RuntimeError):
+                portal.enforce_node_access('/tmp/unused', {'users': {}})
+        self.assertEqual(len(calls), 1)
+
+    def test_corrupt_xray_shape_cannot_confirm_revocation(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            path = root / 'xray.json'
+            for content in ('[]', '"broken"', '{"inbounds": 7}', '{"inbounds": [null]}',
+                            '{"inbounds": [{"tag":"vmess-ws-in"},{"tag":"vmess-ws-in"}]}'):
+                with self.subTest(content=content):
+                    path.write_text(content, encoding='utf-8')
+                    with self.assertRaises(ValueError):
+                        portal.enforce_node_access(root, {'users': {}})
+                    self.assertEqual(path.read_text(encoding='utf-8'), content)
+
     def test_source_handles_unreadable_json(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);(root/'xray.json').write_text('invalid',encoding='utf-8')

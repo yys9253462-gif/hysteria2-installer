@@ -203,12 +203,13 @@ class AnytlsPanelTest(unittest.TestCase):
 class AnytlsRobustnessTests(unittest.TestCase):
     """2026-10-29 修复的健壮性缺口。"""
 
-    def test_corrupt_config_does_not_raise(self):
-        """anytls.json 损坏时只跳过同步，不能让开户/删除全部 503。"""
+    def test_corrupt_config_cannot_confirm_sync(self):
+        """运行中的服务可能仍使用旧配置，损坏时不能谎报同步成功。"""
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             (root / 'anytls.json').write_text('{"inbounds": [', encoding='utf-8')
-            self.assertFalse(portal.sync_anytls_users(root, snapshot([('u1', True)])))
+            with self.assertRaises(RuntimeError):
+                portal.sync_anytls_users(root, snapshot([('u1', True)]))
 
     def test_placeholder_password_is_stable_without_secret(self):
         """secret 缺失时占位密码也必须稳定，否则每轮同步都重启 sing-box。"""

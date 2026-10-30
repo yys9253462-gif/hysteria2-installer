@@ -371,10 +371,11 @@ class PortSelectionSafetyTests(unittest.TestCase):
 
 
 class ManagedInboundRobustnessTests(unittest.TestCase):
-    def test_none_inbounds_is_normalised(self):
+    def test_corrupt_inbounds_is_preserved_and_rejected(self):
         config = {'inbounds': None}
-        portal.upsert_managed_inbound(config, 'x', {'protocol': 'vmess'})
-        self.assertEqual(config['inbounds'][0]['tag'], 'x')
+        with self.assertRaises(ValueError):
+            portal.upsert_managed_inbound(config, 'x', {'protocol': 'vmess'})
+        self.assertEqual(config, {'inbounds': None})
 
     def test_untagged_reality_is_adopted_even_when_other_protocols_are_tagged(self):
         """其它协议带 tag 不影响 Reality 的兜底认领。

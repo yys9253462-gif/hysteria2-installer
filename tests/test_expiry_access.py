@@ -35,6 +35,25 @@ class ExpiryTests(unittest.TestCase):
    def reply_json(self,status,body):return status,body
   self.assertEqual(env['delete'](Fake(),{'user_id':'probe'})[0],503)
   self.assertEqual(state['_pending_revocations'],['probe'])
+class BooleanQuotaTests(unittest.TestCase):
+ """bool 配额必须按「记录损坏」拒绝，而不是当成 1 字节。"""
+
+ def test_boolean_limit_or_used_is_invalid(self):
+  for field in ('limit_bytes', 'used_bytes'):
+   for bad in (True, False):
+    with self.subTest(field=field, bad=bad):
+     u={'status':'active',field:bad}
+     self.assertEqual(portal.user_access_denial(u,1000), 'Invalid user record')
+     self.assertFalse(portal.user_share_available(u,1000))
+
+ def test_real_numbers_still_work(self):
+  self.assertIsNone(portal.user_access_denial(
+      {'status':'active','limit_bytes':10,'used_bytes':5},1000))
+  self.assertEqual(portal.user_access_denial(
+      {'status':'active','limit_bytes':10,'used_bytes':10},1000),
+      'Traffic quota exceeded')
+
+
 class ShareAvailabilityConsistencyTests(unittest.TestCase):
  """分享页可用性与节点准入必须同源（2026-10-25 修复）。"""
 

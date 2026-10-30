@@ -62,10 +62,11 @@ class AnytlsSyncRobustnessTests(unittest.TestCase):
                                         apply=lambda *a, **k: None,
                                         service_active=lambda: False)
 
-    def test_corrupt_config_returns_false(self):
+    def test_corrupt_config_cannot_confirm_sync(self):
         for content in ('[]', '7', '"x"', '{"inbounds": 7}', '{"inbounds": ["x"]}', 'not json'):
             with self.subTest(content=content):
-                self.assertFalse(self.sync(content, {'anytls_config': {'enabled': True}}))
+                with self.assertRaises((RuntimeError, ValueError)):
+                    self.sync(content, {'anytls_config': {'enabled': True}})
 
     def test_corrupt_snapshot_returns_false(self):
         for snap in (None, 7, 'x', ['a'], {'anytls_config': 'x'}):

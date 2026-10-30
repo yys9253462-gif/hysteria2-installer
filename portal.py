@@ -4091,11 +4091,11 @@ def upsert_managed_inbound(config, tag, inbound):
     # config 本身也可能是 list/str（xray.json 被截断或整份改坏）；
     # 旧写法 config.get 抛 AttributeError，启停/重生成整条路径失败。
     if not isinstance(config, dict):
-        config = {}
-    # inbounds 可能是 None（手工改坏 / 旧版写出），setdefault 不会覆盖
-    # 已存在的 None，随后 .append 直接 AttributeError。先归一化成列表。
-    if not isinstance(config.get('inbounds'), list):
-        config['inbounds'] = []
+        raise ValueError('invalid Xray configuration root; existing configuration preserved')
+    # 缺失的 inbounds 可创建，但损坏的已有内容不能被清空覆盖。
+    if 'inbounds' in config and not isinstance(config['inbounds'], list):
+        raise ValueError('invalid Xray inbounds; existing configuration preserved')
+    config.setdefault('inbounds', [])
     idx, current = managed_inbound_index(config, tag)
     inbound = copy.deepcopy(inbound)
     inbound['tag'] = tag
@@ -4378,16 +4378,16 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None):
         try:
             config = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError) as exc:
-            print('[portal] anytls.json unreadable, skip sync: ' + type(exc).__name__,
-                  file=sys.stderr)
-            return False
+            raise RuntimeError('AnyTLS configuration unreadable; cannot confirm user sync') from exc
         wanted = anytls_users(snapshot)
-        # anytls.json 可能是 list / inbounds 是数字：直接迭代会抛 TypeError，
-        # 同样让整轮撤销失败。
         inbounds = config.get('inbounds') if isinstance(config, dict) else None
-        inbound = next((i for i in (inbounds if isinstance(inbounds, list) else [])
-                        if isinstance(i, dict) and i.get('tag') == ANYTLS_INBOUND_TAG), None)
-        if inbound is None or inbound.get('users') == wanted:
+        if not isinstance(inbounds, list) or any(not isinstance(item, dict) for item in inbounds):
+            raise ValueError('invalid AnyTLS inbounds; cannot confirm user sync')
+        matches = [item for item in inbounds if item.get('tag') == ANYTLS_INBOUND_TAG]
+        if len(matches) != 1:
+            raise ValueError('missing or duplicate AnyTLS inbound; cannot confirm user sync')
+        inbound = matches[0]
+        if inbound.get('users') == wanted:
             return False
         inbound['users'] = wanted
         apply(config, path, restart=service_active())
@@ -4687,6 +4687,12 @@ def user_access_denial(info, now=None):
     # 只有缺失 / None 表示永久；0、小数、数字字符串走同一时钟判定。
     try:
         expires_at = info.get('expires_at')
+        # bool 是 int 的子类：`limit_bytes: true` 会被当成「1 字节配额」，
+        # 用户只要用了 1 字节就被判超额停用，而界面上配额显示成 1 B。
+        # JSON 里把字段写成 true 是控制台/旧脚本的常见错误，必须显式拒绝。
+        for field in ('limit_bytes', 'used_bytes'):
+            if isinstance(info.get(field), bool):
+                return 'Invalid user record'
         if expires_at is not None and not float(expires_at) > now:
             return 'User account expired'
         limit_bytes = int(info.get('limit_bytes', 0))
@@ -5106,7 +5112,20 @@ def password_taken(users, pwd, owner_uid):
                for uid, u in users.items())
 
 def enforce_node_access(root, snapshot, force_ids=()):
-    """确认旧会话和 Reality 核心都已收回；失败不伪造销户成功。"""
+    """分别尝试 AnyTLS 与 Xray；任一路无法确认时保留待撤销状态。"""
+    anytls_error = None
+    try:
+        sync_anytls_users(root, snapshot)
+    except Exception as exc:
+        anytls_error = exc
+    result = _enforce_node_access_xray_hy2(root, snapshot, force_ids)
+    if anytls_error is not None:
+        raise RuntimeError('AnyTLS user sync could not be confirmed') from anytls_error
+    return result
+
+
+def _enforce_node_access_xray_hy2(root, snapshot, force_ids=()):
+    """确认旧会话和 Xray 核心都已收回；失败不伪造销户成功。"""
     root = Path(root)
     # 快照里的 users 可能是 null/list（手工编辑或截断写入）：直接 .items()
     # 抛 AttributeError，撤销流程每 5 秒重试失败，停用/到期用户保持在线。
@@ -5160,14 +5179,19 @@ def enforce_node_access(root, snapshot, force_ids=()):
                 online=request_stats('/online')
                 if any(int(online.get(uid, 0)) > 0 for uid in active):
                     raise RuntimeError('Hy2 sessions still present after revocation')
-    # AnyTLS 跑在独立的 sing-box 进程里，不在 xray.json 中，必须单独收回；
-    # 放在 xray.json 的提前返回之前，否则只开 AnyTLS 的节点永远收不回。
-    sync_anytls_users(root,snapshot)
     xj=root/'xray.json'
     if not xj.exists():
         return True
     original=xj.read_bytes()
     xcfg=json.loads(original)
+    # 运行中的 Xray 可能仍加载旧配置；损坏的磁盘配置不能证明没有入站。
+    if not isinstance(xcfg, dict) or ('inbounds' in xcfg and not isinstance(xcfg['inbounds'], list)):
+        raise ValueError('invalid Xray configuration; cannot confirm revocation')
+    if any(not isinstance(item, dict) for item in xcfg.get('inbounds', [])):
+        raise ValueError('invalid Xray inbound entry; cannot confirm revocation')
+    tags = [item.get('tag') for item in xcfg.get('inbounds', [])]
+    if any(tags.count(tag) > 1 for tag in MANAGED_INBOUND_TAGS):
+        raise ValueError('duplicate managed Xray inbound tag; cannot confirm revocation')
     # 收回必须覆盖**所有**托管入站：只看 Reality 的话，VMess-only 节点上
     # 停用/到期/超额的用户会继续用 VMess 连（2026-10-24 接入 VMess 时的关键缺口）。
     _client_builders={REALITY_INBOUND_TAG:reality_clients,

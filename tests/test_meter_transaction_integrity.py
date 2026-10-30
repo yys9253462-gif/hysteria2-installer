@@ -21,6 +21,38 @@ class MeterTransactionIntegrityTests(unittest.TestCase):
             {'hysteria': {'test': True}}, read=lambda *_: copy.deepcopy(self.counters),
             epoch=lambda _: 'epoch')
 
+    def test_malformed_reality_config_does_not_stop_hysteria_sampling(self):
+        from unittest.mock import patch
+        for bad in ('broken', {'binary': None}, {'binary': []}):
+            with self.subTest(bad=bad):
+                data = {'users': {'u': {'used_bytes': 0}}}
+                counters = {'u': {'tx': 0, 'rx': 0}}
+                meter = runtime.PortalMeter(data, threading.RLock(), lambda: None,
+                    {'hysteria': {'url': 'http://127.0.0.1:1', 'secret': 'x'},
+                     'reality': bad}, epoch=lambda _: 'epoch')
+                with patch.object(runtime.readers, 'read_live_connections', return_value={}), \
+                     patch.object(runtime.readers, 'read_hysteria', side_effect=lambda *_: copy.deepcopy(counters)), \
+                     patch.object(runtime.readers, 'read_hysteria_online', return_value={}):
+                    meter.poll()
+                    counters['u']['tx'] = 25
+                    meter.poll()
+                self.assertEqual(data['users']['u']['used_bytes'], 25)
+                self.assertFalse(data['usage_meter']['health']['reality']['ok'])
+
+    def test_persistent_save_failure_reports_unhealthy_in_memory(self):
+        meter = self.make_meter()
+        meter.poll()
+        meter.save = lambda: (_ for _ in ()).throw(OSError('disk full'))
+        self.counters['u']['tx'] = 25
+        meter.poll()
+        self.assertFalse(meter.summary('u')['measurement_current_ok'])
+        self.assertTrue(self.data['usage_meter']['health']['hysteria']['ok'])
+        self.assertIn('hysteria', meter.failed_sources)
+        meter.save = lambda: None
+        meter.poll()
+        self.assertNotIn('hysteria', meter.failed_sources)
+        self.assertTrue(meter.summary('u')['measurement_current_ok'])
+
     def test_corrupt_total_does_not_partially_update_users(self):
         meter = self.make_meter()
         meter.poll()

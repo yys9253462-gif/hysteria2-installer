@@ -102,12 +102,12 @@ class InboundConfigShapeTests(unittest.TestCase):
             with self.subTest(bad=bad):
                 self.assertEqual(env['managed_inbound_index'](bad, TAGS[0]), (-1, None))
 
-    def test_upsert_builds_a_fresh_config_when_input_is_not_a_mapping(self):
+    def test_upsert_rejects_corrupt_config_without_overwriting(self):
         env, _ = load_functions()
-        for bad in (7, 'x', [None], None):
+        for bad in (7, 'x', [None], None, {'inbounds': 'broken'}):
             with self.subTest(bad=bad):
-                result = env['upsert_managed_inbound'](bad, TAGS[1], {'port': 8443})
-                self.assertEqual(result['inbounds'][0]['tag'], TAGS[1])
+                with self.assertRaises(ValueError):
+                    env['upsert_managed_inbound'](bad, TAGS[1], {'port': 8443})
 
     def test_upsert_preserves_other_inbounds(self):
         env, _ = load_functions()
