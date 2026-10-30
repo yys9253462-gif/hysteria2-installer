@@ -53,5 +53,36 @@ class PortProbeBoundaries(unittest.TestCase):
             {'subscription_port': '2053'}, '/nonexistent/config.yaml'), (2053, 'client_meta'))
 
 
+class ReservedPortTests(unittest.TestCase):
+    """端口避让清单对损坏的 meta/data 不能抛异常。
+
+    它在三个协议的启用流程里：异常会让「启用」直接失败，
+    而界面只显示一句「启用失败」，看不出是配置坏了。
+    """
+
+    def test_corrupt_meta_and_data_do_not_raise(self):
+        for meta in (None, 7, 'x', [None], {}):
+            for data in (None, 7, 'x', {}, {'reality_config': 7}, {'anytls_config': 'x'}):
+                with self.subTest(meta=meta, data=data):
+                    portal.managed_reserved_ports(meta, data, None)
+
+    def test_ports_are_collected_from_meta_and_protocol_configs(self):
+        meta = {'listen_port': 443, 'subscription_port': 8443}
+        data = {'vmess_config': {'port': 2087},
+                'vlessenc_config': {'port': 2088},
+                'anytls_config': {'enabled': True, 'port': 2089}}
+        self.assertEqual(portal.managed_reserved_ports(meta, data, None),
+                         {443, 8443, 2087, 2088, 2089})
+
+    def test_disabled_anytls_port_is_not_reserved(self):
+        data = {'anytls_config': {'enabled': False, 'port': 2089}}
+        self.assertEqual(portal.managed_reserved_ports({}, data, None), set())
+
+    def test_excluded_protocol_port_is_not_reserved(self):
+        data = {'vmess_config': {'port': 2087}}
+        self.assertEqual(portal.managed_reserved_ports({}, data, None,
+                                                       exclude_key='vmess_config'), set())
+
+
 if __name__ == '__main__':
     unittest.main()

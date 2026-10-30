@@ -5156,15 +5156,20 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None):
     实测 VMess 选中 2087 而 VLESS Encryption 正监听 2087，两个入站撞车。
     这里统一从 data 与现有 xray.json 的 inbounds 收集，避免每处各写一遍再漏。
     """
+    # meta / data 都来自磁盘上的 JSON，可能被截断成 list/str；`.get` 抛异常
+    # 会让端口选择整条失败 —— 协议启停直接报错，而界面只说「启用失败」。
+    meta = meta if isinstance(meta, dict) else {}
+    data = data if isinstance(data, dict) else {}
     ports = set()
-    for value in ((meta or {}).get('listen_port'), (meta or {}).get('subscription_port')):
+    for value in (meta.get('listen_port'), meta.get('subscription_port')):
         try:
             ports.add(int(value))
         except (TypeError, ValueError):
             pass
     for key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
         # AnyTLS 停用后保留 secret 与端口记录（再启用要沿用），但那个端口已经空出来了。
-        if key == 'anytls_config' and not ((data or {}).get(key) or {}).get('enabled'):
+        section = data.get(key)
+        if key == 'anytls_config' and not (isinstance(section, dict) and section.get('enabled')):
             continue
         if key == exclude_key:
             # 协议**自己**的端口不是冲突：重新启用时应当沿用它。
