@@ -493,9 +493,13 @@ def clean_outbounds(outbounds):
     """
     if not isinstance(outbounds, (list, tuple)):
         return []
+    # 名称必须同时满足标识符规则：旧版本允许直接改 portal.json，历史数据里
+    # 可能留着带换行的名字 —— 它会让 render_outbound_yaml 写出一段结构错乱
+    # 的 YAML（后续每一行都被当成新内容），Hysteria 起不来。
     return [ob for ob in outbounds
             if isinstance(ob, dict) and ob.get('type') in OUTBOUND_TYPES
-            and isinstance(ob.get('name'), str) and ob['name']]
+            and isinstance(ob.get('name'), str)
+            and OUTBOUND_NAME_RE.match(ob['name'])]
 
 
 def render_outbound_yaml(entry):

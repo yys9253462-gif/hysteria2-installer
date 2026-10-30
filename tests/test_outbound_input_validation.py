@@ -133,6 +133,27 @@ class AclBlockTests(unittest.TestCase):
         self.assertNotIn('gone(', missing)
 
 
+class OutboundNameSafetyTests(unittest.TestCase):
+    """历史数据里带换行的出站名必须被丢弃。
+
+    旧版本允许直接改 portal.json，这类名字会让 render_outbound_yaml 写出
+    结构错乱的 YAML（后面每一行都被当成新内容），Hysteria 起不来。
+    """
+
+    def test_names_with_newlines_are_dropped(self):
+        rows = [{'name': 'a\nb', 'type': 'direct'},
+                {'name': 'ok', 'type': 'direct'},
+                {'name': '1bad', 'type': 'direct'},
+                {'name': 'x: y', 'type': 'direct'}]
+        self.assertEqual(portal.clean_outbounds(rows), [{'name': 'ok', 'type': 'direct'}])
+
+    def test_rendered_yaml_stays_single_block(self):
+        cfg = portal.upsert_outbound_block(
+            'listen: :443\n', [{'name': 'a\nb', 'type': 'direct'}])
+        self.assertNotIn('a\nb', cfg)
+        self.assertIn('listen: :443', cfg)
+
+
 class WarpAclRuleTests(unittest.TestCase):
     """WARP ACL 的规则容器损坏时不能抛异常（开关/应用配置的必经路径）。"""
 
