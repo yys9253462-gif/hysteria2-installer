@@ -75,6 +75,36 @@ class KickConfigRobustnessTests(unittest.TestCase):
         self.assertFalse(portal.kick_hy2_users(root, []))
 
 
+class ActiveIpLimitsTests(unittest.TestCase):
+    """设备上限提取：容器或单条记录损坏时不能抛异常。
+
+    调用点在 iplimit worker 的循环里：抛异常会让整轮设备上限失效，
+    所有设备被放行（等于上限形同虚设）。
+    """
+
+    def test_non_dict_container_returns_empty(self):
+        for bad in (None, 7, 'x', ['a'], True):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal.active_ip_limits(bad), {})
+
+    def test_corrupt_records_are_skipped(self):
+        users = {'bad': 'oops', 'none': None,
+                 'good': {'status': 'active', 'ip_limit': 2},
+                 'zero': {'status': 'active', 'ip_limit': 0},
+                 'negative': {'status': 'active', 'ip_limit': -3},
+                 'string': {'status': 'active', 'ip_limit': '5'},
+                 'disabled': {'status': 'disabled', 'ip_limit': 4}}
+        self.assertEqual(portal.active_ip_limits(users),
+                         {'good': 2, 'string': 5})
+
+    def test_boolean_limit_is_not_treated_as_one_device(self):
+        # bool 是 int 的子类：True 会被算成 1 个设备，静默把用户限成单设备。
+        for bad in (True, False):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal.active_ip_limits(
+                    {'u': {'status': 'active', 'ip_limit': bad}}), {})
+
+
 class RevocationConfigRobustnessTests(unittest.TestCase):
     """撤销流程读的 usage-meter-config.json 被改坏时，要报明确的
     「无法确认撤销」，而不是把 AttributeError 抛给调用方。

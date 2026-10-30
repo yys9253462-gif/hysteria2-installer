@@ -4615,12 +4615,21 @@ REALITY_IPLIMIT_TAG_PREFIX = 'iplimit-'
 
 def active_ip_limits(users):
     """逐账户读取设备上限，损坏记录不能撤销其他账户的拦截。"""
+    # 调用方传的是 user_table(data)，但 ip_limit worker 也会直接传快照；
+    # 容器被改坏时 `.items()` 抛异常，整轮设备上限失效（全部设备放行）。
+    if not isinstance(users, dict):
+        return {}
     limits = {}
     for uid, info in users.items():
         if not user_access_allowed(info):
             continue
+        raw = info.get('ip_limit', 0)
+        # bool 是 int 的子类：True 会被静默算成「1 个设备」，把一个本应
+        # 不限设备的账号限成单设备（JSON 里写成 true 就会触发）。
+        if isinstance(raw, bool):
+            continue
         try:
-            limit = int(info.get('ip_limit', 0))
+            limit = int(raw)
         except (ValueError, TypeError, OverflowError):
             continue
         if limit > 0:
