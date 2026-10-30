@@ -3065,11 +3065,18 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
 
 def login_html(token, error_msg=None):
-    error_banner = f'<div class="error-tip" role="alert"><span>⚠</span><span>{html.escape(error_msg)}</span></div>' if error_msg else ''
+    # token 来自 portal.json：被手工改成含引号/尖括号时，它会原样进 action
+    # 属性 —— 既能破坏表单，也是一条自伤 XSS。error_msg 同理，且非字符串时
+    # html.escape 直接抛 AttributeError，登录页变成 500（谁都进不来）。
+    token = token if isinstance(token, str) else ''
+    error_banner = ''
+    if isinstance(error_msg, str) and error_msg:
+        error_banner = ('<div class="error-tip" role="alert"><span>⚠</span><span>'
+                        f'{html.escape(error_msg)}</span></div>')
     return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>验证访问 · Hysteria 2 节点中心</title><style>{STYLE}</style></head><body>
 <div class="login-wrap"><div class="login-card">
 <div class="login-brand"><div class="login-logo">H₂</div><div class="login-badge">HYSTERIA 2 GATEWAY</div><h1 class="login-title">私密身份认证</h1><p class="login-sub">请输入服务器生成的专属凭据以进入节点中心</p></div>
-<form class="login-form" method="POST" action="/{token}/login">
+<form class="login-form" method="POST" action="/{html.escape(token)}/login">
 {error_banner}
 <div class="field-group"><label class="field-label" for="username">用户名 (Username)</label><input class="field-input" id="username" name="username" type="text" autocomplete="username" required autofocus placeholder="输入随机生成的用户名"></div>
 <div class="field-group"><div class="field-label"><label for="password">密码 (Password)</label></div><div class="field-pwd"><input class="field-input" id="password" name="password" type="password" autocomplete="current-password" required placeholder="输入访问密钥"><button type="button" class="toggle-pwd">显示</button></div></div>

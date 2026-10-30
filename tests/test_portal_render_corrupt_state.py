@@ -67,6 +67,41 @@ class RenderCorruptStateTests(unittest.TestCase):
                 self.assertIn('<!doctype html', page.lower())
 
 
+class LoginPageEscapingTests(unittest.TestCase):
+    """登录页的 token 与错误提示必须被转义/兜底。
+
+    token 来自 portal.json，被改成含引号/尖括号时会原样进 action 属性 ——
+    既能破坏登录表单，也是一条自伤 XSS；error_msg 非字符串时 html.escape
+    直接抛 AttributeError，登录页变成 500，谁都进不来。
+    """
+
+    def test_token_is_html_escaped(self):
+        page = portal.login_html('abc"<script>')
+        self.assertNotIn('<script>', page.split('action=')[1][:80])
+        self.assertIn('&quot;', page)
+        self.assertIn('&lt;script&gt;', page)
+
+    def test_non_string_token_does_not_break_the_form(self):
+        for bad in (7, None, ['x']):
+            with self.subTest(bad=bad):
+                page = portal.login_html(bad)
+                self.assertIn('action="//login"', page)
+                self.assertIn('name="password"', page)
+
+    def test_non_string_error_message_is_ignored(self):
+        # CSS 里本来就有 .error-tip 规则，这里断言的是「没有渲染提示块」。
+        marker = '<div class="error-tip" role="alert">'
+        for bad in (7, ['x'], None, {'a': 1}):
+            with self.subTest(bad=bad):
+                page = portal.login_html('t', bad)
+                self.assertNotIn(marker, page)
+
+    def test_error_message_is_escaped(self):
+        page = portal.login_html('t', '<b>x</b>')
+        self.assertIn('&lt;b&gt;', page)
+        self.assertNotIn('<b>x</b>', page)
+
+
 class ShareUnavailablePageTests(unittest.TestCase):
     """不可用说明页的 reason 来自用户记录，非字符串时不能 500。
 
