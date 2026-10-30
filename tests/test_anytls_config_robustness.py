@@ -45,5 +45,38 @@ class AnytlsConfigRobustnessTests(unittest.TestCase):
         self.assertIs(portal.anytls_config({'anytls_config': GOOD}), GOOD)
 
 
+class AnytlsSyncRobustnessTests(unittest.TestCase):
+    """sync_anytls_users 在 enforce_node_access 顶部调用。
+
+    anytls.json 或快照被改坏时抛异常，会让开户/续费/停用/删除全部 503，
+    而且报错写成「Reality sync failed」，完全指不到真正的文件。
+    """
+
+    def setUp(self):
+        import tempfile
+        self.root = Path(tempfile.mkdtemp())
+
+    def sync(self, content, snapshot):
+        (self.root / 'anytls.json').write_text(content)
+        return portal.sync_anytls_users(self.root, snapshot,
+                                        apply=lambda *a, **k: None,
+                                        service_active=lambda: False)
+
+    def test_corrupt_config_returns_false(self):
+        for content in ('[]', '7', '"x"', '{"inbounds": 7}', '{"inbounds": ["x"]}', 'not json'):
+            with self.subTest(content=content):
+                self.assertFalse(self.sync(content, {'anytls_config': {'enabled': True}}))
+
+    def test_corrupt_snapshot_returns_false(self):
+        for snap in (None, 7, 'x', ['a'], {'anytls_config': 'x'}):
+            with self.subTest(snap=snap):
+                self.assertFalse(self.sync('{"inbounds": []}', snap))
+
+    def test_healthy_sync_rewrites_users(self):
+        content = ('{"inbounds": [{"tag": "%s", "users": []}]}'
+                   % portal.ANYTLS_INBOUND_TAG)
+        self.assertTrue(self.sync(content, {'users': {}, 'anytls_config': {'enabled': True}}))
+
+
 if __name__ == '__main__':
     unittest.main()

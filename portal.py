@@ -4300,7 +4300,12 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None):
     服务没在运行（例如整机流量超额停用中）时只写文件、不拉起服务。
     """
     path = Path(root) / ANYTLS_CONFIG_NAME
-    if not path.exists() or not (snapshot.get('anytls_config') or {}).get('enabled'):
+    # snapshot 是 apply_access 的深拷贝，正常一定是 dict；但 refresh/selfheal
+    # 也会传进来，损坏时 `.get` 抛异常会让整轮撤销失败（用户撤不回来）。
+    if not isinstance(snapshot, dict):
+        return False
+    section = snapshot.get('anytls_config')
+    if not path.exists() or not (isinstance(section, dict) and section.get('enabled')):
         return False
     apply = apply or apply_anytls_config
     if service_active is None:
@@ -4317,7 +4322,10 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None):
                   file=sys.stderr)
             return False
         wanted = anytls_users(snapshot)
-        inbound = next((i for i in config.get('inbounds') or []
+        # anytls.json 可能是 list / inbounds 是数字：直接迭代会抛 TypeError，
+        # 同样让整轮撤销失败。
+        inbounds = config.get('inbounds') if isinstance(config, dict) else None
+        inbound = next((i for i in (inbounds if isinstance(inbounds, list) else [])
                         if isinstance(i, dict) and i.get('tag') == ANYTLS_INBOUND_TAG), None)
         if inbound is None or inbound.get('users') == wanted:
             return False
