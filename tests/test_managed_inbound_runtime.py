@@ -71,6 +71,17 @@ class ManagedInboundRuntimeTests(unittest.TestCase):
         self.assertEqual([outbound['type'] for outbound in json.loads(sing)['outbounds']],
                          ['hysteria2'])
 
+    def test_corrupt_stored_config_is_treated_as_absent(self):
+        env, _ = load_functions()
+        for name, key in (('_active_reality_config', 'reality_config'),
+                          ('_active_vmess_config', 'vmess_config'),
+                          ('_active_vlessenc_config', 'vlessenc_config')):
+            for bad in (7, 'x', [None]):
+                with self.subTest(name=name, bad=bad):
+                    env['data'][key] = bad
+                    self.assertIsNone(env[name]())
+            env['data'][key] = {'port': 8443}
+
     def test_live_subscriptions_remain_available(self):
         env, _ = load_functions()
         for name in ('_active_reality_config', '_active_vmess_config', '_active_vlessenc_config'):

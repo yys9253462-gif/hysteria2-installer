@@ -7107,7 +7107,10 @@ if __name__ == '__main__':
         if not managed_inbound_active(cfg, REALITY_INBOUND_TAG):
             return None
         with data_lock:
-            rcfg = dict(data.get('reality_config') or {})
+            # 值可能是数字/字符串：dict(7) 抛 TypeError，订阅生成与状态卡片
+            # 都会 500（配置只应来自本模块写入，但旧版本可直接编辑）。
+            _r = data.get('reality_config')
+            rcfg = dict(_r) if isinstance(_r, dict) else {}
         return rcfg or None
 
     def _active_vmess_config():
@@ -7119,7 +7122,8 @@ if __name__ == '__main__':
         if not managed_inbound_active(cfg, VMESS_INBOUND_TAG):
             return None
         with data_lock:
-            vcfg = dict(data.get('vmess_config') or {})
+            _v = data.get('vmess_config')
+            vcfg = dict(_v) if isinstance(_v, dict) else {}
         return vcfg or None
 
     def _active_vlessenc_config():
@@ -7131,13 +7135,15 @@ if __name__ == '__main__':
         if not managed_inbound_active(cfg, VLESSENC_INBOUND_TAG):
             return None
         with data_lock:
-            ecfg = dict(data.get('vlessenc_config') or {})
+            _e = data.get('vlessenc_config')
+            ecfg = dict(_e) if isinstance(_e, dict) else {}
         return ecfg or None
 
     def _active_anytls_config():
         """AnyTLS 的配置：已启用且 sing-box 配置文件在才算（停用后只保留 secret）。"""
         with data_lock:
-            acfg = dict(data.get('anytls_config') or {})
+            _a = data.get('anytls_config')
+            acfg = dict(_a) if isinstance(_a, dict) else {}
         if not acfg.get('enabled') or not (portal_path.parent / ANYTLS_CONFIG_NAME).exists():
             return None
         return acfg
@@ -9391,12 +9397,16 @@ if __name__ == '__main__':
                 except Exception:
                     active = False
             with data_lock:
-                vcfg = dict(data.get('vmess_config') or {})
+                # 配置可能被改成数字/字符串：dict(7) 抛 TypeError，
+                # 整个 /vmess-status 500，协议卡片整块空白。
+                _v = data.get('vmess_config')
+                vcfg = dict(_v) if isinstance(_v, dict) else {}
             qr_svg = ''
-            if active and vcfg.get('uri'):
+            _uri = vcfg.get('uri')
+            if active and isinstance(_uri, str) and _uri:
                 try:
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
-                                        input=vcfg['uri'].encode('utf-8'),
+                                        input=_uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
@@ -9753,12 +9763,15 @@ if __name__ == '__main__':
                 except Exception:
                     active = False
             with data_lock:
-                ecfg = dict(data.get('vlessenc_config') or {})
+                # 同 /vmess-status：非 dict 配置会让 dict() 抛异常。
+                _e = data.get('vlessenc_config')
+                ecfg = dict(_e) if isinstance(_e, dict) else {}
             qr_svg = ''
-            if active and ecfg.get('uri'):
+            _euri = ecfg.get('uri')
+            if active and isinstance(_euri, str) and _euri:
                 try:
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
-                                        input=ecfg['uri'].encode('utf-8'),
+                                        input=_euri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
