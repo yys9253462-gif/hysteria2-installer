@@ -4586,11 +4586,23 @@ def parse_ip_deny(params, now):
 
 
 def active_ip_deny(table, uid, now):
-    """{ip} —— 某用户当前仍在有效期内的拦截 IP；顺手清掉过期的。"""
-    row = table.get(uid)
-    if not row:
+    """{ip} —— 某用户当前仍在有效期内的拦截 IP；顺手清掉过期的。
+
+    ⚠️ 这个函数在 /auth 的 data_lock 内被每个新连接调用。表项被写成字符串、
+    或过期时间被写成非数字时，旧写法 `.items()` / `until <= now` 直接抛异常，
+    异常穿透 do_POST → 连接被掐断，客户端只会无限重试（表现为「突然全节点
+    连不上」）。损坏项按「无拦截」处理并清掉，绝不能让鉴权路径抛异常。
+    """
+    if not isinstance(table, dict):
         return set()
-    for ip in [ip for ip, until in row.items() if until <= now]:
+    row = table.get(uid)
+    if not isinstance(row, dict):
+        if uid in table:
+            table.pop(uid, None)
+        return set()
+    for ip in [ip for ip, until in row.items()
+               if not isinstance(until, (int, float)) or isinstance(until, bool)
+               or until <= now]:
         row.pop(ip)
     if not row:
         table.pop(uid, None)
