@@ -36,5 +36,33 @@ class UserTableConsumersTests(unittest.TestCase):
         self.assertEqual(portal.vlessenc_clients({'users': users})[0]['email'], 'good')
 
 
+class NetworkGuardTests(unittest.TestCase):
+    """add_private_network_guard 对损坏的 api/routing 段不能抛异常。
+
+    它在「重生成 Reality / VMess / VLESS-Enc 入站」的锁内被调用：
+    异常会让协议启停整轮失败，且内网/云元数据拦截规则也写不进去。
+    """
+
+    def test_corrupt_api_section_does_not_raise(self):
+        for bad in (7, 'x', [None], None):
+            with self.subTest(bad=bad):
+                out = portal.add_private_network_guard({'api': bad})
+                self.assertEqual(out['routing']['rules'][0]['outboundTag'], 'block-private')
+
+    def test_guard_is_still_first_after_api_rules(self):
+        cfg = {'api': {'tag': 'usage-meter-api'},
+               'routing': {'rules': [{'outboundTag': 'usage-meter-api'},
+                                     {'type': 'field', 'domain': ['x']}]}}
+        rules = portal.add_private_network_guard(cfg)['routing']['rules']
+        self.assertEqual(rules[0]['outboundTag'], 'usage-meter-api')
+        self.assertEqual(rules[1]['outboundTag'], 'block-private')
+
+    def test_guard_is_idempotent(self):
+        cfg = {'api': {'tag': 'usage-meter-api'}}
+        once = portal.add_private_network_guard(cfg)['routing']['rules']
+        twice = portal.add_private_network_guard(cfg)['routing']['rules']
+        self.assertEqual(once, twice)
+
+
 if __name__ == '__main__':
     unittest.main()

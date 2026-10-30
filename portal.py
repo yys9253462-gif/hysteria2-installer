@@ -640,7 +640,10 @@ def add_private_network_guard(config):
     # （2026-10-28 修）。原来拦截规则 insert(0) 压在 API 规则前面：发往 127.0.0.1:19997
     # 的统计调用全部命中 127.0.0.0/8 进黑洞，Reality 计量与设备上限静默失效。
     # API 规则只匹配本地 dokodemo 入站，排最前不放行任何用户流量。
-    api_tag = (config.get('api') or {}).get('tag')
+    # api 段被改成数字/字符串时 `.get` 抛 AttributeError，而这条路径在
+    # 「重生成 Reality / VMess / VLESS-Enc 入站」的锁内 —— 协议启停整轮失败。
+    api_section = config.get('api')
+    api_tag = api_section.get('tag') if isinstance(api_section, dict) else None
     api_rules = [r for r in rules if isinstance(r, dict) and api_tag and r.get('outboundTag') == api_tag]
     others = [r for r in rules if r != guard and r not in api_rules]
     routing['rules'] = api_rules + [guard] + others
