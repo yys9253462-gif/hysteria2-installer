@@ -24,7 +24,7 @@ class AuthBoundaryTests(unittest.TestCase):
         fn = ast.parse('def handle(self):\n    pass').body[0]
         fn.body = [copy.deepcopy(branch)]
         env = dict(portal.__dict__, data={'users': users}, data_lock=threading.RLock(),
-                   ip_tracker={}, live_online_ips=lambda uid: set(),
+                   ip_tracker={}, global_ip_deny={}, live_online_ips=lambda uid: set(),
                    reality_live_ips=lambda uid: set())
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
                      '<auth-boundary>', 'exec'), env)

@@ -4533,6 +4533,67 @@ def active_ip_limits(users):
     return limits
 
 
+# ---- 跨节点统一设备上限（2026-10-30）----
+# 节点自己的同时在线 IP 检查只看本机：同一订阅在每台节点上各能用满 ip_limit 个网络。
+# 控制台把各节点在线 IP 合并后，把「超出总名额的 IP」通过 users/ip-deny 下发到每台节点：
+# Hy2 在 /auth 拒绝、已在线的踢下线；Reality 并入 iplimit 黑洞规则。
+# 每条拦截带有效期（控制台每轮续期），控制台停发或节点重启后自动失效 —— 宁可漏拦，不误拦到永远。
+IP_DENY_MAX_IPS = 64
+IP_DENY_TTL_RANGE = (30, 3600)
+
+
+def parse_ip_deny(params, now):
+    """校验 users/ip-deny 请求。返回 (user_id, {ip: 过期时间})；不合法抛 ValueError。"""
+    user_id = str(params.get('user_id', '')).strip()
+    if not USER_ID_RE.match(user_id):
+        raise ValueError('Invalid user_id format')
+    raw = params.get('ips', [])
+    if not isinstance(raw, list) or len(raw) > IP_DENY_MAX_IPS:
+        raise ValueError('ips must be a list of at most %d addresses' % IP_DENY_MAX_IPS)
+    try:
+        ttl = int(params.get('ttl', 600))
+    except (TypeError, ValueError):
+        raise ValueError('Invalid ttl')
+    if not IP_DENY_TTL_RANGE[0] <= ttl <= IP_DENY_TTL_RANGE[1]:
+        raise ValueError('ttl must be between %d and %d seconds' % IP_DENY_TTL_RANGE)
+    entries = {}
+    for item in raw:
+        try:
+            ip = str(ipaddress.ip_address(str(item).strip()))
+        except ValueError:
+            raise ValueError('Invalid IP address: %s' % str(item)[:64])
+        entries[ip] = now + ttl
+    return user_id, entries
+
+
+def active_ip_deny(table, uid, now):
+    """{ip} —— 某用户当前仍在有效期内的拦截 IP；顺手清掉过期的。"""
+    row = table.get(uid)
+    if not row:
+        return set()
+    for ip in [ip for ip, until in row.items() if until <= now]:
+        row.pop(ip)
+    if not row:
+        table.pop(uid, None)
+        return set()
+    return set(row)
+
+
+def kick_hy2_users(root, uids):
+    """让 Hy2 核心断开这些用户的全部会话（被拦 IP 断开后重连会在 /auth 被拒，放行的设备会自动重连）。"""
+    cfg_path = Path(root) / 'usage-meter-config.json'
+    cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+    hc = cfg.get('hysteria', {})
+    url = str(hc.get('url', '')).rstrip('/')
+    if not uids or not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url):
+        return False
+    req = urllib.request.Request(url + '/kick', data=json.dumps(sorted(uids)).encode(),
+                                 headers={'Authorization': hc['secret'], 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=4):
+        pass
+    return True
+
+
 def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
                          release_after=REALITY_IPLIMIT_RELEASE_SECONDS):
     """决定 Reality 上哪些 IP 放行、哪些拦截（纯函数，便于测试）。
@@ -5892,6 +5953,8 @@ def serve(path):
         data.pop('core_upgrade', None)
     ip_tracker = {}
     IP_TIMEOUT_SECONDS = 180
+    # 跨节点统一设备上限：控制台下发的 {uid: {ip: 过期时间}}，只在内存里（见 parse_ip_deny）。
+    global_ip_deny = {}
     VALID_USER_ID_RE = USER_ID_RE
     # AmneziaWG 客户端名称：与 awgctl.sh 中的校验保持一致
     VALID_AWG_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,32}$')
@@ -6205,6 +6268,11 @@ def serve(path):
                 reality = read_reality_online_ips(binary, address, limits)
                 with data_lock:
                     blocked = plan_reality_iplimit(limits, reality, hy2, reality_iplimit_state, time.time())
+                    # 控制台下发的跨节点超额 IP 一并拦截（与本机名额判断取并集）。
+                    for _uid in list(global_ip_deny):
+                        _ips = active_ip_deny(global_ip_deny, _uid, time.time())
+                        if _ips:
+                            blocked.setdefault(_uid, set()).update(_ips)
                     reality_ip_snapshot.update(ips=reality, at=time.time())
                 added, removed = apply_reality_iplimit(binary, address, reality_iplimit_rules(blocked))
                 if added or removed:
@@ -7391,6 +7459,8 @@ if __name__ == '__main__':
                         deny = 'User not found'
                     else:
                         deny = user_access_denial(matched_user, now_ts)
+                        if deny is None and client_ip and client_ip in active_ip_deny(global_ip_deny, matched_uid, now_ts):
+                            deny = 'Device limit exceeded across nodes'
                         try:
                             ip_limit = int(matched_user.get('ip_limit', 0))
                         except (ValueError, TypeError, OverflowError):
@@ -7727,6 +7797,32 @@ if __name__ == '__main__':
                                                  'expires_at': exp_at, 'limit_bytes': lim_b,
                                                  'traffic_gb': round(lim_b / (1024**3), 3),
                                                  'status': status_now})
+
+                elif sub == 'users/ip-deny':
+                    # 跨节点统一设备上限（2026-10-30）：整份替换该用户的拦截 IP（空列表 = 解除）。
+                    try:
+                        user_id, entries = parse_ip_deny(params, time.time())
+                    except ValueError as exc:
+                        return self.reply_json(400, {'ok': False, 'error': str(exc)})
+                    now_ts = time.time()
+                    with data_lock:
+                        before = active_ip_deny(global_ip_deny, user_id, now_ts)
+                        if entries:
+                            global_ip_deny[user_id] = dict(entries)
+                        else:
+                            global_ip_deny.pop(user_id, None)
+                        recent = {ip for ip, t in ip_tracker.get(user_id, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
+                    # 只对「新加入拦截、且此刻在线」的 IP 踢一次：控制台每轮续期不会反复踢人。
+                    fresh = set(entries) - before
+                    online = recent | live_online_ips(user_id)
+                    kicked = False
+                    if fresh & online:
+                        try:
+                            kicked = kick_hy2_users(portal_path.parent, [user_id])
+                        except Exception as exc:
+                            _log_ignored('ip_deny_kick', exc)
+                    return self.reply_json(200, {'ok': True, 'user_id': user_id,
+                                                 'denied': sorted(entries), 'kicked': kicked})
 
                 elif sub == 'users/delete':
                     user_id = str(params.get('user_id', '')).strip()
