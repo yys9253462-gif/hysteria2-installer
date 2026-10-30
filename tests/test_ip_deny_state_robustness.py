@@ -42,6 +42,64 @@ class IpDenyStateTests(unittest.TestCase):
         self.assertEqual(table['other'], {'2.2.2.2': 5000})
 
 
+class KickConfigRobustnessTests(unittest.TestCase):
+    """kick_hy2_users 读的 usage-meter-config.json 被改坏时不能抛异常。
+
+    它在下发拦截后被调用：异常被调用方吞掉，但被拦 IP 的旧会话会一直保持连接。
+    """
+
+    def write_cfg(self, payload):
+        import json
+        import tempfile
+        root = Path(tempfile.mkdtemp())
+        (root / 'usage-meter-config.json').write_text(json.dumps(payload))
+        return root
+
+    def test_corrupt_config_returns_false_without_raising(self):
+        for bad in ({'hysteria': 'x'},
+                    {'hysteria': {'url': 'http://127.0.0.1:19996'}},
+                    {'hysteria': {'url': 'http://127.0.0.1:19996', 'secret': None}},
+                    {'hysteria': {'url': 7}},
+                    ['x'],
+                    None):
+            with self.subTest(bad=bad):
+                root = self.write_cfg(bad)
+                self.assertFalse(portal.kick_hy2_users(root, ['u1']))
+
+    def test_non_loopback_url_is_rejected(self):
+        root = self.write_cfg({'hysteria': {'url': 'http://1.2.3.4:19996', 'secret': 's'}})
+        self.assertFalse(portal.kick_hy2_users(root, ['u1']))
+
+    def test_empty_uid_list_short_circuits(self):
+        root = self.write_cfg({'hysteria': {'url': 'http://127.0.0.1:19996', 'secret': 's'}})
+        self.assertFalse(portal.kick_hy2_users(root, []))
+
+
+class RevocationConfigRobustnessTests(unittest.TestCase):
+    """撤销流程读的 usage-meter-config.json 被改坏时，要报明确的
+    「无法确认撤销」，而不是把 AttributeError 抛给调用方。
+
+    调用方（apply_access）对任何异常都只是记一行日志并重试；报成
+    AttributeError 会把排查方向带偏到代码 bug，而不是坏配置。
+    """
+
+    def write_cfg(self, payload):
+        import json
+        import tempfile
+        root = Path(tempfile.mkdtemp())
+        if payload is not None:
+            (root / 'usage-meter-config.json').write_text(json.dumps(payload))
+        return root
+
+    def test_corrupt_config_reports_revocation_uncertainty(self):
+        for bad in (None, 7, {'hysteria': 'x'}, {'hysteria': {'url': 'ftp://x'}}, ['x']):
+            with self.subTest(bad=bad):
+                root = self.write_cfg(bad)
+                with self.assertRaises(RuntimeError) as caught:
+                    portal.enforce_node_access(root, {'users': {}}, ['u1'])
+                self.assertIn('cannot confirm Hy2 revocation', str(caught.exception))
+
+
 class IpDenyParseTests(unittest.TestCase):
     def test_parse_rejects_bad_payloads(self):
         for params in ({'user_id': 'bad id', 'ips': []},

@@ -4667,13 +4667,23 @@ def active_ip_deny(table, uid, now):
 def kick_hy2_users(root, uids):
     """让 Hy2 核心断开这些用户的全部会话（被拦 IP 断开后重连会在 /auth 被拒，放行的设备会自动重连）。"""
     cfg_path = Path(root) / 'usage-meter-config.json'
-    cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
-    hc = cfg.get('hysteria', {})
-    url = str(hc.get('url', '')).rstrip('/')
-    if not uids or not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url):
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+    except (OSError, ValueError):
+        cfg = {}
+    # 配置文件可能被截断/手工改坏：hysteria 段是字符串、缺 secret 时
+    # `.get` / `hc['secret']` 抛异常。调用方只把异常当「踢人失败」吞掉，
+    # 但被拦 IP 的旧会话会一直保持连接，直到自然断开。
+    hc = cfg.get('hysteria') if isinstance(cfg, dict) else None
+    hc = hc if isinstance(hc, dict) else {}
+    secret = hc.get('secret')
+    url = hc.get('url')
+    url = url.rstrip('/') if isinstance(url, str) else ''
+    if (not uids or not isinstance(secret, str) or not secret
+            or not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url)):
         return False
     req = urllib.request.Request(url + '/kick', data=json.dumps(sorted(uids)).encode(),
-                                 headers={'Authorization': hc['secret'], 'Content-Type': 'application/json'})
+                                 headers={'Authorization': secret, 'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=4):
         pass
     return True
@@ -4983,10 +4993,18 @@ def enforce_node_access(root, snapshot, force_ids=()):
                      | {uid for uid, info in users.items()
                         if not user_access_allowed(info)})
     cfg_path = root / 'usage-meter-config.json'
-    cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+    except (OSError, ValueError):
+        cfg = {}
     if blocked:
-        hc = cfg.get('hysteria', {})
-        url = str(hc.get('url', '')).rstrip('/')
+        # 配置被截断/改坏时旧写法 `.get` 抛 AttributeError，异常类型不是
+        # 「无法确认撤销」那条明确的 RuntimeError，调用方日志里只会看到
+        # AttributeError —— 排查方向被带偏到代码 bug 而不是坏配置。
+        hc = cfg.get('hysteria') if isinstance(cfg, dict) else None
+        hc = hc if isinstance(hc, dict) else {}
+        url = hc.get('url')
+        url = url.rstrip('/') if isinstance(url, str) else ''
         if not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url):
             raise RuntimeError('cannot confirm Hy2 revocation: loopback stats unavailable')
         def request_stats(path, payload=None):
