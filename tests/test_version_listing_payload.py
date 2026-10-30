@@ -68,5 +68,26 @@ class VersionListingPayloadTests(unittest.TestCase):
         self.assertEqual(shas, {'portal.py': 'b' * 40})
 
 
+class BundleVersionInputTests(unittest.TestCase):
+    """portal_bundle_version 的入参可能不是 dict：本机文件读失败、API 限流。
+
+    旧写法直接 .get，/check-version 整条 500 —— 面板连「有没有更新」都看不到。
+    """
+
+    def test_non_dict_inputs_report_unknown(self):
+        import portal
+        for bad in (None, 7, 'x', ['a'], True):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal.portal_bundle_version(bad, {}).get('status'), 'unknown')
+                self.assertEqual(portal.portal_bundle_version({}, bad).get('status'), 'unknown')
+
+    def test_healthy_inputs_still_compare(self):
+        import portal
+        shas = {name: 'a' * 40 for name in portal.PORTAL_BUNDLE_FILES}
+        self.assertEqual(portal.portal_bundle_version(shas, shas)['status'], 'up_to_date')
+        changed = dict(shas, **{portal.PORTAL_BUNDLE_FILES[0]: 'b' * 40})
+        self.assertEqual(portal.portal_bundle_version(shas, changed)['status'], 'update_available')
+
+
 if __name__ == '__main__':
     unittest.main()

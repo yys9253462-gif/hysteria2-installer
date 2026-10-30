@@ -1170,7 +1170,11 @@ PORTAL_BUNDLE_FILES = (
 
 def portal_bundle_version(local_shas, remote_shas):
     """Compare every required file; partial observations cannot establish currency."""
-    remote_shas = remote_shas or {}
+    # 两个入参都可能不是 dict：local_shas 由本机文件算出（文件读失败时为 None），
+    # remote_shas 来自 GitHub API（限流时是错误对象）。旧写法 `.get` 直接抛
+    # AttributeError，/check-version 整条接口 500 —— 面板连「有没有更新」都看不到。
+    local_shas = local_shas if isinstance(local_shas, dict) else {}
+    remote_shas = remote_shas if isinstance(remote_shas, dict) else {}
     valid = lambda sha: isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha)
     changed = [name for name in PORTAL_BUNDLE_FILES
                if valid(remote_shas.get(name)) and local_shas.get(name) != remote_shas[name]]
