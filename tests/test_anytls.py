@@ -253,6 +253,19 @@ class XrayPinnedVersionTests(unittest.TestCase):
                            portal._version_tuple(portal.XRAY_PINNED_VERSION))
         self.assertEqual(portal._version_tuple('v26.3.27'), (26, 3, 27))
 
+    def test_short_and_full_spellings_compare_equal(self):
+        # Python 元组比较是前缀式：不加长度归一化时 (1, 2, 0) > (1, 2) 为真，
+        # 同一个版本写全/写短就会被判成「当前版本更高」，重装被静默拒绝。
+        for short, full in (('1.2', '1.2.0'), ('25.9', '25.9.0'), ('1', '1.0.0')):
+            with self.subTest(short=short, full=full):
+                self.assertEqual(portal._version_tuple(short), portal._version_tuple(full))
+                self.assertFalse(portal._version_tuple(full) > portal._version_tuple(short))
+
+    def test_unparseable_version_stays_empty(self):
+        for bad in (None, '', 'abc', []):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal._version_tuple(bad), ())
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

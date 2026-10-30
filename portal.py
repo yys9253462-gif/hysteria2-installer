@@ -4427,9 +4427,17 @@ XRAY_PINNED_VERSION = '26.3.27'
 
 
 def _version_tuple(value):
-    """把 '26.3.27' / 'v26.3.27' 转成可比较的整数元组；无法解析时返回 ()。"""
+    """把 '26.3.27' / 'v26.3.27' 转成可比较的整数元组；无法解析时返回 ()。
+
+    ⚠️ 必须补齐到固定长度再比较：Python 的元组比较是逐位前缀式，
+    `(1, 2, 0) > (1, 2)` 为真 —— 同一个版本写全/写短就会判成「当前版本更高」，
+    「重新安装 / 修复」被静默拒绝（2026-10-30 修）。
+    """
     parts = re.findall(r'\d+', str(value or ''))
-    return tuple(int(p) for p in parts[:4]) if parts else ()
+    if not parts:
+        return ()
+    numbers = [int(p) for p in parts[:4]]
+    return tuple(numbers + [0] * (3 - len(numbers))) if len(numbers) < 3 else tuple(numbers)
 
 
 def _xray_version(binary='/usr/local/bin/xray', run=subprocess.run):
