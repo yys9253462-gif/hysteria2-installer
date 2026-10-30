@@ -1,5 +1,13 @@
 """Whole-bundle version comparisons, including incomplete remote observations."""
 import unittest
+import sys  # noqa: E402
+# 🔴 2026-10-31：CI 用的是 `python3 -m unittest discover -s tests -p 'test_*.py'`，
+# 那条命令会把 CWD（仓库根）放进 sys.path；而「文档里教的、人最常敲的」
+# `cd tests && python3 -m unittest test_xxx` 不会。用后一种方式时这六个文件
+# 报 ModuleNotFoundError: No module named 'portal' —— 看着像代码坏了，其实是
+# 加载方式差异。这里补上与其它 38 个测试一致的路径注入，两种跑法都能过。
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1]))
+
 import portal
 
 

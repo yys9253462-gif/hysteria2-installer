@@ -193,13 +193,9 @@ class PortalMeter:
                 before=self.epoch(service)
                 counters=self.read(source,cfg)
                 if self.epoch(service)!=before: raise RuntimeError('service_changed_during_read')
-                # 🔴 锁顺序（2026-10-29 修）：
-                # 请求线程是「data_lock → meter.lock」（users/list、traffic-speed
-                # 在持有 data_lock 时调用 summary()），所以这里**绝不能**在
-                # 持有 meter.lock 时去调 save()（它内部拿 data_lock）或
-                # on_speed（同样拿 data_lock）—— 那是典型的 ABBA 死锁，一旦
-                # 交错门户就永久卡死，/auth 不可用、所有客户端掉线。
-                # 现在：锁内只算与写字典，锁外落盘与回调。
+                # self.lock 是门户共享的可重入 data_lock：采样写入、保存及
+                # 失败回滚必须是同一事务，避免对账看到未提交的累计。
+                # on_speed 留在锁外，避免回调引入额外锁顺序。
                 with self.lock:
                     meter=copy.deepcopy(self.data.get('usage_meter',{}))
                     # 每个账户首次基线：不将已存在、未归属新窗口的进程计数混入。
@@ -217,7 +213,7 @@ class PortalMeter:
                     old=self.data.get('usage_meter')
                     user_changes=[]
                     # 先验证所有待写账户，后面的损坏累计不能让前面的账户半提交。
-                    measured={uid: core.total_bytes(meter, uid)
+                    adjusted={uid: core.adjusted_bytes(meter, uid)
                               for uid, user in users_view.items()
                               if isinstance(user, dict)}
                     for uid, user in users_view.items():
@@ -225,7 +221,7 @@ class PortalMeter:
                             continue
                         user_before={k: user[k] for k in ('used_bytes', 'legacy_auth_value') if k in user}
                         user.setdefault('legacy_auth_value', user.get('used_bytes', 0))
-                        user['used_bytes']=measured[uid]
+                        user['used_bytes']=adjusted[uid]
                         user_after={k: user[k] for k in ('used_bytes', 'legacy_auth_value')}
                         user_changes.append((uid, user, user_before, user_after))
                     applied_meter=copy.deepcopy(meter)
@@ -234,25 +230,29 @@ class PortalMeter:
                     previous=self.sample_times.get(source)
                     deltas=dict(outcome.get('deltas') or {})
                     interval=sampled-previous if previous is not None else 0
-                try:
-                    self.save()
-                except Exception:
-                    with self.lock:
-                        # 锁外写盘期间用户可能已被删除、停用或重新创建。只撤销
-                        # 本次仍未被改动的计量字段，不能用旧快照替换整张用户表。
-                        for uid, user, before, after in user_changes:
-                            if _users_view(self.data).get(uid) is not user:
-                                continue
-                            for key, value in after.items():
-                                if key not in user or user[key] != value:
+                    try:
+                        self.save()
+                    except Exception as save_error:
+                        # replace 已成功而目录 fsync 失败时磁盘已是新快照；
+                        # 回滚内存会使下一轮重复累计。保留新状态并标记不健康。
+                        if getattr(save_error, 'replaced', False):
+                            raise
+                        with self.lock:
+                            # 锁外写盘期间用户可能已被删除、停用或重新创建。只撤销
+                            # 本次仍未被改动的计量字段，不能用旧快照替换整张用户表。
+                            for uid, user, before, after in user_changes:
+                                if _users_view(self.data).get(uid) is not user:
                                     continue
-                                if key in before: user[key]=before[key]
-                                else: user.pop(key, None)
-                        if self.data.get('usage_meter') is meter:
-                            _rollback_sample(meter,old if isinstance(old,dict) else {},applied_meter)
-                            if old is None and not meter:
-                                self.data.pop('usage_meter',None)
-                    raise
+                                for key, value in after.items():
+                                    if key not in user or user[key] != value:
+                                        continue
+                                    if key in before: user[key]=before[key]
+                                    else: user.pop(key, None)
+                            if self.data.get('usage_meter') is meter:
+                                _rollback_sample(meter,old if isinstance(old,dict) else {},applied_meter)
+                                if old is None and not meter:
+                                    self.data.pop('usage_meter',None)
+                        raise
                 with self.lock:
                     self.failed_sources.discard(source)
                 self.sample_times[source]=sampled
@@ -282,7 +282,9 @@ class PortalMeter:
                     self.failed_sources.add(source)
                 try:
                     self.save()
-                except Exception:
+                except Exception as save_error:
+                    if getattr(save_error, 'replaced', False):
+                        continue
                     with self.lock:
                         # 只撤销本轮诊断，保留锁外保存期间的账户删除与累计修改。
                         if (self.data.get('usage_meter') is failed_meter
@@ -353,8 +355,18 @@ class PortalMeter:
                 'measurement_scope':'since_measurement_started'}
 
     def run(self):
+        # 🔴 2026-10-31：poll() 内部已尽量兜住每个来源，但它自己仍可能以
+        # 非 Exception 的形式退出（KeyboardInterrupt、被 re-raise 的 SystemExit，
+        # 或某处 raise 了 BaseException 子类）。这个线程是计量与「同时在线 IP」
+        # 的唯一采样者，静默死掉的表现是：面板流量不再增长、ip_limit 形同虚设，
+        # 而 systemd 只看得到主进程活着。这里兜住并记录，线程继续下一轮。
         while not self.stop.is_set():
-            self.poll(); self.stop.wait(5)
+            try:
+                self.poll()
+            except BaseException as exc:
+                print('[meter] poll interrupted by %s; retrying' % type(exc).__name__,
+                      file=sys.stderr)
+            self.stop.wait(5)
 
     def start(self):
         thread=threading.Thread(target=self.run,name='portal-real-usage-meter',daemon=True)

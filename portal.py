@@ -838,7 +838,16 @@ def _hy2_config_loaded(config_path, identity=None):
     try:
         state, pid, started = identity or _hy2_runtime_identity()
         fields = started.split()
-        timestamp = time.mktime(time.strptime(' '.join(fields[1:3]), '%Y-%m-%d %H:%M:%S'))
+        # systemd 的 ExecMainStartTimestamp 形如 "Sat 2026-10-31 03:54:39 UTC"，
+        # 末尾是时区缩写；旧实现只取后两段（日期 + 时间）再用 time.mktime 按
+        # **本机时区**解释 —— 节点跑 UTC 时碰巧对，跑 Asia/Shanghai 时整段偏移
+        # 8 小时，`mtime <= start+1` 恒成立，于是「配置改了但没被加载」也会
+        # 被判成已加载，apply_egress_config 直接返回成功（面板显示已生效，
+        # 实际 Hysteria 还在用旧 ACL）。这里显式解析末尾时区段。
+        when = ' '.join(fields[1:3])
+        timestamp = time.mktime(time.strptime(when, '%Y-%m-%d %H:%M:%S'))
+        if len(fields) >= 4 and fields[3] in ('UTC', 'GMT'):
+            timestamp -= time.timezone or 0
         return state == 'active' and pid not in ('', '0') and Path(config_path).stat().st_mtime <= timestamp + 1
     except Exception:
         return False
@@ -959,16 +968,29 @@ def _restart_hy2():
     `reset-failed` 是官方解封手段，必须在**每次**启动前调用。
 
     流量超额停用期间不启动：配置已经落盘，控制台恢复节点时会带着新配置启动。
+
+    🔴 2026-10-31 修：`timeout=` 抛出的是 subprocess.TimeoutExpired，而
+    `stop` 用 25 秒、`start` 用 30 秒。某些云盘/超卖机器上 stop 会卡到超时
+    （Hysteria 正在 flush QUIC 连接）。旧实现让这个异常**一路穿过调用方**：
+    apply_egress_config 里 `_restart_hy2()` 抛异常 → 落到 except 分支 →
+    面板报「应用 WARP 配置失败」并回滚，而真相是「重启被超时打断」。
+    现在每一段都兜住超时并转成可诊断的 RuntimeError，调用方原有的
+    回滚/报错逻辑仍然生效，只是错误原因变成了准确的那一句。
     """
     if _unit_suspended('hysteria-server'):
         return
-    subprocess.run(['systemctl', 'stop', 'hysteria-server'],
-                   capture_output=True, timeout=25)
-    # 🔴 关键：每次启动前都要 reset，否则上一次的失败计数会累积
-    subprocess.run(['systemctl', 'reset-failed', 'hysteria-server'],
-                   capture_output=True, timeout=15)
-    subprocess.run(['systemctl', 'start', 'hysteria-server'],
-                   capture_output=True, timeout=30)
+    for args, limit in ((['systemctl', 'stop', 'hysteria-server'], 25),
+                        # 🔴 关键：每次启动前都要 reset，否则上一次的失败计数会累积
+                        (['systemctl', 'reset-failed', 'hysteria-server'], 15),
+                        (['systemctl', 'start', 'hysteria-server'], 30)):
+        try:
+            subprocess.run(args, capture_output=True, timeout=limit)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('systemctl %s hysteria-server 超时（%d 秒），服务状态未知'
+                               % (args[1], limit)) from None
+        except OSError as exc:
+            raise RuntimeError('systemctl %s hysteria-server 无法执行: %s'
+                               % (args[1], type(exc).__name__)) from exc
 
 
 def _unreachable_outbounds(outs, timeout=2):
@@ -982,14 +1004,24 @@ def _unreachable_outbounds(outs, timeout=2):
     而 WARP 没装 → 报"配置可能有误"，实际是"代理没启动"。
 
     只对 socks5 / http 有意义（direct 不需要外部服务）。
+
+    🔴 2026-10-31 修：outs 来自 custom_outbounds（JSON 可写、历史数据可能被
+    手工改坏）。条目是字符串/数字时 `ob.get` 抛 AttributeError，而本函数在
+    「应用出站配置」路径上 —— 一条坏条目会让整个保存动作失败，报错还只说
+    「应用失败」。逐条跳过非 dict，和 clean_outbounds 保持同一口径。
     """
     dead = []
     for ob in outs or []:
+        if not isinstance(ob, dict):
+            continue
+        name = ob.get('name')
         target = None
         if ob.get('type') == 'socks5':
-            target = ob.get('addr') or ''
+            addr = ob.get('addr')
+            target = addr if isinstance(addr, str) else ''
         elif ob.get('type') == 'http':
-            m = re.match(r'^[a-zA-Z]+://([^/:]+)(?::(\d+))?', ob.get('url') or '')
+            url = ob.get('url')
+            m = re.match(r'^[a-zA-Z]+://([^/:]+)(?::(\d+))?', url) if isinstance(url, str) else None
             if m:
                 target = '%s:%s' % (m.group(1), m.group(2) or '80')
         if not target or ':' not in target:
@@ -999,11 +1031,13 @@ def _unreachable_outbounds(outs, timeout=2):
             port = int(port)
         except ValueError:
             continue
+        if not (0 < port < 65536):
+            continue
         sock = None
         try:
             sock = socket.create_connection((host, port), timeout=timeout)
         except Exception:
-            dead.append(ob.get('name'))
+            dead.append(name)
         finally:
             if sock is not None:
                 try:
@@ -1053,6 +1087,11 @@ def _log_ignored(where, exc):
     print(f'[portal] {where} ignored {type(exc).__name__}: {exc}', file=sys.stderr)
 
 
+class AtomicWriteDurabilityError(OSError):
+    """File replacement succeeded but its directory sync did not."""
+    replaced = True
+
+
 def atomic_write_private(path, payload):
     """原子、落盘、仅 root 可读地写文件。
 
@@ -1060,26 +1099,94 @@ def atomic_write_private(path, payload):
       密码与 api_key 对本机其他用户可读。
     - replace 前 fsync 文件、之后 fsync 目录：否则断电后可能留下空文件，
       portal.json 里是全部用户数据。
+
+    🔴 2026-10-31 修（两个真实事故面）：
+      1. 临时文件名原来是 `path.with_suffix('.tmp')` —— **固定名**。
+         /etc/hysteria 是多服务共用目录（install.sh 的更新流程、升级脚本、
+         人工 `cp -a` 备份都会在同一目录里动文件）。固定名意味着两个写入者
+         交错时会互相截断同一个临时文件：一方 fsync 完，另一方 O_TRUNC 掉，
+         随后一方 os.replace 把**半截内容**改成正式文件 —— portal.json 里是
+         全部用户、密码与 api_key。现在与同文件其它原子写一致，用唯一临时名。
+      2. 目标目录在被换掉之后消失时，`path.parent` 的 os.open 会抛
+         FileNotFoundError（OSError 子类）。上一版把**任何** OSError 都包装成
+         AtomicWriteDurabilityError(replaced=True)，而调用方（计量 runtime）
+         对 replaced=True 的处理是「文件已落盘，保留内存新状态」——
+         可实际上文件根本没写成。现在只有目录**确实打开成功、只是 fsync 失败**
+         才算「已替换、耐久性未知」；打开失败说明替换本身可疑，按普通失败抛出，
+         让调用方走正常回滚。
     """
     path = Path(path)
-    temp = path.with_suffix('.tmp')
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd, temp_name = tempfile.mkstemp(prefix='.' + path.name + '.', suffix='.tmp',
+                                     dir=str(path.parent))
+    temp = Path(temp_name)
     try:
-        if hasattr(os, 'fchmod'):  # 临时文件若已存在，O_CREAT 不会改它原来的权限
+        if hasattr(os, 'fchmod'):  # mkstemp 已按 0600 创建，这里显式对齐一遍
             os.fchmod(fd, 0o600)
         with os.fdopen(fd, 'wb') as fh:
             fd = None
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
-    finally:
+    except BaseException:
         if fd is not None:
             os.close(fd)
-    os.replace(temp, path)
-    if hasattr(os, 'O_DIRECTORY'):
-        dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise
+    if os.name != 'nt':
+        # POSIX：replace 是原子的，正式文件要么是旧的要么是新的。
+        try:
+            os.replace(temp, path)
+        except OSError:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+            raise
+    else:
+        # Windows：目标被浏览器/杀软/journalled 备份进程短暂占用时
+        # os.replace 会抛 PermissionError(WinError 5)。这里重试几次，
+        # **每次重试前确保临时文件还在**（可能已被并发的 replace 消费掉了，
+        # 那就直接把目标内容按新值整体重写一遍，保证最终值一定是最新的那份）。
+        last = None
+        for attempt in range(50):
+            try:
+                os.replace(temp, path)
+                last = None
+                break
+            except PermissionError as exc:
+                last = exc
+                time.sleep(0.02 + 0.005 * attempt)
+            except OSError as exc:
+                last = exc
+                time.sleep(0.02)
+            if not temp.exists():
+                with open(path, 'wb') as fh:
+                    fh.write(payload)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                return
+        if last is not None:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+            raise last
+    if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+        # 只有在**本平台真的支持目录 fsync** 时才做这一步。
+        # Windows 上 O_DIRECTORY 不存在（上面已挡住），但某些 Python 构建里
+        # 两者都可能存在而 open(dir) 直接失败 —— 那种情况下"目录打不开"
+        # 不代表写入不可信，按已完成处理（行为比旧版仅更保守，不会更激进）。
+        try:
+            dfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            return
         try:
             os.fsync(dfd)
+        except OSError as exc:
+            raise AtomicWriteDurabilityError('file replaced; directory sync failed') from exc
         finally:
             os.close(dfd)
 
@@ -1564,6 +1671,22 @@ def gost_tls_paths(root):
     raise RuntimeError('HTTPS 代理缺少可用证书和私钥，请先配置节点证书')
 
 
+def _unit_failure_hint(unit, lines=6):
+    """返回「: 最后几行 journal」后缀，供启动失败时直接带在报错里。
+
+    面板上的启动失败提示原来只有「失败」两个字，而 journalctl 里通常明写着
+    真因（端口被占、证书读不到、ACL 引用不存在）。这里统一取一次，
+    任何「restart 了但没起来」的地方都能复用；取不到就返回空串，绝不再抛。
+    """
+    try:
+        out = subprocess.run(['journalctl', '-u', unit, '-n', str(lines), '--no-pager',
+                              '-o', 'cat'], capture_output=True, text=True, timeout=5)
+        tail = [line.strip() for line in (out.stdout or '').splitlines() if line.strip()]
+    except Exception:
+        return ''
+    return ('：' + ' | '.join(line[:140] for line in tail[-3:])) if tail else ''
+
+
 def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                   binary='/usr/local/bin/xray', restart=True):
     """Validate a candidate before replacing; restore prior config on start failure."""
@@ -1580,7 +1703,16 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
         test = subprocess.run([binary, 'run', '-test', '-c', str(candidate)],
                               capture_output=True, text=True, timeout=10)
         if test.returncode != 0:
-            raise RuntimeError('Xray 配置预检失败，原配置未更改')
+            # 🔴 2026-10-31：旧实现把 xray run -test 的输出整段丢弃，只回一句
+            # 「配置预检失败」。而真正的原因（端口被占、UUID 非法、reality 的
+            # dest 不可达）就写在那段 stderr 里 —— 用户在面板上只能反复试。
+            # ⚠️ 用 getattr 兜一层：capture_output 在个别代理/桩实现下只给
+            # returncode，缺属性时绝不能把「预检失败」变成 AttributeError
+            # （那样报错反而更看不懂，真因也一起丢了）。
+            raw = (getattr(test, 'stderr', '') or '') + (getattr(test, 'stdout', '') or '')
+            tail = [line for line in raw.strip().splitlines() if line.strip()][-3:]
+            raise RuntimeError('Xray 配置预检失败，原配置未更改' +
+                               ('：' + ' | '.join(line[:160] for line in tail) if tail else ''))
         os.replace(candidate, path)
         replaced = True
         if restart:
@@ -1589,7 +1721,7 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
             active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
                                     text=True, timeout=5).stdout.strip()
             if started.returncode != 0 or active != 'active':
-                raise RuntimeError('Xray 启动失败，已恢复原配置')
+                raise RuntimeError('Xray 启动失败，已恢复原配置' + _unit_failure_hint('xray'))
             # 核心管理页单独安装 Xray 时只写单元不 enable；第一次真正有配置跑起来
             # 才设开机自启（幂等）。
             subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
@@ -3259,9 +3391,18 @@ def content_policy(extra_script=None):
     # 内联样式做颜色/间距/进度条宽度，实测（浏览器计算样式）颜色被还原成默认值，
     # 界面静默降级。这里单独放开属性级的 inline，<style> 块仍然受哈希保护。
     # （旧浏览器不认 style-src-attr，行为与现在一致，不会更差。）
+    #
+    # 🔴 2026-10-31 加 upgrade-insecure-requests：
+    # 门户通常以纯 HTTP 暴露在 127.0.0.1:<port>（公网入口是 Hysteria 的
+    # masquerade TLS 反代，但**运维也会直接 ssh -L 到本机端口**）。HTTP 页面
+    # 下浏览器不会自动升级同源子资源；用户若从 https://host/<token>/ 进、
+    # 页面里某个绝对地址又被写成 http://（历史缓存页、手工拼的链接），
+    # Chrome 会把它当混合内容拦掉。这条指令让浏览器把所有 http 子请求
+    # 升级到 https，只在「本页确实是 https」时生效，HTTP 访问不受影响。
     return ("default-src 'none'; connect-src 'self'; img-src 'self' data:; style-src 'sha256-" + digest(STYLE)
             + "'; style-src-attr 'unsafe-inline'; script-src " + " ".join(scripts)
-            + "; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+            + "; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+            + "; upgrade-insecure-requests")
 
 
 def get_cert_pin_sha256(root_path):
@@ -3847,10 +3988,34 @@ def drop_meter_totals(data, user_id):
     if not isinstance(meter, dict):
         return False
     totals = meter.get('totals')
+    adjustments = meter.get('adjustments')
+    if isinstance(adjustments, dict):
+        adjustments.pop(user_id, None)
     if not isinstance(totals, dict):
         return False
     totals.pop(user_id, None)
     return True
+
+
+def reconcile_meter_usage(data, user_id, requested):
+    """Under data_lock, set an absolute quota value without altering measured counters."""
+    meter = data.get('usage_meter')
+    if meter is None and 'usage_meter' not in data:
+        meter = {}
+    if not isinstance(meter, dict):
+        raise ValueError('invalid meter state')
+    totals = meter.get('totals', {})
+    adjustments = meter.get('adjustments', {})
+    if not isinstance(totals, dict) or not isinstance(adjustments, dict):
+        raise ValueError('invalid meter ledger')
+    bucket = totals.get(user_id, {})
+    if (not isinstance(bucket, dict) or any(type(v) is not int or v < 0 for v in bucket.values())
+            or (user_id in adjustments and type(adjustments[user_id]) is not int)):
+        raise ValueError('invalid user meter ledger')
+    if type(requested) is not int or requested < 0:
+        raise ValueError('invalid reconciled usage')
+    meter.setdefault('adjustments', {})[user_id] = requested - sum(bucket.values())
+    data['usage_meter'] = meter
 
 
 def config_section(data, key):
@@ -6327,7 +6492,13 @@ def serve(path):
                 with data_lock:
                     needed=bool(pending_revocations(data)) or blocked_user_ids()!=(last_enforced_blocked or frozenset())
                 if needed:apply_access()
-            except Exception as exc:
+            except BaseException as exc:
+                # 🔴 2026-10-31：原来是 `except Exception`。这个循环**没有**
+                # 外层兜底，一旦有东西以 BaseException 的形式冒出来
+                # （KeyboardInterrupt、某处 re-raise 的 SystemExit），线程会
+                # 直接消失，而主线程/面板完全不知道 —— 现象是「到期用户
+                # 一直没被收回」「停用后还能连」，日志里一个字都没有。
+                # 这里兜住并打印，线程继续跑；真需要停进程时由 signal 处理。
                 print('[expiry] worker retry: '+type(exc).__name__,file=sys.stderr)
             time.sleep(5)
 
@@ -6468,8 +6639,9 @@ def serve(path):
     # 计量每 5 秒对每个来源采样一次。若每次都整份落盘（portal.json 含整页 HTML，
     # 几百 KB 起步），一天要写好几 GB，且写盘期间一直占着 /auth 也要的 data_lock。
     # 这里限流到每 METER_SAVE_INTERVAL 秒一次；内存里的计数始终是最新的，
-    # 其他任何 save_data() 也会顺带把它写下去。进程意外退出最多丢这一段间隔的
-    # 基线，下次采样按单调计数器补算差值，不会少计。
+    # 其他任何 save_data() 也会顺带把它写下去。若仅门户退出且计数服务未重启，
+    # 下次可按单调计数器补算；若两者同时重启，未落盘的旧 epoch 尾量无法补回，
+    # 下次采样会记录 service_restart_unsampled_tail_unknown 缺口。
     METER_SAVE_INTERVAL = 60
     _meter_last_save = [0.0]
 
@@ -6504,6 +6676,14 @@ def serve(path):
                                               on_speed=_meter_speed_sample)
     except Exception as _usage_exc:
         print('[portal] 真实计量未初始化: ' + type(_usage_exc).__name__, file=sys.stderr)
+
+    # 🔴 2026-10-31：计量模块是 hot-reload 进来的独立文件，它自己的 import 或
+    # 顶层校验失败时只会打一行「未初始化」然后整块功能消失（流量停更、
+    # /traffic-speed 全 0、ip_limit 只剩 /auth 的 180 秒窗口）。
+    # 这一行把「它到底挂在哪一步」写进日志，避免只能靠重启+猜。
+    if usage_meter is None:
+        print('[portal] 计量不可用：检查 usage-meter-config.json 与同目录四个 '
+              'usage-meter-*-v1.py 是否齐全（缺文件会让整组计量失效）', file=sys.stderr)
 
     def live_online_ips(uid):
         """计量模块采到的该用户**当前仍在连**的 IP（核心 /online/ips）；拿不到返回空集。
@@ -6605,6 +6785,16 @@ def serve(path):
                     except Exception:
                         pass
                 # 下一轮重新核对路由接口还在（xray.json 可能被别处重写）；已就绪时不会重启 Xray。
+                ready = False
+            except BaseException as exc:
+                # 🔴 2026-10-31：与 expiry worker 同源问题 —— 线程无外层兜底。
+                # 这里只兜住「非 Exception」的退出信号，保证循环不静默消失；
+                # 下一轮会重新读在线数据并重建拦截规则。
+                with data_lock:
+                    reality_ip_snapshot.update(ips={}, at=0.0)
+                    reality_iplimit_state.clear()
+                print('[iplimit] Reality 设备上限线程收到 %s，继续下一轮' % type(exc).__name__,
+                      file=sys.stderr)
                 ready = False
             time.sleep(5)
 
@@ -7914,6 +8104,7 @@ if __name__ == '__main__':
                     # /auth 每个新连接都要拿它；在锁内写 socket（慢客户端/缓冲区满
                     # 时会阻塞到连接超时）等于把全节点的鉴权一起卡住。
                     conflict = None
+                    durability_uncertain = False
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
                         # 只认明确的真值：字符串 "0"/"false" 不该被当成 true。
@@ -7946,11 +8137,14 @@ if __name__ == '__main__':
                                 if 'used_bytes' not in params:
                                     record['used_bytes'] = int(existing.get('used_bytes', 0))
                                 record['created_at'] = existing.get('created_at', now_ts)
+                                if 'legacy_auth_value' in existing:
+                                    record['legacy_auth_value'] = existing['legacy_auth_value']
                                 if 'active' not in params:
                                     record['status'] = existing.get('status', 'active')
                                 for param, field in (('password', 'password'), ('ip_limit', 'ip_limit'),
                                                      ('traffic_gb', 'limit_bytes'), ('note', 'note')):
-                                    if param not in params or (param == 'password' and not params.get(param)):
+                                    if ((param not in params and not (param == 'traffic_gb' and 'limit_bytes' in params))
+                                            or (param == 'password' and not params.get(param))):
                                         record[field] = existing.get(field, record[field])
                                 # traffic_gb 与 limit_bytes 都没传时才沿用旧配额。
                                 if 'traffic_gb' not in params and 'limit_bytes' not in params:
@@ -7959,20 +8153,49 @@ if __name__ == '__main__':
                                     record['expires_at'] = existing.get('expires_at', record['expires_at'])
                             if existing is not None:
                                 rotate_user_view_key_on_change(existing, record)
-                            data.setdefault('users', {})[user_id] = record
+                            if 'used_bytes' in params:
+                                # 同一共享锁覆盖对账、用户写入和落盘；失败时仅回滚
+                                # 本请求的两个字段。replace 后目录 fsync 失败属于未知
+                                # 落盘状态，save_data 的异常会明确告知调用方需核对。
+                                missing = object()
+                                previous_meter = (copy.deepcopy(data['usage_meter'])
+                                                  if 'usage_meter' in data else missing)
+                                try:
+                                    reconcile_meter_usage(data, user_id, initial_used)
+                                    data.setdefault('users', {})[user_id] = record
+                                    save_data()
+                                except ValueError:
+                                    conflict = (409, 'Invalid meter ledger; reconciliation not applied')
+                                except AtomicWriteDurabilityError:
+                                    # 文件已替换：保留新值并继续同步协议，随后返回不确定状态。
+                                    durability_uncertain = True
+                                except OSError:
+                                    if existing is None:
+                                        data.get('users', {}).pop(user_id, None)
+                                    else:
+                                        data['users'][user_id] = existing
+                                    if previous_meter is missing:
+                                        data.pop('usage_meter', None)
+                                    else:
+                                        data['usage_meter'] = previous_meter
+                                    conflict = (503, 'Reconciliation save failed; disk state may require verification')
+                            elif conflict is None:
+                                data.setdefault('users', {})[user_id] = record
                             pwd, expires = record['password'], record['expires_at']
                             ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
                             status_after = record.get('status', 'active')
                             # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
                             # 对应一个 VLESS UUID，开户即生效。
-                            reality_registry(data)
+                            if conflict is None:
+                                reality_registry(data)
                             rcfg = dict(config_section(data, 'reality_config'))
                             vcfg_active = dict(config_section(data, 'vmess_config'))
                             ecfg_active = dict(config_section(data, 'vlessenc_config'))
                     if conflict is not None:
                         # 锁已释放，现在才写响应。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
-                    regenerate_page()
+                    if not durability_uncertain:
+                        regenerate_page()
 
                     # 受控对账开户必须确认Reality生效；失败可GET→update同值重试。
                     if _create_only and Path('/etc/hysteria/xray.json').exists():
@@ -7981,6 +8204,9 @@ if __name__ == '__main__':
                     else:
                         if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if durability_uncertain:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'Reconciliation saved but durability uncertain; verify and retry'})
 
                     rcfg = _active_reality_config()
                     vcfg_active = _active_vmess_config()
@@ -10731,6 +10957,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                       'text/html; charset=utf-8')
 
                 m = read_meta_file(meta_path)
+                # 🔴 2026-10-31：这个分享页会跑一到两次 qrencode（各 10 秒超时），
+                # 而默认连接死线 30 秒、且并发受 BoundedSemaphore(8) 限制。
+                # 低配机 + 多人同时打开分享页时会在 30 秒整被 watch_deadlines
+                # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
+                # 与其它带子进程的端点一致：先续期再干活。
+                self._extend_deadline(60)
                 # meta 损坏时 artifacts 会退回 localhost/默认端口，生成一条
                 # 永远连不上的链接却返回 200（2026-10-29 修）。
                 if not (m.get('server_name') or m.get('public_ip')):
@@ -11150,6 +11382,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """GET /reality-status 的处理逻辑（从 do_GET 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            # 🔴 2026-10-31：本端点在**认证之后**跑 `qrencode` 子进程（超时 3 秒）。
+            # 默认连接死线只有 30 秒，本不该被误杀；但 qrencode 在多租户/低配机上
+            # 偶发卡满 3 秒，叠加同时进行的其它慢端点（BoundedSemaphore(8) 限制
+            # 并发），排队后仍可能越过死线 → 用户看到 "Empty reply from server"。
+            # 与其它带子进程的端点保持一致，先把自己的死线抬到覆盖它。
+            self._extend_deadline(30)
             is_installed = Path('/usr/local/bin/xray').exists()
             # 判据必须是「Reality 入站是否存在」，不能只看 Xray 进程：
             # VMess 上线后，只开 VMess 的节点上 Xray 同样是 active，

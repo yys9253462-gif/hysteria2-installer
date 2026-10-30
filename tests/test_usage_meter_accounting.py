@@ -167,6 +167,49 @@ class MeterAccountingTest(unittest.TestCase):
         self.meter.poll()
         self.assertEqual(self.data['users']['admin_master']['used_bytes'], 30)
 
+    def test_adjustment_two_sources_and_restart(self):
+        self.meter.config['reality'] = {'test': True}
+        self.counters['reality'] = {'admin_master': {'tx': 0, 'rx': 0}}
+        self.data['usage_meter'] = {'adjustments': {'admin_master': 7}}
+        self.meter.poll()
+        self.counters['hysteria']['admin_master']['tx'] = 10
+        self.counters['reality']['admin_master']['rx'] = 20
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 37)
+        self.assertEqual(self.meter.summary('admin_master')['measured_bytes'], 30)
+        self.assertEqual(self.meter.hot_summary('admin_master')['measured_bytes'], 30)
+        self.data['usage_meter']['adjustments']['admin_master'] = -30
+        restarted = runtime.PortalMeter(self.data, threading.RLock(), lambda: None,
+            self.meter.config, read=self.meter.read, epoch=self.meter.epoch)
+        restarted.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 0)
+        self.assertEqual(restarted.summary('admin_master')['measured_bytes'], 30)
+
+    def test_invalid_adjustment_fails_atomically_and_recovers(self):
+        self.meter.poll()
+        self.counters['hysteria']['admin_master']['tx'] = 10
+        self.meter.poll()
+        for invalid in (None, True, 1.5, '1', -12):
+            with self.subTest(invalid=invalid):
+                self.data['usage_meter']['adjustments'] = {'admin_master': invalid}
+                before = copy.deepcopy(self.data['usage_meter']['totals'])
+                self.counters['hysteria']['admin_master']['tx'] = 11
+                self.meter.poll()
+                self.assertEqual(self.data['users']['admin_master']['used_bytes'], 10)
+                self.assertEqual(self.data['usage_meter']['totals'], before)
+                self.assertFalse(self.meter.summary('admin_master')['measurement_current_ok'])
+                self.assertEqual(self.meter.summary('admin_master')['measured_bytes'], 10)
+                self.data['usage_meter']['adjustments']['admin_master'] = 0
+                self.counters['hysteria']['admin_master']['tx'] = 10
+                self.meter.poll()
+        self.counters['hysteria']['admin_master']['tx'] = 11
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 11)
+        self.assertTrue(self.meter.summary('admin_master')['measurement_current_ok'])
+        for invalid in (None, [], 'bad'):
+            with self.subTest(container=invalid), self.assertRaises(ValueError):
+                runtime.core.adjusted_bytes({'adjustments': invalid}, 'u')
+
     def test_service_epoch_and_counter_regression(self):
         self.meter.poll()
         self.counters['hysteria']['admin_master']['tx'] = 10

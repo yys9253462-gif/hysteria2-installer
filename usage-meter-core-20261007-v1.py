@@ -126,3 +126,18 @@ def total_bytes(state, uid):
             or any(type(value) is not int or value < 0 for value in bucket.values())):
         raise ValueError('invalid user totals')
     return sum(bucket.values())
+
+
+def adjusted_bytes(state, uid):
+    """返回实测累计加账户有符号偏移；损坏状态和负结果均失败。"""
+    total = total_bytes(state, uid)
+    adjustments = state.get('adjustments', {})
+    if not isinstance(adjustments, dict):
+        raise ValueError('invalid adjustments')
+    offset = adjustments.get(uid, 0)
+    if type(offset) is not int:
+        raise ValueError('invalid adjustment')
+    result = total + offset
+    if result < 0:
+        raise ValueError('negative adjusted usage')
+    return result

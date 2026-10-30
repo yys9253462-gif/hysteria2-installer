@@ -62,6 +62,18 @@ log_step() { echo -e "${CYAN}==>${PLAIN} ${BLUE}$*${PLAIN}" >&2; }
 
 die() { log_err "$*"; exit 1; }
 
+# need_value <选项名> <当前剩余参数个数> <该选项最少需要的参数个数>
+# 用法： `--port) need_value "$1" "$#" 2 && port="$2"; shift 2 ;;`
+# 目的：把「选项后面缺值」变成一句人话，而不是 `set -u` 的 unbound variable。
+# 注意写成 `cmd && assign; shift 2`：need_value 失败时 die 已 exit 1，
+# 不会走到 shift；成功时返回 0 才赋值。
+need_value() {
+    local opt="$1" have="$2" need="$3"
+    if [[ "$have" -lt "$need" ]]; then
+        die "${opt} 缺少取值（当前只剩 $((have - 1)) 个参数）"
+    fi
+}
+
 require_root() {
     [[ "${EUID:-$(id -u)}" -eq 0 ]] || die "本工具必须以 root 运行。"
 }
@@ -790,11 +802,15 @@ cmd_install() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --line)      line="$2"; shift 2 ;;
-            --port)      port="$2"; shift 2 ;;
-            --endpoint)  endpoint="$2"; shift 2 ;;
-            --client)    client="$2"; shift 2 ;;
-            --server-name) server_name="$2"; shift 2 ;;
+            # 🔴 2026-10-31：全部改成「先验取值，再 shift」。原写法在
+            # `--port` 后面缺值时于 `set -u` 下抛 `$2: unbound variable`，
+            # 而面板把这些 stderr 原样回给用户 —— 看到的是 shell 内部报错，
+            # 完全看不出是自己少填了一个值。
+            --line)        need_value "$1" "$#" 2 && line="$2"; shift 2 ;;
+            --port)        need_value "$1" "$#" 2 && port="$2"; shift 2 ;;
+            --endpoint)    need_value "$1" "$#" 2 && endpoint="$2"; shift 2 ;;
+            --client)      need_value "$1" "$#" 2 && client="$2"; shift 2 ;;
+            --server-name) need_value "$1" "$#" 2 && server_name="$2"; shift 2 ;;
             *) die "install 未知参数: $1" ;;
         esac
     done
@@ -1064,7 +1080,15 @@ cmd_update() {
     local line=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --line) line="$2"; shift 2 ;;
+            # 🔴 2026-10-31：`line="$2"; shift 2` 在 --line 后面缺值时，$2 未定义，
+            # `set -u` 直接以「$2: unbound variable」退出 —— 报错完全不指向
+            # 真正的参数问题，用户只会以为是脚本坏了。与 parse_name_endpoint
+            # 同一口径，先显式检查再 shift。
+            --line)
+                if [[ $# -lt 2 ]]; then
+                    die "--line 缺少取值（应为 2 或 3）"
+                fi
+                line="$2"; shift 2 ;;
             *) die "update 未知参数: $1" ;;
         esac
     done

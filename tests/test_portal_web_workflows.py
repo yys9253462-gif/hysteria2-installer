@@ -11,6 +11,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from urllib.parse import urlencode
 
+import sys  # noqa: E402
+# 🔴 2026-10-31：CI 用的是 `python3 -m unittest discover -s tests -p 'test_*.py'`，
+# 那条命令会把 CWD（仓库根）放进 sys.path；而「文档里教的、人最常敲的」
+# `cd tests && python3 -m unittest test_xxx` 不会。用后一种方式时这六个文件
+# 报 ModuleNotFoundError: No module named 'portal' —— 看着像代码坏了，其实是
+# 加载方式差异。这里补上与其它 38 个测试一致的路径注入，两种跑法都能过。
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1]))
+
 import portal
 
 SOURCE = Path(portal.__file__).read_text(encoding='utf-8')
@@ -197,6 +205,53 @@ class WebWorkflowTests(unittest.TestCase):
         self.handler.rfile = io.BytesIO(body)
         extract_method('do_POST', self.ns)(self.handler)
         return self.response
+
+    def test_api_reconciles_absolute_usage_against_measured_ledger(self):
+        self.data['users']['qa-user'] = {'password': 'original', 'used_bytes': 50,
+                                          'legacy_auth_value': 7, 'expires_at': 2200000000}
+        self.data['usage_meter'] = {'totals': {'qa-user': {'hysteria': 40, 'reality': 10}}}
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'used_bytes': 999})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.data['users']['qa-user']['used_bytes'], 999)
+        self.assertEqual(self.data['users']['qa-user']['legacy_auth_value'], 7)
+        self.assertEqual(self.data['usage_meter']['adjustments']['qa-user'], 949)
+        self.assertEqual(self.data['usage_meter']['totals']['qa-user']['hysteria'], 40)
+
+    def test_api_explicit_limit_bytes_is_not_overwritten_by_old_value(self):
+        self.data['users']['qa-user'] = {'password': 'original', 'used_bytes': 5,
+                                          'limit_bytes': 100, 'expires_at': 2200000000}
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'limit_bytes': 50})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.data['users']['qa-user']['limit_bytes'], 50)
+
+    def test_api_reconciliation_after_replace_failure_keeps_live_state(self):
+        self.data['users']['qa-user'] = {'password': 'original', 'used_bytes': 50, 'expires_at': 2200000000}
+        self.data['usage_meter'] = {'totals': {'qa-user': {'hysteria': 50}}}
+        self.ns['save_data'] = Mock(side_effect=portal.AtomicWriteDurabilityError('directory sync'))
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'used_bytes': 0})
+        self.assertEqual(status, 503)
+        self.assertEqual(self.data['users']['qa-user']['used_bytes'], 0)
+        self.assertEqual(self.data['usage_meter']['adjustments']['qa-user'], -50)
+        self.sync.assert_called_once()
+
+    def test_api_reconciliation_save_failure_restores_state(self):
+        old = {'password': 'original', 'used_bytes': 50, 'expires_at': 2200000000}
+        self.data['users']['qa-user'] = dict(old)
+        self.data['usage_meter'] = {'totals': {'qa-user': {'hysteria': 50}}}
+        before = copy.deepcopy(self.data)
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'used_bytes': 0})
+        self.assertEqual(status, 503)
+        self.assertEqual(self.data, before)
+
+    def test_api_reconciliation_rejects_corrupt_ledger_without_mutating_user(self):
+        old = {'password': 'original', 'used_bytes': 50, 'expires_at': 2200000000}
+        self.data['users']['qa-user'] = dict(old)
+        self.data['usage_meter'] = {'totals': {'qa-user': {'hysteria': -1}}}
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'used_bytes': 999})
+        self.assertEqual(status, 409)
+        self.assertEqual(self.data['users']['qa-user'], old)
+        self.assertNotIn('adjustments', self.data['usage_meter'])
 
     def test_api_duplicate_create_preserves_existing_usage_and_password(self):
         old = {'password': 'original-test-only', 'used_bytes': 123456, 'expires_at': 2200000000}

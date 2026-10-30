@@ -39,6 +39,21 @@ class MeterTransactionIntegrityTests(unittest.TestCase):
                 self.assertEqual(data['users']['u']['used_bytes'], 25)
                 self.assertFalse(data['usage_meter']['health']['reality']['ok'])
 
+    def test_post_replace_sync_failure_does_not_double_count(self):
+        class DurabilityError(OSError):
+            replaced = True
+        meter = self.make_meter()
+        meter.poll()
+        self.counters['u']['tx'] = 25
+        meter.save = lambda: (_ for _ in ()).throw(DurabilityError('directory sync'))
+        meter.poll()
+        self.assertEqual(self.data['users']['u']['used_bytes'], 25)
+        self.assertEqual(self.data['usage_meter']['sources']['hysteria']['counters']['u']['tx'], 25)
+        self.assertFalse(meter.summary('u')['measurement_current_ok'])
+        meter.save = lambda: None
+        meter.poll()
+        self.assertEqual(self.data['users']['u']['used_bytes'], 25)
+
     def test_persistent_save_failure_reports_unhealthy_in_memory(self):
         meter = self.make_meter()
         meter.poll()
@@ -111,6 +126,41 @@ class MeterTransactionIntegrityTests(unittest.TestCase):
                 for result in (meter.summary('u'), meter.hot_summary('u')):
                     self.assertIsNone(result['measured_bytes'])
                     self.assertFalse(result['measurement_ok'])
+
+    def test_reconciliation_waits_for_failed_sample_transaction(self):
+        meter = self.make_meter()
+        meter.poll()
+        self.counters['u']['tx'] = 25
+        entered, attempted, finished = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        def failed_save():
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                self.assertTrue(attempted.wait(2))
+                # Give the other thread a chance to enter the critical section.
+                finished.wait(0.1)
+                raise OSError('disk full')
+        def reconcile():
+            self.assertTrue(entered.wait(2))
+            attempted.set()
+            with meter.lock:
+                state = self.data['usage_meter']
+                state.setdefault('adjustments', {})['u'] = 100 - runtime.core.total_bytes(state, 'u')
+                self.data['users']['u']['used_bytes'] = 100
+            finished.set()
+        meter.save = failed_save
+        worker = threading.Thread(target=reconcile)
+        worker.start()
+        meter.poll()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        state = self.data['usage_meter']
+        self.assertEqual(runtime.core.adjusted_bytes(state, 'u'), 100)
+        self.assertEqual(self.data['users']['u']['used_bytes'], 100)
+        meter.save = lambda: None
+        meter.poll()
+        self.assertEqual(self.data['users']['u']['used_bytes'], 125)
 
     def test_failed_sample_save_preserves_deleted_totals(self):
         meter = self.make_meter()

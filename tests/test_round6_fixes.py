@@ -137,7 +137,12 @@ class AwgEndpointValidationTest(unittest.TestCase):
         for cmd in ('cmd_install', 'cmd_peer_add', 'cmd_client_conf', 'cmd_qr'):
             m = re.search(r'%s\(\)\s*\{' % cmd, AWGCTL_SRC)
             self.assertIsNotNone(m, '%s 不见了' % cmd)
-            body = AWGCTL_SRC[m.start():m.start() + 1500]
+            # ⚠️ 窗口必须覆盖到整个函数体：cmd_install 前面还有一段参数解析，
+            # 固定的 1500 字符窗口在 2026-10-31 加 need_value 之后越界了，
+            # 断言于是假失败（函数本身没问题）。改为「到下一个顶格函数为止」。
+            start = m.start()
+            nxt = re.search(r'\n[a-z_]+\(\)\s*\{', AWGCTL_SRC[start + 1:])
+            body = AWGCTL_SRC[start:start + 1 + nxt.start()] if nxt else AWGCTL_SRC[start:]
             self.assertIn('validate_endpoint', body,
                           '%s 必须校验 endpoint' % cmd)
 
