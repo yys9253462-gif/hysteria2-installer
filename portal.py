@@ -3088,7 +3088,10 @@ def share_unavailable_html(reason):
     用户拿到的是一条 URL，看到英文 "Access denied" 只会以为链接坏了；
     实际原因通常是到期、超额或停用（2026-10-29 加）。
     """
-    body = html.escape(reason or '该链接当前不可用')
+    # reason 由调用方从用户记录里拼出来（停用/到期/超额），但外部也可能
+    # 传进数字或列表：html.escape 会调 .replace() 直接抛 AttributeError，
+    # 于是「账号不可用」这条本该给人看的说明变成 500。
+    body = html.escape(reason if isinstance(reason, str) and reason else '该链接当前不可用')
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>链接不可用</title>
 <style>{STYLE}</style></head><body><main style="max-width:640px">

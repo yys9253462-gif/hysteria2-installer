@@ -67,5 +67,24 @@ class RenderCorruptStateTests(unittest.TestCase):
                 self.assertIn('<!doctype html', page.lower())
 
 
+class ShareUnavailablePageTests(unittest.TestCase):
+    """不可用说明页的 reason 来自用户记录，非字符串时不能 500。
+
+    这条页面本身就是为了「告诉用户为什么连不上」，它挂了就只剩一行裸 403。
+    """
+
+    def test_non_string_reason_still_renders(self):
+        for bad in (None, 7, ['x'], {'a': 1}, ''):
+            with self.subTest(bad=bad):
+                page = portal.share_unavailable_html(bad)
+                self.assertIn('<!doctype html', page.lower())
+                self.assertIn('该链接当前不可用', page)
+
+    def test_reason_is_escaped(self):
+        page = portal.share_unavailable_html('<script>x</script>')
+        self.assertNotIn('<script>x</script>', page)
+        self.assertIn('&lt;script&gt;', page)
+
+
 if __name__ == '__main__':
     unittest.main()
