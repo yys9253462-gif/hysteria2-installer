@@ -56,10 +56,12 @@ class TestRealityPublicParameters(unittest.TestCase):
         })
 
     def test_invalid_port_and_empty_values_are_omitted(self):
-        self.assertEqual(
-            portal._reality_public_params({'public_key': ' ', 'port': 70000}),
-            {},
-        )
+        for bad in (70000, 0, -1, 'abc', True, 1.5, float('inf')):
+            with self.subTest(bad=bad):
+                self.assertEqual(
+                    portal._reality_public_params({'public_key': ' ', 'port': bad}),
+                    {},
+                )
 
 
 class TestRealityPortSelection(unittest.TestCase):

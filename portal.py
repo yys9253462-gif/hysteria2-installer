@@ -5330,11 +5330,10 @@ def _reality_public_params(rcfg):
     dest_sni = rcfg.get('dest_sni')
     if isinstance(dest_sni, str) and dest_sni.strip():
         out['dest_sni'] = dest_sni.strip()
-    try:
-        port = int(rcfg.get('port') or 0)
-    except (TypeError, ValueError):
-        port = 0
-    if 1 <= port <= 65535:
+    # 与 artifacts() 同一套端口校验：True 会变成 1、1.5 被截断成 1，
+    # 主面板据此下发一个指向错误端口的 Reality 节点（客户端连不上）。
+    port = _valid_port(rcfg.get('port') or 0)
+    if port:
         out['port'] = port
     return out
 
