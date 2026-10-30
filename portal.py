@@ -6959,7 +6959,14 @@ if __name__ == '__main__':
 
     def awg_state():
         meta = awg_read_json(AWG_META_PATH, {})
-        peers_raw = awg_read_json(AWG_PEERS_PATH, {}).get('peers', []) or []
+        if not isinstance(meta, dict):
+            meta = {}
+        # peers 文件是 awgctl.sh 写的 JSON：被截断/手工改坏时 `peers` 可能是
+        # 字符串或含非 dict 条目。旧写法 len() / p.get() 直接抛异常，
+        # 整个 /awg-state 端点 500，面板的 AWG 卡片整块空白。
+        peers_doc = awg_read_json(AWG_PEERS_PATH, {})
+        peers_raw = peers_doc.get('peers') if isinstance(peers_doc, dict) else None
+        peers_raw = [p for p in peers_raw if isinstance(p, dict)] if isinstance(peers_raw, list) else []
         line = str(meta.get('line', '3') or '3')
         if line not in ('2', '3'):
             line = '3'
