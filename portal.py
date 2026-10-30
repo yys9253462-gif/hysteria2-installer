@@ -655,6 +655,10 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     🔴 两种模式最后都补一条兜底，否则未匹配的连接会落到 outbounds
     列表第一个出站上——那通常是内建 direct_ipv4，行为不可控。
     """
+    # 入参来自 render_egress_config 的快照，但也可能被直接调用（测试、旧路径）
+    # 传进损坏值：数字会让 `for ... in 7` 抛 TypeError，条目是字符串时
+    # `.get` 抛 AttributeError —— 都在「应用配置」路径上。
+    outbounds = clean_outbounds(outbounds)
     names = [ob['name'] for ob in (outbounds or [])]
     existing = set(_existing_outbound_names() if existing_names is None else existing_names)
     available = set(names) | existing | {'direct', 'reject'}
@@ -664,8 +668,13 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
         acl.append('    - %s(all)' % names[0])
         return '\n'.join(acl)
 
-    for r in (rules or []):
-        dom = (r.get('domain') or '').strip().lower()
+    if not isinstance(rules, (list, tuple)):
+        rules = ()
+    for r in rules:
+        if not isinstance(r, dict):
+            continue
+        raw_dom = r.get('domain')
+        dom = raw_dom.strip().lower() if isinstance(raw_dom, str) else ''
         if not dom:
             continue
         target = r.get('outbound') or ''

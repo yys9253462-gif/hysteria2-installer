@@ -97,6 +97,42 @@ class ConfigTextHelperTests(unittest.TestCase):
         self.assertEqual(portal.strip_managed_outbounds(text), text)
 
 
+class AclBlockTests(unittest.TestCase):
+    """acl.inline 生成对损坏的规则/出站不能抛异常。
+
+    它在 apply_egress_config 里：异常会让「应用出站配置」永久失败，
+    界面只有一句「应用失败」，而内网拦截规则也一起没写进去。
+    """
+
+    def test_corrupt_rules_are_skipped(self):
+        for rules in (None, 7, 'x', [None], ['x'], [{'domain': 123}],
+                      [{'domain': ['a']}], [{'domain': 'a', 'outbound': 5}]):
+            with self.subTest(rules=rules):
+                block = portal.build_acl_block('rules', rules, [], 'direct')
+                # 内网拦截与兜底规则必须始终存在。
+                self.assertIn('reject(127.0.0.0/8)', block)
+                self.assertIn('direct(all)', block)
+
+    def test_corrupt_outbounds_do_not_raise_in_global_mode(self):
+        for outs in (None, 7, 'x', [None], ['x'], [{'name': 'p', 'type': 'socks5'}]):
+            with self.subTest(outs=outs):
+                block = portal.build_acl_block('global', [], outs, 'direct')
+                self.assertIn('reject(127.0.0.0/8)', block)
+
+    def test_healthy_rule_is_rendered(self):
+        # 出站名必须真的存在：不存在时有意回落到兜底出站，避免 Hysteria
+        # 引用未定义的 outbound 而起不来。
+        block = portal.build_acl_block(
+            'rules', [{'domain': 'ok.com', 'outbound': 'warp_socks'}], [], 'direct',
+            existing_names={'warp_socks'})
+        self.assertIn('warp_socks(suffix:ok.com)', block)
+        missing = portal.build_acl_block(
+            'rules', [{'domain': 'ok.com', 'outbound': 'gone'}], [], 'direct',
+            existing_names=set())
+        self.assertIn('direct(suffix:ok.com)', missing)
+        self.assertNotIn('gone(', missing)
+
+
 class RoutingStateTests(unittest.TestCase):
     def test_corrupt_state_degrades_to_empty_lists(self):
         for data in ({'custom_outbounds': 7, 'warp_rules': 7, 'outbound_mode': 5},
