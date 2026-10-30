@@ -458,6 +458,21 @@ def outbound_names_in(text):
     return [_yaml_name_value(m)
             for m in re.findall(_OUTBOUND_NAME_LINE_RE.pattern, text or '', re.M)]
 
+def clean_outbounds(outbounds):
+    """只保留结构完整的出站条目；容器被改坏时返回空表。
+
+    custom_outbounds 是用户可写的 JSON，旧版本还允许直接改 portal.json。
+    渲染时 `entry['type']` 对 None / 字符串 / 缺字段会抛
+    TypeError/KeyError，而调用点在 apply_egress_config 里 —— 一次坏数据就让
+    WARP 与出站配置永久无法应用，界面只显示「应用失败」。
+    """
+    if not isinstance(outbounds, (list, tuple)):
+        return []
+    return [ob for ob in outbounds
+            if isinstance(ob, dict) and ob.get('type') in OUTBOUND_TYPES
+            and isinstance(ob.get('name'), str) and ob['name']]
+
+
 def render_outbound_yaml(entry):
     """把一条出站配置渲染成 YAML 片段（缩进与 config.yaml 风格一致）。"""
     otype = entry['type']
@@ -492,7 +507,7 @@ def upsert_outbound_block(cfg_text, outbounds):
     if not outbounds:
         return text
 
-    block = '\n'.join(render_outbound_yaml(ob) for ob in outbounds)
+    block = '\n'.join(render_outbound_yaml(ob) for ob in clean_outbounds(outbounds))
     if 'outbounds:' in text:
         # 插到 outbounds 段的末尾（顶格行的下一行起）
         lines = text.split('\n')
@@ -694,8 +709,12 @@ def build_warp_acl_config(original, enabled, rules):
 
 
 def normalize_route_rules(rules):
+    # 容器被改成数字/对象时旧写法 `for item in rules` 抛 TypeError，
+    # 而它在 render_egress_config 里 —— WARP 分流保存永久失败。
+    if not isinstance(rules, (list, tuple, set, frozenset)):
+        return []
     result = []
-    for item in rules or ():
+    for item in rules:
         if isinstance(item, str):
             item = {'domain': item, 'outbound': 'warp_socks'}
         if not isinstance(item, dict):
@@ -717,7 +736,7 @@ def render_egress_config(original, state):
     enabled = bool(state.get('warp_enabled', False))
     # Ensure the WARP transport/sniffer, then render the one shared route table.
     base = strip_acl_block(build_warp_acl_config(original, enabled, []))
-    outs = state.get('custom_outbounds', [])
+    outs = clean_outbounds(state.get('custom_outbounds', []))
     base = upsert_outbound_block(base, outs)
     existing = outbound_names_in(base)
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
@@ -4552,22 +4571,42 @@ def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
     这也意味着满额用户切换网络后，旧 IP 要等这段时间才释放。
     返回 {uid: set(要拦截的 ip)}。
     """
+    if not isinstance(state, dict):
+        state = {}
     for uid in list(state):
         if uid not in limits:
             state.pop(uid)
     blocked_out = {}
     for uid, limit in limits.items():
-        row = state.setdefault(uid, {'admitted': {}, 'blocked': {}})
+        row = state.get(uid)
+        # 跨轮次状态是内存字典，格式被旧版本/手工改坏时（字符串、缺 admitted 等）
+        # 旧写法直接 row['admitted'] 抛 TypeError，iplimit worker 每轮都在这里
+        # 失败 —— 设备上限形同虚设，且日志只有一句「本轮跳过」。
+        if (not isinstance(row, dict) or not isinstance(row.get('admitted'), dict)
+                or not isinstance(row.get('blocked'), dict)):
+            row = {'admitted': {}, 'blocked': {}}
+            state[uid] = row
         # admitted: {ip: last_seen}；blocked: {ip: [first_blocked, last_seen]}。
         # 被拦 IP 要单独记「开始等待的时间」，名额空出时按它排队。
         admitted, blocked = row['admitted'], row['blocked']
         seen = set(reality_ips.get(uid) or ())
+        # 单个 IP 的时间戳/区间被改坏时只丢这一条：不能让它把整轮规划打断，
+        # 否则该用户的所有设备都不再受上限约束。
         for ip in list(admitted):
-            if ip in seen:
+            last = admitted[ip]
+            if not isinstance(last, (int, float)) or isinstance(last, bool):
+                admitted.pop(ip)
+            elif ip in seen:
                 admitted[ip] = now
-            elif now - admitted[ip] >= release_after:
+            elif now - last >= release_after:
                 admitted.pop(ip)
         for ip in list(blocked):
+            span = blocked[ip]
+            if (not isinstance(span, (list, tuple)) or len(span) != 2
+                    or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                               for v in span)):
+                blocked.pop(ip)
+                continue
             if ip in seen:
                 blocked[ip][1] = now
             elif now - blocked[ip][1] >= release_after:
@@ -4618,8 +4657,17 @@ def apply_reality_iplimit(binary, address, desired, run=subprocess.run):
     listed = run([binary, 'api', 'lsrules', server], capture_output=True, text=True, timeout=5)
     if listed.returncode != 0:
         raise RuntimeError('xray lsrules failed')
-    current = {str(r.get('ruleTag')) for r in (json.loads(listed.stdout or '{}').get('rules') or [])
-               if str(r.get('ruleTag', '')).startswith(REALITY_IPLIMIT_TAG_PREFIX)}
+    # lsrules 的输出来自外部进程：空串、非 JSON、rules 被写成字符串或含非 dict
+    # 条目都可能出现。旧写法 `r.get(...)` 直接抛 AttributeError/JSONDecodeError，
+    # 每轮都失败 —— 已下发的拦截规则既不会被补也不会被清。
+    try:
+        listing = json.loads(listed.stdout or '{}')
+    except ValueError:
+        listing = {}
+    rows = listing.get('rules') if isinstance(listing, dict) else None
+    current = {str(r.get('ruleTag')) for r in (rows if isinstance(rows, list) else [])
+               if isinstance(r, dict)
+               and str(r.get('ruleTag', '')).startswith(REALITY_IPLIMIT_TAG_PREFIX)}
     missing = [tag for tag in sorted(desired) if tag not in current]
     stale = sorted(current - set(desired))
     if missing:
@@ -4648,21 +4696,45 @@ def read_reality_online_ips(binary, address, uids, run=subprocess.run):
     out = run([binary, 'api', 'statsgetallonlineusers', server], capture_output=True, text=True, timeout=5)
     if out.returncode != 0:
         raise RuntimeError('xray statsgetallonlineusers failed')
-    names = json.loads(out.stdout or '{}').get('users') or []
+    try:
+        listing = json.loads(out.stdout or '{}')
+    except ValueError:
+        listing = {}
+    names = listing.get('users') if isinstance(listing, dict) else None
+    # users 可能是字符串（旧版本回显）或含非字符串条目；按字符拆会把
+    # "alice" 变成 a/l/i/c/e 五个假用户，然后逐个去查 IP。
+    names = names if isinstance(names, list) else []
     online = set()
     for name in names:
-        parts = str(name).split('>>>')
-        online.add(parts[1] if len(parts) == 3 and parts[0] == 'user' else str(name))
+        if not isinstance(name, str):
+            continue
+        parts = name.split('>>>')
+        online.add(parts[1] if len(parts) == 3 and parts[0] == 'user' else name)
     result = {}
+    # uids 由调用方从 limits 传入；容器被改坏时 set() 会抛 TypeError，
+    # 而调用方只会把异常当成「读不到在线数据」并把全部拦截规则撤掉。
+    uids = uids if isinstance(uids, (list, tuple, set, frozenset, dict)) else ()
     for uid in sorted(set(uids) & online):
         got = run([binary, 'api', 'statsonlineiplist', server, '--email=' + uid],
                   capture_output=True, text=True, timeout=5)
         if got.returncode != 0:
             raise RuntimeError('xray statsonlineiplist failed')
-        ips = json.loads(got.stdout or '{}').get('ips') or {}
+        try:
+            payload = json.loads(got.stdout or '{}')
+        except ValueError:
+            payload = {}
+        ips = payload.get('ips') if isinstance(payload, dict) else None
         if not isinstance(ips, dict):
             raise ValueError('invalid online ip list')
-        result[uid] = {str(ipaddress.ip_address(ip)) for ip in ips}
+        clean = set()
+        for ip in ips:
+            try:
+                clean.add(str(ipaddress.ip_address(ip)))
+            except ValueError:
+                # 单个畸形 IP 不能让整轮抛异常 —— 调用方会因此撤掉**全部**
+                # 拦截规则，等于所有超额用户瞬间恢复不限设备。
+                continue
+        result[uid] = clean
     return result
 
 
@@ -7516,60 +7588,68 @@ if __name__ == '__main__':
                     want_active = params.get('active', True)
                     note = str(params.get('note', '')).strip()[:200]
 
+                    # 🔴 判定必须在锁内、回包必须在锁外：data_lock 是全局锁，
+                    # /auth 每个新连接都要拿它；在锁内写 socket（慢客户端/缓冲区满
+                    # 时会阻塞到连接超时）等于把全节点的鉴权一起卡住。
+                    conflict = None
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
                         # 只认明确的真值：字符串 "0"/"false" 不该被当成 true。
                         _create_only = str(params.get('create_only', '')).strip().lower() in ('1', 'true', 'yes', 'on')
                         if _create_only and existing is not None:
-                            return self.reply_json(409, {'ok': False, 'error': 'User already exists'})
-                        if params.get('password') and password_taken(data.get('users', {}), pwd, user_id):
-                            return self.reply_json(409, {'ok': False, 'error': 'Password already in use by another user'})
-                        record = {
-                            'password': pwd,
-                            'expires_at': expires,
-                            'ip_limit': ip_limit,
-                            'limit_bytes': limit_bytes,
-                            'used_bytes': initial_used,
-                            'status': 'active' if want_active else 'disabled',
-                            'created_at': now_ts,
-                            'note': note,
-                            'view_nonce': secrets.token_hex(8),
-                        }
-                        if existing is not None:
-                            # 更新已有用户不能换 nonce，否则发出去的分享链接会失效。
-                            if 'view_nonce' in existing:
-                                record['view_nonce'] = existing['view_nonce']
-                            else:
-                                record.pop('view_nonce')
-                            # 显式传入的字段以本次请求为准；没传才保留旧值
-                            # （2026-10-29 修：旧实现无条件保留旧 status/用量，
-                            # 控制台对账时传 active=false 或 limit_bytes 会被静默忽略）。
-                            if 'used_bytes' not in params:
-                                record['used_bytes'] = int(existing.get('used_bytes', 0))
-                            record['created_at'] = existing.get('created_at', now_ts)
-                            if 'active' not in params:
-                                record['status'] = existing.get('status', 'active')
-                            for param, field in (('password', 'password'), ('ip_limit', 'ip_limit'),
-                                                 ('traffic_gb', 'limit_bytes'), ('note', 'note')):
-                                if param not in params or (param == 'password' and not params.get(param)):
-                                    record[field] = existing.get(field, record[field])
-                            # traffic_gb 与 limit_bytes 都没传时才沿用旧配额。
-                            if 'traffic_gb' not in params and 'limit_bytes' not in params:
-                                record['limit_bytes'] = existing.get('limit_bytes', record['limit_bytes'])
-                            if 'duration_days' not in params and 'expires_at' not in params:
-                                record['expires_at'] = existing.get('expires_at', record['expires_at'])
-                        if existing is not None:
-                            rotate_user_view_key_on_change(existing, record)
-                        data.setdefault('users', {})[user_id] = record
-                        pwd, expires = record['password'], record['expires_at']
-                        ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
-                        status_after = record.get('status', 'active')
-                        # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
-                        # 对应一个 VLESS UUID，开户即生效。
-                        reality_registry(data)
-                        rcfg = dict(data.get('reality_config', {}) or {})
-                        vcfg_active = dict(data.get('vmess_config') or {})
-                        ecfg_active = dict(data.get('vlessenc_config') or {})
+                            conflict = (409, 'User already exists')
+                        elif params.get('password') and password_taken(data.get('users', {}), pwd, user_id):
+                            conflict = (409, 'Password already in use by another user')
+                        if conflict is None:
+                            record = {
+                                'password': pwd,
+                                'expires_at': expires,
+                                'ip_limit': ip_limit,
+                                'limit_bytes': limit_bytes,
+                                'used_bytes': initial_used,
+                                'status': 'active' if want_active else 'disabled',
+                                'created_at': now_ts,
+                                'note': note,
+                                'view_nonce': secrets.token_hex(8),
+                            }
+                            if existing is not None:
+                                # 更新已有用户不能换 nonce，否则发出去的分享链接会失效。
+                                if 'view_nonce' in existing:
+                                    record['view_nonce'] = existing['view_nonce']
+                                else:
+                                    record.pop('view_nonce')
+                                # 显式传入的字段以本次请求为准；没传才保留旧值
+                                # （2026-10-29 修：旧实现无条件保留旧 status/用量，
+                                # 控制台对账时传 active=false 或 limit_bytes 会被静默忽略）。
+                                if 'used_bytes' not in params:
+                                    record['used_bytes'] = int(existing.get('used_bytes', 0))
+                                record['created_at'] = existing.get('created_at', now_ts)
+                                if 'active' not in params:
+                                    record['status'] = existing.get('status', 'active')
+                                for param, field in (('password', 'password'), ('ip_limit', 'ip_limit'),
+                                                     ('traffic_gb', 'limit_bytes'), ('note', 'note')):
+                                    if param not in params or (param == 'password' and not params.get(param)):
+                                        record[field] = existing.get(field, record[field])
+                                # traffic_gb 与 limit_bytes 都没传时才沿用旧配额。
+                                if 'traffic_gb' not in params and 'limit_bytes' not in params:
+                                    record['limit_bytes'] = existing.get('limit_bytes', record['limit_bytes'])
+                                if 'duration_days' not in params and 'expires_at' not in params:
+                                    record['expires_at'] = existing.get('expires_at', record['expires_at'])
+                            if existing is not None:
+                                rotate_user_view_key_on_change(existing, record)
+                            data.setdefault('users', {})[user_id] = record
+                            pwd, expires = record['password'], record['expires_at']
+                            ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
+                            status_after = record.get('status', 'active')
+                            # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
+                            # 对应一个 VLESS UUID，开户即生效。
+                            reality_registry(data)
+                            rcfg = dict(data.get('reality_config', {}) or {})
+                            vcfg_active = dict(data.get('vmess_config') or {})
+                            ecfg_active = dict(data.get('vlessenc_config') or {})
+                    if conflict is not None:
+                        # 锁已释放，现在才写响应。
+                        return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
                     regenerate_page()
 
                     # 受控对账开户必须确认Reality生效；失败可GET→update同值重试。
@@ -7659,19 +7739,24 @@ if __name__ == '__main__':
                             changes['status'] = params['status']
                     except (ValueError, TypeError):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid attribute'})
+                    conflict = None
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
                         if u is None:
-                            return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                        if 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
-                            return self.reply_json(409, {'ok': False, 'error': 'Password already in use by another user'})
-                        previous = dict(u)
-                        u.update(changes)
-                        rotate_user_view_key_on_change(previous, u)
-                        result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
-                        # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
-                        result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
-                        result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
+                            conflict = (404, 'User not found')
+                        elif 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
+                            conflict = (409, 'Password already in use by another user')
+                        else:
+                            previous = dict(u)
+                            u.update(changes)
+                            rotate_user_view_key_on_change(previous, u)
+                            result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
+                            # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
+                            result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
+                            result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
+                    if conflict is not None:
+                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
                     regenerate_page()
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
                     if not self._sync_reality_clients():
@@ -7696,28 +7781,34 @@ if __name__ == '__main__':
                         added_bytes = int(add_traffic_gb * (1024**3))
                     except (ValueError, TypeError, OverflowError):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid renewal: extend_days must be 1..36500; add_traffic_gb must be finite and 0..1000000'})
+                    conflict = None
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
                         if not u:
-                            return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                        # expires_at 可能是 None（「永久」的表示方式之一）：
-                        # max(None, int) 会抛 TypeError，而这里在锁内、无兜底，
-                        # 连接会被直接掐断（2026-10-29 修）。
-                        try:
-                            base_time = max(int(u.get('expires_at') or 0), now_ts)
-                            new_expiry = int(base_time) + days * 86400
-                            new_limit = int(u.get('limit_bytes', 0)) + added_bytes
-                            if not 0 <= new_expiry <= 253402300799 or not 0 <= new_limit <= 2**63 - 1:
-                                raise ValueError()
-                        except (ValueError, TypeError, OverflowError):
-                            return self.reply_json(400, {'ok': False, 'error': 'Renewal exceeds supported limits'})
-                        # 不能无条件写 status='active'：管理员因滥用手动停用的
-                        # 用户，控制台一续费就会被静默恢复可用（2026-10-29 修）。
-                        # 到期与否由 expires_at 判定，不依赖 status。
-                        u.update(expires_at=new_expiry, limit_bytes=new_limit)
-                        exp_at = u['expires_at']
-                        lim_b = u.get('limit_bytes', 0)
-                        status_now = u.get('status', 'active')
+                            conflict = (404, 'User not found')
+                        else:
+                            # expires_at 可能是 None（「永久」的表示方式之一）：
+                            # max(None, int) 会抛 TypeError，而这里在锁内、无兜底，
+                            # 连接会被直接掐断（2026-10-29 修）。
+                            try:
+                                base_time = max(int(u.get('expires_at') or 0), now_ts)
+                                new_expiry = int(base_time) + days * 86400
+                                new_limit = int(u.get('limit_bytes', 0)) + added_bytes
+                                if not 0 <= new_expiry <= 253402300799 or not 0 <= new_limit <= 2**63 - 1:
+                                    raise ValueError()
+                            except (ValueError, TypeError, OverflowError):
+                                conflict = (400, 'Renewal exceeds supported limits')
+                            else:
+                                # 不能无条件写 status='active'：管理员因滥用手动停用的
+                                # 用户，控制台一续费就会被静默恢复可用（2026-10-29 修）。
+                                # 到期与否由 expires_at 判定，不依赖 status。
+                                u.update(expires_at=new_expiry, limit_bytes=new_limit)
+                                exp_at = u['expires_at']
+                                lim_b = u.get('limit_bytes', 0)
+                                status_now = u.get('status', 'active')
+                    if conflict is not None:
+                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
                     regenerate_page()
                     # 续费后立即同步协议客户端：过期用户续费后不必等 5 秒的
                     # 后台 worker 才恢复连接。
@@ -7778,12 +7869,15 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot disable the master account'})
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        if not u:
-                            return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                        before = u.get('status', 'active')
-                        previous = dict(u)
-                        u['status'] = want
-                        rotate_user_view_key_on_change(previous, u)
+                        missing = not u
+                        if not missing:
+                            before = u.get('status', 'active')
+                            previous = dict(u)
+                            u['status'] = want
+                            rotate_user_view_key_on_change(previous, u)
+                    if missing:
+                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                     regenerate_page()
                     # ⚠️ 2026-10-04 补：停用/启用必须同步到 xray。
                     #
@@ -8127,9 +8221,12 @@ if __name__ == '__main__':
                 allow_custom = form.get('allow_custom', ['0'])[0] == '1'
                 with data_lock:
                     _job_now = data.get('core_upgrade')
-                    if isinstance(_job_now, dict) and _job_now.get('state') == 'running':
-                        return self.reply_json(409, {'ok': False, 'error': '核心更新仍在运行，请等待完成'})
-                    data['core_upgrade'] = {'state': 'running', 'started_at': int(time.time())}
+                    _busy = isinstance(_job_now, dict) and _job_now.get('state') == 'running'
+                    if not _busy:
+                        data['core_upgrade'] = {'state': 'running', 'started_at': int(time.time())}
+                if _busy:
+                    # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                    return self.reply_json(409, {'ok': False, 'error': '核心更新仍在运行，请等待完成'})
                 save_data()
                 def upgrade_worker():
                     try:
@@ -8535,10 +8632,24 @@ if __name__ == '__main__':
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
 
+        def _egress_pending_count(value):
+            """待应用计数；被改坏成非数字时按 0 处理。
+
+            旧写法 int(data.get('_egress_pending', 0)) 在值是 "abc"/列表/None 时
+            抛异常，位置在**返回响应之前** —— 用户点了「应用」，请求直接 500，
+            而配置其实一行都没写。
+            """
+            if isinstance(value, bool):
+                return 0
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError, OverflowError):
+                return 0
+
         def _reply_with_egress_apply(self, payload, kind='outbound'):
             with data_lock:
                 data['egress_applying'] = True
-                data['_egress_pending'] = int(data.get('_egress_pending', 0)) + 1
+                data['_egress_pending'] = _egress_pending_count(data.get('_egress_pending')) + 1
             save_data()
             def worker():
                 with warp_apply_lock:
@@ -8547,7 +8658,7 @@ if __name__ == '__main__':
                     except Exception as exc:
                         applied, error = False, '应用出站失败: %s' % type(exc).__name__
                     with data_lock:
-                        pending = max(0, int(data.get('_egress_pending', 1)) - 1)
+                        pending = max(0, _egress_pending_count(data.get('_egress_pending')) - 1)
                         if pending:
                             data['_egress_pending'] = pending
                         else:
@@ -8585,6 +8696,7 @@ if __name__ == '__main__':
                                   'add_rule', 'del_rule', 'reset_rules'):
                     return self.reply_json(400, {'ok': False, 'error': '未知 WARP 操作'})
 
+                bad_domain = False
                 with data_lock:
                     rules = normalize_route_rules(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
                     if action == 'toggle':
@@ -8595,9 +8707,10 @@ if __name__ == '__main__':
                         raw = form.get('domain', [''])[0].strip().lower()
                         domain = re.sub(r'^[a-zA-Z]+://', '', raw).split('/')[0].split(':')[0].strip('.')
                         if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
-                            return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
-                        rules = [r for r in rules if r['domain'] != domain]
-                        rules.append({'domain': domain, 'outbound': 'warp_socks'})
+                            bad_domain = True
+                        else:
+                            rules = [r for r in rules if r['domain'] != domain]
+                            rules.append({'domain': domain, 'outbound': 'warp_socks'})
                     elif action == 'del_rule':
                         domain = form.get('domain', [''])[0].strip().lower()
                         rules = [r for r in rules if not (r['domain'] == domain and r['outbound'] in ('warp', 'warp_socks'))]
@@ -8609,6 +8722,9 @@ if __name__ == '__main__':
                     new_state = bool(data.get('warp_enabled'))
                     current_rules = [r['domain'] for r in rules if r['outbound'] in ('warp', 'warp_socks')]
 
+                if bad_domain:
+                    # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                    return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
                 save_data()
 
                 return self._reply_with_warp_apply({
@@ -9492,6 +9608,7 @@ if __name__ == '__main__':
                     # 而用户拿到的是 200 成功响应。API 那条路径有 create_only 守卫，
                     # 网页表单这条没有。表单又不预填 id、不提示重名，重复提交很容易撞上。
                     # 现在显式 409，并回显密码尾号帮机主确认自己是不是认错了人。
+                    conflict = None
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
                         if existing is not None:
@@ -9503,25 +9620,30 @@ if __name__ == '__main__':
                             except (TypeError, ValueError):
                                 _used = 0
                             used_gb = round(_used / (1024 ** 3), 2)
+                            conflict = ('exists', tail, used_gb)
+                        elif password_taken(data.get('users', {}), pwd, user_id):
+                            conflict = ('password',)
+                        else:
+                            data.setdefault('users', {})[user_id] = {
+                                'password': pwd,
+                                'expires_at': now_ts + days * 86400,
+                                'ip_limit': ip_limit,
+                                'limit_bytes': limit_bytes,
+                                'used_bytes': 0,
+                                'status': 'active',
+                                'created_at': now_ts,
+                                'note': note,
+                                'view_nonce': secrets.token_hex(8),
+                            }
+                    if conflict is not None:
+                        if conflict[0] == 'exists':
                             return self.reply(409, (
-                                f'用户 {user_id} 已存在（当前密码尾号 {tail}，已用 {used_gb} GB）。'
+                                f'用户 {user_id} 已存在（当前密码尾号 {conflict[1]}，已用 {conflict[2]} GB）。'
                                 # Web 端没有「修改」入口（只有 REST API 的 users/update），
                                 # 旧文案会把管理员指向不存在的功能（2026-10-25 修）。
                                 '如需改参数请调用 REST API 的 users/update，或先删除该用户再重建。'
                             ).encode('utf-8'))
-                        if password_taken(data.get('users', {}), pwd, user_id):
-                            return self.reply(409, '该密码已被其他用户使用，请换一个（留空则自动生成）。'.encode('utf-8'))
-                        data.setdefault('users', {})[user_id] = {
-                            'password': pwd,
-                            'expires_at': now_ts + days * 86400,
-                            'ip_limit': ip_limit,
-                            'limit_bytes': limit_bytes,
-                            'used_bytes': 0,
-                            'status': 'active',
-                            'created_at': now_ts,
-                            'note': note,
-                            'view_nonce': secrets.token_hex(8),
-                        }
+                        return self.reply(409, '该密码已被其他用户使用，请换一个（留空则自动生成）。'.encode('utf-8'))
                 elif action == 'delete' and user_id:
                     # 🔴 admin_master 不能被注销：它的 password 就是 Hysteria 的
                     # auth_password（机主本人的主密码）。/auth 是遍历 data['users']
@@ -9530,10 +9652,11 @@ if __name__ == '__main__':
                     # 只能重装。所以这里必须拒绝，UI 那边也不渲染删除按钮。
                     if user_id == MASTER_USER_ID:
                         return self.reply(400, b'Cannot delete the master account')
+                    delete_missing = False
                     with data_lock:
                         if user_id not in data.get('users', {}):
-                            return self.reply(404, b'User not found')
-                        if user_id in data.get('users', {}):
+                            delete_missing = True
+                        else:
                             data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
                             del data['users'][user_id]
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
@@ -9545,18 +9668,26 @@ if __name__ == '__main__':
                             # 速率样本同理：不删的话，同名用户重建后第一轮
                             # 速率会沿用旧样本算出尖峰（2026-10-25 修）。
                             speed_tracker.pop(user_id, None)
+                    if delete_missing:
+                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        return self.reply(404, b'User not found')
 
                 regenerate_page()
                 if not self._sync_reality_clients():
                     with data_lock:
                         if action == 'delete':
                             save_data()
-                            return self.reply(503, b'Access revocation pending; retry required')
-                        if previous_user is None:
-                            data.get('users', {}).pop(user_id, None)
+                            revoked_pending = True
                         else:
-                            data.setdefault('users', {})[user_id] = previous_user
+                            revoked_pending = False
+                            if previous_user is None:
+                                data.get('users', {}).pop(user_id, None)
+                            else:
+                                data.setdefault('users', {})[user_id] = previous_user
                     save_data()
+                    if revoked_pending:
+                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        return self.reply(503, b'Access revocation pending; retry required')
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
                 regenerate_page()
@@ -10113,12 +10244,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        if u is None:
-                            return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                        result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
-                        # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
-                        result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
-                        result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
+                        missing_user = u is None
+                        result = None
+                        if u is not None:
+                            result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
+                            # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
+                            result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
+                            result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
+                    if missing_user:
+                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        return self.reply_json(404, {'ok': False, 'error': 'User not found'})
                     return self.reply_json(200, {'ok': True, 'user_id': user_id, 'user': result})
                 if sub == 'node/traffic':
                     try:
@@ -10349,9 +10484,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                 with data_lock:
                     u = data.get('users', {}).get(target_uid)
-                    if not u:
-                        return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                    u_copy = dict(u)
+                    u_copy = dict(u) if u else None
+                if not u_copy:
+                    # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                    return self.reply_json(404, {'ok': False, 'error': 'User not found'})
 
                 m = read_meta_file(meta_path)
                 pwd = u_copy.get('password')
@@ -10975,15 +11111,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     name = (form.get('name', [''])[0] or '').strip()
                     if not name:
                         return self.reply_json(400, {'ok': False, 'error': '缺少 name 参数'})
+                    missing_outbound = False
                     with data_lock:
                         outs = list(data.get('custom_outbounds', []))
                         if not any(o.get('name') == name for o in outs):
-                            return self.reply_json(404, {'ok': False, 'error': '出站不存在'})
-                        data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
-                        # 🔴 必须同步清理引用它的分流规则，否则 ACL 里会留下
-                        #    不存在的出站名 ⇒ Hysteria 启动失败（且用户毫无察觉）。
-                        data['warp_rules'] = [r for r in data.get('warp_rules', [])
-                                              if (r.get('outbound') if isinstance(r, dict) else None) != name]
+                            missing_outbound = True
+                        else:
+                            data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
+                            # 🔴 必须同步清理引用它的分流规则，否则 ACL 里会留下
+                            #    不存在的出站名 ⇒ Hysteria 启动失败（且用户毫无察觉）。
+                            data['warp_rules'] = [r for r in data.get('warp_rules', [])
+                                                  if (r.get('outbound') if isinstance(r, dict) else None) != name]
+                    if missing_outbound:
+                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        return self.reply_json(404, {'ok': False, 'error': '出站不存在'})
                     msg = '出站「%s」已删除' % name
 
             # ---------- 模式切换 ----------
@@ -11007,23 +11148,29 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 dom = (form.get('domain', [''])[0] or '').strip().lower()
                 if not dom:
                     return self.reply_json(400, {'ok': False, 'error': '缺少 domain 参数'})
+                rule_error = None
                 with data_lock:
                     rules = [({'domain': r, 'outbound': 'warp_socks'} if isinstance(r, str) else dict(r))
                              for r in data.get('warp_rules', [])]
                     if action == 'rule-add':
                         cleaned = re.sub(r'^[a-zA-Z]+://', '', dom).split('/')[0].split(':')[0].strip('.')
-                        if not cleaned or not re.match(r'^[a-zA-Z0-9.\-]+$', cleaned):
-                            return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()
-                        if not outbound_target_exists(target, data.get('custom_outbounds', [])):
-                            return self.reply_json(400, {'ok': False, 'error': 'Unknown outbound target; refresh and select a configured outbound'})
-                        rules = [r for r in rules if r['domain'] != cleaned]
-                        rules.append({'domain': cleaned, 'outbound': target})
-                        msg = '规则「%s」→ %s 已添加' % (cleaned, target)
+                        if not cleaned or not re.match(r'^[a-zA-Z0-9.\-]+$', cleaned):
+                            rule_error = '域名格式不正确'
+                        elif not outbound_target_exists(target, data.get('custom_outbounds', [])):
+                            rule_error = 'Unknown outbound target; refresh and select a configured outbound'
+                        else:
+                            rules = [r for r in rules if r['domain'] != cleaned]
+                            rules.append({'domain': cleaned, 'outbound': target})
+                            msg = '规则「%s」→ %s 已添加' % (cleaned, target)
                     else:
                         rules = [r for r in rules if r['domain'] != dom]
                         msg = '规则「%s」已删除' % dom
-                    data['warp_rules'] = rules
+                    if rule_error is None:
+                        data['warp_rules'] = rules
+                if rule_error is not None:
+                    # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                    return self.reply_json(400, {'ok': False, 'error': rule_error})
             else:
                 return self.reply_json(400, {'ok': False, 'error': '未知 action: ' + action})
 
