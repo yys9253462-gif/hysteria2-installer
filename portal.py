@@ -472,6 +472,9 @@ def _yaml_name_value(raw):
 
 def outbound_names_in(text):
     """按出现顺序返回配置里所有出站名（已去引号）。"""
+    # 非字符串（快照被改坏）直接当空：findall 对 int/list 抛 TypeError。
+    if not isinstance(text, str):
+        return []
     # 必须带 re.M：否则 ^/$ 只匹配整串的开头结尾，一行都提取不到。
     return [_yaml_name_value(m)
             for m in re.findall(_OUTBOUND_NAME_LINE_RE.pattern, text or '', re.M)]
@@ -559,6 +562,10 @@ def strip_managed_outbounds(cfg_text):
     自定义（自定义出站是本模块独占管理的，install.sh 不会写它们）。
     """
     builtin = {'direct', 'direct_ipv4', 'warp', 'warp_socks'}
+    # 非字符串（拼接前的快照被改坏）直接当空配置：split 会抛 AttributeError，
+    # 而调用点在「应用出站配置」路径上。
+    if not isinstance(cfg_text, str):
+        return ''
     lines = cfg_text.split('\n')
     out = []
     skipping = False
@@ -10818,7 +10825,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 用 .get：qrencode 从未成功时 data 里可能根本没有 'qr'
                 # （例如从旧备份恢复的 portal.json），旧实现会 KeyError 并
                 # 直接掐断连接，而不是返回一个可读的错误（2026-10-29 修）。
-                content = (data.get(key) or '').encode()
+                # 值也可能被改成数字/列表：`.encode()` 抛 AttributeError，
+                # 连接照样被掐断 —— 这是用户点「下载配置」的路径。
+                raw_content = data.get(key)
+                content = raw_content.encode() if isinstance(raw_content, str) else b''
             self.reply(200, content, mime)
 
         # ==========================================================================

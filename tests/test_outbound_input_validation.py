@@ -72,6 +72,31 @@ class OutboundTargetLookupTests(unittest.TestCase):
         self.assertTrue(portal.outbound_target_exists('t', [{'name': 't'}]))
 
 
+class ConfigTextHelperTests(unittest.TestCase):
+    """配置文本助手对非字符串输入不能抛异常。
+
+    这两个函数在「应用出站配置」路径上被调用：config.yaml 读取结果或拼接前的
+    快照被改坏成 int/list 时，split/findall 直接抛异常，用户点「应用」就 500。
+    """
+
+    def test_outbound_names_in_tolerates_non_string(self):
+        for bad in (None, 7, ['x'], {'a': 1}, True):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal.outbound_names_in(bad), [])
+
+    def test_strip_managed_outbounds_tolerates_non_string(self):
+        for bad in (None, 7, ['x'], {'a': 1}, True):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal.strip_managed_outbounds(bad), '')
+
+    def test_healthy_text_still_parsed(self):
+        text = ('outbounds:\n'
+                '  - name: direct\n'
+                '    type: direct\n')
+        self.assertEqual(portal.outbound_names_in(text), ['direct'])
+        self.assertEqual(portal.strip_managed_outbounds(text), text)
+
+
 class RoutingStateTests(unittest.TestCase):
     def test_corrupt_state_degrades_to_empty_lists(self):
         for data in ({'custom_outbounds': 7, 'warp_rules': 7, 'outbound_mode': 5},
