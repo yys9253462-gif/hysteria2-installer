@@ -1261,6 +1261,46 @@ def portal_start_update(restart_prefix, script, lock_fd, ready_timeout=10):
                 os.close(fd)
 
 
+def _prune_portal_backups(directory, keep=3, protected=()):
+    """只保留最近 keep 份**轮次**的面板备份。
+
+    🔴 2026-10-31：备份名改成带时间戳之后（见 do-upgrade 的说明），
+    每次更新都会留下一份新的 `<file>.bak-<stamp>`，需要清理 —— 门户自更新
+    可以一天点很多次，小盘 VPS 根分区写满后 portal.json 的原子写就会失败，
+    那时用户数据处在「内存有、磁盘没有」的状态，比丢一份旧备份严重得多。
+
+    ⚠️ 但**绝不能按文件个数算 keep**：一次更新就有 6 个文件各留一份备份，
+    keep=3 会把本轮刚建的三份直接删掉 —— 而那正是回滚要用的。所以：
+      * `protected` 传本轮生成的备份路径，永远不删；
+      * keep 按**轮次戳**（文件名里的 `<stamp>`）计，不是按文件数。
+    """
+    directory = Path(directory)
+    protected = {Path(p).name for p in (protected or ())}
+    try:
+        items = [p for p in directory.iterdir()
+                 if p.is_file() and '.bak-' in p.name]
+    except OSError:
+        return
+    # 从文件名取轮次戳：<name>.bak-<YYYYmmdd-HHMMSS>-<pid>
+    stamps = {}
+    for p in items:
+        tail = p.name.split('.bak-', 1)[1]
+        stamps.setdefault(tail, []).append(p)
+
+    # ⚠️ 按**戳本身**排序，不按 mtime：一次更新里 6 个文件几乎同毫秒写完，
+    # mtime 排序不稳定（实测 keep=3 时能保留错的一轮、删掉对的一轮）。
+    # 戳是 `YYYYmmdd-HHMMSS-<pid>`，字典序即时间序。
+    ordered = sorted(stamps, reverse=True)
+    for stamp_key in ordered[keep:]:
+        for old in stamps[stamp_key]:
+            if old.name in protected:
+                continue
+            try:
+                old.unlink()
+            except OSError:
+                continue
+
+
 def portal_update_restart_script(port, backups, created, wait_seconds=20):
     """面板自更新后的重启脚本：起不来就自动回滚到旧版本。
 
@@ -1840,6 +1880,23 @@ def user_note_text(value):
 
 
 def format_bytes(b):
+    """把字节数渲染成人可读文本；任何非数值输入都按 0 处理。
+
+    🔴 2026-10-31：旧签名假定入参一定是数字，`if b < 0` 在字符串/None 上
+    直接 TypeError。它有 6 个调用点，全在**页面渲染**主路径上
+    （总览表、用户页、合计行），而入参来自 portal.json 的 used_bytes /
+    limit_bytes，历史数据里确实存在 "12.5"、null、空串。
+    一处坏数据 = 整页 500，而页面是 /auth 的常用路径（regenerate_page）。
+    调用方虽然大多已经过了 _safe_int，但那个约定没有任何强制力，
+    这里自保一层，成本为零。
+    """
+    try:
+        b = float(b)
+    except (TypeError, ValueError):
+        return "0 B"
+    if b != b or b in (float('inf'), float('-inf')):   # NaN / inf
+        return "0 B"
+    b = int(b)
     # 负数只可能来自计数器回退或手工改坏的数据；直接展示 "-1 B" 会让人
     # 以为用量是负的。归零并保留原语义（调用方另有 used_bytes 原始值）。
     if b < 0:
@@ -3415,17 +3472,59 @@ def get_cert_pin_sha256(root_path):
     cert_file = Path(root_path) / 'cert' / 'server.crt'
     if not cert_file.exists():
         return ''
+    return _openssl_sha256_hex(cert_file)
+
+
+def _openssl_sha256_hex(cert_file, timeout=8):
+    """cert 的 SHA-256(DER) 小写 HEX64；任何失败返回 ''。
+
+    🔴 2026-10-31：这里原来是一条 `Popen → Popen → communicate()` 的管道，
+    **完全没有超时**。两个后果都真实发生过：
+      1) openssl 卡在 NFS/慢盘上读文件、或被截断的 PEM 触发交互式重试时，
+         `communicate()` 永久阻塞。本函数在 `prepare()` / `refresh()` /
+         `sync_pin()` 里被调用，都是门户启动与页面刷新路径 —— 卡住的是
+         整个门户进程，而它同时是 Hysteria 的鉴权后端，全节点掉线。
+      2) p1 的 stderr 被丢到 DEVNULL，失败时只用空串表示，调用方无法
+         区分「证书不是自签」和「openssl 不存在/超时」。
+    现在改成单进程 `openssl x509 -outform DER | openssl dgst` 的等价写法：
+    先用 `openssl x509 -outform DER` 输出到临时文件（带超时），再用
+    `openssl dgst -sha256 -binary` 读取（带超时），全链路可控。
+    """
+    tmp = None
+    out_fh = None
     try:
-        p1 = subprocess.Popen(['openssl', 'x509', '-in', str(cert_file), '-outform', 'DER'],
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        p2 = subprocess.Popen(['openssl', 'dgst', '-sha256'], stdin=p1.stdout,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        p1.stdout.close()
-        out = p2.communicate()[0].decode().strip()
-        hexval = out.rsplit('=', 1)[-1].strip().lower()
+        fd, tmp = tempfile.mkstemp(prefix='.cert-der-', suffix='.der')
+        os.close(fd)
+        # ⚠️ 用 with 打开目的文件：直接给 stdout=open(...) 会把句柄交给子进程
+        # 且永不关闭，而本函数在页面刷新路径上被反复调用 —— 句柄耗尽后
+        # 门户会开始报 "Too many open files"，整片接口 500。
+        out_fh = open(tmp, 'wb')
+        conv = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-outform', 'DER'],
+                              stdout=out_fh, stderr=subprocess.PIPE, timeout=timeout)
+        out_fh.close()
+        out_fh = None
+        if conv.returncode != 0:
+            return ''
+        dig = subprocess.run(['openssl', 'dgst', '-sha256', '-r', tmp],
+                             capture_output=True, timeout=timeout)
+        if dig.returncode != 0:
+            return ''
+        hexval = (dig.stdout or b'').decode('utf-8', 'replace').split()[0].strip().lower()
         return hexval if len(hexval) == 64 and all(c in '0123456789abcdef' for c in hexval) else ''
-    except Exception:
+    except Exception as exc:
+        _log_ignored('openssl_sha256', exc)
         return ''
+    finally:
+        if out_fh is not None:
+            try:
+                out_fh.close()
+            except OSError:
+                pass
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def pin_sha256_of_file(cert_file):
@@ -3433,17 +3532,7 @@ def pin_sha256_of_file(cert_file):
     cert_file = Path(cert_file)
     if not cert_file.exists():
         return ''
-    try:
-        p1 = subprocess.Popen(['openssl', 'x509', '-in', str(cert_file), '-outform', 'DER'],
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        p2 = subprocess.Popen(['openssl', 'dgst', '-sha256'], stdin=p1.stdout,
-                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        p1.stdout.close()
-        out = p2.communicate()[0].decode().strip()
-        hexval = out.rsplit('=', 1)[-1].strip().lower()
-        return hexval if len(hexval) == 64 and all(c in '0123456789abcdef' for c in hexval) else ''
-    except Exception:
-        return ''
+    return _openssl_sha256_hex(cert_file)
 
 
 def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
@@ -6231,8 +6320,12 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
         }
     if 'proxy_services' not in data:
         data['proxy_services'] = []
-    data['page'] = page_html(m, uri, subscription, clash, sing, users=data['users'], api_key=data['api_key'], token=data['token'], session_secret=data.get('session_secret', ''),
-                             username=access.get('username', ''), password=access.get('password', ''))
+    # 🔴 2026-10-31：只存摘要，不存整页 HTML（见 regenerate_page 的详细说明）。
+    # 页面由 users / meta / clash / qr 完全可重建，存整份纯属写放大。
+    _page = page_html(m, uri, subscription, clash, sing, users=data['users'], api_key=data['api_key'], token=data['token'], session_secret=data.get('session_secret', ''),
+                      username=access.get('username', ''), password=access.get('password', ''))
+    data['page_digest'] = hashlib.sha256(_page.encode('utf-8')).hexdigest()
+    data.pop('page', None)
     # 🔴 clash/sing/qr 必须一起更新（2026-10-09 修）：
     # 这三个键原先**只在 prepare() 里写过**，refresh() 重新算出的 clash/sing
     # 只喂给了 page_html 就被丢掉，于是「下载配置」按钮和二维码仍在发换证**之前**
@@ -7447,8 +7540,21 @@ if __name__ == '__main__':
         with data_lock:
             # 内容没变就不重写：页面在用户、端口、证书都没变化时是同一份，
             # 每次刷新都全量序列化 + fsync 是纯浪费（2000 用户约 8 ms/次）。
-            changed = data.get('page') != page
-            data['page'] = page
+            #
+            # 🔴 2026-10-31：**不再把整页 HTML 存进 portal.json**。
+            # 旧实现 `data['page'] = page` 把整份渲染结果（实测 300+ KB，
+            # 与 2000 用户线性相关）写进数据文件，而它唯一的作用就是下一句
+            # 的脏检查 —— 页面内容本来就能由 users/meta/clash/qr 完全重建，
+            # 全项目没有任何一处读它来响应请求（routes 里的 'page' 键是
+            # data.get() 兜底，且 subpath=='' 分支一定先 regenerate_page()）。
+            # 代价是实打实的：portal.json 每 60 秒被计量保存重写一次，
+            # 多写 300 KB × 1440 次/天 ≈ 420 MB/天 的写放大，小盘 VPS 的
+            # 寿命和 I/O 都被它吃掉。改成存 sha256 摘要，脏检查语义不变。
+            digest = hashlib.sha256(page.encode('utf-8')).hexdigest()
+            changed = data.get('page_digest') != digest
+            data['page_digest'] = digest
+            # 老版本留下的整页 HTML 顺手清掉（一次性迁移）。
+            data.pop('page', None)
             # 与 refresh() 同理：二维码/下载配置必须跟着 uri 一起更新，
             # 否则自愈换了 sni 之后，页面文本框是对的、二维码仍是旧节点。
             # ⚠️ 2026-10-29 修：sync_download_artifacts 也会改 clash/sing/qr，
@@ -7535,16 +7641,24 @@ if __name__ == '__main__':
             # Reality 与 VMess 的 clients 都由 enforce_node_access 一并收回。
             return apply_access()
 
-        def _extend_deadline(self, seconds):
+        def _extend_deadline(self, seconds, heavy=False):
             """为本连接延长死线（见 ThreadingHTTPServer.extend_deadline 的说明）。
 
             seconds 取该端点自己的最长预期耗时（subprocess 超时 + 余量）。
             连接不存在或已结束就是无操作，不影响别的请求。
+
+            heavy=True 表示这是**重型**操作（安装 / 更新 / 卸载 / 重启），
+            需要单独申领 heavy_slot；返回 False 表示重型槽已满，调用方必须
+            立刻回 409。这类操作有副作用且耗时可到十分钟，排队执行比明确
+            拒绝更糟：用户以为没点上，会再点一次。
             """
             try:
+                if heavy and not self.server.claim_heavy(self.connection):
+                    return False
                 self.server.extend_deadline(self.connection, seconds)
+                return True
             except Exception:
-                pass
+                return True  # 续期本身失败不该阻断业务（保持旧行为）
 
         def _generate_and_apply_reality(self, restart=True, force=False):
             """生成（或刷新）Reality 的服务端配置。
@@ -7792,6 +7906,24 @@ if __name__ == '__main__':
             except Exception:
                 pass
 
+        def _is_https_request(self):
+            """本请求是否经 TLS 到达（决定 Cookie 要不要加 Secure）。
+
+            判据顺序：
+              1. X-Forwarded-Proto —— Hysteria 的 masquerade 代理会带上
+                 （config.yaml 里 xForwarded: true），这是公网入口的唯一线索；
+              2. 直连时看本端 socket 是不是 TLS（门户自身永远是明文，
+                 所以直连基本总是 False，除非运维真的挂了反代）。
+            ⚠️ 绝不读配置来判断：配置写错会把所有人的登录锁死。
+            """
+            proto = (self.headers.get('X-Forwarded-Proto') or '').strip().lower()
+            if proto:
+                return proto.split(',')[0].strip() == 'https'
+            try:
+                return isinstance(getattr(self.connection, 'cipher', lambda: None)(), tuple)
+            except Exception:
+                return False
+
         def check_rate_limit(self, bucket='web'):
             now = time.monotonic()
             with data_lock:
@@ -7837,12 +7969,39 @@ if __name__ == '__main__':
             with data_lock:
                 self.server.login_failures[:] = [
                     t for t in self.server.login_failures if now - t < 600]
-                return len(self.server.login_failures) >= 10
+                if len(self.server.login_failures) >= 10:
+                    # 🔴 2026-10-31：锁定必须留痕。旧实现静默返回 True，
+                    # 管理员只会看到「尝试次数过多，请 10 分钟后再试」，
+                    # 而日志里查不到是谁、什么时候开始的 —— 分不清是自己
+                    # 输错了还是有人在刷。这里每轮最多打一条（去重见 _login_lock_logged）。
+                    if not getattr(self.server, '_login_lock_logged', False):
+                        self.server._login_lock_logged = True
+                        print('[portal] 登录失败达上限，已锁定 %d 秒（%d 次失败）'
+                              % (600, len(self.server.login_failures)), file=sys.stderr)
+                    return True
+                return False
 
         def record_login_failure(self):
             now = time.monotonic()
             with data_lock:
                 self.server.login_failures.append(now)
+
+        def clear_login_failures(self):
+            """登录成功后清空失败桶。
+
+            🔴 2026-10-31：旧实现**从不清零**。这个桶是全局的（所有请求
+            都来自 127.0.0.1 经 masquerade 进来，无法按来源 IP 区分），
+            于是两个真实后果：
+              1) 管理员自己分几次输错（累计到 10 次，10 分钟窗口内）就被
+                 锁在门外，唯一的解法是重启门户 —— 面板上没有任何提示；
+              2) 知道门户 token 的人（token 在 URL 路径里，会进浏览器历史、
+                 会被截图分享）故意刷 10 次错误密码，就能把管理员锁出去。
+            成功登录说明凭据正确，把计数清掉是标准做法；同时清掉锁定日志
+            标记，下次再锁还会重新记一条。
+            """
+            with data_lock:
+                self.server.login_failures.clear()
+                self.server._login_lock_logged = False
 
         def record_failure(self):
             now = time.monotonic()
@@ -8604,9 +8763,14 @@ if __name__ == '__main__':
                 self.send_response(302)
                 self._responded = True
                 self.send_header('Location', prefix)
+                # 🔴 2026-10-31：Secure 属性必须与登入时**完全一致**，否则
+                # 清除不掉。HTTP 访问下浏览器不会回写带 Secure 的 Cookie，
+                # 于是「点了退出登录，其实还登录着」—— 共用电脑场景下这是
+                # 真事故（登出入口就是为它加的）。
+                _secure = '; Secure' if self._is_https_request() else ''
                 self.send_header('Set-Cookie',
-                                 'hy2_session=; Path=/%s/; HttpOnly; SameSite=Strict; Secure; Max-Age=0'
-                                 % data['token'])
+                                 'hy2_session=; Path=/%s/; HttpOnly; SameSite=Strict%s; Max-Age=0'
+                                 % (data['token'], _secure))
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('Connection', 'close')
                 self.end_headers()
@@ -8680,7 +8844,9 @@ if __name__ == '__main__':
                     # 六个文件 × 三个源 × 30 秒超时 + blob 校验，最坏远超
                     # 30 秒默认死线：不抬死线，更新结果永远送不回浏览器
                     # （副作用照常发生，面板却显示失败/无响应，2026-10-28 修）。
-                    self._extend_deadline(600)
+                    if not self._extend_deadline(600, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     # 门户前后端与四个计量模块必须一起更新，避免新旧回调接口不兼容。
                     # 🔴 必须成对更新 —— 门户同时是 Hysteria 的鉴权后端，
                     # 只换其中一个会让它起不来、所有客户端连不上。
@@ -8727,6 +8893,8 @@ if __name__ == '__main__':
                         fetched.append((fname, content))
 
                     base_dir = PORTAL_SELF.parent
+                    # 本轮更新的唯一标识：备份/临时文件名都带上它，见下面备份段的注释。
+                    stamp = '%s-%s' % (time.strftime('%Y%m%d-%H%M%S'), os.getpid())
                     backups = []
                     created = []
                     changed = False
@@ -8739,18 +8907,40 @@ if __name__ == '__main__':
                             except Exception:
                                 pass
                             if dest.exists():
-                                bak = Path(str(dest) + '.bak')
+                                # 🔴 2026-10-31：备份名必须带时间戳。
+                                # 旧实现固定用 `<file>.bak`，而它是**跨轮次复用**的：
+                                #   第 1 次更新：好版本 A 被备份成 .bak ✓
+                                #   第 2 次更新：把 B 备份成 .bak，A 被覆盖 ✗
+                                #   若第 3 次更新的新版本起不来，回滚脚本恢复的是 B ——
+                                #   而 B 也是坏的（正是它被换掉的原因），于是
+                                #   「回滚成功」却仍然打不开。
+                                # 回滚脚本 portal_update_restart_script 拿的是
+                                # backups 列表里的具体路径，改名字不影响它。
+                                bak = dest.with_name('%s.bak-%s' % (dest.name, stamp))
                                 shutil.copy2(str(dest), str(bak))
                                 backups.append((dest, bak))
                             else:
                                 created.append(dest)
-                            tmp = str(dest) + '.new'
-                            with open(tmp, 'wb') as fh:
-                                fh.write(content)
-                            os.chmod(tmp, 0o644)
-                            os.replace(tmp, str(dest))
+                            # 临时文件同样不能用固定名 `.new`：两个更新请求
+                            # （或一次更新 + 一次手工 cp）会互相写坏同一个文件，
+                            # 随后 os.replace 把半截内容变成 root 运行的面板代码。
+                            tmp = dest.with_name('%s.new-%s' % (dest.name, stamp))
+                            try:
+                                with open(tmp, 'wb') as fh:
+                                    fh.write(content)
+                                    fh.flush()
+                                    os.fsync(fh.fileno())
+                                os.chmod(tmp, 0o644)
+                                os.replace(tmp, str(dest))
+                            finally:
+                                if tmp.exists():
+                                    tmp.unlink(missing_ok=True)
                             changed = True
                         if changed:
+                            # 只保留最近 3 **轮**更新留下的备份；本轮的必须护住
+                            # （protected），否则回滚时找不到上一版。
+                            _prune_portal_backups(base_dir,
+                                                  protected=[str(b) for _, b in backups])
                             # scope 内脚本 ready/go 握手完成才交接；失败也走整包回滚。
                             portal_start_update(
                                 restart_prefix, portal_update_restart_script(data['port'], backups, created),
@@ -8782,7 +8972,9 @@ if __name__ == '__main__':
                     # 先刷新控制脚本自身，再更新二进制。不需要重启面板。
                     ensure_awgctl(force=True)
                     # awgctl update 要下载并核验二进制，超时 420 秒。
-                    self._extend_deadline(480)
+                    if not self._extend_deadline(480, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     rc, out, err = awg_run(['update'], timeout=420)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False,
@@ -8959,7 +9151,9 @@ if __name__ == '__main__':
             try:
                 # 下载走多源回退、单源 180 秒超时：默认 30 秒连接死线
                 # 会先一步关掉连接（2026-10-28 修，见 _extend_deadline）。
-                self._extend_deadline(600)
+                if not self._extend_deadline(600, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 if Path('/usr/local/bin/gost').exists():
                     version = subprocess.run(['/usr/local/bin/gost', '-V'], capture_output=True, timeout=5)
                     if version.returncode == 0:
@@ -9104,7 +9298,9 @@ if __name__ == '__main__':
                 if not ensure_awgctl():
                     return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
                 # 安装要下载并核验两个二进制，awgctl 超时 420 秒。
-                self._extend_deadline(480)
+                if not self._extend_deadline(480, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
 
                 args = ['install', '--line', line, '--endpoint', endpoint]
                 if port:
@@ -9146,7 +9342,9 @@ if __name__ == '__main__':
                 # update / set_line 的 awgctl 超时给到 420 秒（要下载并交叉
                 # 验证二进制），必须先把连接死线抬到覆盖全程。
                 if action in ('set_line', 'update'):
-                    self._extend_deadline(480)
+                    if not self._extend_deadline(480, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
 
                 if action == 'peer_add':
                     name = (form.get('name', [''])[0] or '').strip()
@@ -9160,7 +9358,9 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False,
                             'error': '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'})
                     # peer-add 会生成密钥并渲染服务端配置，90 秒超时。
-                    self._extend_deadline(120)
+                    if not self._extend_deadline(120, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     rc, out, err = awg_run(['peer-add', name, '--endpoint', endpoint], timeout=90)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False, 'error': '创建失败：' + awg_err_tail(rc, out, err, 400)})
@@ -9314,7 +9514,9 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 # 三个下载源 × 45 秒 + 校验/解压，全程远超 30 秒默认死线。
-                self._extend_deadline(300)
+                if not self._extend_deadline(300, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 ok, msg = install_xray_binary()
                 if not ok:
                     return self.reply_json(500, {'ok': False, 'error': msg})
@@ -9772,7 +9974,9 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                self._extend_deadline(420)
+                if not self._extend_deadline(420, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
@@ -10139,7 +10343,21 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                subprocess.Popen(['bash', '-c', 'sleep 1 && reboot'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # 🔴 2026-10-31：两处修正。
+                #  1) `Popen(...)` 没有 start_new_session —— 它挂在门户的
+                #     进程组里。`systemctl restart hysteria-portal` 或门户自身
+                #     退出时，systemd 会连这个还在 sleep 的子进程一起收掉，
+                #     于是「点了重启但机器没重启」，而接口已经回了 ok。
+                #     其它延迟任务（更新重启、清理）都用了 start_new_session，
+                #     这里漏了。
+                #  2) 重启会掐断门户，属于重型操作，先申领重型槽：
+                #     避免与 install/update 并发（它们正在改配置，重启会打断）。
+                if not self._extend_deadline(30, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
+                subprocess.Popen(['bash', '-c', 'sleep 1 && reboot'],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
                 return self.reply_json(200, {'ok': True, 'message': '服务器正在重启中'})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
@@ -10308,9 +10526,23 @@ if __name__ == '__main__':
                 page = login_html(data['token'], error_msg='用户名或密码不正确，请重新输入')
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
+            # 🔴 2026-10-31：登录成功必须清空失败桶。
+            # 旧实现从不清零 → 管理员自己累计输错 10 次就被锁 10 分钟，
+            # 而且这个桶是全局的（所有请求都从 127.0.0.1 经 masquerade 进来，
+            # 无法按来源区分），知道 token 的人刷 10 次就能把管理员锁出去。
+            self.clear_login_failures()
             sess_val = sign_session(data['token'])
             max_age = f'; Max-Age={SESSION_MAX_AGE}' if remember else ''
-            cookie = f'hy2_session={sess_val}; Path=/{data["token"]}/; HttpOnly; SameSite=Strict; Secure{max_age}'
+            # 🔴 2026-10-31：Secure 只在**真的是 HTTPS** 时加。
+            # 门户本体监听 127.0.0.1 的明文 HTTP，运维排障时常用
+            # `ssh -L 8080:127.0.0.1:<port>` 直接打开 —— 那时浏览器按
+            # http:// 访问，带 Secure 的 Cookie 会被**静默丢弃**：
+            # 登录页 302 跳回去、又跳回登录页，无限循环，且没有任何报错。
+            # 判断依据只看本请求是否经 TLS（masquerade 会带
+            # X-Forwarded-Proto），不看配置 —— 配置读错会把所有人锁在门外。
+            secure = '; Secure' if self._is_https_request() else ''
+            cookie = (f'hy2_session={sess_val}; Path=/{data["token"]}/; '
+                      f'HttpOnly; SameSite=Strict{secure}{max_age}')
             self.send_response(302)
             self._responded = True
             self.send_header('Location', prefix)
@@ -10325,7 +10557,9 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 # 安装脚本 subprocess 超时 180 秒，必须同步抬连接死线。
-                self._extend_deadline(240)
+                if not self._extend_deadline(240, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 install_warp_sh = r'''
 set -eo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -11191,6 +11425,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
             if subpath == '':
+                # 先刷新产物快照（clash/sing/qr 与 page_digest），
+                # 再由路由分支直接渲染页面。
                 regenerate_page()
 
             routes = {'': ('page', 'text/html; charset=utf-8'), 'qr.svg': ('qr', 'image/svg+xml'),
@@ -11209,7 +11445,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             #   meta / portal.json / 页面直链  = round2.example.com  ✅
             #   clash.yaml 端点              = newnode.example.com  ❌
             # 用户扫二维码/导入订阅就是旧节点，直接 CRYPTO_ERROR 0x150。
-            # 页面之所以是对的，只因为 subpath=='' 分支恰好会调 regenerate_page()。
+            #
+            # 🔴 2026-10-31：''' 首页不能再从 data['page'] 取 —— portal.json
+            # 已经不再保存整页 HTML（见 regenerate_page 的说明，改为只存
+            # page_digest）。改成在这里**直接渲染**：regenerate_page() 已经把
+            # meta/产物快照刷新过了，page_html 本身是纯函数，约 27 ms/2000 用户，
+            # 而且这条路径本来就只在浏览器打开首页时走一次。
+            if key == 'page':
+                index_html = self._render_index_page()
+                if index_html is None:
+                    # 渲染失败不能回空 200（浏览器白屏、日志无痕）。
+                    # 退回登录页 + 503，至少让人看出「面板自己有问题」。
+                    return self.reply(503, b'Portal render failed; check journalctl -u hysteria-portal',
+                                      'text/plain')
+                return self.reply(200, index_html.encode('utf-8'), 'text/html; charset=utf-8')
             if key in ('clash', 'sing', 'qr'):
                 regenerate_page()
             with data_lock:
@@ -11221,6 +11470,42 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 raw_content = data.get(key)
                 content = raw_content.encode() if isinstance(raw_content, str) else b''
             self.reply(200, content, mime)
+
+        def _render_index_page(self):
+            """渲染首页 HTML（不落盘，portal.json 只存摘要）。
+
+            与 regenerate_page() 共用同一套输入，保证「摘要里的内容」
+            与「真正发出去的页面」是同一份。任何一步读不到就返回 None，
+            调用方改回登录页 —— 绝不能像 2026-10-31 那次一样回一个
+            0 字节的 200（浏览器白屏，日志里什么都没有）。
+            """
+            try:
+                m = read_meta_file(meta_path)
+                uri, clash, sing = artifacts(m)
+                root = portal_path.parent
+                access_file = root / 'portal-access.json'
+                access = (json.loads(access_file.read_text(encoding='utf-8'))
+                          if access_file.exists() else {})
+                host = (m.get('public_ip', '127.0.0.1') if m.get('is_insecure')
+                        else m.get('server_name', 'localhost'))
+                with data_lock:
+                    users = {uid: dict(u) for uid, u in users_list_rows(user_table(data))
+                             if isinstance(u, dict)}
+                    _api_key = data.get('api_key')
+                    _token = data['token']
+                subscription = (
+                    "https://%s:%s@%s:%d/%s/clash.yaml"
+                    % (access.get('username', ''), access.get('password', ''),
+                       host, resolve_subscription_port(m)[0], _token))
+                return page_html(m, uri, subscription, clash, sing, users=users,
+                                 api_key=_api_key, token=_token,
+                                 session_secret=session_secret,
+                                 username=access.get('username', ''),
+                                 password=access.get('password', ''))
+            except Exception as exc:
+                _log_ignored('render_index', exc)
+                return None
+
 
         # ==========================================================================
         # do_GET 各端点的处理逻辑（同样是纯代码搬移，逻辑未改）
@@ -11282,14 +11567,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     entry['measurement_ok'] = _summary.get('measurement_ok')
                     entry['measurement_started_at'] = _summary.get('measurement_started_at')
                     entry['measurement_scope'] = _summary.get('measurement_scope')
-                    entry['used_bytes'] = user.get('used_bytes', 0)
+                    # 🔴 2026-10-31：`used_bytes` 直接取自 portal.json，可能是
+                    # "12.5" / null / 列表（手工编辑、旧版本写入、截断恢复）。
+                    # 下面那句 sum() 只要碰到一个非数字就抛 TypeError，
+                    # 整个 /traffic-speed 变 500 —— 而它是每 2 秒一次的前端
+                    # 主轮询，后果是「面板流量整块空白、所有用户都看不到」。
+                    entry['used_bytes'] = _safe_int(user.get('used_bytes'))
 
             return self.reply_json(200, {
                 'ok': True,
                 'node_tx': total_tx_speed,
                 'node_rx': total_rx_speed,
                 'users': user_speeds,
-                'total_used_bytes': sum(u['used_bytes'] for u in user_speeds.values())
+                'total_used_bytes': sum(_safe_int(u.get('used_bytes'))
+                                        for u in user_speeds.values())
             })
 
         def _h_get_proxy_services(self, subpath):
@@ -11898,12 +12189,43 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
 
+        # 🔴 2026-10-31（事故级）：并发槽必须**按用途分开**。
+        #
+        # 原来只有一个 BoundedSemaphore(8)，/auth 与「安装 / 更新 / 卸载 / 重启」
+        # 共用同一个池子。长端点的死线被抬到 120–600 秒，也就是
+        # **8 个并发长任务就能把池子占满十分钟**；池满时 process_request 直接
+        # shutdown_request —— /auth 也在此列，而它是 Hysteria 每个新连接的必经
+        # 之路。运维在面板点几次长操作 → 全节点新连接全部鉴权失败，
+        # 用户侧只看到「节点突然连不上」，面板与 journal 里一个字都没有
+        # （shutdown_request 静默关连接，不打日志）。
+        #
+        # 现在分两个池：
+        #   heavy_slots —— 只有耗时不可控的重型端点申领（容量 4）。
+        #                  满了立刻回 409，而不是排队（这些操作有副作用，
+        #                  排队十分钟后突然执行比明确拒绝更糟）。
+        #   quick_slots —— 其它所有请求，含 /auth（容量 32）。
         def __init__(self, *args, **kwargs):
-            self.slots = threading.BoundedSemaphore(8)
+            self.heavy_slots = threading.BoundedSemaphore(4)
+            self.quick_slots = threading.BoundedSemaphore(32)
+            self._heavy = {}          # request -> True，表示已申领 heavy_slot
             self.deadlines = {}
             self.deadline_lock = threading.Lock()
             super().__init__(*args, **kwargs)
             threading.Thread(target=self.watch_deadlines, daemon=True).start()
+
+        def claim_heavy(self, request):
+            """把本请求标记为重型任务；返回 False 表示重型槽已满。
+
+            幂等：同一个 request 重复申领只占一个槽（端点里可能多处续期）。
+            """
+            with self.deadline_lock:
+                if request in self._heavy:
+                    return True
+            if not self.heavy_slots.acquire(blocking=False):
+                return False
+            with self.deadline_lock:
+                self._heavy[request] = True
+            return True
 
         def extend_deadline(self, request, seconds):
             """长操作续期连接死线（2026-10-28 修）。
@@ -11937,7 +12259,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             self.deadlines.pop(connection, None)
 
         def process_request(self, request, address):
-            if not self.slots.acquire(blocking=False):
+            if not self.quick_slots.acquire(blocking=False):
+                # 打一行日志：旧实现在这里静默关连接，排障时完全看不出
+                # 「刚才拒绝了哪个来源的请求」。
+                print('[portal] quick slots exhausted, dropping request from %s'
+                      % (address,), file=sys.stderr)
                 self.shutdown_request(request)
                 return
             with self.deadline_lock:
@@ -11947,7 +12273,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             except Exception:
                 with self.deadline_lock:
                     self.deadlines.pop(request, None)
-                self.slots.release()
+                    heavy = self._heavy.pop(request, False)
+                self.quick_slots.release()
+                # BoundedSemaphore 多余释放会抛 ValueError：只有真申领过才还。
+                if heavy:
+                    self.heavy_slots.release()
                 raise
 
         def process_request_thread(self, request, address):
@@ -11956,7 +12286,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             finally:
                 with self.deadline_lock:
                     self.deadlines.pop(request, None)
-                self.slots.release()
+                    heavy = self._heavy.pop(request, False)
+                if heavy:
+                    self.heavy_slots.release()
+                self.quick_slots.release()
+
 
 
     server = ThreadingHTTPServer(('127.0.0.1', data['port']), Handler)

@@ -15,11 +15,32 @@ ROOT = Path(__file__).resolve().parents[1]
 TREE = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
 
 
+def _real_safe_int(_probe=None):
+    """从 portal.py 里取出真实的 _safe_int，供隔离命名空间使用。
+
+    🔴 不要在测试里另写一份等价实现：一旦两份语义漂移（比如真实版本
+    接受 "5" 而桩拒绝），测试就不再证明生产行为 —— 而这条守卫正是
+    为了「坏数据不能让 /traffic-speed 500」。
+    """
+    node = next(n for n in ast.walk(TREE)
+                if isinstance(n, ast.FunctionDef) and n.name == '_safe_int')
+    mod = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    env = {}
+    exec(compile(mod, '<safe_int>', 'exec'), env)
+    return env['_safe_int']
+
+
 def load(tracker, data, summaries=None):
     funcs = [n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef)
              and n.name in {'_meter_speed_sample', '_h_get_traffic_speed'}]
     env = {'time': time, 'data_lock': threading.RLock(), 'speed_tracker': tracker,
            'SPEED_WINDOW_SECONDS': 15, 'data': data,
+           # 2026-10-31：_h_get_traffic_speed 现在用 _safe_int 兜住
+           # used_bytes 的 "12.5"/null/列表（否则 sum() 直接 TypeError，
+           # 前端主轮询整块 500）。用生产实现，不要在这里另写一份 ——
+           # 两份语义一旦漂移，测试就不再证明真实行为。
+           '_safe_int': _real_safe_int(),
            'user_table': lambda d: d.get('users') if isinstance(d.get('users'), dict) else {},
            'users_list_rows': lambda users: list(users.items())
            if isinstance(users, dict) else [],

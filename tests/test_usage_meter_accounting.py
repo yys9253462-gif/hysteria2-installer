@@ -9,6 +9,21 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _real_safe_int():
+    """从 portal.py 里取出真实的 _safe_int。
+
+    🔴 不要在测试里另写一份等价实现：语义一旦漂移，测试就不再证明生产行为。
+    """
+    tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
+    node = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == '_safe_int')
+    mod = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(mod)
+    env = {}
+    exec(compile(mod, '<safe_int>', 'exec'), env)
+    return env['_safe_int']
 spec = importlib.util.spec_from_file_location('meter_runtime_test', ROOT / 'usage-meter-runtime-20261007-v1.py')
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
@@ -231,6 +246,11 @@ class MeterAccountingTest(unittest.TestCase):
         # fixture 同步提供两个入口，行为与 meter.hot_summary / meter.summary 对齐。
         env = {'time': time, 'data_lock': threading.RLock(), 'speed_tracker': {},
                'SPEED_WINDOW_SECONDS': 15, 'data': self.data,
+               # 2026-10-31：_h_get_traffic_speed 现在用 _safe_int 兜住
+               # used_bytes 的 "12.5"/null/列表（否则 total_used_bytes 的
+               # sum() 直接 TypeError，前端每 2 秒的主轮询整块 500）。
+               # 取真实实现，别在测试里另写一份。
+               '_safe_int': _real_safe_int(),
                'user_table': lambda data: (data.get('users')
                    if isinstance(data.get('users'), dict) else {}),
                'users_list_rows': lambda users: list(users.items())

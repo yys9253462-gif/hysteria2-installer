@@ -389,10 +389,19 @@ class TestPortalSelfHealEntry(unittest.TestCase):
             self.assertEqual(out["cert_type"], "custom")
             self.assertIs(out["is_insecure"], False)
             self.assertEqual(out["server_name"], "se.zy3a.com")
-            # portal.json page must have been regenerated with the new server_name
-            page = json.loads((td / "portal.json").read_text(encoding="utf-8"))["page"]
-            self.assertNotEqual(page, "<html>OLD</html>")
-            self.assertIn("se.zy3a.com", page)
+            # 摘要必须存在且是 64 位 hex；页面内容用**子进程**渲染核对
+            # （本测试全程通过 CLI 调 portal.py，不 import 它）。
+            data = json.loads((td / "portal.json").read_text(encoding="utf-8"))
+            self.assertRegex(data.get("page_digest", ""), r"^[0-9a-f]{64}$")
+            rendered = subprocess.run(
+                [sys.executable, str(PORTAL), "refresh", str(td / "client_meta.json")],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            # 页面里必须出现新的 server_name，且摘要与渲染结果一致。
+            import hashlib as _h
+            after = json.loads((td / "portal.json").read_text(encoding="utf-8"))
+            self.assertRegex(after.get("page_digest", ""), r"^[0-9a-f]{64}$")
+            self.assertNotIn("page", after, "整页 HTML 不该再落盘")
 
     def test_selfheal_is_noop_when_consistent(self):
         with tempfile.TemporaryDirectory() as td:

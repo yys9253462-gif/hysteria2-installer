@@ -39,7 +39,11 @@ class DeadlineExtensionTest(unittest.TestCase):
         self.assertIn('def extend_deadline(self, request, seconds):', PORTAL_SRC)
 
     def test_handler_has_extend_deadline_helper(self):
-        self.assertIn('def _extend_deadline(self, seconds):', PORTAL_SRC)
+        # 2026-10-31：签名多了 heavy 参数（重型端点要单独申领并发槽，
+        # 否则 8 个长任务能把 /auth 一起饿死）。这里锁「有这个方法且
+        # seconds 仍是第一个参数」，不锁完整签名 —— 后面再加默认参数
+        # 不该让测试假失败。
+        self.assertRegex(PORTAL_SRC, r'def _extend_deadline\(self, seconds[,)]')
 
     def test_extend_deadline_extends_not_shortens(self):
         """续期只能把死线往后推，不能把它缩短（max 语义）。"""

@@ -262,14 +262,21 @@ class PageHtmlCallSitesTest(unittest.TestCase):
         self.fail('portal.py 里找不到 page_html 的定义')
 
     def test_every_call_site_passes_both_credentials(self):
+        """每个 page_html 调用点都必须显式传 username/password。
+
+        🔴 2026-10-31：原来是 `assertEqual(len(sites), 3)` —— 加一个调用点
+        （这轮新增了首页直渲染 _render_index_page）就要改测试，而改测试的
+        人往往顺手把数字改成新值，等于把守卫架空。真正的不变量是
+        「**每个**调用点都传了凭据」，数量本身不是。
+        这里改成：至少 3 处（防止误删渲染入口），且逐个断言两个关键字都在。
+        """
         sites = []
         for node in ast.walk(self.tree):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                     and node.func.id == 'page_html'):
                 sites.append(node)
-        self.assertEqual(len(sites), 3,
-                         'page_html 的调用点数量变了（%d 处）；'
-                         '新增的入口必须一并传 username/password' % len(sites))
+        self.assertGreaterEqual(len(sites), 3,
+                                'page_html 的调用点只剩 %d 处，像是有渲染入口被删了' % len(sites))
         for node in sites:
             passed = {kw.arg for kw in node.keywords}
             self.assertIn('username', passed,

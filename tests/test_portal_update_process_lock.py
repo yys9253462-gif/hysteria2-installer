@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 import uuid
@@ -25,7 +26,10 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 TREE = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
 NAMES = {'portal_update_process_lock', 'portal_update_restart_prefix', 'portal_start_update',
-         '_h_post_do_upgrade', '_h_post_do_upgrade_impl'}
+         '_h_post_do_upgrade', '_h_post_do_upgrade_impl',
+         # 2026-10-31：do-upgrade 落盘后会清理旧的 `.bak-<stamp>`，
+         # 避免小盘 VPS 被多轮更新写满（写满后 portal.json 的原子写会失败）。
+         '_prune_portal_backups'}
 FUNCTIONS = [node for node in ast.walk(TREE)
              if isinstance(node, ast.FunctionDef) and node.name in NAMES]
 BUNDLE = ('portal.py', 'portal_assets.py', 'usage-meter-core-20261007-v1.py',
@@ -70,6 +74,9 @@ class PortalUpdateFixture(unittest.TestCase):
         self.fetch = Mock(return_value=b'# new\n')
         self.env = {
             'ast': ast, 'os': os, 'Path': Path, 'fcntl': fcntl, 'uuid': uuid, 'select': select,
+            # 2026-10-31：备份/临时文件名现在带时间戳（固定名 .bak/.new 会跨轮次
+            # 互相覆盖，导致回滚到也是坏的那一版），需要 time 与 shlex。
+            'time': time, 'shlex': shlex,
             'parse_qs': parse_qs, 're': re, 'shutil': shutil,
             'PORTAL_SELF': self.base / 'portal.py',
             'portal_upgrade_lock': self.lock, 'data': {'port': 18080},
@@ -84,7 +91,10 @@ class PortalUpdateFixture(unittest.TestCase):
         class Handler:
             def is_authenticated(self): return True
             def reply_json(self, code, payload): return code, payload
-            def _extend_deadline(self, seconds): pass
+            # 2026-10-31：重型端点会传 heavy=True 申领独立并发槽
+            # （见 portal.ThreadingHTTPServer.__init__）。桩要跟上真实签名，
+            # 否则测的根本不是生产路径。
+            def _extend_deadline(self, seconds, heavy=False): return True
         Handler._h_post_do_upgrade = self.env['_h_post_do_upgrade']
         Handler._h_post_do_upgrade_impl = self.env['_h_post_do_upgrade_impl']
         self.Handler = Handler

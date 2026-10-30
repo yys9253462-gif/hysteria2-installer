@@ -350,5 +350,62 @@ class AwgctlArgumentTests(unittest.TestCase):
         self.assertEqual(leftovers, [])
 
 
+# --------------------------------------------------------------------------
+# 12. _prune_portal_backups 不能删掉本轮备份（make-or-break：删了就没法回滚）
+# --------------------------------------------------------------------------
+class PrunePortalBackupsTests(unittest.TestCase):
+    def load(self):
+        return exec_function('_prune_portal_backups', {'Path': Path})
+
+    def test_current_round_files_survive(self):
+        """一次更新有 6 个文件；keep=3 若按文件数算会把本轮备份全删掉。"""
+        prune = self.load()
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, True)
+        # 三轮历史备份
+        for stamp in ('20260101-000000-1', '20260102-000000-1', '20260103-000000-1'):
+            (base / ('portal.py.bak-' + stamp)).write_text('old')
+        # 本轮 6 个文件
+        current = []
+        for name in ('portal.py', 'portal_assets.py', 'usage-meter-core-20261007-v1.py',
+                     'usage-meter-readers-20261007-v1.py',
+                     'usage-meter-runtime-20261007-v1.py',
+                     'usage-meter-xray-config-20261007-v1.py'):
+            p = base / ('%s.bak-20260104-000000-9' % name)
+            p.write_text('current')
+            current.append(p)
+        prune(base, keep=3, protected=[str(p) for p in current])
+        for p in current:
+            self.assertTrue(p.exists(), '本轮备份被删掉了，回滚会失效: %s' % p.name)
+        # 最老的一轮应当已被清理
+        self.assertFalse((base / 'portal.py.bak-20260101-000000-1').exists())
+
+    def test_keep_counts_rounds_not_files(self):
+        prune = self.load()
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, True)
+        for stamp in ('20260101-000000-1', '20260102-000000-1', '20260103-000000-1',
+                      '20260104-000000-1'):
+            for name in ('portal.py', 'portal_assets.py'):
+                (base / ('%s.bak-%s' % (name, stamp))).write_text('x')
+        prune(base, keep=3)
+        remaining = sorted(p.name for p in base.iterdir())
+        # 保留最近 3 轮 × 2 文件 = 6 个
+        self.assertEqual(len(remaining), 6, remaining)
+        self.assertNotIn('portal.py.bak-20260101-000000-1', remaining)
+
+    def test_legacy_fixed_bak_files_are_never_touched(self):
+        """旧版本的固定名 .bak 可能是当前唯一可用的回滚点，绝不能删。"""
+        prune = self.load()
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, True)
+        legacy = base / 'portal.py.bak'
+        legacy.write_text('legacy')
+        for i in range(6):
+            (base / ('portal.py.bak-2026010%d-000000-1' % i)).write_text('x')
+        prune(base, keep=1)
+        self.assertTrue(legacy.exists())
+
+
 if __name__ == '__main__':
     unittest.main()

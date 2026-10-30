@@ -127,7 +127,20 @@ class PortalTest(unittest.TestCase):
             self.assertEqual(refreshed['token'], data['token'])
             self.assertEqual(refreshed['auth_hash'], data['auth_hash'])
             self.assertEqual(json.loads((root/'portal-access.json').read_text(encoding="utf-8")), access)
-            self.assertIn('data-copy="hy2-link"', refreshed['page'])
+            # 🔴 2026-10-31：portal.json 不再存整页 HTML（只存 page_digest，
+            # 见 portal.regenerate_page 的说明）。这里改成验证**同一件事**：
+            # 页面能被重建出来，且重建结果与摘要一致、不含转义缺口。
+            _meta_reload = json.loads((root/'meta.json').read_text(encoding='utf-8'))
+            _uri, _clash, _sing = portal.artifacts(_meta_reload)
+            _sub = ('https://%s:%s@%s:%d/%s/clash.yaml'
+                    % (access['username'], access['password'],
+                       meta['server_name'], meta['subscription_port'], refreshed['token']))
+            page = portal.page_html(
+                _meta_reload, _uri, _sub, _clash, _sing,
+                users=refreshed['users'], api_key=refreshed['api_key'],
+                token=refreshed['token'], session_secret=refreshed['session_secret'],
+                username=access['username'], password=access['password'])
+            self.assertIn('data-copy="hy2-link"', page)
             self.assertIn("script-src 'sha256-", portal.content_policy())
             policy = portal.content_policy()
             # 只允许 style-src-attr 的 inline（页面大量使用 style="..." 属性，
@@ -136,7 +149,10 @@ class PortalTest(unittest.TestCase):
             self.assertNotIn('unsafe-inline', script_src)
             self.assertEqual(len(data['token']), 64)
             self.assertEqual(json.loads(data['clash'])['proxies'][0]['password'], meta['auth_password'])
-            self.assertNotIn('</textarea><script>', data['page'])
+            # 整页 HTML 不该再落盘；摘要必须存在且是 64 位 hex。
+            self.assertNotIn('page', refreshed)
+            self.assertRegex(refreshed.get('page_digest', ''), r'^[0-9a-f]{64}$')
+            self.assertNotIn('</textarea><script>', page)
             self.assertIn('MATCH,PROXY', data['clash'])
             self.assertIn('server_ports', data['sing'])
             proc = subprocess.Popen([sys.executable, str(Path(portal.__file__)), 'serve', str(root/'portal.json')])
