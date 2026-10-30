@@ -3546,7 +3546,9 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
     卡片 + 倒计时 + 临期告警，是让这类故障在到期前就被看见的唯一办法。
     """
     root = Path(root)
-    meta = meta or {}
+    # meta 来自 client_meta.json：被截断成 list/str 时 `.get` 抛 AttributeError，
+    # 证书卡片与 /cert-status 直接 500 —— 而证书到期正是最需要它的时候。
+    meta = meta if isinstance(meta, dict) else {}
     cert_file, cn, sans, self_signed = _resolve_live_cert(root, config_path)
 
     info = {

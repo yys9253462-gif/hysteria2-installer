@@ -665,3 +665,33 @@ class TestRepoInvariants(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class CertStatusInputTests(unittest.TestCase):
+    """cert_status 的 meta 来自 client_meta.json，损坏时不能抛异常。
+
+    证书到期正是最需要这张卡片的时候：meta 被截断成 list/str 时旧写法
+    `.get` 抛 AttributeError，/cert-status 直接 500。
+    """
+
+    def setUp(self):
+        if str(REPO) not in sys.path:
+            sys.path.insert(0, str(REPO))
+        import portal
+        self.portal = portal
+
+    def test_corrupt_meta_does_not_raise(self):
+        root = Path(tempfile.mkdtemp())
+        for bad in (7, 'x', [None], None, True):
+            with self.subTest(bad=bad):
+                info = self.portal.cert_status(root, bad)
+                self.assertFalse(info['ok'])
+
+    def test_healthy_meta_returns_a_full_record(self):
+        root = Path(tempfile.mkdtemp())
+        info = self.portal.cert_status(root, {'cert_type': 'acme', 'server_name': 'h.example.com'})
+        self.assertIn('warn_level', info)
+        self.assertIn('expires_in_days', info)
+
+
+if __name__ == '__main__':
+    unittest.main()
