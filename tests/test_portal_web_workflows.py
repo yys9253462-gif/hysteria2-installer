@@ -412,6 +412,32 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(events[1], ('check', None))
         self.assertEqual(events[-1], ('close', 23))
 
+    def test_share_denial_for_corrupt_expiry_returns_403_without_type_error(self):
+        handler = extract_method('do_GET', self.ns)
+        users = {'qa-user': {'password': 'pass', 'status': 'active',
+                             'expires_at': '100', 'view_nonce': 'nonce'}}
+        session_secret = 'secret'
+        view_key = portal.user_view_key(session_secret, 'qa-user', 'nonce')
+        path = '/test-token/u/qa-user/clash.yaml?k=' + view_key
+        self.handler.path = path
+        self.handler.headers = {}
+        self.handler.is_authenticated = lambda: False
+        self.handler.rfile = io.BytesIO()
+        self.ns.update({'data': {'token': 'test-token', 'users': users,
+                                 'session_secret': session_secret},
+                        'session_secret': session_secret,
+                        'user_table': lambda _: users,
+                        'read_meta_file': lambda _: {'server_name': 'node.example.com',
+                            'public_ip': '203.0.113.10', 'listen_port': 443,
+                            'subscription_port': 8443, 'is_insecure': False},
+                        'user_view_key': portal.user_view_key,
+                        'user_share_available': portal.user_share_available,
+                        'share_unavailable_reason': portal.share_unavailable_reason,
+                        'time': portal.time})
+        code, body = handler(self.handler)
+        self.assertEqual(code, 403)
+        self.assertIn('服务已到期'.encode('utf-8'), body)
+
     def test_api_set_status_persists_and_rolls_back_on_save_failure(self):
         original = {'password': 'qa-pass', 'status': 'active', 'expires_at': 2200000000}
         self.data['users']['qa-user'] = copy.deepcopy(original)

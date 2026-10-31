@@ -1870,15 +1870,32 @@ def rotate_user_view_key_on_change(previous, current):
 
 
 def user_share_available(user, now=None):
-    """分享页是否可用 —— 判据必须与 user_access_allowed 完全同源。
-
-    ⚠️ 2026-10-25 修：旧实现用 `not expires` 把 0 当「永久」，
-    而 user_access_allowed 用 `expires_at is None` 才当永久。
-    于是 expires_at=0 的用户出现「分享页能打开、节点却连不上」的矛盾状态，
-    与 users/list 显示的 active 也不一致。现在两者共用同一个函数。
-    """
+    """分享页是否可用 —— 判据必须与 user_access_allowed 完全同源。"""
     return user_access_allowed(user, now)
 
+
+def share_unavailable_reason(user, now=None):
+    """Return a stable explanation for a denied share without trusting JSON types."""
+    now_ts = int(time.time() if now is None else now)
+    if not isinstance(user, dict):
+        return '账号资料无效'
+    if user.get('status', 'active') != 'active':
+        return '账号已被停用'
+    expires = user.get('expires_at')
+    if expires is not None:
+        try:
+            if float(expires) <= now_ts:
+                return '服务已到期'
+        except (TypeError, ValueError, OverflowError):
+            return '到期时间无效'
+    try:
+        limit_bytes = int(user.get('limit_bytes', 0) or 0)
+        used_bytes = int(user.get('used_bytes', 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return '流量数据无效'
+    if limit_bytes > 0 and used_bytes >= limit_bytes:
+        return '流量已超额'
+    return '当前不可用'
 
 
 def _expiry_text(value):
@@ -8382,6 +8399,9 @@ if __name__ == '__main__':
             # 后拿到锁的那次会用**较早读到的旧快照**覆盖磁盘，把先写入的
             # 另一个协议静默丢掉（两个请求都返回成功，用户下次重启才发现）。
             with reality_apply_lock:
+                previous_xray_bytes = xray_path.read_bytes() if xray_path.exists() else None
+                previous_xray = json.loads(previous_xray_bytes) if previous_xray_bytes is not None else None
+                previous_service_active = _systemd_state('xray') == 'active'
                 if xray_path.exists():
                     # 只按 tag 替换 Reality 自己那一条；VMess 入站、统计 api 入站、
                     # routing、outbounds 一律原样保留。旧版无 tag 的 Reality 由
@@ -8421,6 +8441,15 @@ if __name__ == '__main__':
                 except OSError:
                     with data_lock:
                         data['reality_config'] = previous_cfg
+                    if previous_xray is None:
+                        xray_path.unlink(missing_ok=True)
+                        if not previous_service_active:
+                            subprocess.run(['systemctl', 'disable', '--now', 'xray'],
+                                           capture_output=True, timeout=20)
+                    else:
+                        apply_xray_config_transaction(
+                            previous_xray, config_path=str(xray_path),
+                            binary='/usr/local/bin/xray', restart=previous_service_active)
                     raise
             if old_port and old_port != new_rcfg.get('port'):
                 close_protocol_port(old_port, 'tcp', 'reality_config')
@@ -12171,19 +12200,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 核对配置、重发凭据都是正当操作，页面本身也会标明账号状态。
                 # 只有走分享链接（未鉴权）的访问才需要拦。
                 if not authed and not user_share_available(u_copy):
-                    # 区分原因，给一条人能看懂的说明（旧实现只有一行英文 403）。
-                    now_ts = int(time.time())
-                    limit_b = int(u_copy.get('limit_bytes', 0) or 0)
-                    used_b = int(u_copy.get('used_bytes', 0) or 0)
-                    exp = u_copy.get('expires_at')
-                    if u_copy.get('status', 'active') != 'active':
-                        reason = '账号已被停用'
-                    elif exp is not None and exp <= now_ts:
-                        reason = '服务已到期'
-                    elif limit_b > 0 and used_b >= limit_b:
-                        reason = '流量已超额'
-                    else:
-                        reason = '当前不可用'
+                    # Keep the denial response stable even when a persisted user field is malformed.
+                    reason = share_unavailable_reason(u_copy)
                     return self.reply(403, share_unavailable_html(reason).encode('utf-8'),
                                       'text/html; charset=utf-8')
 
