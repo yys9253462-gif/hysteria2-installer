@@ -238,23 +238,78 @@ systemctl() { :; }
             self.assertFalse(binary.exists())
 
 
+class UninstallWireproxyOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_uninstall_preserves_unowned_wireproxy_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hy2 = root / 'etc/hysteria'
+            hy2.mkdir(parents=True)
+            units = root / 'etc/systemd/system'
+            units.mkdir(parents=True)
+            wireguard = root / 'etc/wireguard'
+            wireguard.mkdir(parents=True)
+            binary = root / 'usr/local/bin/wireproxy'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('unmanaged wireproxy binary')
+            unit = units / 'wireproxy.service'
+            unit.write_text('[Service]\nExecStart=/usr/local/bin/wireproxy -c /etc/other/proxy.conf\n')
+            fakebin = root / 'bin'
+            fakebin.mkdir()
+            (fakebin / 'systemctl').write_text('#!/bin/sh\nexit 0\n')
+            (fakebin / 'systemctl').chmod(0o755)
+            start = INSTALL.index('        # 只有 systemd unit 确认为本安装器生成')
+            end = INSTALL.index('        # 证书自愈定时/事件单元', start)
+            block = INSTALL[start:end]
+            block = block.replace('/etc/hysteria', hy2.as_posix())
+            block = block.replace('/etc/systemd/system', units.as_posix())
+            block = block.replace('/etc/wireguard', wireguard.as_posix())
+            block = block.replace('/usr/local/bin/wireproxy', binary.as_posix())
+            block = block.replace('/usr/local/bin/wgcf', str(root / 'usr/local/bin/wgcf'))
+            script = root / 'wireproxy-cleanup.sh'
+            script.write_text('''#!/usr/bin/env bash
+HY2_DIR="$TEST_ROOT/etc/hysteria"
+systemctl() { :; }
+''' + block, encoding='utf-8')
+            subprocess.run([shutil.which('bash'), str(script)], check=True,
+                           env=dict(os.environ, TEST_ROOT=str(root)))
+            self.assertTrue(unit.exists())
+            self.assertTrue(binary.exists())
+            unit.write_text('[Service]\nExecStart=%s -c %s/wp.conf\n' %
+                            (binary.as_posix(), wireguard.as_posix()))
+            marker = hy2 / '.hy2-warp-owned'
+            marker.write_text('owned')
+            subprocess.run([shutil.which('bash'), str(script)], check=True,
+                           env=dict(os.environ, TEST_ROOT=str(root)))
+            self.assertFalse(unit.exists())
+            self.assertFalse(binary.exists())
+
+
 class UninstallSysctlCleanupTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
     def test_owned_sysctl_tuning_is_removed_on_uninstall(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            hy2 = root / 'etc/hysteria'
+            hy2.mkdir(parents=True)
+            (hy2 / '.hy2-installer-owned').write_text('owned')
             sysctl_dir = root / 'etc/sysctl.d'
             sysctl_dir.mkdir(parents=True)
             sysctl = sysctl_dir / '99-hysteria2.conf'
             sysctl.write_text('net.core.rmem_max = 8388608\n')
-            fragment = INSTALL[INSTALL.index('        # 仅删除安装器自己生成的持久化 sysctl 调优项'):]
-            fragment = fragment[:fragment.index('\n        clear_all_hopping_rules')]
+            start = INSTALL.index('        if [[ -f "$HY2_DIR/.hy2-installer-owned" ]]',
+                                  INSTALL.index('uninstall_all() {'))
+            fragment = INSTALL[start:INSTALL.index('\n        clear_all_hopping_rules', start)]
+            fragment = fragment.replace('/etc/hysteria', str(hy2).replace('\\', '/'))
             fragment = fragment.replace('/etc/sysctl.d/99-hysteria2.conf', sysctl.as_posix())
+            self.assertIn('rm -f ' + sysctl.as_posix(), fragment)
             script = root / 'cleanup.sh'
             script.write_text('''#!/usr/bin/env bash
+HY2_DIR="$TEST_ROOT/etc/hysteria"
 clear_all_hopping_rules() { :; }
 ''' + fragment, encoding='utf-8')
-            subprocess.run([shutil.which('bash'), str(script)], check=True)
+            env = dict(os.environ, TEST_ROOT=str(root))
+            subprocess.run([shutil.which('bash'), str(script)], check=True, env=env)
             self.assertFalse(sysctl.exists())
 
 

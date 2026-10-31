@@ -16,11 +16,30 @@ class TestRealityClientSyncGuards(unittest.TestCase):
     「没装 xray 的节点」上凭空创建配置、或抛权限错误把 HTTP handler 打死。
     """
 
-    def test_source_has_existence_guard(self):
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d)
-            self.assertTrue(portal.enforce_node_access(root,{'users':{}}))
-            self.assertFalse((root/'xray.json').exists())
+    def test_missing_config_is_noop_when_xray_is_stopped(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(portal, '_systemd_state', return_value='inactive'):
+            root = Path(d)
+            self.assertTrue(portal.enforce_node_access(root, {'users': {}}))
+            self.assertFalse((root / 'xray.json').exists())
+
+    def test_missing_config_while_xray_active_cannot_confirm_revocation(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(portal, '_systemd_state', return_value='active'):
+            root = Path(d)
+            (root / 'usage-meter-config.json').write_text(json.dumps(
+                {'hysteria': {'url': 'http://127.0.0.1:19996', 'secret': 'fixture'}}),
+                encoding='utf-8')
+            with patch.object(portal.urllib.request, 'urlopen', return_value=type(
+                    'Response', (), {'__enter__': lambda self: self,
+                                     '__exit__': lambda *args: None,
+                                     'read': lambda self: b'{}'})()):
+                with self.assertRaisesRegex(RuntimeError, 'xray.json missing while Xray is active'):
+                    portal.enforce_node_access(root, {'users': {'revoked': {'status': 'disabled'}}},
+                                               ['revoked'])
+            self.assertFalse((root / 'xray.json').exists())
 
     def test_anytls_failure_does_not_skip_xray_revocation(self):
         from unittest.mock import patch

@@ -975,7 +975,8 @@ function renderOutboundList(outs) {
       + '<div class="ob-item-meta">' + obEsc(obMetaOf(o)) + '</div></div>'
       + '<div class="ob-item-actions">'
       + '<button class="ob-mini-btn" data-ob-test="' + obEsc(o.name) + '" data-ob-kind="' + obEsc(o.type)
-      + '" data-ob-addr="' + obEsc(testAddr) + '">测出口</button>'
+      + '" data-ob-addr="' + obEsc(testAddr) + '" data-ob-insecure="' + (o.insecure ? 'true' : 'false')
+      + '">测出口</button>'
       + '<button class="ob-mini-btn" data-ob-edit="' + obEsc(o.name) + '">编辑</button>'
       + '<button class="ob-mini-btn danger" data-ob-del="' + obEsc(o.name) + '">删除</button>'
       + '</div></div>';
@@ -1121,12 +1122,13 @@ async function loadOutbounds() {
   } catch (_) {}
 }
 
-async function probeOutbound(kind, addr) {
+async function probeOutbound(kind, addr, insecure = false) {
   if (!obEls.ip) return;
   obEls.ip.textContent = '探测中...';
   if (obEls.ipNote) obEls.ipNote.textContent = '正在通过所选出站访问 ipify';
   try {
-    const body = new URLSearchParams({ kind: kind || 'direct', addr: addr || '' });
+    const body = new URLSearchParams({ kind: kind || 'direct', addr: addr || '',
+      insecure: insecure ? 'true' : '' });
     const res = await fetch(location.pathname + 'outbounds/probe', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -1436,12 +1438,13 @@ if (obEls.list) {
       e.preventDefault();
       const kind = test.getAttribute('data-ob-kind');
       const addr = test.getAttribute('data-ob-addr') || '';
+      const insecure = test.getAttribute('data-ob-insecure') === 'true';
       if (obEls.probeKind) obEls.probeKind.value = kind;
       if (obEls.probeAddr) {
         obEls.probeAddr.value = addr;
         obEls.probeAddr.hidden = (kind !== 'socks5' && kind !== 'http');
       }
-      await probeOutbound(kind, addr);
+      await probeOutbound(kind, addr, insecure);
       window.scrollTo({ top: obEls.ip.offsetTop - 200, behavior: 'smooth' });
     }
   });
@@ -1484,7 +1487,7 @@ if (obEls.btnGlobal) obEls.btnGlobal.addEventListener('click', () => setOutbound
 if (obEls.btnProbe) {
   obEls.btnProbe.addEventListener('click', () => {
     probeOutbound(obEls.probeKind ? obEls.probeKind.value : 'direct',
-      obEls.probeAddr ? obEls.probeAddr.value.trim() : '');
+      obEls.probeAddr ? obEls.probeAddr.value.trim() : '', false);
   });
 }
 if (obEls.probeKind) {

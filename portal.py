@@ -5707,6 +5707,11 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=()):
                     raise RuntimeError('Hy2 sessions still present after revocation')
     xj=root/'xray.json'
     if not xj.exists():
+        # A running Xray keeps its last loaded config in memory after the file is
+        # deleted. Do not acknowledge a pending revoke merely because the disk copy
+        # is missing; its in-memory managed inbounds may still authorize the user.
+        if blocked and _systemd_state('xray') == 'active':
+            raise RuntimeError('cannot confirm Xray revocation: xray.json missing while Xray is active')
         return True
     original=xj.read_bytes()
     xcfg=json.loads(original)

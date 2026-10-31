@@ -36,6 +36,54 @@ JS_CONSTANTS = ('SCRIPT', 'LOGIN_SCRIPT', 'USER_SCRIPT')
 SOURCE_FILES = ('portal.py', 'portal_assets.py')
 
 
+class SavedOutboundProbeTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_saved_http_proxy_probe_respects_insecure_setting(self):
+        script = portal.SCRIPT
+        code = script[script.index('function renderOutboundList'):script.index('function renderOutboundRules')]
+        probe = script[script.index('async function probeOutbound'):script.index('function obResetForm')]
+
+        harness = r'''
+const assert = require('assert');
+const nodes = {};
+const list = {innerHTML:'', addEventListener:(kind, fn) => nodes.click=fn};
+const ip = {textContent:'', offsetTop:300};
+const note = {textContent:''};
+const probeKind = {value:''}; const probeAddr = {value:'', hidden:false};
+const document = {getElementById:id=>({'ob-list':list,'ob-outbound-ip':ip,
+ 'ob-outbound-ip-note':note,'ob-probe-kind':probeKind,'ob-probe-addr':probeAddr}[id] || null)};
+const window = {scrollTo:()=>{}}; let captured;
+const location = {pathname:'/token/'};
+const fetch = async (url, opts) => {captured=opts; return {json:async()=>({ok:true,ip:'203.0.113.1'})};};
+const obEls = {list,ip,ipNote:note,probeKind,probeAddr};
+const OB_TYPE_LABEL={http:{label:'HTTP',cls:''}};
+const obEsc = s=>String(s);
+const obMetaOf = ()=>'';
+'''
+        checks = r'''
+(async()=>{
+renderOutboundList([{name:'tls-proxy',type:'http',url:'https://proxy.example:8080',insecure:true}]);
+assert(list.innerHTML.includes('data-ob-insecure="true"'));
+'''
+        # Execute the real row-click listener and prove it forwards the saved flag.
+        click = script[script.index("if (obEls.list) {"):script.index('if (obEls.rulesList)')]
+        checks += r'''
+''' + click + r'''
+await nodes.click({target:{closest:selector => selector === '[data-ob-test]' ? {
+  getAttribute:key=>({'data-ob-kind':'http','data-ob-addr':'https://proxy.example:8080',
+                      'data-ob-insecure':'true'}[key] || '')
+} : null}, preventDefault:()=>{}});
+assert.strictEqual(captured.method,'POST');
+const body = new URLSearchParams(captured.body);
+assert.strictEqual(body.get('insecure'),'true');
+assert(!captured.body.includes('username') && !captured.body.includes('password'));
+})().catch(e=>{console.error(e);process.exitCode=1});
+'''
+        result = subprocess.run([NODE,'-e',harness+code+probe+checks],capture_output=True,
+                                text=True,encoding='utf-8')
+        self.assertEqual(result.returncode,0,result.stderr)
+
+
 class VersionUiBehaviorTests(unittest.TestCase):
     @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):

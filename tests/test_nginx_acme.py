@@ -129,5 +129,25 @@ class SetupCertViaNginxTest(unittest.TestCase):
         self.assertNotIn('hy2-acme-new.example.com.conf', out, '签发失败后应撤掉新增的验证配置')
 
 
+class NginxAcmeOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(BASH, 'requires bash')
+    def test_existing_hy2_named_config_is_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            confd = root / 'conf.d'
+            confd.mkdir()
+            target = confd / 'hy2-acme-node.example.com.conf'
+            original = '# administrator-owned site configuration\nserver { return 200; }\n'
+            target.write_text(original, encoding='utf-8')
+            block = re.search(r'^    else\n        conf="/etc/nginx/conf.d/hy2-acme-\$\{domain\}\.conf".*?^    fi\n',
+                              SRC, re.S | re.M).group(0)
+            block = block.replace('/etc/nginx/conf.d', bash_path(confd))
+            script = 'set -e\n' + block + '\necho SHOULD_NOT_REACH\n'
+            result = subprocess.run([BASH, '-c', script], capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn('SHOULD_NOT_REACH', result.stdout)
+            self.assertEqual(target.read_text(encoding='utf-8'), original)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

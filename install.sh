@@ -1448,6 +1448,7 @@ setup_cert_via_nginx() {
     fi
     hy2_acme_ensure || return 1
     local acct="${HOME}/.acme.sh/acme.sh" conf="" rc=0
+    local created_owned_conf=0
     export SKIP_ACME_SH_UPGRADE=1
 
     if nginx_has_server_name "$domain"; then
@@ -1456,6 +1457,10 @@ setup_cert_via_nginx() {
             --accountemail "$email" --keylength ec-256 || rc=$?
     else
         conf="/etc/nginx/conf.d/hy2-acme-${domain}.conf"
+        if [[ -e "$conf" ]]; then
+            log_warn "目标 Nginx 配置文件已存在，无法确认归属；保留原文件并跳过自动建站。"
+            return 1
+        fi
         if [[ ! -d /etc/nginx/conf.d ]]; then
             log_warn "找不到 /etc/nginx/conf.d，无法为 ${domain} 新增验证配置。"
             return 1
@@ -1482,6 +1487,7 @@ ${listen6}
 }
 EOF
         chmod 644 "$conf"
+        created_owned_conf=1
         if ! nginx_reload_checked; then
             # IPv6 监听不可用时再试一次只监听 IPv4。
             sed -i '/listen \[::\]:80;/d' "$conf"
@@ -1531,6 +1537,11 @@ EOF
         return 1
     fi
     chmod 600 "$out_key"
+    if [[ "$created_owned_conf" == 1 ]]; then
+        mkdir -p "$HY2_DIR"
+        touch "$HY2_DIR/.hy2-nginx-acme-${domain}.owned"
+        chmod 600 "$HY2_DIR/.hy2-nginx-acme-${domain}.owned"
+    fi
     log_info "借 Nginx 签发成功；续期由 acme.sh 定时任务自动完成，续期后自动重启相关服务。"
     echo "$out_cert|$out_key" >&3
     return 0
@@ -2098,29 +2109,42 @@ setup_system_firewall() {
 #    出事后用户唯一能做的事是手工翻备份目录，而他根本不知道备份存在哪。
 # 这里在动手之前把四个关键文件各留一份带时间戳的快照，并在菜单里告知位置。
 backup_state_before_reconfigure() {
-    local ts saved=0 f
+    local ts saved=0 failed=0 f
     ts="$(date +%Y%m%d-%H%M%S)"
-    # 每个文件只保留最近 5 份快照：portal.json 含全部用户密码与 API Key，
-    # 每次重装都留一份会让 /etc/hysteria 无限增长（也扩大泄露面，2026-10-29 修）。
-    # 只清理本函数生成的那四种 *.bak-<时间戳>，不碰其它备份（如手工部署的
-    # portal.py.bak-*）。
-    local _old
-    for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" "$HY2_CONFIG"; do
-        while IFS= read -r _old; do
-            [[ -n "$_old" ]] && rm -f "$_old" 2>/dev/null || true
-        done < <(ls -1t "${f}".bak-* 2>/dev/null | tail -n +6)
-    done
-    for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" "$HY2_CONFIG"; do
+    # 配置、用户数据和自签证书一起快照：menu 4 会覆盖固定证书路径，
+    # 若随后失败/中断，旧 config.yaml 仍可能引用旧证书指纹。
+    for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
+             "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
         [[ -f "$f" ]] || continue
         if cp -a "$f" "${f}.bak-${ts}" 2>/dev/null; then
             saved=$((saved + 1))
+        else
+            failed=$((failed + 1))
+            rm -f "${f}.bak-${ts}" 2>/dev/null || true
         fi
     done
-    if (( saved > 0 )); then
-        log_info "已备份 ${saved} 个关键文件（后缀 .bak-${ts}），改配置出问题可回滚。"
-    else
-        log_warn "关键文件备份失败（可能是首次安装），请自行确认原数据已无价值。"
+    if (( failed > 0 )); then
+        # 任何已有关键文件备份失败都中止后续写入，且保留之前可用的恢复点。
+        for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
+                 "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
+            [[ -n "$f" ]] && rm -f "${f}.bak-${ts}" 2>/dev/null || true
+        done
+        log_err "关键配置快照有 ${failed} 个文件失败；已中止重配置，原服务配置未改动。"
+        return 1
     fi
+    if (( saved == 0 )); then
+        log_warn "没有可快照的现有配置文件（可能是首次安装）。"
+        return 0
+    fi
+    # 只在新快照全部成功后裁剪，且保留最近 5 个旧快照 + 本次快照。
+    local _old
+    for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
+             "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
+        while IFS= read -r _old; do
+            [[ -n "$_old" ]] && rm -f "$_old" 2>/dev/null || true
+        done < <(ls -1t "${f}".bak-* 2>/dev/null | tail -n +7)
+    done
+    log_info "已备份 ${saved} 个关键文件（后缀 .bak-${ts}），改配置出问题可回滚。"
 }
 
 select_subscription_port() {
@@ -2963,6 +2987,11 @@ EOF
 
 setup_systemd() {
     log_step "配置 systemd 系统守护服务: ${HY2_SERVICE}..."
+    mkdir -p "$HY2_DIR"
+    if [[ ! -e "$HY2_DIR/.hy2-installer-owned" ]]; then
+        : > "$HY2_DIR/.hy2-installer-owned"
+        chmod 600 "$HY2_DIR/.hy2-installer-owned"
+    fi
     
     # 系统内核网络与 UDP 缓冲优化 (BUGFIX #13: 同时持久化到 /etc/sysctl.d/)
     cat > /etc/sysctl.d/99-hysteria2.conf <<EOF
@@ -3785,6 +3814,21 @@ install_warp_local_proxy() {
     WGCF_CONF="${WGCF_DIR}/wgcf.conf"
     WGCF_ACCT="${WGCF_DIR}/wgcf-account.toml"
     WP_BIN="/usr/local/bin/wireproxy"
+    HY2_WARP_OWNED_MARKER="${HY2_DIR}/.hy2-warp-owned"
+    if [[ ! -f "$HY2_WARP_OWNED_MARKER" ]]; then
+        if [[ -f /etc/systemd/system/wireproxy.service && -f /etc/wireguard/wp.conf ]] \
+                && grep -qF '# wireproxy config (managed by hysteria2-installer, do not edit)' \
+                    /etc/wireguard/wp.conf \
+                && grep -qF 'ExecStart=/usr/local/bin/wireproxy -c /etc/wireguard/wp.conf' \
+                    /etc/systemd/system/wireproxy.service; then
+            # Adopt only an unmistakably older installer-managed WARP deployment.
+            : > "$HY2_WARP_OWNED_MARKER"
+            chmod 600 "$HY2_WARP_OWNED_MARKER"
+        elif [[ -e "$WP_BIN" || -e /etc/systemd/system/wireproxy.service || -e /etc/wireguard/wp.conf ]]; then
+            log_err "wireproxy 资产已存在但归属无法确认；为避免覆盖宿主服务，已停止 WARP 安装。"
+            return 1
+        fi
+    fi
     WARP_SOCKS_PORT=19898
     WARP_SOCKS_ADDR="127.0.0.1:${WARP_SOCKS_PORT}"
 
@@ -3833,6 +3877,14 @@ install_warp_local_proxy() {
 
     # 2. 下载 wireproxy (把 WireGuard 配置转成 socks5 代理)
     if [[ ! -x "$WP_BIN" ]]; then
+        # 存在一个损坏但不可执行的共享文件时不能覆盖/认领它。
+        if [[ -e "$WP_BIN" || -e /etc/systemd/system/wireproxy.service ]]; then
+            log_err "检测到现有 wireproxy 文件或服务，安装器不会覆盖它。请先确认其归属后再试。"
+            return 1
+        fi
+        # 标记仅在本项目确认拥有该二进制路径并准备新建时落盘。
+        : > "$HY2_WARP_OWNED_MARKER"
+        chmod 600 "$HY2_WARP_OWNED_MARKER"
         log_step "下载 wireproxy 二进制..."
         RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
         if command -v jq >/dev/null 2>&1; then
@@ -4901,25 +4953,55 @@ uninstall_all() {
         if [[ "$managed_singbox" == 1 ]]; then
             rm -f /usr/local/bin/sing-box
         fi
-        # BUGFIX: 卸载时同时清理 WARP 相关服务与配置
-        systemctl disable --now wireproxy 2>/dev/null || true
-        systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true
-        systemctl disable --now hy2-warp-watchdog.service 2>/dev/null || true
+        # 只有 systemd unit 确认为本安装器生成，才停用/删除 WARP 资产。
+        # wireproxy 是共享二进制路径；不能把管理员原有服务误当成 Hy2 资产。
+        local managed_wireproxy=0
+        if [[ -f "$HY2_DIR/.hy2-warp-owned" && -f /etc/systemd/system/wireproxy.service ]] \
+                && grep -qF 'ExecStart=/usr/local/bin/wireproxy -c /etc/wireguard/wp.conf' \
+                    /etc/systemd/system/wireproxy.service; then
+            managed_wireproxy=1
+            systemctl disable --now wireproxy 2>/dev/null || true
+            rm -f /etc/systemd/system/wireproxy.service /etc/wireguard/wp.conf
+            rm -f /usr/local/bin/wireproxy /usr/local/bin/wgcf /usr/local/bin/hy2-warp-watchdog.sh
+        fi
+        if [[ "$managed_wireproxy" == 1 ]]; then
+            systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true
+            systemctl disable --now hy2-warp-watchdog.service 2>/dev/null || true
+        fi
         # 证书自愈定时/事件单元
         systemctl disable --now hy2-cert-selfheal.timer 2>/dev/null || true
         systemctl disable --now hy2-cert-selfheal.path 2>/dev/null || true
         systemctl disable --now hy2-cert-selfheal.service 2>/dev/null || true
         rm -f /etc/systemd/system/hysteria-portal.service
         rm -f /etc/systemd/system/gost.service
-        rm -f /etc/systemd/system/wireproxy.service
-        rm -f /etc/systemd/system/hy2-warp-watchdog.service
-        rm -f /etc/systemd/system/hy2-warp-watchdog.timer
+        if [[ "$managed_wireproxy" == 1 ]]; then
+            rm -f /etc/systemd/system/hy2-warp-watchdog.service
+            rm -f /etc/systemd/system/hy2-warp-watchdog.timer
+        fi
         rm -f /etc/systemd/system/hy2-cert-selfheal.service
         rm -f /etc/systemd/system/hy2-cert-selfheal.timer
         rm -f /etc/systemd/system/hy2-cert-selfheal.path
         rm -f /usr/local/bin/hy2-cert-selfheal.sh
-        # 仅删除安装器自己生成的持久化 sysctl 调优项，恢复系统默认配置来源。
-        rm -f /etc/sysctl.d/99-hysteria2.conf
+        # 只移除本安装器创建且带 owner marker 的 Nginx ACME challenge site。
+        local nginx_owner nginx_conf nginx_domain
+        for nginx_owner in "$HY2_DIR"/.hy2-nginx-acme-*.owned; do
+            [[ -f "$nginx_owner" ]] || continue
+            nginx_domain="${nginx_owner##*/.hy2-nginx-acme-}"
+            nginx_domain="${nginx_domain%.owned}"
+            nginx_conf="/etc/nginx/conf.d/hy2-acme-${nginx_domain}.conf"
+            if [[ -f "$nginx_conf" ]] \
+                    && grep -qF "由 hysteria2-installer 生成：只用于 Let's Encrypt 签发与续期 ${nginx_domain}" "$nginx_conf"; then
+                rm -f "$nginx_conf"
+            fi
+            rm -f "$nginx_owner"
+        done
+        if command -v nginx >/dev/null 2>&1; then
+            nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; } || true
+        fi
+        # 仅删除首次安装时存在 marker 的安装器资产；旧版没有 marker 时保留，避免误删用户文件。
+        if [[ -f "$HY2_DIR/.hy2-installer-owned" ]]; then
+            rm -f /etc/sysctl.d/99-hysteria2.conf
+        fi
         clear_all_hopping_rules
         rm -f "$HY2_SERVICE"
         systemctl daemon-reload
@@ -4927,15 +5009,14 @@ uninstall_all() {
         log_step "清理二进制与配置目录..."
         rm -f "$HY2_BIN"
         rm -f /usr/local/bin/gost
-        rm -f /usr/local/bin/wgcf
-        rm -f /usr/local/bin/wireproxy
-        rm -f /usr/local/bin/hy2-warp-watchdog.sh
         rm -rf "$HY2_DIR"
         # 只删 wgcf / wireproxy 自己的文件：/etc/wireguard 是系统 WireGuard 的公共目录，
         # 机主自己的 wg0.conf 之类不能被一并删掉。目录空了才移除。
-        rm -f /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf.conf \
-              /etc/wireguard/wgcf-profile.conf /etc/wireguard/wp.conf
-        rmdir /etc/wireguard 2>/dev/null || true
+        if [[ "$managed_wireproxy" == 1 ]]; then
+            rm -f /etc/wireguard/wgcf-account.toml /etc/wireguard/wgcf.conf \
+                  /etc/wireguard/wgcf-profile.conf /etc/wireguard/wp.conf
+            rmdir /etc/wireguard 2>/dev/null || true
+        fi
 
         # AmneziaWG 清理（按上面的确认结果决定）
         if [[ "$awg_confirm" =~ ^[Yy]$ ]]; then
@@ -5015,7 +5096,7 @@ flow_install() {
             return 0
         fi
         ask_preserve_portal
-        backup_state_before_reconfigure
+        backup_state_before_reconfigure || return 1
     fi
     install_dependencies
     get_public_ip
@@ -5092,7 +5173,7 @@ flow_reconfigure() {
         return 0
     fi
     ask_preserve_portal
-    backup_state_before_reconfigure
+    backup_state_before_reconfigure || return 1
     install_dependencies
     get_public_ip
     setup_certificates

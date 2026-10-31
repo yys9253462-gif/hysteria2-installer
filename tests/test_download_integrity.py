@@ -1403,8 +1403,13 @@ setup_cert_via_dns_api example.com || echo "RC=$?"
             (home / '.acme.sh').mkdir(parents=True)
             (home / '.acme.sh' / 'acme.sh').write_text('#!/bin/sh\n', encoding='utf-8')
             (home / '.acme.sh' / 'acme.sh').chmod(0o755)
+            cert_dir = home / 'hy2-certs'
+            (home / '.acme.sh' / 'example.com_ecc').mkdir()
+            (home / '.acme.sh' / 'example.com_ecc' / 'fullchain.cer').write_text('CERT')
+            (home / '.acme.sh' / 'example.com_ecc' / 'example.com.key').write_text('KEY')
             script = f'''
 HOME="{home}"
+HY2_CERT_DIR="{cert_dir}"
 HY2_CF_TOKEN="tok"; HY2_CF_EMAIL="a@b.c"
 log_info() {{ echo "INF: $*"; }}; log_warn() {{ echo "WRN: $*"; }}
 log_err() {{ echo "ERR: $*"; }}; log_step() {{ :; }}
@@ -1418,6 +1423,10 @@ setup_cert_via_dns_api example.com || true
             self.assertIn('CHECK-EXISTING', out, out)
             self.assertNotIn('INSTALLER-CALLED', out, out)
             self.assertIn('使用 Cloudflare DNS API 签发', out)
+            self.assertTrue((cert_dir / 'acme-example.com.crt').exists())
+            self.assertTrue((cert_dir / 'acme-example.com.key').exists())
+            self.assertIn('--install-cert', out)
+            self.assertIn('--reloadcmd', out)
 
     def test_existing_acme_verification_failure_blocks_issue(self):
         """已有 acme.sh 核验失败：setup_cert_via_dns_api 必须返回 1 且不签发。"""

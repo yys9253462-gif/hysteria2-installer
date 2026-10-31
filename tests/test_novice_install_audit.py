@@ -283,11 +283,15 @@ class TestBackupBeforeReconfigure(unittest.TestCase):
             (td / "client_meta.json").write_text('{"a":1}')
             (td / "portal.json").write_text('{"b":2}')
             (td / "config.yaml").write_text('listen: :443')
+            (td / "cert").mkdir()
+            (td / "cert/server.crt").write_text('CERT')
+            (td / "cert/server.key").write_text('KEY')
             script = (
                 'set -eo pipefail\n'
                 f'HY2_DIR="{td}"\n'
                 f'HY2_META_FILE="{td}/client_meta.json"\n'
                 f'HY2_CONFIG="{td}/config.yaml"\n'
+                f'HY2_CERT_DIR="{td}/cert"\n'
                 "log_info(){ echo \"INFO: $*\"; }\n"
                 "log_warn(){ echo \"WARN: $*\"; }\n"
                 + _extract_fn("backup_state_before_reconfigure") + "\n"
@@ -297,9 +301,32 @@ class TestBackupBeforeReconfigure(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             baks = list(td.glob("*.bak-*"))
             self.assertGreaterEqual(len(baks), 3, f"备份没生成：{r.stdout}{r.stderr}")
-            for name in ("client_meta.json", "portal.json", "config.yaml"):
+            for name in ("client_meta.json", "portal.json", "config.yaml",
+                         "cert/server.crt", "cert/server.key"):
                 self.assertTrue(list(td.glob(name + ".bak-*")),
                                 f"{name} 没有快照")
+
+    def test_snapshot_failure_aborts_reconfiguration(self):
+        flow = INSTALL.read_text(encoding='utf-8')
+        self.assertIn('backup_state_before_reconfigure || return 1', flow)
+        helper = _extract_fn('backup_state_before_reconfigure')
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            protected = td / 'client_meta.json'
+            protected.write_text('original')
+            script = (
+                'set -eo pipefail\n'
+                f'HY2_DIR="{td}"\n'
+                f'HY2_META_FILE="{protected}"\n'
+                f'HY2_CONFIG="{td}/config.yaml"\n'
+                f'HY2_CERT_DIR="{td}/cert"\n'
+                'cp() { return 1; }\n'
+                'log_info(){ :; }; log_warn(){ :; }; log_err(){ echo "ERR:$*"; }\n'
+                + helper + '\nbackup_state_before_reconfigure\n'
+            )
+            result = _run_shell(script)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(protected.read_text(), 'original')
 
     def test_menu4_warns_and_calls_backup(self):
         text = INSTALL.read_text(encoding="utf-8")
