@@ -691,14 +691,15 @@ class TestRepoInvariants(unittest.TestCase):
         self.assertIn("OnUnitActiveSec=30min", text)
         self.assertIn("PathChanged=", text)
         self.assertIn("enable --now hy2-cert-selfheal.timer", text)
+        self.assertIn('systemctl disable --now "hy2-cert-selfheal.${selfheal_unit}"', text)
         self.assertIn("enable --now hy2-cert-selfheal.path", text)
         # the executable the units call must invoke `portal.py selfheal`
         self.assertIn('"$HY2_DIR/portal.py" selfheal', text)
         # do_upgrade.sh must also install them for already-deployed nodes
         self.assertIn("证书一致性自愈单元已启用", text)
         # uninstall must clean them up
-        self.assertIn("disable --now hy2-cert-selfheal.timer", text)
-        self.assertIn("rm -f /etc/systemd/system/hy2-cert-selfheal.path", text)
+        self.assertIn('disable --now "hy2-cert-selfheal.${selfheal_unit}"', text)
+        self.assertIn('rm -f "/etc/systemd/system/hy2-cert-selfheal.${selfheal_unit}"', text)
 
     def test_portal_cli_exposes_selfheal_subcommand(self):
         text = PORTAL.read_text(encoding="utf-8")

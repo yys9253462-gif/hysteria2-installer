@@ -310,6 +310,8 @@ class TestBackupBeforeReconfigure(unittest.TestCase):
         source = INSTALL.read_text(encoding='utf-8')
         start = source.index('        install)\n', source.index('# 命令行直通参数'))
         branch = source[start:source.index('        update)', start)]
+        self.assertLess(branch.index('acquire_installer_core_lock || exit 1'),
+                        branch.index('backup_state_before_reconfigure || exit 1'))
         self.assertLess(branch.index('backup_state_before_reconfigure || exit 1'),
                         branch.index('install_dependencies'))
 

@@ -2268,13 +2268,18 @@ persist_hopping_rules() {
     fi
 }
 
+_hy2_iptables_unit_owned() {
+    local unit=/etc/systemd/system/hy2-iptables.service
+    [[ -f "$unit" ]] \
+        && grep -qF 'Description=Hysteria 2 Port Hopping iptables persistence' "$unit" \
+        && grep -qF -- '--comment hy2-installer' "$unit"
+}
+
 clear_all_hopping_rules() {
     # Commented rules prove current installer ownership. For older unmarked rules,
     # require both matching saved metadata and the legacy installer unit signature.
     local legacy_start='' legacy_end='' legacy_target='' saved_range=''
-    if [[ -f "$HY2_META_FILE" && -f /etc/systemd/system/hy2-iptables.service ]] \
-            && grep -qF 'Description=Hysteria 2 Port Hopping iptables persistence' \
-                /etc/systemd/system/hy2-iptables.service; then
+    if [[ -f "$HY2_META_FILE" ]] && _hy2_iptables_unit_owned; then
         saved_range="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
         legacy_target="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
         if [[ "$saved_range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
@@ -2295,8 +2300,10 @@ clear_all_hopping_rules() {
         _clear_hop_chain ip6tables OUTPUT "$legacy_start" "$legacy_end" "$legacy_target"
     fi
     persist_hopping_rules || log_warn "端口跳跃规则持久化状态未能同步，重启后请检查 netfilter-persistent 配置。"
-    systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
-    rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
+    if _hy2_iptables_unit_owned; then
+        systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
+    fi
 }
 
 setup_iptables_port_hopping() {
@@ -2316,9 +2323,16 @@ setup_iptables_port_hopping() {
         HOP_START=""
         HOP_END=""
         HOP_PORT_RANGE=""
-        systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
+        if _hy2_iptables_unit_owned; then
+            systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
+        fi
         return 0
+    fi
+
+    if [[ -e /etc/systemd/system/hy2-iptables.service ]] && ! _hy2_iptables_unit_owned; then
+        log_err "发现同名但不属于本安装器的 hy2-iptables.service，拒绝覆盖。"
+        return 1
     fi
 
     log_step "配置 iptables 端口跳跃转发规则 (${s_port}-${e_port} -> ${l_port})..."
@@ -4995,6 +5009,7 @@ uninstall_all() {
     fi
 
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        acquire_installer_core_lock || return 1
         log_step "正在停止并删除系统服务..."
         systemctl stop hysteria-server 2>/dev/null || true
         systemctl disable hysteria-server 2>/dev/null || true
@@ -5016,9 +5031,12 @@ uninstall_all() {
         # AnyTLS / TUIC 的 sing-box 同样由门户安装，配置在 /etc/hysteria/{anytls,tuic}.json。
         # 仅当本项目的 systemd 单元存在时才认领并删除共享二进制；无关联单元时
         # sing-box 可能由管理员供其它服务使用，卸载 Hysteria 不能动它。
-        local sb_unit managed_singbox=0
+        local sb_unit sb_config managed_singbox=0
         for sb_unit in hy2-anytls hy2-tuic; do
-            if [[ -f /etc/systemd/system/${sb_unit}.service ]]; then
+            sb_config="/etc/hysteria/${sb_unit#hy2-}.json"
+            if [[ -f "/etc/systemd/system/${sb_unit}.service" ]] \
+                    && grep -qF "ExecStart=/usr/local/bin/sing-box run -c ${sb_config}" \
+                        "/etc/systemd/system/${sb_unit}.service"; then
                 managed_singbox=1
                 systemctl disable --now "$sb_unit" 2>/dev/null || true
                 rm -f "/etc/systemd/system/${sb_unit}.service"
@@ -5042,19 +5060,27 @@ uninstall_all() {
             systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true
             systemctl disable --now hy2-warp-watchdog.service 2>/dev/null || true
         fi
-        # 证书自愈定时/事件单元
-        systemctl disable --now hy2-cert-selfheal.timer 2>/dev/null || true
-        systemctl disable --now hy2-cert-selfheal.path 2>/dev/null || true
-        systemctl disable --now hy2-cert-selfheal.service 2>/dev/null || true
+        # 证书自愈单元必须匹配本安装器模板，不能因同名删除管理员服务。
+        local selfheal_unit
+        if [[ -f /etc/systemd/system/hy2-cert-selfheal.service ]] \
+                && grep -qF 'ExecStart=/usr/local/bin/hy2-cert-selfheal.sh' \
+                    /etc/systemd/system/hy2-cert-selfheal.service \
+                && [[ -f /etc/systemd/system/hy2-cert-selfheal.timer ]] \
+                && grep -qF 'OnUnitActiveSec=30min' /etc/systemd/system/hy2-cert-selfheal.timer \
+                && [[ -f /etc/systemd/system/hy2-cert-selfheal.path ]] \
+                && grep -qF 'Unit=hy2-cert-selfheal.service' \
+                    /etc/systemd/system/hy2-cert-selfheal.path; then
+            for selfheal_unit in timer path service; do
+                systemctl disable --now "hy2-cert-selfheal.${selfheal_unit}" 2>/dev/null || true
+                rm -f "/etc/systemd/system/hy2-cert-selfheal.${selfheal_unit}"
+            done
+            rm -f /usr/local/bin/hy2-cert-selfheal.sh
+        fi
         rm -f /etc/systemd/system/hysteria-portal.service
         if [[ "$managed_wireproxy" == 1 ]]; then
             rm -f /etc/systemd/system/hy2-warp-watchdog.service
             rm -f /etc/systemd/system/hy2-warp-watchdog.timer
         fi
-        rm -f /etc/systemd/system/hy2-cert-selfheal.service
-        rm -f /etc/systemd/system/hy2-cert-selfheal.timer
-        rm -f /etc/systemd/system/hy2-cert-selfheal.path
-        rm -f /usr/local/bin/hy2-cert-selfheal.sh
         # 只移除可识别为安装器生成的 Nginx ACME challenge site；兼容旧版本
         # 尚未写 owner marker 的配置，同时检查模板特征，绝不按文件名前缀盲删。
         local nginx_conf nginx_domain nginx_removed=0
@@ -5086,7 +5112,13 @@ uninstall_all() {
 
         log_step "清理二进制与配置目录..."
         rm -f "$HY2_BIN"
-        rm -rf "$HY2_DIR"
+        # 保留持锁 inode：删除它后并发安装器可能新建另一个锁文件并越过当前卸载。
+        local hy2_path
+        for hy2_path in "$HY2_DIR"/* "$HY2_DIR"/.[!.]* "$HY2_DIR"/..?*; do
+            [[ -e "$hy2_path" || -L "$hy2_path" ]] || continue
+            [[ "$hy2_path" == "$HY2_DIR/.core-operation.lock" ]] && continue
+            rm -rf -- "$hy2_path"
+        done
         # 只删 wgcf / wireproxy 自己的文件：/etc/wireguard 是系统 WireGuard 的公共目录，
         # 机主自己的 wg0.conf 之类不能被一并删掉。目录空了才移除。
         if [[ "$managed_wireproxy" == 1 ]]; then
@@ -5156,6 +5188,17 @@ ask_preserve_portal() {
     fi
 }
 
+acquire_installer_core_lock() {
+    mkdir -p "$HY2_DIR" || return 1
+    local lock_fd
+    exec {lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
+        log_err "无法创建核心操作锁。"; return 1; }
+    if ! flock -n "$lock_fd"; then
+        log_err "门户正在修改节点核心，等待完成后重试。"
+        return 1
+    fi
+}
+
 flow_install() {
     check_root
     check_arch
@@ -5173,6 +5216,9 @@ flow_install() {
             return 0
         fi
         ask_preserve_portal
+    fi
+    acquire_installer_core_lock || return 1
+    if [[ -f "$HY2_CONFIG" ]]; then
         backup_state_before_reconfigure || return 1
     fi
     install_dependencies
@@ -5250,6 +5296,7 @@ flow_reconfigure() {
         return 0
     fi
     ask_preserve_portal
+    acquire_installer_core_lock || return 1
     backup_state_before_reconfigure || return 1
     install_dependencies
     get_public_ip
@@ -5426,6 +5473,7 @@ if [[ $# -gt 0 ]]; then
     esac
     case "$1" in
         install)
+            acquire_installer_core_lock || exit 1
             # 免交互重装也要先留出与菜单安装相同的恢复快照。
             if [[ -f "$HY2_DIR/config.yaml" || -f "$HY2_META_FILE" ]]; then
                 backup_state_before_reconfigure || exit 1

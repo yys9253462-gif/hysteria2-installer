@@ -8929,7 +8929,7 @@ if __name__ == '__main__':
                                     record['expires_at'] = existing.get('expires_at', record['expires_at'])
                             if existing is not None:
                                 rotate_user_view_key_on_change(existing, record)
-                            if 'used_bytes' in params:
+                            if conflict is None and 'used_bytes' in params:
                                 # 同一共享锁覆盖对账、用户写入和落盘；失败时仅回滚
                                 # 本请求的两个字段。replace 后目录 fsync 失败属于未知
                                 # 落盘状态，save_data 的异常会明确告知调用方需核对。
@@ -8957,16 +8957,16 @@ if __name__ == '__main__':
                                     conflict = (503, 'Reconciliation save failed; disk state may require verification')
                             elif conflict is None:
                                 data.setdefault('users', {})[user_id] = record
-                            pwd, expires = record['password'], record['expires_at']
-                            ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
-                            status_after = record.get('status', 'active')
-                            # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
-                            # 对应一个 VLESS UUID，开户即生效。
                             if conflict is None:
+                                pwd, expires = record['password'], record['expires_at']
+                                ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
+                                status_after = record.get('status', 'active')
+                                # 同步 Reality 账号表（2026-10-03）：一个 Hy2 用户
+                                # 对应一个 VLESS UUID，开户即生效。
                                 reality_registry(data)
-                            rcfg = dict(config_section(data, 'reality_config'))
-                            vcfg_active = dict(config_section(data, 'vmess_config'))
-                            ecfg_active = dict(config_section(data, 'vlessenc_config'))
+                                rcfg = dict(config_section(data, 'reality_config'))
+                                vcfg_active = dict(config_section(data, 'vmess_config'))
+                                ecfg_active = dict(config_section(data, 'vlessenc_config'))
                     if conflict is not None:
                         # 锁已释放，现在才写响应。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
@@ -10448,10 +10448,11 @@ if __name__ == '__main__':
             with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                 with data_lock:
                     inbound['settings']['clients'] = vmess_clients(data)
-                config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                          if xray_path.exists() else {'log': {'loglevel': 'warning'},
-                                                      'outbounds': [{'protocol': 'freedom',
-                                                                     'tag': 'direct'}]})
+                original_config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                                   if xray_path.exists() else None)
+                config = (copy.deepcopy(original_config) if original_config is not None else
+                          {'log': {'loglevel': 'warning'},
+                           'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]})
                 config = upsert_managed_inbound(config, VMESS_INBOUND_TAG, inbound)
                 apply_xray_config_with_meter(
                     config, xray_path, portal_path.parent / 'usage-meter-config.json',
@@ -10461,8 +10462,28 @@ if __name__ == '__main__':
             new_cfg['uri'] = vmess_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
                                                 label='VMess-WS-' + domain)
             with data_lock:
+                old_state = data.get('vmess_config')
                 data['vmess_config'] = new_cfg
-            save_data()
+            try:
+                save_data()
+            except AtomicWriteDurabilityError:
+                raise
+            except OSError:
+                try:
+                    with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                        if original_config is None:
+                            xray_path.unlink(missing_ok=True)
+                        else:
+                            apply_xray_config_transaction(
+                                original_config, config_path=str(xray_path),
+                                binary='/usr/local/bin/xray', restart=not unit_suspended('xray'))
+                finally:
+                    with data_lock:
+                        if old_state is None:
+                            data.pop('vmess_config', None)
+                        else:
+                            data['vmess_config'] = old_state
+                raise
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
             # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
             regenerate_page()
@@ -10532,10 +10553,11 @@ if __name__ == '__main__':
             with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                 with data_lock:
                     inbound['settings']['clients'] = vlessenc_clients(data)
-                config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                          if xray_path.exists() else {'log': {'loglevel': 'warning'},
-                                                      'outbounds': [{'protocol': 'freedom',
-                                                                     'tag': 'direct'}]})
+                original_config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                                   if xray_path.exists() else None)
+                config = (copy.deepcopy(original_config) if original_config is not None else
+                          {'log': {'loglevel': 'warning'},
+                           'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]})
                 config = upsert_managed_inbound(config, VLESSENC_INBOUND_TAG, inbound)
                 apply_xray_config_with_meter(
                     config, xray_path, portal_path.parent / 'usage-meter-config.json',
@@ -10545,8 +10567,28 @@ if __name__ == '__main__':
             new_cfg['uri'] = vlessenc_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
                                                    label='VLESS-Enc-' + domain)
             with data_lock:
+                old_state = data.get('vlessenc_config')
                 data['vlessenc_config'] = new_cfg
-            save_data()
+            try:
+                save_data()
+            except AtomicWriteDurabilityError:
+                raise
+            except OSError:
+                try:
+                    with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                        if original_config is None:
+                            xray_path.unlink(missing_ok=True)
+                        else:
+                            apply_xray_config_transaction(
+                                original_config, config_path=str(xray_path),
+                                binary='/usr/local/bin/xray', restart=not unit_suspended('xray'))
+                finally:
+                    with data_lock:
+                        if old_state is None:
+                            data.pop('vlessenc_config', None)
+                        else:
+                            data['vlessenc_config'] = old_state
+                raise
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
             # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
             regenerate_page()

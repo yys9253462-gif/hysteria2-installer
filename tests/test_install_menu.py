@@ -173,6 +173,30 @@ class MenuSourceTest(unittest.TestCase):
 
 
 class UninstallSingboxOwnershipTests(unittest.TestCase):
+    def test_uninstall_preserves_unrelated_same_name_singbox_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            units = root / 'etc/systemd/system'
+            units.mkdir(parents=True)
+            binary = root / 'usr/local/bin/sing-box'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('shared binary', encoding='utf-8')
+            unit = units / 'hy2-anytls.service'
+            unit.write_text('[Service]\\nExecStart=/usr/local/bin/sing-box run -c /etc/admin/other.json\\n')
+            start = INSTALL.index('        local sb_unit sb_config managed_singbox=0')
+            end = INSTALL.index('        # 只有 systemd unit 确认为本安装器生成', start)
+            script = INSTALL[start:end]
+            script = script.replace('/etc/systemd/system', units.as_posix())
+            script = script.replace('/usr/local/bin/sing-box', binary.as_posix())
+            script = script.replace('/etc/hysteria', (root / 'etc/hysteria').as_posix())
+            wrapper = root / 'uninstall.sh'
+            wrapper.write_text('''#!/usr/bin/env bash
+systemctl() { :; }
+''' + script, encoding='utf-8')
+            subprocess.run([shutil.which('bash'), str(wrapper)], check=True)
+            self.assertTrue(unit.exists())
+            self.assertTrue(binary.exists())
+
     def test_uninstall_keeps_singbox_unless_managed_unit_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -274,6 +298,37 @@ class ReconfigureSnapshotRetentionTests(unittest.TestCase):
 
 
 class HoppingRuleOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_cleanup_preserves_unowned_same_name_systemd_unit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            units = root / 'etc/systemd/system'
+            units.mkdir(parents=True)
+            unit = units / 'hy2-iptables.service'
+            unit.write_text('[Unit]\nDescription=Administrator firewall helper\n')
+            calls = root / 'calls'
+            script = (
+                'set -eo pipefail\n'
+                'HY2_META_FILE="$PWD/missing-meta.json"\n'
+                'systemctl() { printf "%s\\n" "$*" >> "$PWD/calls"; }\n'
+                'rm() { printf "%s\\n" "$*" >> "$PWD/calls"; }\n'
+                'persist_hopping_rules() { :; }\n'
+                'iptables() { if [[ "$*" == "-t nat -S PREROUTING" || "$*" == "-t nat -S OUTPUT" ]]; then return 0; fi; }\n'
+                'command() { if [[ "$1" == -v ]]; then return 1; fi; builtin command "$@"; }\n'
+                + extract_shell_function('_hy2_iptables_unit_owned') + '\n'
+                + extract_shell_function('_clear_hop_chain') + '\n'
+                + extract_shell_function('clear_all_hopping_rules') + '\n'
+                'clear_all_hopping_rules\n')
+            script = script.replace('/etc/systemd/system/hy2-iptables.service', unit.as_posix())
+            path = root / 'cleanup.sh'
+            path.write_text(script, encoding='utf-8')
+            result = subprocess.run([shutil.which('bash'), str(path)], cwd=root,
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(unit.exists())
+            call_log = calls.read_text(encoding='utf-8') if calls.exists() else ''
+            self.assertNotIn('disable --now hy2-iptables.service', call_log)
+
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
     def test_cleanup_deletes_only_marked_hysteria_rules_and_persists_removal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -377,7 +432,7 @@ class UninstallWireproxyOwnershipTests(unittest.TestCase):
             (fakebin / 'systemctl').write_text('#!/bin/sh\nexit 0\n')
             (fakebin / 'systemctl').chmod(0o755)
             start = INSTALL.index('        # 只有 systemd unit 确认为本安装器生成')
-            end = INSTALL.index('        # 证书自愈定时/事件单元', start)
+            end = INSTALL.index('        # 证书自愈单元必须匹配本安装器模板', start)
             block = INSTALL[start:end]
             block = block.replace('/etc/hysteria', hy2.as_posix())
             block = block.replace('/etc/systemd/system', units.as_posix())

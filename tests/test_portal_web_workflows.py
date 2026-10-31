@@ -66,6 +66,13 @@ class WebWorkflowTests(unittest.TestCase):
                        subprocess=SimpleNamespace(run=self.run, Popen=Mock(), TimeoutExpired=subprocess.TimeoutExpired),
                        write_gost_config=Mock(), _pick_reality_port=Mock(return_value=(8443, 'existing')),
                        unit_suspended=lambda unit: False,
+                       apply_xray_config_with_meter=Mock(), apply_xray_config_transaction=Mock(),
+                       upsert_managed_inbound=portal.upsert_managed_inbound,
+                       vmess_clients=lambda _: [{'id': 'placeholder', 'email': 'placeholder'}],
+                       vlessenc_clients=lambda _: [{'id': 'placeholder', 'email': 'placeholder'}],
+                       vmess_uuid_for_user=lambda _: '00000000-0000-4000-8000-000000000001',
+                       vlessenc_uri_for_user=lambda *a, **kw: 'vlessenc://fixture',
+                       vmess_uri_for_user=lambda *a, **kw: 'vmess://fixture',
                        _active_reality_config=lambda: self.data.get('reality_config'),
                        _active_vmess_config=lambda: self.data.get('vmess_config'),
                        _active_vlessenc_config=lambda: self.data.get('vlessenc_config'),
@@ -323,6 +330,42 @@ class WebWorkflowTests(unittest.TestCase):
                 read_clients = body.index('inbound[\'settings\'][\'clients\'] = ' + builder)
                 self.assertGreater(read_clients, lock)
 
+    def test_vmess_and_vless_save_failure_restore_xray_and_portal_state(self):
+        for method_name, config_key, tag in (
+                ('_apply_vmess_enable', 'vmess_config', portal.VMESS_INBOUND_TAG),
+                ('_apply_vlessenc_enable', 'vlessenc_config', portal.VLESSENC_INBOUND_TAG)):
+            with self.subTest(method=method_name):
+                path = self.hdir / 'xray.json'
+                original = {'inbounds': [{'tag': portal.REALITY_INBOUND_TAG, 'port': 8443}],
+                            'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}
+                path.write_text(json.dumps(original), encoding='utf-8')
+                self.ns['Path'] = lambda value: path if str(value) == '/etc/hysteria/xray.json' else (
+                    self.root / 'usr/local/bin/xray' if str(value) == '/usr/local/bin/xray' else Path(value))
+                self.ns['Path']('/usr/local/bin/xray').touch()
+                self.ns['portal_path'] = self.hdir / 'portal.json'
+                self.ns['read_meta_file'] = lambda _: {'server_name': 'node.example.com',
+                                                        'public_ip': '203.0.113.10'}
+                self.ns['_is_dns_name'] = lambda _: True
+                self.handler._vmess_certificate = lambda *a: ('cert.pem', 'key.pem', 'node.example.com')
+                self.handler._vmess_ws_path = lambda: '/fixture'
+                self.ns['managed_reserved_ports'] = lambda *a, **kw: set()
+                self.ns['_pick_reality_port'] = lambda **kw: (2087 if config_key == 'vmess_config' else 2088, '')
+                self.ns['generate_vless_encryption_pair'] = lambda: ('decryption', 'encryption')
+                self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
+                self.ns['core_operation_lock'] = threading.RLock()
+                self.ns['apply_xray_config_with_meter'] = Mock(side_effect=lambda cfg, target, *_:
+                    target.write_text(json.dumps(cfg), encoding='utf-8'))
+                self.ns['apply_xray_config_transaction'] = Mock(side_effect=lambda cfg, **kw:
+                    Path(kw['config_path']).write_text(json.dumps(cfg), encoding='utf-8'))
+                self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+                self.data.pop(config_key, None)
+                before = copy.deepcopy(original)
+                with self.assertRaisesRegex(OSError, 'disk full'):
+                    extract_method(method_name, self.ns)(self.handler)
+                self.assertEqual(json.loads(path.read_text(encoding='utf-8')), before)
+                self.assertNotIn(tag, [item.get('tag') for item in json.loads(path.read_text())['inbounds']])
+                self.assertNotIn(config_key, self.data)
+
     def test_protocol_install_paths_share_cross_process_core_lock(self):
         source = Path(portal.__file__).read_text(encoding='utf-8')
         for handler, action in (('_h_post_manage_vmess', "if action == 'enable':"),
@@ -512,6 +555,18 @@ class WebWorkflowTests(unittest.TestCase):
         status, _ = self.invoke_api({'user_id': 'qa-user', 'create_only': True, 'password': 'replacement'})
         self.assertEqual(status, 409)
         self.assertEqual(self.data['users']['qa-user'], old)
+
+    def test_api_create_only_conflict_with_usage_reconciliation_has_no_side_effects(self):
+        old = {'password': 'original-test-only', 'used_bytes': 123456, 'expires_at': 2200000000}
+        self.data['users']['qa-user'] = dict(old)
+        self.data['usage_meter'] = {'totals': {'qa-user': {'hysteria': 123456}}}
+        before = copy.deepcopy(self.data)
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'create_only': True,
+                                     'password': 'replacement', 'used_bytes': 0})
+        self.assertEqual(status, 409)
+        self.assertEqual(self.data, before)
+        self.save.assert_not_called()
+        self.sync.assert_not_called()
 
     def test_api_explicit_password_upsert_preserves_cumulative_usage(self):
         self.data['users']['qa-user'] = {'password': 'original', 'used_bytes': 123456, 'expires_at': 2200000000}
