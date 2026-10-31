@@ -262,6 +262,20 @@ class AwgEndpointTest(unittest.TestCase):
             self.assertEqual(status, 400, f'端口 {bad_port} 未被拒绝')
             self.assertIn('跳跃区间', json.loads(body)['error'])
 
+    def test_invalid_endpoint_ports_are_rejected_in_install_and_peer_add(self):
+        for endpoint in ('vpn.example.com:0', 'vpn.example.com:65536',
+                         'vpn.example.com:99999', 'vpn.example.com:025000',
+                         '[2001:db8::1]:040000', '[2001:db8::1]:25000'):
+            with self.subTest(endpoint=endpoint):
+                status, _, body = self.post(self.prefix + 'install-amneziawg',
+                    {'line': '3', 'endpoint': endpoint}, self.auth)
+                self.assertEqual(status, 400, body[:200])
+                self.assertIn('端口', json.loads(body)['error'])
+                status, _, body = self.post(self.prefix + 'manage-amneziawg',
+                    {'action': 'peer_add', 'name': 'qa-peer', 'endpoint': endpoint}, self.auth)
+                self.assertEqual(status, 400, body[:200])
+                self.assertIn('端口', json.loads(body)['error'])
+
     def test_install_rejects_non_numeric_port(self):
         status, _, body = self.post(self.prefix + 'install-amneziawg',
                                     {'line': '3', 'endpoint': 'vpn.example.com', 'port': 'abc'},

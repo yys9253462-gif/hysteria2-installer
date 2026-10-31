@@ -218,8 +218,15 @@ validate_endpoint() {
     if [[ "$ep" =~ ^[A-Za-z0-9_.-]+(:([0-9]{1,5}))?$ ]] || [[ "$ep" =~ ^\[[0-9A-Fa-f:.]+\](:([0-9]{1,5}))?$ ]]; then
         port="${BASH_REMATCH[2]}"
         # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置。
+        if [[ -n "$port" ]]; then
+            port="$((10#$port))"
+        fi
         if [[ -n "$port" ]] && (( port < 1 || port > 65535 )); then
             log_err "连接地址里的端口超出范围（1-65535）: ${ep}"
+            return 1
+        fi
+        if [[ -n "$port" ]] && (( port >= 20000 && port <= 40000 )); then
+            log_err "连接地址端口落在 Hysteria2 跳跃区间 20000-40000 内: ${ep}"
             return 1
         fi
         return 0
@@ -515,6 +522,9 @@ render_client_config() {
     priv="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .private_key' "$AWG_PEERS_FILE")"
     psk="$(jq  -r --arg n "$name" '.peers[]? | select(.name==$n) | .preshared_key' "$AWG_PEERS_FILE")"
     addr="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .address' "$AWG_PEERS_FILE")"
+    [[ -n "$endpoint" ]] || endpoint="$(jq -r --arg n "$name" \
+        '.peers[]? | select(.name==$n) | .endpoint // empty' "$AWG_PEERS_FILE")"
+    [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
     [[ -n "$priv" ]] || die "找不到客户端: ${name}"
 
@@ -683,9 +693,10 @@ cmd_peer_add() {
 
     tmp="$(mktemp "${AWG_DIR}/.peers.XXXXXX")"
     jq --arg n "$name" --arg ip "$addr" --arg priv "$priv" \
-       --arg pub "$pub" --arg psk "$psk" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       --arg pub "$pub" --arg psk "$psk" --arg ep "$endpoint" \
+       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        '.peers += [{name:$n, address:$ip, private_key:$priv, public_key:$pub,
-                    preshared_key:$psk, created_at:$ts, enabled:true}]' \
+                    preshared_key:$psk, endpoint:$ep, created_at:$ts, enabled:true}]' \
        "$AWG_PEERS_FILE" > "$tmp"
     chmod 600 "$tmp"
     mv -f "$tmp" "$AWG_PEERS_FILE"
@@ -737,7 +748,7 @@ cmd_peer_list() {
 
     if [[ "${1:-}" == "--json" ]]; then
         # 不输出私钥，避免门户页面泄露
-        jq '[.peers[]? | {name, address, public_key, created_at, enabled}]' "$AWG_PEERS_FILE"
+        jq '[.peers[]? | {name, address, endpoint, public_key, created_at, enabled}]' "$AWG_PEERS_FILE"
         return 0
     fi
 
@@ -785,8 +796,10 @@ cmd_client_conf() {
     peer_exists "$name" || die "客户端不存在: ${name}"
 
     if [[ -z "$endpoint" ]]; then
-        endpoint="$(meta_get endpoint)"
+        endpoint="$(jq -r --arg n "$name" \
+            '.peers[]? | select(.name==$n) | .endpoint // empty' "$AWG_PEERS_FILE")"
     fi
+    [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
     validate_endpoint "$endpoint" || die "连接地址非法"
 
@@ -1188,7 +1201,13 @@ cmd_qr() {
     if [[ -n "$endpoint" ]]; then
         validate_endpoint "$endpoint" || die "连接地址非法"
     fi
-    render_client_config "$name" "${endpoint:-$(meta_get endpoint)}" | qrencode -t ANSIUTF8
+    if [[ -z "$endpoint" ]]; then
+        endpoint="$(jq -r --arg n "$name" \
+            '.peers[]? | select(.name==$n) | .endpoint // empty' "$AWG_PEERS_FILE")"
+    fi
+    [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
+    [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
+    render_client_config "$name" "$endpoint" | qrencode -t ANSIUTF8
 }
 
 # 解析 "名称 [--endpoint HOST]" 形式的参数。

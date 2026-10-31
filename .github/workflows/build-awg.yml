@@ -57,13 +57,20 @@ jobs:
     steps:
       - name: 解析目标 tag 与 GOARCH
         id: meta
+        env:
+          AWG_GO_TAG_2: ${{ github.event.inputs.go_tag_2 || 'v0.2.19' }}
+          AWG_GO_TAG_3: ${{ github.event.inputs.go_tag_3 || 'v3.1.20260828' }}
         run: |
           set -euo pipefail
           case "${{ matrix.line }}" in
-            2) TAG="${{ env.AWG_GO_TAG_2 }}" ;;
-            3) TAG="${{ env.AWG_GO_TAG_3 }}" ;;
+            2) TAG="$AWG_GO_TAG_2" ;;
+            3) TAG="$AWG_GO_TAG_3" ;;
             *) echo "未知协议版本线: ${{ matrix.line }}"; exit 1 ;;
           esac
+          if [[ ! "$TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+            echo "无效的 amneziawg-go tag: $TAG" >&2
+            exit 1
+          fi
           case "${{ matrix.arch }}" in
             amd64) GOARCH=amd64; GOARM="" ;;
             arm64) GOARCH=arm64; GOARM="" ;;
@@ -213,8 +220,18 @@ jobs:
           path: artifacts
 
       - name: 组装 per-架构 tarball
+        env:
+          AWG_GO_TAG_2: ${{ github.event.inputs.go_tag_2 || 'v0.2.19' }}
+          AWG_GO_TAG_3: ${{ github.event.inputs.go_tag_3 || 'v3.1.20260828' }}
+          AWG_TOOLS_TAG: ${{ github.event.inputs.tools_tag || 'v3.1.20260812' }}
         run: |
           set -euo pipefail
+          for tag in "$AWG_GO_TAG_2" "$AWG_GO_TAG_3" "$AWG_TOOLS_TAG"; do
+            if [[ ! "$tag" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]; then
+              echo "无效的上游版本 tag: $tag" >&2
+              exit 1
+            fi
+          done
           mkdir -p dist
           for arch in amd64 arm64 armv7; do
             for line in 2 3; do
@@ -226,8 +243,8 @@ jobs:
               {
                 echo "protocol_line=awg${line}"
                 echo "arch=${arch}"
-                if [[ "$line" == "2" ]]; then echo "amneziawg-go=${{ env.AWG_GO_TAG_2 }}"; else echo "amneziawg-go=${{ env.AWG_GO_TAG_3 }}"; fi
-                echo "amneziawg-tools=${{ env.AWG_TOOLS_TAG }}"
+                if [[ "$line" == "2" ]]; then echo "amneziawg-go=$AWG_GO_TAG_2"; else echo "amneziawg-go=$AWG_GO_TAG_3"; fi
+                echo "amneziawg-tools=$AWG_TOOLS_TAG"
                 echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
                 echo "commit=${{ github.sha }}"
               } > "$stage/VERSION"

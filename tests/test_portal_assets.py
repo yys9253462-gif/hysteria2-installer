@@ -160,7 +160,7 @@ const pending=handler();
 assert.deepStrictEqual(opened,[['about:blank','_blank']]);
 assert.strictEqual(btnAddAwgPeer.disabled,true);
 response={ok:true}; resolvePost(); await pending;
-assert.strictEqual(nextTab.location,'/token/awg-conf?name=peer-1');
+assert.strictEqual(nextTab.location,'/token/awg-conf?name=peer-1&endpoint=vpn.example%3A51820');
 assert.strictEqual(btnAddAwgPeer.disabled,false);
 assert.strictEqual(awgPeerName.value,'');
 assert.strictEqual(toasts.length,1);

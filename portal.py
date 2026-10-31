@@ -6894,6 +6894,21 @@ def serve(path):
     VALID_AWG_ENDPOINT_RE = re.compile(
         r'^[A-Za-z0-9_.\-]+(?::[0-9]{1,5})?$|^\[[0-9A-Fa-f:.]+\](?::[0-9]{1,5})?$')
 
+    def awg_endpoint_error(endpoint):
+        if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
+            return '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'
+        port_match = re.search(r':([0-9]+)$', endpoint)
+        if port_match:
+            raw_port = port_match.group(1)
+            if len(raw_port) > 5:
+                return '连接地址中的端口必须是 1-65535'
+            port = int(raw_port, 10)
+            if not 1 <= port <= 65535:
+                return '连接地址中的端口必须是 1-65535'
+            if 20000 <= port <= 40000:
+                return '连接地址端口落在 Hysteria2 跳跃区间 20000-40000 内，AWG 无法收到握手包'
+        return ''
+
     # 实时速率计算滑动窗口数据结构: {uid: [(timestamp, total_bytes_tx, total_bytes_rx)]}
     speed_tracker = {}
 
@@ -7797,6 +7812,7 @@ if __name__ == '__main__':
             'ctl': Path(AWG_CTL).exists(),
             # 注意：只回传非敏感字段，私钥与预共享密钥绝不下发到前端
             'peers': [{'name': p.get('name', ''), 'address': p.get('address', ''),
+                       'endpoint': p.get('endpoint', ''),
                        'created_at': p.get('created_at', '')} for p in peers_raw],
         }
 
@@ -8822,6 +8838,7 @@ if __name__ == '__main__':
                     except (ValueError, TypeError):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid attribute'})
                     conflict = None
+                    durability_uncertain = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
                         if u is None:
@@ -8829,9 +8846,16 @@ if __name__ == '__main__':
                         elif 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
                             conflict = (409, 'Password already in use by another user')
                         else:
-                            previous = dict(u)
+                            previous = copy.deepcopy(u)
                             u.update(changes)
                             rotate_user_view_key_on_change(previous, u)
+                            try:
+                                save_data()
+                            except AtomicWriteDurabilityError:
+                                durability_uncertain = True
+                            except OSError:
+                                data['users'][user_id] = previous
+                                conflict = (503, 'User update save failed; disk state may require verification')
                             result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
                             # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
                             result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
@@ -8839,10 +8863,14 @@ if __name__ == '__main__':
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
-                    regenerate_page()
+                    if not durability_uncertain:
+                        regenerate_page()
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if durability_uncertain:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'User update saved but durability uncertain; verify and retry'})
                     return self.reply_json(200, {'ok': True, 'user_id': user_id, 'user': result})
 
                 elif sub == 'users/renew':
@@ -8867,6 +8895,7 @@ if __name__ == '__main__':
                     except (ValueError, TypeError, OverflowError):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid renewal: extend_days must be 1..36500; add_traffic_gb must be finite and 0..1000000'})
                     conflict = None
+                    durability_uncertain = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
                         if not u:
@@ -8887,18 +8916,32 @@ if __name__ == '__main__':
                                 # 不能无条件写 status='active'：管理员因滥用手动停用的
                                 # 用户，控制台一续费就会被静默恢复可用（2026-10-29 修）。
                                 # 到期与否由 expires_at 判定，不依赖 status。
+                                previous = copy.deepcopy(u)
                                 u.update(expires_at=new_expiry, limit_bytes=new_limit)
+                                try:
+                                    save_data()
+                                except AtomicWriteDurabilityError:
+                                    durability_uncertain = True
+                                except OSError:
+                                    data['users'][user_id] = previous
+                                    conflict = (503, 'Renewal save failed; disk state may require verification')
                                 exp_at = u['expires_at']
                                 lim_b = u.get('limit_bytes', 0)
                                 status_now = u.get('status', 'active')
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
-                    regenerate_page()
+                    if conflict is not None:
+                        return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
+                    if not durability_uncertain:
+                        regenerate_page()
                     # 续费后立即同步协议客户端：过期用户续费后不必等 5 秒的
                     # 后台 worker 才恢复连接。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if durability_uncertain:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'Renewal saved but durability uncertain; verify and retry'})
                     return self.reply_json(200, {'ok': True, 'user_id': user_id,
                                                  'expires_at': exp_at, 'limit_bytes': lim_b,
                                                  'traffic_gb': round(lim_b / (1024**3), 3),
@@ -9688,9 +9731,9 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': '必须提供客户端连接地址（域名或公网 IP）'})
                 # 连接地址必须是「域名或 IP:端口」形态：含换行/空白会让
                 # render_client_config 把任意行注入客户端配置文件（2026-10-28 修）。
-                if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
-                    return self.reply_json(400, {'ok': False,
-                        'error': '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'})
+                endpoint_error = awg_endpoint_error(endpoint)
+                if endpoint_error:
+                    return self.reply_json(400, {'ok': False, 'error': endpoint_error})
                 # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃冲突的取值
                 if port:
                     if not port.isdigit() or not (1 <= int(port) <= 65535):
@@ -9755,10 +9798,9 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': '客户端名称只允许字母、数字、点、下划线、连字符，长度 1-32'})
                     if not endpoint:
                         return self.reply_json(400, {'ok': False, 'error': '必须提供连接地址'})
-                    # 与安装通道同一校验：换行/空白能注入客户端配置行（2026-10-28 修）。
-                    if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
-                        return self.reply_json(400, {'ok': False,
-                            'error': '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'})
+                    endpoint_error = awg_endpoint_error(endpoint)
+                    if endpoint_error:
+                        return self.reply_json(400, {'ok': False, 'error': endpoint_error})
                     # peer-add 会生成密钥并渲染服务端配置，90 秒超时。
                     if not self._extend_deadline(120, heavy=True):
                         return self.reply_json(409, {'ok': False, 'error':
@@ -10390,12 +10432,21 @@ if __name__ == '__main__':
                 if name not in ('xray', 'sing-box'):
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里安装该核心'})
                 with core_operation_lock:
-                    if name == 'xray':
-                        ok, msg = install_xray_binary()
-                        if ok:
-                            write_xray_unit()
-                    else:
-                        ok, msg = install_singbox()
+                    try:
+                        core_lock_fd = acquire_core_operation_lock()
+                    except RuntimeError as exc:
+                        if str(exc) == 'another core operation is running':
+                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                        raise
+                    try:
+                        if name == 'xray':
+                            ok, msg = install_xray_binary()
+                            if ok:
+                                write_xray_unit()
+                        else:
+                            ok, msg = install_singbox()
+                    finally:
+                        os.close(core_lock_fd)
                 return self.reply_json(200 if ok else 500, {'ok': ok, ('message' if ok else 'error'): msg})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -11938,12 +11989,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply(404, b'Client not found')
 
                 # 连接地址优先用查询参数，其次用安装时记录的 endpoint
-                endpoint = (query.get('endpoint', [''])[0] or '').strip() or awg_state()['endpoint']
+                endpoint = ((query.get('endpoint', [''])[0] or '').strip()
+                            or next((p.get('endpoint', '') for p in peers_now
+                                     if p.get('name') == name and p.get('endpoint')), '')
+                            or awg_state()['endpoint'])
                 if not endpoint:
                     return self.reply(400, b'Endpoint not configured; re-run install with an endpoint')
-                # 与 POST 通道同一校验：换行/空白能注入客户端配置行。
-                if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
-                    return self.reply(400, b'Invalid endpoint format')
+                endpoint_error = awg_endpoint_error(endpoint)
+                if endpoint_error:
+                    return self.reply(400, endpoint_error.encode('utf-8'))
 
                 try:
                     rc, out, err = awg_run(['client-conf', name, '--endpoint', endpoint], timeout=60)

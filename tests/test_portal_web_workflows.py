@@ -75,6 +75,7 @@ class WebWorkflowTests(unittest.TestCase):
         self.handler = SimpleNamespace(is_authenticated=lambda: True, server=SimpleNamespace(),
             _sync_reality_clients=self.sync, _reply_with_warp_apply=lambda payload: self.reply_json(200, payload),
             _generate_and_apply_reality=Mock(), _reality_restart_allowed=Mock(return_value=True),
+            _extend_deadline=lambda *args, **kwargs: True,
             check_rate_limit=lambda **kwargs: True, verify_api_key=lambda: True)
         self.handler._manage_proxy_operation = lambda action, params: extract_method('_manage_proxy_operation', self.ns)(self.handler, action, params)
         self.handler._reply_with_egress_apply = lambda payload, kind='outbound': self.reply_json(200, payload)
@@ -225,13 +226,73 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertFalse(body.get('ok'))
         self.assertEqual(self.data['proxy_services'], [])
 
-    def invoke_api(self, payload):
+    def invoke_core_install(self, name='xray'):
+        self.handler.path = '/test-token/install-core'
+        body = urlencode({'name': name}).encode()
+        self.handler.headers = {'Content-Length': str(len(body))}
+        self.handler.rfile = io.BytesIO(body)
+        return extract_method('_h_post_install_core', self.ns)(self.handler, '/test-token/')
+
+    def test_core_install_returns_conflict_when_cross_process_lock_is_held(self):
+        self.ns['acquire_core_operation_lock'] = Mock(
+            side_effect=RuntimeError('another core operation is running'))
+        install = self.ns['install_xray_binary'] = Mock()
+        status, body = self.invoke_core_install()
+        self.assertEqual(status, 409)
+        self.assertFalse(body['ok'])
+        install.assert_not_called()
+
+    def test_core_install_releases_cross_process_lock_after_operation(self):
+        acquire = Mock(return_value=17)
+        closed = []
+        self.ns['acquire_core_operation_lock'] = acquire
+        self.ns['os'] = SimpleNamespace(close=closed.append)
+        self.ns['install_xray_binary'] = Mock(return_value=(True, 'installed'))
+        self.ns['write_xray_unit'] = Mock()
+        status, body = self.invoke_core_install()
+        self.assertEqual(status, 200)
+        self.assertTrue(body['ok'])
+        acquire.assert_called_once_with()
+        self.assertEqual(closed, [17])
+
+    def invoke_api(self, payload, endpoint='users/create'):
         body = json.dumps(payload).encode()
-        self.handler.path = '/api/v1/users/create'
+        self.handler.path = '/api/v1/' + endpoint
         self.handler.headers = {'Content-Length': str(len(body))}
         self.handler.rfile = io.BytesIO(body)
         extract_method('do_POST', self.ns)(self.handler)
         return self.response
+
+    def test_api_update_and_renew_persist_user_changes(self):
+        self.data['users']['qa-user'] = {'password': 'old', 'status': 'active',
+            'expires_at': 2200000000, 'limit_bytes': 10, 'ip_limit': 0}
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'password': 'new', 'ip_limit': 2},
+                                    'users/update')
+        self.assertEqual(status, 200)
+        persisted_update = copy.deepcopy(self.data['users']['qa-user'])
+        self.assertEqual(persisted_update['password'], 'new')
+        self.assertEqual(persisted_update['ip_limit'], 2)
+        self.assertGreaterEqual(self.save.call_count, 2)  # user data plus generated page
+        self.save.reset_mock()
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'extend_days': 30,
+                                    'add_traffic_gb': 1}, 'users/renew')
+        self.assertEqual(status, 200)
+        persisted_renew = copy.deepcopy(self.data['users']['qa-user'])
+        self.assertGreater(persisted_renew['expires_at'], persisted_update['expires_at'])
+        self.assertGreater(persisted_renew['limit_bytes'], persisted_update['limit_bytes'])
+        self.assertGreaterEqual(self.save.call_count, 2)
+
+    def test_api_update_and_renew_restore_memory_on_save_failure(self):
+        original = {'password': 'old', 'status': 'active', 'expires_at': 2200000000,
+                    'limit_bytes': 10, 'ip_limit': 0}
+        self.data['users']['qa-user'] = copy.deepcopy(original)
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'password': 'new'}, 'users/update')
+        self.assertEqual(status, 503)
+        self.assertEqual(self.data['users']['qa-user'], original)
+        status, _ = self.invoke_api({'user_id': 'qa-user', 'extend_days': 30}, 'users/renew')
+        self.assertEqual(status, 503)
+        self.assertEqual(self.data['users']['qa-user'], original)
 
     def test_api_reconciles_absolute_usage_against_measured_ledger(self):
         self.data['users']['qa-user'] = {'password': 'original', 'used_bytes': 50,

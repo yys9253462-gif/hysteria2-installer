@@ -203,7 +203,7 @@ for line in 2 3; do
     meta_set port "52341"
     meta_set server_private_key "$(head -c 32 /dev/urandom | base64)"
     meta_set server_public_key  "$(head -c 32 /dev/urandom | base64)"
-    meta_set endpoint "vpn.example.com"
+    meta_set endpoint "global.example.com"
     meta_set Jc "$AWG_JC";     meta_set Jmin "$AWG_JMIN"; meta_set Jmax "$AWG_JMAX"
     meta_set S1 "$AWG_S1";     meta_set S2 "$AWG_S2"
     meta_set S3 "$AWG_S3";     meta_set S4 "$AWG_S4"
@@ -214,13 +214,13 @@ for line in 2 3; do
     fi
 
     # 加一个客户端
-    jq '.peers += [{name:"phone", address:"10.66.66.2",
+    jq '.peers += [{name:"phone", address:"10.66.66.2", endpoint:"vpn.example.com:51820",
                     private_key:"CPRIV", public_key:"CPUB", preshared_key:"CPSK",
                     created_at:"2026-01-01T00:00:00Z", enabled:true}]' \
        "$AWG_PEERS_FILE" > "${AWG_PEERS_FILE}.tmp" && mv "${AWG_PEERS_FILE}.tmp" "$AWG_PEERS_FILE"
 
     render_server_config
-    CLIENT_TEXT="$(render_client_config "phone" "vpn.example.com")"
+    CLIENT_TEXT="$(render_client_config "phone" "")"
     SERVER_TEXT="$(cat "$AWG_CONFIG")"
 
     # 9 个必须对齐的混淆参数
@@ -263,7 +263,7 @@ for line in 2 3; do
 
     # 客户端必备项
     check_eq "  客户端 Address 为 /32" "$(conf_get "$CLIENT_TEXT" "Address")" "10.66.66.2/32"
-    check_eq "  客户端 Endpoint 带端口" "$(conf_get "$CLIENT_TEXT" "Endpoint")" "vpn.example.com:52341"
+    check_eq "  客户端 Endpoint 使用客户端自定义值" "$(conf_get "$CLIENT_TEXT" "Endpoint")" "vpn.example.com:51820"
     check_eq "  客户端 AllowedIPs 全流量" "$(conf_get "$CLIENT_TEXT" "AllowedIPs")" "0.0.0.0/0"
     check_eq "  客户端含 PresharedKey" "$(conf_get "$CLIENT_TEXT" "PresharedKey")" "CPSK"
 done
@@ -343,6 +343,15 @@ meta_set line "2"
 check_eq "meta 指定后协议线为 2" "$(version_line)" "2"
 meta_set line "9"
 check_eq "非法协议线回退为 3" "$(version_line)" "3"
+
+# Endpoint 端口必须按十进制判断，包括前导零形式；跳跃区间不可被绕过。
+endpoint_ok() { ( validate_endpoint "$1" ) >/dev/null 2>&1; }
+for ep in vpn.example.com:20000 vpn.example.com:025000 '[2001:db8::1]:040000' vpn.example.com:00000 vpn.example.com:65536; do
+    if endpoint_ok "$ep"; then bad "非法 Endpoint 端口被放行: $ep"; else ok; fi
+done
+for ep in vpn.example.com:019999 vpn.example.com:040001 '[2001:db8::1]:050000'; do
+    if endpoint_ok "$ep"; then ok; else bad "合法十进制 Endpoint 端口被拒绝: $ep"; fi
+done
 
 # ==============================================================================
 section "6. 随机数工具"

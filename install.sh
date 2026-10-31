@@ -5378,7 +5378,19 @@ check_arch
 
 if [[ $# -gt 0 ]]; then
     case "$1" in
+        install|update|info|refresh-page|status|restart|uninstall|awg-menu|awg-status|awg-update|awg-uninstall)
+            if [[ $# -ne 1 ]]; then
+                log_err "命令 $1 不接受额外参数。"
+                exit 2
+            fi
+            ;;
+    esac
+    case "$1" in
         install)
+            # 免交互重装也要先留出与菜单安装相同的恢复快照。
+            if [[ -f "$HY2_DIR/config.yaml" || -f "$HY2_META_FILE" ]]; then
+                backup_state_before_reconfigure || exit 1
+            fi
             # 免交互重装时默认沿用现有门户（凭据、API Key、订阅地址、用户），
             # 要彻底重建请显式传 HY2_PRESERVE_PORTAL=0。
             if [[ -f "$HY2_DIR/portal.json" ]]; then
@@ -5400,10 +5412,7 @@ if [[ $# -gt 0 ]]; then
             show_client_configs
             ;;
         update)
-            require_installed || exit 1
-            scrub_caddy_identity || true
-            install_binary
-            traffic_suspended || restart_service
+            flow_update_core
             ;;
         info)
             show_client_configs

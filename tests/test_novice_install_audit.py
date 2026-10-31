@@ -306,6 +306,13 @@ class TestBackupBeforeReconfigure(unittest.TestCase):
                 self.assertTrue(list(td.glob(name + ".bak-*")),
                                 f"{name} 没有快照")
 
+    def test_command_line_install_saves_snapshot_before_overwriting_state(self):
+        source = INSTALL.read_text(encoding='utf-8')
+        start = source.index('        install)\n', source.index('# 命令行直通参数'))
+        branch = source[start:source.index('        update)', start)]
+        self.assertLess(branch.index('backup_state_before_reconfigure || exit 1'),
+                        branch.index('install_dependencies'))
+
     def test_snapshot_failure_aborts_reconfiguration(self):
         flow = INSTALL.read_text(encoding='utf-8')
         self.assertIn('backup_state_before_reconfigure || return 1', flow)

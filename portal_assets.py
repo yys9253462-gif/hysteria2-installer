@@ -3177,7 +3177,7 @@ function renderAwgPeers(peers) {
   awgPeerTbody.innerHTML = peers.map(p => {
     const enc = encodeURIComponent(p.name);
     const bs = 'padding:3px 10px;font-size:11px';
-    return '<tr>'
+    return '<tr data-awg-endpoint="' + obEsc(p.endpoint || '') + '">'
       // 名称/地址虽受后端正则限制，仍统一走 obEsc —— 与其他表格保持同一套转义习惯。
       + '<td><strong>' + obEsc(p.name) + '</strong></td>'
       + '<td>' + obEsc(p.address) + '</td>'
@@ -3191,12 +3191,16 @@ function renderAwgPeers(peers) {
 
   awgPeerTbody.querySelectorAll('[data-awg-conf]').forEach(b => {
     b.addEventListener('click', () => {
-      window.open(location.pathname + 'awg-conf?name=' + b.getAttribute('data-awg-conf'), '_blank');
+      const row = b.closest('tr');
+      const endpoint = row && row.dataset.awgEndpoint ? '&endpoint=' + encodeURIComponent(row.dataset.awgEndpoint) : '';
+      window.open(location.pathname + 'awg-conf?name=' + b.getAttribute('data-awg-conf') + endpoint, '_blank');
     });
   });
   awgPeerTbody.querySelectorAll('[data-awg-qr]').forEach(b => {
     b.addEventListener('click', () => {
-      window.open(location.pathname + 'awg-qr.svg?name=' + b.getAttribute('data-awg-qr'), '_blank');
+      const row = b.closest('tr');
+      const endpoint = row && row.dataset.awgEndpoint ? '&endpoint=' + encodeURIComponent(row.dataset.awgEndpoint) : '';
+      window.open(location.pathname + 'awg-qr.svg?name=' + b.getAttribute('data-awg-qr') + endpoint, '_blank');
     });
   });
   awgPeerTbody.querySelectorAll('[data-awg-del]').forEach(b => {
@@ -3252,7 +3256,8 @@ if (btnAddAwgPeer) {
       const json = await awgPost('manage-amneziawg', { action: 'peer_add', name: name, endpoint: endpoint });
       if (json.ok) {
         if (awgPeerName) awgPeerName.value = '';
-        const confUrl = location.pathname + 'awg-conf?name=' + encodeURIComponent(name);
+        const confUrl = location.pathname + 'awg-conf?name=' + encodeURIComponent(name)
+          + '&endpoint=' + encodeURIComponent(endpoint);
         if (confTab) confTab.location = confUrl;
         else showToast('客户端已新增，请用列表中的“配置”按钮打开配置', 'success');
         if (confTab) showToast('已新增客户端 ' + name + '，正在打开配置', 'success');

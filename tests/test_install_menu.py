@@ -206,6 +206,44 @@ if [[ "$managed_singbox" == 1 ]]; then rm -f "$BINARY"; fi
             self.assertFalse(binary.exists())
 
 
+class DirectCommandArgumentTests(unittest.TestCase):
+    def test_simple_commands_reject_extra_arguments(self):
+        source = (ROOT / 'install.sh').read_text(encoding='utf-8')
+        start = source.index('if [[ $# -gt 0 ]]; then', source.index('# 命令行直通参数'))
+        end = source.index('        install)', start)
+        guard = source[start:end]
+        for command in ('install', 'update', 'info', 'refresh-page', 'status',
+                        'restart', 'uninstall', 'awg-menu', 'awg-status',
+                        'awg-update', 'awg-uninstall'):
+            self.assertIn(command, guard)
+        self.assertIn('if [[ $# -ne 1 ]]', guard)
+
+
+class AwgBuildWorkflowInputTests(unittest.TestCase):
+    def test_go_tags_are_read_from_env_and_validated_before_checkout(self):
+        workflow = (ROOT / '.github/workflows/build-awg.yml').read_text(encoding='utf-8')
+        start = workflow.index('      - name: 解析目标 tag 与 GOARCH')
+        end = workflow.index('      - name: 检出 amneziawg-go', start)
+        step = workflow[start:end]
+        self.assertIn('AWG_GO_TAG_2: ${{ github.event.inputs.go_tag_2', step)
+        self.assertIn('AWG_GO_TAG_3: ${{ github.event.inputs.go_tag_3', step)
+        self.assertIn('TAG="$AWG_GO_TAG_2"', step)
+        self.assertIn('TAG="$AWG_GO_TAG_3"', step)
+        self.assertIn('[[ ! "$TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]', step)
+        self.assertNotIn('${{ env.AWG_GO_TAG_', step[step.index('        run: |'):])
+
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_tag_validation_accepts_release_tag_and_rejects_shell_syntax(self):
+        validator = '[[ "$TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z._+-]*$ ]]'
+        for tag, expected in (('v0.2.19', 0), ('v3.1.20260828', 0),
+                              ('v1.2.3; touch /tmp/workflow-injected', 1),
+                              ('$(touch /tmp/workflow-injected)', 1)):
+            with self.subTest(tag=tag):
+                result = subprocess.run([shutil.which('bash'), '-c', validator],
+                    env=dict(os.environ, TAG=tag), capture_output=True, check=False)
+                self.assertEqual(result.returncode, expected)
+
+
 class ReconfigureSnapshotRetentionTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
     def test_retains_five_old_snapshots_plus_current_snapshot(self):
