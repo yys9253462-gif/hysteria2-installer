@@ -11,10 +11,11 @@
 - **Hysteria 2 主协议**：官方二进制（amd64 / arm64 / armv7），默认开启端口跳跃（UDP 20000-40000）与 Salamander 混淆；证书支持自签、已有证书或域名自动申请 Let's Encrypt。
 - **备用通道（可选，网页一键启停）**：
   - **VLESS-Reality**（TCP）：借用大厂证书握手，无需域名；
-  - **VMess-WS-TLS**、**VLESS Encryption**（后量子密钥交换）、**AnyTLS**：需要域名与可信证书。
+  - **VMess-WS-TLS**、**VLESS Encryption**（后量子密钥交换）、**AnyTLS**：需要域名与可信证书；
+  - **TUIC v5**（QUIC / UDP，sing-box 承载）：需要域名与可信证书，端口自动从 41000-49999 选取（避开端口跳跃区间），云安全组需放行该 UDP 端口。
   - 订阅里与 Hy2 一起下发，Clash / sing-box 用 url-test 自动择优，UDP 被限时自动走 TCP。
   - ⚠️ **AnyTLS 的流量暂不计入用户已用流量，也不占用「同时在线 IP」名额**：它由独立的 sing-box 进程承载，而上游的 Clash API 不暴露按用户的用量。停用 / 到期 / 超额仍会同步收回它的登录凭据，但仅靠 AnyTLS 无法触发额度限制 —— 对计费敏感的用户请以 Hy2 或 Xray 协议为主。
-- **核心管理页**：集中查看 Hysteria 2 / Xray / sing-box / GOST / WARP / AmneziaWG 的安装状态、版本与服务状态，Xray 与 sing-box 可在此安装 / 卸载。
+- **核心管理页**：集中查看 Hysteria 2 / Xray / sing-box / GOST / WARP / AmneziaWG 的安装状态、版本与服务状态，Xray 与 sing-box（AnyTLS / TUIC 共用）可在此安装 / 卸载。
 - **扩展服务**：GOST 入站代理（SOCKS5 / HTTP / HTTPS）、Cloudflare WARP 分流（AI 站点走干净出口）、AmneziaWG 抗 DPI VPN。
 - **多用户**：每个用户独立的到期时间、流量额度、同时在线 IP 限制，按真实流量计量；停用 / 到期 / 超额 / 删除即时在所有协议上收回并断开现有连接。
 - **集群节点**：内置 REST API，可接入 Teyir 控制台或发卡商城，支持整机流量超额停用 / 恢复。
@@ -135,6 +136,7 @@ PANEL_ADMIN_TOKEN=<JWT> python3 panel-join.py --register --panel https://你的�
 | `/etc/hysteria/portal-access.json` | 门户地址、登录凭据、API Key |
 | `/etc/hysteria/xray.json` | Reality / VMess / VLESS Encryption |
 | `/etc/hysteria/anytls.json` | AnyTLS（sing-box） |
+| `/etc/hysteria/tuic.json` | TUIC v5（sing-box） |
 | `/etc/hysteria/gost.yml` | GOST 代理 |
 | `/etc/wireguard/` | WARP（wgcf / wireproxy） |
 | `/etc/amnezia/amneziawg/` | AmneziaWG |

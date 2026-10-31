@@ -2663,6 +2663,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <button class="subtab-btn" data-subtab="vmess" type="button">🧩 VMess 兼容通道</button>
     <button class="subtab-btn" data-subtab="vlessenc" type="button">🔐 VLESS Encryption</button>
     <button class="subtab-btn" data-subtab="anytls" type="button">🧬 AnyTLS</button>
+    <button class="subtab-btn" data-subtab="tuic" type="button">🛸 TUIC</button>
     <button class="subtab-btn" data-subtab="cert" type="button">🔐 证书状态</button>
     <button class="subtab-btn" data-subtab="bbr" type="button">🚀 BBR 加速</button>
   </div>
@@ -2907,6 +2908,66 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
               <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">sing-box 版本</div>
               <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="anytls-ver-val">-</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+  </div>
+  <div class="subtab-pane" id="sub-tuic">
+  <!-- TUIC（2026-10-31 加）：由独立的 sing-box 进程 hy2-tuic 承载，与 AnyTLS 互不影响。 -->
+  <section class="card" style="margin-bottom:22px">
+    <div class="user-header">
+      <div>
+        <h2>🛸 TUIC v5 通道</h2>
+        <p style="font-size:13px">基于 QUIC（UDP）的代理协议，0-RTT 握手、BBR 拥塞控制，UDP 原生转发。由 sing-box 承载，与 Hy2、AnyTLS、Xray 上的协议互不影响</p>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <span class="status-pill" id="tuic-badge" style="background:#f1efe8;color:#5f5e5a">检测中...</span>
+        <button class="button primary js-goto" data-goto="cores" id="tuic-goto-cores" type="button" style="padding:6px 14px;font-size:12px;display:none">🧱 前往核心管理安装</button>
+        <button class="toggle-btn off" id="btn-toggle-tuic" type="button" style="display:none">切换中...</button>
+      </div>
+    </div>
+    <div class="warp-switch-card" style="background:#f7f9fc;border-color:#d7e2ee">
+      <div class="warp-desc-title" style="color:#1a365d">🛸 启用前须知</div>
+      <p class="warp-desc-text" style="color:#4a5568">
+        TUIC 内置 TLS 1.3，<b>必须已绑定域名且持有可被客户端校验的证书</b>（与 VMess / AnyTLS 相同）。
+        需要先在「核心管理」安装 sing-box（1.12+）。端口为 <b>UDP</b>，自动从 41000-49999 选取以避开 Hy2 的端口跳跃区间；
+        云安全组需要放行该 UDP 端口。UDP 被限速或封锁的网络里它和 Hy2 一样会受影响。
+        客户端：Clash Verge / mihomo、sing-box、v2rayN、NekoBox、Shadowrocket 等。
+        每个用户有独立的 UUID 与密码，停用 / 到期 / 超额会同步收回。<b>TUIC 的流量暂不计入用户已用流量。</b>
+      </p>
+    </div>
+    <div id="tuic-content-box" style="display:none">
+      <div class="layout" style="margin-top:10px">
+        <section class="card qr-card" style="background:#fbfcfd;border-color:var(--line)">
+          <div class="eyebrow" style="color:#0f766e">TUIC</div>
+          <h2>TUIC 扫码</h2>
+          <p class="hint">机主账号的连接；其他用户请用「专属连接」</p>
+          <div class="qr-frame" style="max-width:220px;margin:16px auto;padding:10px"><div id="tuic-qr-box" style="width:100%;height:auto"></div></div>
+          <div class="tags"><span class="tag">TUIC</span><span class="tag">QUIC</span><span class="tag" id="tuic-port-tag">UDP --</span></div>
+        </section>
+        <div class="stack">
+          <section class="card" style="border-color:#d7e2ee">
+            <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>TUIC 直链 (URI)</h2><p>tuic:// 格式（v5），导入即用</p></div></div>
+            <textarea class="link" id="tuic-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <div class="actions" style="margin-top:12px">
+              <button class="button primary" id="btn-copy-tuic-uri" type="button">复制 TUIC 直链</button>
+            </div>
+          </section>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">域名 / SNI</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="tuic-domain-val">-</div>
+            </div>
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">监听端口</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="tuic-tcp-val">-</div>
+            </div>
+            <div style="background:#fbfcfd;border:1px solid var(--line);border-radius:12px;padding:12px">
+              <div style="font-size:11px;color:var(--muted);font-weight:700;margin-bottom:2px">sing-box 版本</div>
+              <div style="font-size:13px;font-weight:750;color:var(--ink);font-family:monospace" id="tuic-ver-val">-</div>
             </div>
           </div>
         </div>
@@ -4572,14 +4633,15 @@ def anytls_uri_for_user(acfg, user_id, label=None):
     return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
 
 
-def apply_anytls_config(config, config_path, restart=True, run=subprocess.run):
+def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
+                        service=ANYTLS_SERVICE):
     """原子应用 sing-box 配置：预检 → 替换 → 重启 → 核对，任何一步失败就回滚。
 
-    调用方必须持有 anytls_apply_lock。
+    调用方必须持有对应协议的 apply 锁（AnyTLS / TUIC 共用此函数，service 区分单元）。
     """
     config_path = Path(config_path)
     original = config_path.read_bytes() if config_path.exists() else None
-    candidate = config_path.with_name('anytls.candidate.json')
+    candidate = config_path.with_name(config_path.stem + '.candidate.json')
     candidate.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding='utf-8')
     os.chmod(str(candidate), 0o600)
     replaced = False
@@ -4589,9 +4651,9 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run):
         candidate.replace(config_path)
         replaced = True
         if restart:
-            run(['systemctl', 'reset-failed', ANYTLS_SERVICE], capture_output=True, timeout=5)
-            run(['systemctl', 'restart', ANYTLS_SERVICE], capture_output=True, timeout=15, check=True)
-            run(['systemctl', 'is-active', '--quiet', ANYTLS_SERVICE],
+            run(['systemctl', 'reset-failed', service], capture_output=True, timeout=5)
+            run(['systemctl', 'restart', service], capture_output=True, timeout=15, check=True)
+            run(['systemctl', 'is-active', '--quiet', service],
                 capture_output=True, timeout=5, check=True)
     except Exception:
         if replaced:
@@ -4600,7 +4662,7 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run):
             else:
                 config_path.write_bytes(original)
             if restart and original is not None:
-                run(['systemctl', 'restart', ANYTLS_SERVICE], capture_output=True, timeout=15)
+                run(['systemctl', 'restart', service], capture_output=True, timeout=15)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -4640,6 +4702,170 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None):
         matches = [item for item in inbounds if item.get('tag') == ANYTLS_INBOUND_TAG]
         if len(matches) != 1:
             raise ValueError('missing or duplicate AnyTLS inbound; cannot confirm user sync')
+        inbound = matches[0]
+        if inbound.get('users') == wanted:
+            return False
+        inbound['users'] = wanted
+        apply(config, path, restart=service_active())
+        return True
+
+
+# ---- TUIC v5（2026-10-31 加，由 sing-box 承载）----
+#
+# TUIC 基于 QUIC（UDP），与 AnyTLS 一样跑在**独立的 sing-box 进程**里
+# （systemd 单元 hy2-tuic，配置 /etc/hysteria/tuic.json），两者启停互不影响。
+# 需要域名 + 可信证书（QUIC 内置 TLS 1.3）。端口是 UDP，必须避开 Hy2 的
+# 监听端口与端口跳跃区间 20000-40000（落进去的包会被 DNAT 给 Hy2），默认从
+# 41000-49999 里挑（AWG 用 50000-59000）。
+# uuid 与密码都由节点 secret 做 HMAC 派生：user_id 出现在分享链接里，不能直接用。
+TUIC_SERVICE = 'hy2-tuic'
+TUIC_CONFIG_NAME = 'tuic.json'
+TUIC_INBOUND_TAG = 'tuic-in'
+TUIC_PORT_RANGE = (41000, 49999)
+TUIC_UNIT_CONTENT = ANYTLS_UNIT_CONTENT.replace(
+    'AnyTLS (sing-box)', 'TUIC (sing-box)').replace('/etc/hysteria/anytls.json', '/etc/hysteria/tuic.json')
+# tuic.json 的读-改-写与启停都在这把锁内。
+tuic_apply_lock = threading.Lock()
+
+
+def tuic_credentials_for_user(secret, user_id):
+    """(uuid, password) —— 由节点 secret 派生，稳定且不可猜。"""
+    digest = hmac.new(str(secret).encode('utf-8'), ('hy2-portal-tuic:' + str(user_id)).encode('utf-8'),
+                      hashlib.sha256).digest()
+    return str(uuid.UUID(bytes=digest[:16], version=4)), digest[16:].hex()
+
+
+def tuic_config(data):
+    """TUIC 配置字典；被改成数字/字符串时按未配置处理（同 anytls_config）。"""
+    cfg = data.get('tuic_config') if isinstance(data, dict) else None
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def tuic_users(data):
+    """TUIC 入站的 users —— 同一套准入判据 user_access_allowed；空表给稳定占位用户。"""
+    secret = tuic_config(data).get('secret')
+    secret = secret if isinstance(secret, str) else ''
+    users = []
+    if secret:
+        all_users = user_table(data)
+        for uid in sorted(all_users):
+            if user_access_allowed(all_users.get(uid) or {}):
+                u, pwd = tuic_credentials_for_user(secret, uid)
+                users.append({'name': uid, 'uuid': u, 'password': pwd})
+    if not users:
+        u, pwd = tuic_credentials_for_user(secret or 'tuic-placeholder', 'placeholder')
+        users = [{'name': 'placeholder', 'uuid': u, 'password': pwd}]
+    return users
+
+
+def build_tuic_config(tcfg, users, cert_file, key_file):
+    """sing-box 完整配置（只有一个 tuic 入站）；出站同样先 resolve 再拒内网。"""
+    return {
+        'log': {'level': 'warn', 'timestamp': True},
+        'inbounds': [{
+            'type': 'tuic',
+            'tag': TUIC_INBOUND_TAG,
+            'listen': '::',
+            'listen_port': int(tcfg['port']),
+            'users': users,
+            'congestion_control': 'bbr',
+            'tls': {
+                'enabled': True,
+                'server_name': tcfg.get('sni') or tcfg.get('domain'),
+                'alpn': ['h3'],
+                'certificate_path': cert_file,
+                'key_path': key_file,
+            },
+        }],
+        'outbounds': [{'type': 'direct', 'tag': 'direct'}],
+        'route': {
+            'rules': [
+                {'action': 'resolve'},
+                {'ip_cidr': list(PRIVATE_REJECT_RULES), 'action': 'reject'},
+            ],
+            'final': 'direct',
+        },
+    }
+
+
+def tuic_uri_for_user(tcfg, user_id, label=None):
+    """tuic:// 直链（v2rayN / NekoBox / Shadowrocket / mihomo 通用格式）。"""
+    if not isinstance(tcfg, dict):
+        return ''
+    secret = tcfg.get('secret')
+    if not isinstance(secret, str) or not secret:
+        return ''
+    host = tcfg.get('domain')
+    port = _valid_port(tcfg.get('port'))
+    if not (host and port):
+        return ''
+    u, pwd = tuic_credentials_for_user(secret, user_id)
+    params = urlencode({'sni': tcfg.get('sni') or host, 'alpn': 'h3',
+                        'congestion_control': 'bbr', 'udp_relay_mode': 'native'})
+    return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(label or ('TUIC-' + str(user_id)))}"
+
+
+def pick_tuic_port(preferred, blocked, listening=None):
+    """挑一个 UDP 端口：preferred 可用就沿用，否则从 TUIC_PORT_RANGE 里找空闲的。
+
+    返回 0 表示找不到。20000-40000 是 Hy2 端口跳跃区间，任何情况都不能用。
+    """
+    listening = _listening_ports() if listening is None else listening
+    bad = set()
+    for p in blocked or ():
+        try:
+            bad.add(int(p))
+        except (TypeError, ValueError):
+            pass
+
+    def usable(p, own=False):
+        if isinstance(p, bool):
+            return False
+        try:
+            p = int(p)
+        except (TypeError, ValueError):
+            return False
+        if not 1024 <= p <= 65535 or 20000 <= p <= 40000 or p in bad:
+            return False
+        # 自己的旧端口：重新启用前 sing-box 已停，监听表里残留也不算冲突。
+        return own or p not in listening
+
+    if usable(preferred, own=True):
+        return int(preferred)
+    lo, hi = TUIC_PORT_RANGE
+    candidates = list(range(lo, hi + 1))
+    random.shuffle(candidates)
+    for p in candidates:
+        if usable(p):
+            return p
+    return 0
+
+
+def sync_tuic_users(root, snapshot, apply=None, service_active=None):
+    """把 tuic.json 的 users 对齐到当前准入名单；规则同 sync_anytls_users。"""
+    path = Path(root) / TUIC_CONFIG_NAME
+    if not isinstance(snapshot, dict):
+        return False
+    section = snapshot.get('tuic_config')
+    if not path.exists() or not (isinstance(section, dict) and section.get('enabled')):
+        return False
+    if apply is None:
+        def apply(cfg, cfg_path, restart=True):
+            apply_anytls_config(cfg, cfg_path, restart=restart, service=TUIC_SERVICE)
+    if service_active is None:
+        service_active = lambda: _systemd_state(TUIC_SERVICE) == 'active'  # noqa: E731
+    with tuic_apply_lock:
+        try:
+            config = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError('TUIC configuration unreadable; cannot confirm user sync') from exc
+        wanted = tuic_users(snapshot)
+        inbounds = config.get('inbounds') if isinstance(config, dict) else None
+        if not isinstance(inbounds, list) or any(not isinstance(item, dict) for item in inbounds):
+            raise ValueError('invalid TUIC inbounds; cannot confirm user sync')
+        matches = [item for item in inbounds if item.get('tag') == TUIC_INBOUND_TAG]
+        if len(matches) != 1:
+            raise ValueError('missing or duplicate TUIC inbound; cannot confirm user sync')
         inbound = matches[0]
         if inbound.get('users') == wanted:
             return False
@@ -5366,15 +5592,21 @@ def password_taken(users, pwd, owner_uid):
                for uid, u in users.items())
 
 def enforce_node_access(root, snapshot, force_ids=()):
-    """分别尝试 AnyTLS 与 Xray；任一路无法确认时保留待撤销状态。"""
-    anytls_error = None
+    """分别尝试 AnyTLS、TUIC 与 Xray；任一路无法确认时保留待撤销状态。"""
+    anytls_error = tuic_error = None
     try:
         sync_anytls_users(root, snapshot)
     except Exception as exc:
         anytls_error = exc
+    try:
+        sync_tuic_users(root, snapshot)
+    except Exception as exc:
+        tuic_error = exc
     result = _enforce_node_access_xray_hy2(root, snapshot, force_ids)
     if anytls_error is not None:
         raise RuntimeError('AnyTLS user sync could not be confirmed') from anytls_error
+    if tuic_error is not None:
+        raise RuntimeError('TUIC user sync could not be confirmed') from tuic_error
     return result
 
 
@@ -5932,7 +6164,7 @@ def _host_for_url(host):
 
 
 def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
-              vmess=None, vlessenc=None, anytls=None):
+              vmess=None, vlessenc=None, anytls=None, tuic=None):
     """生成 hy2:// 直链 + Clash / Sing-box 配置。
 
     reality（可选）—— 传 rcfg 时会**额外产出一条 VLESS-Reality 节点**，
@@ -6112,15 +6344,38 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                            tls=dict(enabled=True, server_name=a_sni,
                                     utls=dict(enabled=True, fingerprint='chrome')))
 
+    # ---- TUIC v5（可选，2026-10-31 加）----
+    # QUIC（UDP）+ 自有证书，由 sing-box 承载。
+    tuic_proxy = None
+    tuic_sing = None
+    if tuic and user_id and tuic.get('domain') \
+            and _valid_port(tuic.get('port')) and isinstance(tuic.get('secret'), str) and tuic.get('secret'):
+        t_name = name + '-TUIC'
+        t_host = tuic['domain']
+        t_sni = tuic.get('sni') or t_host
+        t_uuid, t_pwd = tuic_credentials_for_user(tuic['secret'], user_id)
+        t_port = _valid_port(tuic.get('port'))
+        tuic_proxy = dict(name=t_name, type='tuic', server=t_host, port=t_port,
+                          uuid=t_uuid, password=t_pwd, alpn=['h3'], sni=t_sni,
+                          udp=True, **{'congestion-controller': 'bbr',
+                                       'udp-relay-mode': 'native'})
+        tuic_sing = dict(type='tuic', tag=t_name, server=t_host, server_port=t_port,
+                         uuid=t_uuid, password=t_pwd, congestion_control='bbr',
+                         udp_relay_mode='native',
+                         tls=dict(enabled=True, server_name=t_sni, alpn=['h3']))
+
     proxies = [proxy] + ([reality_proxy] if reality_proxy else []) + \
               ([vmess_proxy] if vmess_proxy else []) + \
               ([vlessenc_proxy] if vlessenc_proxy else []) + \
-              ([anytls_proxy] if anytls_proxy else [])
+              ([anytls_proxy] if anytls_proxy else []) + \
+              ([tuic_proxy] if tuic_proxy else [])
     sing_outbounds = [sing] + ([reality_sing] if reality_sing else []) + \
                      ([vmess_sing] if vmess_sing else []) + \
                      ([vlessenc_sing] if vlessenc_sing else []) + \
-                     ([anytls_sing] if anytls_sing else [])
-    alternates = [p['name'] for p in (reality_proxy, vmess_proxy, vlessenc_proxy, anytls_proxy) if p]
+                     ([anytls_sing] if anytls_sing else []) + \
+                     ([tuic_sing] if tuic_sing else [])
+    alternates = [p['name'] for p in (reality_proxy, vmess_proxy, vlessenc_proxy, anytls_proxy,
+                                      tuic_proxy) if p]
 
     if alternates:
         # url-test：客户端定时探测多条链路，自动选延迟低的。
@@ -6141,7 +6396,8 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         sing_doc['outbounds'].append({
             'type': 'urltest', 'tag': 'PROXY',
             'outbounds': [sing['tag']] + [o['tag'] for o in
-                                          (reality_sing, vmess_sing, vlessenc_sing, anytls_sing) if o],
+                                          (reality_sing, vmess_sing, vlessenc_sing, anytls_sing,
+                                           tuic_sing) if o],
             'url': 'https://www.gstatic.com/generate_204',
             'interval': '5m', 'tolerance': 50,
         })
@@ -6661,7 +6917,8 @@ def serve(path):
     # 超额停用只停**对外提供代理**的服务，portal 自己不停 —— 否则控制台
     # 下个周期就没法远程恢复。停之前记下哪些本来是开着的，恢复时只启动它们，
     # 不会把机主有意关掉的服务顺手拉起来。
-    TRAFFIC_SUSPEND_UNITS = ('hysteria-server', 'xray', 'gost', 'amneziawg-server', ANYTLS_SERVICE)
+    TRAFFIC_SUSPEND_UNITS = ('hysteria-server', 'xray', 'gost', 'amneziawg-server', ANYTLS_SERVICE,
+                             TUIC_SERVICE)
 
     def _unit_active(unit):
         try:
@@ -7491,6 +7748,15 @@ if __name__ == '__main__':
         if not acfg.get('enabled') or not (portal_path.parent / ANYTLS_CONFIG_NAME).exists():
             return None
         return acfg
+
+    def _active_tuic_config():
+        """TUIC 的配置：已启用且 tuic.json 在才算（停用后只保留 secret 与端口）。"""
+        with data_lock:
+            _t = data.get('tuic_config')
+            tcfg = dict(_t) if isinstance(_t, dict) else {}
+        if not tcfg.get('enabled') or not (portal_path.parent / TUIC_CONFIG_NAME).exists():
+            return None
+        return tcfg
 
     def regenerate_page():
         m = read_meta_file(meta_path)
@@ -8371,13 +8637,14 @@ if __name__ == '__main__':
                     vcfg_active = _active_vmess_config()
                     ecfg_active = _active_vlessenc_config()
                     acfg_active = _active_anytls_config()
+                    tcfg_active = _active_tuic_config()
                     m = read_meta_file(meta_path)
                     # artifacts 传入 reality + user_id ⇒ 输出「Hy2 + Reality」双节点
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
                     uri, clash_yaml, sing_json = artifacts(
                         m, auth_override=pwd, name_override=f"Teyir-Hy2-{user_id}",
                         reality=rcfg, user_id=user_id, vmess=vcfg_active,
-                        vlessenc=ecfg_active, anytls=acfg_active)
+                        vlessenc=ecfg_active, anytls=acfg_active, tuic=tcfg_active)
                     public_ip = m.get('public_ip', '127.0.0.1')
                     reality_uri = reality_uri_for_user(
                         rcfg, user_id, public_ip, label=f"Teyir-Reality-{user_id}")
@@ -8389,6 +8656,8 @@ if __name__ == '__main__':
                         label=f"Teyir-VLESS-Enc-{user_id}") if ecfg_active else ''
                     anytls_uri = anytls_uri_for_user(
                         acfg_active, user_id, label=f"Teyir-AnyTLS-{user_id}") if acfg_active else ''
+                    tuic_uri = tuic_uri_for_user(
+                        tcfg_active, user_id, label=f"Teyir-TUIC-{user_id}") if tcfg_active else ''
                     return self.reply_json(200, {
                         'ok': True,
                         'user_id': user_id,
@@ -8409,6 +8678,7 @@ if __name__ == '__main__':
                         'vlessenc_uri': vlessenc_uri,
                         'vlessenc_uuid': reality_uuid_for_user(user_id) if ecfg_active else '',
                         'anytls_uri': anytls_uri,
+                        'tuic_uri': tuic_uri,
                         'clash': clash_yaml,
                         'sing_box': sing_json
                     })
@@ -8737,6 +9007,9 @@ if __name__ == '__main__':
 
             if self.path == prefix + 'manage-anytls':
                 return self._h_post_manage_anytls(prefix)
+
+            if self.path == prefix + 'manage-tuic':
+                return self._h_post_manage_tuic(prefix)
 
             if self.path == prefix + 'install-core':
                 return self._h_post_install_core(prefix)
@@ -9944,7 +10217,7 @@ if __name__ == '__main__':
                 {'id': 'xray', 'name': 'Xray-core', 'used_by': ['VLESS-Reality', 'VMess', 'VLESS Encryption'],
                  'version': version_of('/usr/local/bin/xray', ['version'], r'Xray\s+v?([\w.\-]+)'),
                  'service': 'xray', 'installable': True, 'manage': 'reality/reality-node'},
-                {'id': 'sing-box', 'name': 'sing-box', 'used_by': ['AnyTLS'],
+                {'id': 'sing-box', 'name': 'sing-box', 'used_by': ['AnyTLS', 'TUIC'],
                  'version': '.'.join(map(str, singbox)) if singbox else '',
                  'service': ANYTLS_SERVICE, 'installable': True, 'manage': 'reality/anytls'},
                 {'id': 'gost', 'name': 'GOST', 'used_by': ['SOCKS5 / HTTP 入站代理'],
@@ -9996,7 +10269,8 @@ if __name__ == '__main__':
         def _core_users(self, name):
             """返回仍在使用该核心的协议名列表；非空时拒绝卸载。"""
             if name == 'sing-box':
-                return ['AnyTLS'] if _active_anytls_config() else []
+                return [label for label, cfg in (('AnyTLS', _active_anytls_config()),
+                                                 ('TUIC', _active_tuic_config())) if cfg]
             try:
                 cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
             except FileNotFoundError:
@@ -10024,20 +10298,22 @@ if __name__ == '__main__':
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
-                units = {'xray': ('xray', '/usr/local/bin/xray'),
-                         'sing-box': (ANYTLS_SERVICE, ANYTLS_BINARY)}
+                units = {'xray': (('xray',), '/usr/local/bin/xray'),
+                         'sing-box': ((ANYTLS_SERVICE, TUIC_SERVICE), ANYTLS_BINARY)}
                 if name not in units:
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里卸载该核心'})
                 in_use = self._core_users(name)
                 if in_use:
                     return self.reply_json(409, {'ok': False, 'error':
                         '以下协议仍在使用 %s：%s。请先到对应协议页关闭后再卸载' % (name, '、'.join(in_use))})
-                unit, binary = units[name]
+                unit_names, binary = units[name]
                 with core_operation_lock:
-                    subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
-                    Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
+                    for unit in unit_names:
+                        subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
+                        Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
                     subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
-                    subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
+                    for unit in unit_names:
+                        subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
                     Path(binary).unlink(missing_ok=True)
                 return self.reply_json(200, {'ok': True, 'message': '%s 已卸载' % name})
             except Exception as exc:
@@ -10179,6 +10455,138 @@ if __name__ == '__main__':
                     'domain': acfg.get('domain', ''),
                     'sni': acfg.get('sni', ''),
                     'port': acfg.get('port', 0) if running else 0,
+                    'qr_svg': qr_svg,
+                },
+            })
+
+        def _apply_tuic_enable(self):
+            """启用 TUIC：检查 sing-box → 选 UDP 端口 → 写配置并重启 → 落 data。
+
+            规则同 _apply_anytls_enable：配置先落地、数据后写入；secret 只在首次生成。
+            """
+            m = read_meta_file(meta_path)
+            domain = (m.get('server_name') or '').strip()
+            if not domain or not _is_dns_name(domain):
+                raise RuntimeError('TUIC 需要先绑定域名（当前无可用 server_name）')
+            cert_file, key_file, sni = self._vmess_certificate(domain, 'TUIC')
+            version = _singbox_version()
+            if not version or version < ANYTLS_MIN_SINGBOX:
+                raise RuntimeError('sing-box 核心未安装或版本低于 1.12，请先在「核心管理」中安装')
+            with data_lock:
+                old = dict(config_section(data, 'tuic_config'))
+            # UDP 端口只会和其它 UDP 服务撞：Hy2 监听端口与跳跃区间、AWG（监听表里能看到）。
+            blocked = set()
+            for value in (m.get('listen_port'),):
+                try:
+                    blocked.add(int(value))
+                except (TypeError, ValueError):
+                    pass
+            listen_port = pick_tuic_port(old.get('port'), blocked)
+            if not listen_port:
+                raise RuntimeError('在 %d-%d 内找不到空闲的 UDP 端口' % TUIC_PORT_RANGE)
+            new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
+                       'secret': old.get('secret') if isinstance(old.get('secret'), str) and old.get('secret')
+                       else secrets.token_hex(32)}
+            with data_lock:
+                preview = dict(data)
+                preview['tuic_config'] = new_cfg
+                users = tuic_users(preview)
+            unit_path = Path('/etc/systemd/system/%s.service' % TUIC_SERVICE)
+            if not unit_path.exists() or unit_path.read_text(encoding='utf-8') != TUIC_UNIT_CONTENT:
+                unit_path.write_text(TUIC_UNIT_CONTENT, encoding='utf-8')
+                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+            with tuic_apply_lock:
+                apply_anytls_config(build_tuic_config(new_cfg, users, cert_file, key_file),
+                                    portal_path.parent / TUIC_CONFIG_NAME, restart=True,
+                                    service=TUIC_SERVICE)
+                # 预检 + 启动成功之后再 enable，避免坏配置被设成开机自启。
+                subprocess.run(['systemctl', 'enable', TUIC_SERVICE],
+                               capture_output=True, timeout=30)
+            with data_lock:
+                data['tuic_config'] = new_cfg
+            save_data()
+            regenerate_page()
+            firewall_port(listen_port, 'udp', open_=True)
+            return new_cfg
+
+        def _h_post_manage_tuic(self, prefix):
+            """POST /manage-tuic —— 独立启停 TUIC（sing-box），不影响 AnyTLS 与 Xray。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
+                action = parse_qs(body).get('action', ['toggle'])[0]
+                enabled = _active_tuic_config() is not None
+                if action == 'toggle':
+                    action = 'disable' if enabled else 'enable'
+                if action not in ('enable', 'disable'):
+                    return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                if action == 'enable':
+                    with data_lock:
+                        suspended = suspend_state(data).get('suspended') is True
+                    if suspended:
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '节点因流量超额停用中，请在控制台恢复节点后再启用 TUIC'})
+                    cfg = self._apply_tuic_enable()
+                    return self.reply_json(200, {'ok': True, 'active': True, 'port': cfg['port'],
+                                                 'uri': tuic_uri_for_user(cfg, MASTER_USER_ID,
+                                                                          label='TUIC-' + cfg['domain'])})
+                if not enabled:
+                    return self.reply_json(200, {'ok': True, 'active': False,
+                                                 'message': 'TUIC 本来就没有启用'})
+                with tuic_apply_lock:
+                    subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
+                                   capture_output=True, timeout=30)
+                    # 确认真的停了再删配置，否则被停用的用户仍能连。
+                    if _systemd_state(TUIC_SERVICE) == 'active':
+                        return self.reply_json(500, {'ok': False, 'error':
+                            'TUIC 服务未能停止，配置已保留，请重试或查看 systemctl status %s'
+                            % TUIC_SERVICE})
+                    (portal_path.parent / TUIC_CONFIG_NAME).unlink(missing_ok=True)
+                with data_lock:
+                    tcfg = dict(config_section(data, 'tuic_config'))
+                    closed_port = _valid_port(tcfg.get('port')) or 0
+                    # secret 与端口保留：再次启用时沿用，已下发的订阅不失效。
+                    tcfg['enabled'] = False
+                    data['tuic_config'] = tcfg
+                save_data()
+                regenerate_page()
+                if closed_port:
+                    firewall_port(closed_port, 'udp', open_=False)
+                return self.reply_json(200, {'ok': True, 'active': False})
+            except Exception as exc:
+                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+
+        def _h_get_tuic_status(self, subpath):
+            """GET /tuic-status —— 以 hy2-tuic 服务实际状态为准。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            tcfg = _active_tuic_config() or {}
+            running = bool(tcfg) and _systemd_state(TUIC_SERVICE) == 'active'
+            version = _singbox_version()
+            uri = tuic_uri_for_user(tcfg, MASTER_USER_ID,
+                                    label='TUIC-' + str(tcfg.get('domain', ''))) if tcfg else ''
+            qr_svg = ''
+            if running and uri:
+                try:
+                    qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode('utf-8'),
+                                        capture_output=True, timeout=3)
+                    if qr.returncode == 0:
+                        qr_svg = qr.stdout.decode('utf-8')
+                except Exception as exc:
+                    _log_ignored('tuic_qr', exc)
+            return self.reply_json(200, {
+                'ok': True,
+                'installed': bool(version),
+                'version': '.'.join(map(str, version)) if version else '',
+                'enabled': bool(tcfg),
+                'active': running,
+                'config': {
+                    'uri': uri if running else '',
+                    'domain': tcfg.get('domain', ''),
+                    'sni': tcfg.get('sni', ''),
+                    'port': tcfg.get('port', 0) if running else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -10882,6 +11290,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'vmess': dict(config_section(data, 'vmess_config')),
                             'vlessenc': dict(config_section(data, 'vlessenc_config')),
                             'anytls': dict(config_section(data, 'anytls_config')),
+                            'tuic': dict(config_section(data, 'tuic_config')),
                             'warp_enabled': bool(data.get('warp_enabled')),
                             'users_count': len(user_table(data)),
                             'proxy_services': proxy_services(data),
@@ -11027,6 +11436,21 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                    if d_snap['anytls'].get('domain') else {}),
                                 **({'sni': d_snap['anytls']['sni']}
                                    if d_snap['anytls'].get('sni') else {}),
+                            ),
+                            # TUIC（2026-10-31 加）：同样由 sing-box 承载，端口为 UDP。
+                            'tuic': dict(
+                                {
+                                    'installed': bool(_singbox_version()),
+                                    'active': _active_tuic_config() is not None
+                                              and _svc_active(TUIC_SERVICE),
+                                    'configured': bool(d_snap['tuic'].get('domain')),
+                                },
+                                **({'port': int(d_snap['tuic'].get('port') or 0)}
+                                   if d_snap['tuic'].get('port') else {}),
+                                **({'domain': d_snap['tuic']['domain']}
+                                   if d_snap['tuic'].get('domain') else {}),
+                                **({'sni': d_snap['tuic']['sni']}
+                                   if d_snap['tuic'].get('sni') else {}),
                             ),
                         },
                         'extras': {
@@ -11215,7 +11639,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     reality=_active_reality_config(), user_id=target_uid,
                     vmess=_active_vmess_config(),
                     vlessenc=_active_vlessenc_config(),
-                    anytls=_active_anytls_config())
+                    anytls=_active_anytls_config(),
+                    tuic=_active_tuic_config())
 
                 if action_file == 'clash.yaml':
                     return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml')
@@ -11262,6 +11687,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             if subpath == 'anytls-status':
                 return self._h_get_anytls_status(subpath)
+
+            if subpath == 'tuic-status':
+                return self._h_get_tuic_status(subpath)
 
             if subpath == 'cores-status':
                 return self._h_get_cores_status(subpath)
@@ -11320,7 +11748,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     reality=_active_reality_config(), user_id=target_uid,
                     vmess=_active_vmess_config(),
                     vlessenc=_active_vlessenc_config(),
-                    anytls=_active_anytls_config())
+                    anytls=_active_anytls_config(),
+                    tuic=_active_tuic_config())
                 qr_svg = ""
                 try:
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
@@ -12347,7 +12776,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         with data_lock:
             _enabled = {k: bool((data.get(k) or {}).get('enabled'))
                         for k in ('reality_config', 'vmess_config',
-                                  'vlessenc_config', 'anytls_config')}
+                                  'vlessenc_config', 'anytls_config', 'tuic_config')}
         _missing = []
         if _enabled['reality_config'] and not Path('/etc/hysteria/xray.json').exists():
             _missing.append('Reality')
@@ -12362,6 +12791,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 _missing.append('VLESS Encryption')
         if _enabled['anytls_config'] and not (portal_path.parent / ANYTLS_CONFIG_NAME).exists():
             _missing.append('AnyTLS')
+        if _enabled['tuic_config'] and not (portal_path.parent / TUIC_CONFIG_NAME).exists():
+            _missing.append('TUIC')
         if _missing:
             print('[portal] 以下协议标记为已启用但配置文件缺失，当前不会生效：%s。'
                   '请在面板重新开关一次以重建配置。' % '、'.join(_missing),
@@ -12380,6 +12811,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             print('[portal] 启动时补同步了 AnyTLS users', file=sys.stderr)
     except Exception as e:
         print('[portal] AnyTLS 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
+    try:
+        with data_lock:
+            _tuic_snapshot = copy.deepcopy(data)
+        if sync_tuic_users(portal_path.parent, _tuic_snapshot):
+            print('[portal] 启动时补同步了 TUIC users', file=sys.stderr)
+    except Exception as e:
+        print('[portal] TUIC 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
 
     # 超额停用要扛住重启：开机后 systemd 会把服务重新拉起来，这里再停一次。
     try:

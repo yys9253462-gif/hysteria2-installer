@@ -552,6 +552,7 @@ document.querySelectorAll('[data-tab]').forEach(btn => {
       checkVmessStatus();
       checkVlessencStatus();
       checkAnytlsStatus();
+      checkTuicStatus();
     }
     if (btn.dataset.tab === 'cores') loadCores();
   });
@@ -567,6 +568,7 @@ document.querySelectorAll('.subtab-btn').forEach(btn => {
     if (btn.dataset.subtab === 'vmess') checkVmessStatus();
     if (btn.dataset.subtab === 'vlessenc') checkVlessencStatus();
     if (btn.dataset.subtab === 'anytls') checkAnytlsStatus();
+    if (btn.dataset.subtab === 'tuic') checkTuicStatus();
     if (btn.dataset.subtab === 'reality-node') checkRealityStatus();
     history.replaceState(null, null, '#' + paneId + '/' + btn.dataset.subtab);
   });
@@ -584,6 +586,7 @@ if (location.hash) {
       checkVlessencStatus();
       // 深链接路径此前漏了 AnyTLS：书签进入时卡片会停在首屏旧状态。
       checkAnytlsStatus();
+      checkTuicStatus();
     }
   }
 }
@@ -1701,6 +1704,101 @@ if (btnCopyAnytlsUri) {
 
 checkAnytlsStatus();
 
+// TUIC 卡片：由独立的 sing-box（hy2-tuic）承载，开关与 AnyTLS / Xray 系协议互不影响。
+const tuicBadge = document.getElementById('tuic-badge');
+const btnToggleTuic = document.getElementById('btn-toggle-tuic');
+const tuicContentBox = document.getElementById('tuic-content-box');
+const tuicUriVal = document.getElementById('tuic-uri-val');
+const btnCopyTuicUri = document.getElementById('btn-copy-tuic-uri');
+
+function setTuicBadge(text, bg, color) {
+  tuicBadge.textContent = text;
+  tuicBadge.style.background = bg;
+  tuicBadge.style.color = color;
+}
+
+let tuicStatusSeq = 0;
+async function checkTuicStatus() {
+  if (!tuicBadge) return;
+  const seq = ++tuicStatusSeq;
+  try {
+    const res = await fetch(location.pathname + 'tuic-status', { credentials: 'same-origin' });
+    if (!res.ok) { if (seq === tuicStatusSeq) tuicBadge.textContent = '● 状态未知（请求失败）'; return; }
+    const json = await res.json();
+    if (seq !== tuicStatusSeq || !json.ok) return;
+    const gotoTuic = document.getElementById('tuic-goto-cores');
+    if (!json.installed) {
+      setTuicBadge('● 未安装 sing-box 核心', '#fff1f0', '#cf3c3c');
+      if (btnToggleTuic) btnToggleTuic.style.display = 'none';
+      if (gotoTuic) gotoTuic.style.display = 'inline-flex';
+      if (tuicContentBox) tuicContentBox.style.display = 'none';
+      return;
+    }
+    if (gotoTuic) gotoTuic.style.display = 'none';
+    if (btnToggleTuic) btnToggleTuic.style.display = 'inline-flex';
+    const verEl = document.getElementById('tuic-ver-val');
+    if (verEl) verEl.textContent = json.version || '未安装';
+    const cfg = json.config || {};
+    if (json.active) {
+      setTuicBadge('● 运行中 (UDP ' + (cfg.port || '--') + ')', '#eaf3de', '#27500a');
+      btnToggleTuic.textContent = '已开启 (点击关闭)';
+      btnToggleTuic.className = 'toggle-btn on';
+      if (tuicContentBox) tuicContentBox.style.display = 'block';
+      if (tuicUriVal) tuicUriVal.value = cfg.uri || '';
+      const qrBox = document.getElementById('tuic-qr-box');
+      if (qrBox) qrBox.innerHTML = cfg.qr_svg || '';
+      const domainEl = document.getElementById('tuic-domain-val');
+      if (domainEl) domainEl.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
+      const tcpEl = document.getElementById('tuic-tcp-val');
+      if (tcpEl) tcpEl.textContent = 'UDP ' + (cfg.port || '--');
+      const portTag = document.getElementById('tuic-port-tag');
+      if (portTag) portTag.textContent = 'UDP ' + (cfg.port || '--');
+    } else {
+      if (json.enabled) setTuicBadge('● 已启用但服务未运行', '#fff1f0', '#cf3c3c');
+      else setTuicBadge('○ 已关闭', '#f1efe8', '#5f5e5a');
+      btnToggleTuic.textContent = json.enabled ? '已启用 (点击关闭)' : '已关闭 (点击开启)';
+      btnToggleTuic.className = json.enabled ? 'toggle-btn on' : 'toggle-btn off';
+      if (tuicContentBox) tuicContentBox.style.display = 'none';
+    }
+  } catch (_) {}
+}
+
+if (btnToggleTuic) {
+  btnToggleTuic.addEventListener('click', async () => {
+    if (btnToggleTuic.disabled) return;
+    btnToggleTuic.disabled = true;
+    btnToggleTuic.textContent = '切换中...';
+    try {
+      const res = await fetch(location.pathname + 'manage-tuic', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'action=toggle'
+      });
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (!res.ok || !json || !json.ok) {
+        alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
+      }
+      await checkTuicStatus();
+    } catch (e) {
+      alert('请求异常: ' + e.message);
+    } finally {
+      btnToggleTuic.disabled = false;
+    }
+  });
+}
+
+if (btnCopyTuicUri) {
+  btnCopyTuicUri.addEventListener('click', () => {
+    if (tuicUriVal && tuicUriVal.value) {
+      copyWithFeedback(tuicUriVal.value, btnCopyTuicUri, '✓ 已复制直链');
+    }
+  });
+}
+
+checkTuicStatus();
+
 // BBR 状态获取与一键切换交互
 const bbrBadge = document.getElementById('bbr-badge');
 const bbrCurrentText = document.getElementById('bbr-current-text');
@@ -2159,6 +2257,7 @@ function gotoTarget(target) {
     checkVmessStatus();
     checkVlessencStatus();
     checkAnytlsStatus();
+    checkTuicStatus();
   }
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }

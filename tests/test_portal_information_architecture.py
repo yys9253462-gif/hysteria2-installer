@@ -92,7 +92,7 @@ class InformationArchitectureTest(unittest.TestCase):
     def test_reality_group_separates_cert_and_bbr(self):
         pane = _pane(self.page, 'reality')
         self.assertEqual(re.findall(r'data-subtab="([a-z-]+)"', pane),
-                         ['reality-node', 'vmess', 'vlessenc', 'anytls', 'cert', 'bbr'])
+                         ['reality-node', 'vmess', 'vlessenc', 'anytls', 'tuic', 'cert', 'bbr'])
         self.assertIn('cert-badge', _sub(pane, 'cert'))
         self.assertIn('bbr-current-text', _sub(pane, 'bbr'))
         self.assertNotIn('cert-badge', _sub(pane, 'reality-node'))

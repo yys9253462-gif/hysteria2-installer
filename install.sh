@@ -1526,7 +1526,7 @@ EOF
     mkdir -p "$HY2_CERT_DIR"
     if ! "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
-            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls" >/dev/null; then
+            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic" >/dev/null; then
         log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败。"
         return 1
     fi
@@ -4861,11 +4861,15 @@ uninstall_all() {
         # 否则配置目录删了它还在跑，Reality 用户要到重启后才断。
         systemctl disable --now xray 2>/dev/null || true
         rm -f /etc/systemd/system/xray.service /usr/local/bin/xray
-        # AnyTLS 的 sing-box 同样由门户安装，配置在 /etc/hysteria/anytls.json。
-        if [[ -f /etc/systemd/system/hy2-anytls.service ]]; then
-            systemctl disable --now hy2-anytls 2>/dev/null || true
-            rm -f /etc/systemd/system/hy2-anytls.service /usr/local/bin/sing-box
-        fi
+        # AnyTLS / TUIC 的 sing-box 同样由门户安装，配置在 /etc/hysteria/{anytls,tuic}.json。
+        local sb_unit
+        for sb_unit in hy2-anytls hy2-tuic; do
+            if [[ -f /etc/systemd/system/${sb_unit}.service ]]; then
+                systemctl disable --now "$sb_unit" 2>/dev/null || true
+                rm -f "/etc/systemd/system/${sb_unit}.service"
+            fi
+        done
+        rm -f /usr/local/bin/sing-box
         # BUGFIX: 卸载时同时清理 WARP 相关服务与配置
         systemctl disable --now wireproxy 2>/dev/null || true
         systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true
@@ -5103,6 +5107,7 @@ show_menu_status() {
     # 状态行不能只写 Reality，否则用户会以为只有 Reality 在跑。
     [[ -f /etc/systemd/system/xray.service ]] && extra+="Xray(Reality/VMess/VLESS-Enc): $(unit_state_text xray)  "
     [[ -f /etc/systemd/system/hy2-anytls.service ]] && extra+="AnyTLS: $(unit_state_text hy2-anytls)  "
+    [[ -f /etc/systemd/system/hy2-tuic.service ]] && extra+="TUIC: $(unit_state_text hy2-tuic)  "
     [[ -f /usr/local/bin/gost ]] && extra+="GOST: $(unit_state_text gost)  "
     [[ -f /etc/systemd/system/wireproxy.service ]] && extra+="WARP: $(unit_state_text wireproxy)"
     [[ -n "$extra" ]] && echo -e "扩展服务: ${extra}"

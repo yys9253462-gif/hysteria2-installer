@@ -68,7 +68,8 @@ class WebWorkflowTests(unittest.TestCase):
                        _active_reality_config=lambda: self.data.get('reality_config'),
                        _active_vmess_config=lambda: self.data.get('vmess_config'),
                        _active_vlessenc_config=lambda: self.data.get('vlessenc_config'),
-                       _active_anytls_config=lambda: None)
+                       _active_anytls_config=lambda: None,
+                       _active_tuic_config=lambda: None)
         self.sync = Mock(return_value=True)
         self.handler = SimpleNamespace(is_authenticated=lambda: True, server=SimpleNamespace(),
             _sync_reality_clients=self.sync, _reply_with_warp_apply=lambda payload: self.reply_json(200, payload),
