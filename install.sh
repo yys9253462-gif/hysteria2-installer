@@ -2477,7 +2477,7 @@ EOTW
     # 写入 do_upgrade.sh 供 Web 控制台在线升级官方核心或面板
     cat > "$HY2_DIR/do_upgrade.sh" <<'EOUG'
 #!/usr/bin/env bash
-TARGET="$1" # 'core' or 'portal'
+TARGET="${1:-}" # 'core' or 'portal'
 HY2_DIR="/etc/hysteria"
 HY2_BIN="/usr/local/bin/hysteria"
 
@@ -2905,6 +2905,9 @@ PYBUNDLE
         rm -rf "$_bundle_dir"
         [[ "$_write_rc" == "0" ]] || exit 1
     fi
+else
+    echo "无效的升级目标：只能使用 core 或 portal" >&2
+    exit 2
 fi
 EOUG
     chmod +x "$HY2_DIR/do_upgrade.sh"
