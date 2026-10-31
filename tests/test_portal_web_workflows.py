@@ -276,6 +276,23 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertFalse(body.get('ok'))
         self.assertEqual(self.data['proxy_services'], [])
 
+    def test_proxy_save_failure_restores_memory_before_returning_error(self):
+        before = copy.deepcopy(self.data['proxy_services'])
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, body = self.invoke('_h_post_manage_proxy', {'action': 'create', 'type': 'http'})
+        self.assertEqual(status, 500, body)
+        self.assertEqual(self.data['proxy_services'], before)
+        self.reload.assert_not_called()
+
+    def test_proxy_delete_save_failure_restores_memory(self):
+        original = [{'id': 'proxy_fixture', 'type': 'http', 'port': 32001}]
+        self.data['proxy_services'] = copy.deepcopy(original)
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, body = self.invoke('_h_post_manage_proxy', {'action': 'delete', 'id': 'proxy_fixture'})
+        self.assertEqual(status, 500, body)
+        self.assertEqual(self.data['proxy_services'], original)
+        self.reload.assert_not_called()
+
     def invoke_core_install(self, name='xray'):
         self.handler.path = '/test-token/install-core'
         body = urlencode({'name': name}).encode()

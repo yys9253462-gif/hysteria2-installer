@@ -4185,62 +4185,105 @@ install_gost() {
 
     DOWNLOAD_URL="https://github.com/go-gost/gost/releases/download/${GOST_LATEST}/gost_${GOST_VER}_${GOST_ASSET}.tar.gz"
     GOST_ASSET_NAME="gost_${GOST_VER}_${GOST_ASSET}.tar.gz"
+    local had_gost=0 old_gost="" old_unit="" old_check="" old_owner="" had_unit=0 had_check=0 had_owner=0
+    local old_config="" old_cert="" old_key="" had_config=0 had_cert=0 had_key=0
+    [[ -f "$GOST_BIN" ]] && { had_gost=1; old_gost="$(mktemp)"; cp -p "$GOST_BIN" "$old_gost" || return 1; }
+    [[ -f "$GOST_UNIT" ]] && { had_unit=1; old_unit="$(mktemp)"; cp -p "$GOST_UNIT" "$old_unit" || return 1; }
+    [[ -f /usr/local/lib/hy2-gost-selfcheck ]] && { had_check=1; old_check="$(mktemp)"; cp -p /usr/local/lib/hy2-gost-selfcheck "$old_check" || return 1; }
+    [[ -f "$HY2_DIR/.hy2-gost-owned" ]] && { had_owner=1; old_owner="$(mktemp)"; cp -p "$HY2_DIR/.hy2-gost-owned" "$old_owner" || return 1; }
+    [[ -f "$GOST_CONFIG" ]] && { had_config=1; old_config="$(mktemp)"; cp -p "$GOST_CONFIG" "$old_config" || return 1; }
+    [[ -f "$HY2_DIR/gost-cert/cert.pem" ]] && { had_cert=1; old_cert="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/cert.pem" "$old_cert" || return 1; }
+    [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; old_key="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/key.pem" "$old_key" || return 1; }
     log_info "目标版本: ${GOST_LATEST} (${GOST_ASSET})"
     log_step "下载并解压 gost 二进制..."
     TMP_DIR=$(mktemp -d)
+    _restore_gost_install() {
+        if [[ "$had_gost" == 1 ]]; then cp -p "$old_gost" "$GOST_BIN"; else rm -f "$GOST_BIN"; fi
+        if [[ "$had_unit" == 1 ]]; then cp -p "$old_unit" "$GOST_UNIT"; else rm -f "$GOST_UNIT"; fi
+        if [[ "$had_check" == 1 ]]; then cp -p "$old_check" /usr/local/lib/hy2-gost-selfcheck; else rm -f /usr/local/lib/hy2-gost-selfcheck; fi
+        if [[ "$had_owner" == 1 ]]; then cp -p "$old_owner" "$HY2_DIR/.hy2-gost-owned"; else rm -f "$HY2_DIR/.hy2-gost-owned"; fi
+        if [[ "$had_config" == 1 ]]; then cp -p "$old_config" "$GOST_CONFIG"; else rm -f "$GOST_CONFIG"; fi
+        if [[ "$had_cert" == 1 ]]; then cp -p "$old_cert" "$HY2_DIR/gost-cert/cert.pem"; else rm -f "$HY2_DIR/gost-cert/cert.pem"; fi
+        if [[ "$had_key" == 1 ]]; then cp -p "$old_key" "$HY2_DIR/gost-cert/key.pem"; else rm -f "$HY2_DIR/gost-cert/key.pem"; fi
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if [[ "$had_gost" == 1 ]]; then systemctl restart gost >/dev/null 2>&1 || true; else systemctl disable --now gost >/dev/null 2>&1 || true; fi
+        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+    }
+    _finish_gost_install() {
+        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+    }
     # 先从该版本的官方 checksums.txt 取摘要，再下载校验；取不到就不装。
     if ! GOST_SUM="$(hy2_expected_sha256 \
             "https://github.com/go-gost/gost/releases/download/${GOST_LATEST}/checksums.txt" \
             "$GOST_ASSET_NAME" "$TMP_DIR")"; then
         rm -rf "$TMP_DIR"
+        _finish_gost_install
         log_err "取不到 gost ${GOST_LATEST} 的官方 checksums.txt（或其中没有 ${GOST_ASSET_NAME}），已放弃安装。"
         return 1
     fi
     if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/$GOST_ASSET_NAME" "$DOWNLOAD_URL"; then
         rm -rf "$TMP_DIR"
+        _finish_gost_install
         log_err "gost 下载失败，请检查网络连接。"
         return 1
     fi
     if ! hy2_verify_sha256 "$TMP_DIR/$GOST_ASSET_NAME" "$GOST_SUM"; then
         rm -rf "$TMP_DIR"
+        _finish_gost_install
         log_err "gost 校验失败：SHA256 与官方 checksums.txt 不一致，已放弃安装。"
         return 1
     fi
     if ! hy2_tar_listing_safe "$TMP_DIR/$GOST_ASSET_NAME"; then
         rm -rf "$TMP_DIR"
+        _finish_gost_install
         log_err "gost 包内含不安全路径成员，已放弃安装。"
         return 1
     fi
     GOST_MEMBER="$(hy2_tar_find_member "$TMP_DIR/$GOST_ASSET_NAME" gost)" || GOST_MEMBER=""
     if [[ -z "$GOST_MEMBER" ]]; then
         rm -rf "$TMP_DIR"
+        _finish_gost_install
         log_err "gost 包内没有 gost 成员，已放弃安装。"
         return 1
     fi
     if ! tar -xzf "$TMP_DIR/$GOST_ASSET_NAME" -C "$TMP_DIR" "$GOST_MEMBER" 2>/dev/null; then
         rm -rf "$TMP_DIR"
+        _finish_gost_install
         log_err "gost 解压失败。"
         return 1
     fi
     if ! install -m 755 "$TMP_DIR/$GOST_MEMBER" "${GOST_BIN}.new"; then
         rm -rf "$TMP_DIR"
+        _finish_gost_install
         log_err "安装 gost 失败，现有文件未改动。"
         return 1
     fi
     rm -rf "$TMP_DIR"
-    mv -f "${GOST_BIN}.new" "$GOST_BIN"
+    if ! mv -f "${GOST_BIN}.new" "$GOST_BIN"; then
+        _restore_gost_install
+        log_err "gost 二进制替换失败，已恢复原部署。"
+        return 1
+    fi
     if [[ ! -f "$GOST_BIN" ]]; then
+        _restore_gost_install
         log_err "gost 二进制解压失败。"
         return 1
     fi
 
     # 生成 HTTPS 代理专用自签证书 (若不存在)
     GOST_CERT_DIR="${HY2_DIR}/gost-cert"
-    mkdir -p "$GOST_CERT_DIR"
+    if ! mkdir -p "$GOST_CERT_DIR"; then
+        _restore_gost_install
+        return 1
+    fi
     if [[ ! -f "$GOST_CERT_DIR/cert.pem" ]]; then
-        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-            -keyout "$GOST_CERT_DIR/key.pem" -out "$GOST_CERT_DIR/cert.pem" \
-            -days 3650 -subj "/CN=gost-proxy" >/dev/null 2>&1
+        if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+                -keyout "$GOST_CERT_DIR/key.pem" -out "$GOST_CERT_DIR/cert.pem" \
+                -days 3650 -subj "/CN=gost-proxy" >/dev/null 2>&1; then
+            _restore_gost_install
+            log_err "GOST HTTPS 证书生成失败，已恢复原部署。"
+            return 1
+        fi
     fi
 
     # 生成初始配置（services 由 Web 控制台动态管理）
@@ -4254,7 +4297,7 @@ EOF
     # 落盘启动自检脚本 (unit 的 ExecStartPost 会调用它)
     # ⚠️ 内容必须与 portal.py 的 GOST_SELFCHECK_SCRIPT 常量一致
     # (tests/test_portal_gost_reload.py 有断言钉死).
-    mkdir -p /usr/local/lib
+    mkdir -p /usr/local/lib || { _restore_gost_install; return 1; }
     cat > /usr/local/lib/hy2-gost-selfcheck <<'PYSELFCHECK'
 #!/usr/bin/env python3
 """确认 /etc/hysteria/gost.yml 里声明监听的服务端口都真的在监听.
@@ -4316,7 +4359,7 @@ def main():
 if __name__ == '__main__':
     sys.exit(main())
 PYSELFCHECK
-    chmod 755 /usr/local/lib/hy2-gost-selfcheck
+    chmod 755 /usr/local/lib/hy2-gost-selfcheck || { _restore_gost_install; return 1; }
 
     # 创建 systemd 守护服务
     # ⚠️ 这份内容必须与 portal.py 的 GOST_UNIT_CONTENT 常量**完全一致**
@@ -4349,18 +4392,26 @@ ExecStartPost=/usr/local/lib/hy2-gost-selfcheck
 [Install]
 WantedBy=multi-user.target
 EOF
-
-    : > "$HY2_DIR/.hy2-gost-owned"
-    chmod 600 "$HY2_DIR/.hy2-gost-owned"
-    systemctl daemon-reload
-    systemctl enable gost >/dev/null 2>&1
-    systemctl restart gost
+    if ! : > "$HY2_DIR/.hy2-gost-owned" || ! chmod 600 "$HY2_DIR/.hy2-gost-owned"; then
+        _restore_gost_install
+        log_err "GOST 所有权标记写入失败，已恢复原部署。"
+        return 1
+    fi
+    if ! systemctl daemon-reload || ! systemctl enable gost >/dev/null 2>&1 \
+            || ! systemctl restart gost; then
+        _restore_gost_install
+        log_err "GOST 更新或启动失败，已恢复原部署。"
+        return 1
+    fi
     # 核实服务真的在跑（不谎报成功）
     sleep 1
     if systemctl is-active --quiet gost; then
+        _finish_gost_install
         log_info "gost 入站代理引擎安装成功！现在可在 Web 控制台添加 SOCKS5/HTTP/HTTPS 代理账号。"
     else
-        log_warn "gost 已安装，服务暂未启动（尚无代理配置，添加代理账号后自动生效）。"
+        _restore_gost_install
+        log_err "GOST 更新后服务未能启动，已恢复原部署。"
+        return 1
     fi
 }
 
@@ -5014,6 +5065,13 @@ uninstall_all() {
         systemctl stop hysteria-server 2>/dev/null || true
         systemctl disable hysteria-server 2>/dev/null || true
         systemctl disable --now hysteria-portal 2>/dev/null || true
+        local preserve_gost_config=0
+        if [[ -f /etc/systemd/system/gost.service ]] \
+                && { [[ ! -f "$HY2_DIR/.hy2-gost-owned" ]] ||
+                     ! grep -qF 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s' \
+                         /etc/systemd/system/gost.service; }; then
+            preserve_gost_config=1
+        fi
         if [[ -f "$HY2_DIR/.hy2-gost-owned" && -f /etc/systemd/system/gost.service ]] \
                 && grep -qF 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s' \
                     /etc/systemd/system/gost.service; then
@@ -5117,6 +5175,10 @@ uninstall_all() {
         for hy2_path in "$HY2_DIR"/* "$HY2_DIR"/.[!.]* "$HY2_DIR"/..?*; do
             [[ -e "$hy2_path" || -L "$hy2_path" ]] || continue
             [[ "$hy2_path" == "$HY2_DIR/.core-operation.lock" ]] && continue
+            if [[ "$preserve_gost_config" == 1 \
+                    && ( "$hy2_path" == "$HY2_DIR/gost.yml" || "$hy2_path" == "$HY2_DIR/gost-cert" ) ]]; then
+                continue
+            fi
             rm -rf -- "$hy2_path"
         done
         # 只删 wgcf / wireproxy 自己的文件：/etc/wireguard 是系统 WireGuard 的公共目录，

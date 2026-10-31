@@ -197,6 +197,38 @@ systemctl() { :; }
             self.assertTrue(unit.exists())
             self.assertTrue(binary.exists())
 
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_uninstall_preserves_gost_config_needed_by_unmanaged_service(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hy2 = root / 'etc/hysteria'
+            hy2.mkdir(parents=True)
+            config = hy2 / 'gost.yml'
+            config.write_text('services: []\\n', encoding='utf-8')
+            certdir = hy2 / 'gost-cert'
+            certdir.mkdir()
+            (certdir / 'cert.pem').write_text('cert', encoding='utf-8')
+            (certdir / 'key.pem').write_text('key', encoding='utf-8')
+            unit_dir = root / 'etc/systemd/system'
+            unit_dir.mkdir(parents=True)
+            unit = unit_dir / 'gost.service'
+            unit.write_text('[Service]\\nExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml\\n', encoding='utf-8')
+            start = INSTALL.index('        local hy2_path')
+            end = INSTALL.index('        # 只删 wgcf', start)
+            block = INSTALL[start:end]
+            block = block.replace('/etc/hysteria', hy2.as_posix())
+            script = root / 'cleanup.sh'
+            script.write_text('''#!/usr/bin/env bash
+HY2_DIR="$TEST_ROOT/etc/hysteria"
+preserve_gost_config=1
+rm() { command rm "$@"; }
+''' + block, encoding='utf-8')
+            subprocess.run([shutil.which('bash'), str(script)], check=True,
+                           env=dict(os.environ, TEST_ROOT=str(root)))
+            self.assertTrue(config.exists())
+            self.assertTrue((certdir / 'cert.pem').exists())
+            self.assertTrue(unit.exists())
+
     def test_uninstall_keeps_singbox_unless_managed_unit_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

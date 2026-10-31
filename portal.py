@@ -9775,7 +9775,14 @@ if __name__ == '__main__':
                         return 404, {'ok': False, 'error': 'Proxy service not found'}
                     with data_lock:
                         data['proxy_services'] = remaining
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        data['proxy_services'] = previous
+                    raise
                 if not reload_gost():
                     with data_lock:
                         data['proxy_services'] = previous
@@ -9898,6 +9905,24 @@ if __name__ == '__main__':
 
                 installed = False
                 errors = []
+                gost_unit_path = Path('/etc/systemd/system/gost.service')
+                gost_check_path = Path('/usr/local/lib/hy2-gost-selfcheck')
+                owner_marker_path = Path('/etc/hysteria/.hy2-gost-owned')
+                gost_config_path = Path('/etc/hysteria/gost.yml')
+                with data_lock:
+                    had_proxy_services = 'proxy_services' in data
+                    previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
+                cert_dir = Path('/etc/hysteria/gost-cert')
+                cert_files = (cert_dir / 'cert.pem', cert_dir / 'key.pem')
+                had_cert_dir = cert_dir.exists()
+                with data_lock:
+                    had_proxy_services = 'proxy_services' in data
+                    previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
+                old_assets = {}
+                for asset_path in (gost_binary, gost_unit_path, gost_check_path,
+                                   owner_marker_path, gost_config_path, *cert_files):
+                    old_assets[asset_path] = (asset_path.read_bytes(),
+                        asset_path.stat().st_mode & 0o777) if asset_path.exists() else None
                 with tempfile.TemporaryDirectory() as tmpdir:
                     archive_path = Path(tmpdir) / 'gost.tar.gz'
                     for u in download_urls:
@@ -9933,6 +9958,24 @@ if __name__ == '__main__':
                         except Exception as e:
                             errors.append('%s: %s: %s' % (host, type(e).__name__, e))
 
+                def restore_gost_assets():
+                    for asset_path, old_asset in old_assets.items():
+                        if old_asset is None:
+                            asset_path.unlink(missing_ok=True)
+                        else:
+                            contents, mode = old_asset
+                            asset_path.parent.mkdir(parents=True, exist_ok=True)
+                            asset_path.write_bytes(contents)
+                            asset_path.chmod(mode)
+                    if not had_cert_dir:
+                        cert_dir.rmdir()
+                    with data_lock:
+                        if had_proxy_services:
+                            data['proxy_services'] = previous_proxy_services
+                        else:
+                            data.pop('proxy_services', None)
+                    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+
                 if not installed:
                     # 把【每个源】的错误都报出来。
                     # 只显示最后一个源的错误会掩盖真正原因 —— 例如首个源超时、
@@ -9953,16 +9996,30 @@ if __name__ == '__main__':
 
                 # 重新生成 gost.yml 并启动服务
                 if not reload_gost():
-                    return self.reply_json(500, {'ok': False, 'error': 'GOST 已安装，但服务或监听端口未就绪'})
+                    restore_gost_assets()
+                    if old_assets[gost_binary] is not None:
+                        reload_gost()
+                    return self.reply_json(500, {'ok': False, 'error': 'GOST 已安装，但服务或监听端口未就绪；已恢复原资产'})
 
                 # 核实真的起来了 —— 不谎报成功 (见技能 §12).
                 # `is-active` 为 active 但端口未绑定, 是本项目踩过的静默故障.
                 if not gost_status():
+                    restore_gost_assets()
+                    if old_assets[gost_binary] is not None:
+                        reload_gost()
                     return self.reply_json(500, {'ok': False,
-                                                 'error': 'GOST 已安装但服务未启动成功，请查看 journalctl -u gost -n 20'})
+                        'error': 'GOST 服务未启动成功；已恢复原资产，请查看 journalctl -u gost -n 20'})
                 return self.reply_json(200, {'ok': True, 'message': f'GOST {tag} 官方核心安装成功，服务已自动配置并启动！'})
             except Exception as e:
-                return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
+                try:
+                    if 'old_assets' in locals():
+                        restore_gost_assets()
+                        if old_assets.get(gost_binary) is not None:
+                            reload_gost()
+                except Exception as rollback_error:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'GOST 安装失败且恢复旧资产也失败：%s；%s' % (e, rollback_error)})
+                return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}；已恢复安装前资产'})
 
         def _h_post_install_amneziawg(self, prefix):
             """POST /install-amneziawg 的处理逻辑（从 do_POST 机械搬移而来）。"""
