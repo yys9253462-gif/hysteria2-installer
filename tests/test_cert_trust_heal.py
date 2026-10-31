@@ -436,6 +436,25 @@ class TestPortalSelfHealEntry(unittest.TestCase):
 # portal.py::cert_status —— 证书状态 + 到期告警
 # ----------------------------------------------------------------------------
 class TestCertRuntimeReload(unittest.TestCase):
+    def test_first_fingerprint_observation_reloads_active_service_after_upgrade(self):
+        import portal
+        from types import SimpleNamespace
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert = root / 'fullchain.pem'
+            cert.write_bytes(b'certificate installed before runtime fingerprint feature')
+            state = root / 'cert-selfheal.json'
+            calls = []
+            run = lambda args, **kwargs: (calls.append(args) or SimpleNamespace(returncode=0))
+            with mock.patch.object(portal, '_systemd_state',
+                                   side_effect=lambda service: 'active' if service == 'xray' else 'inactive'), \
+                 mock.patch.object(portal.subprocess, 'run', side_effect=run):
+                self.assertTrue(portal.sync_cert_runtime(root, cert, state))
+                self.assertFalse(portal.sync_cert_runtime(root, cert, state))
+            self.assertEqual(calls, [['systemctl', 'try-restart', 'xray']])
+            self.assertTrue(state.exists())
+
     def test_changed_certificate_restarts_only_active_services_and_retries_failures(self):
         import portal
         from types import SimpleNamespace
@@ -445,7 +464,7 @@ class TestCertRuntimeReload(unittest.TestCase):
             cert = root / 'fullchain.pem'
             state = root / 'cert-selfheal.json'
             cert.write_bytes(b'old certificate')
-            self.assertFalse(portal.sync_cert_runtime(root, cert, state))
+            self.assertTrue(portal.sync_cert_runtime(root, cert, state))
             cert.write_bytes(b'new certificate')
             calls = []
             def active(service):
@@ -458,7 +477,13 @@ class TestCertRuntimeReload(unittest.TestCase):
                 self.assertFalse(portal.sync_cert_runtime(root, cert, state))
             self.assertEqual(calls, [['systemctl', 'try-restart', service] for service in
                                      ('hysteria-server', 'xray', 'hy2-anytls', 'gost')])
-            self.assertTrue(portal.sync_cert_runtime(root, cert, state))
+            calls.clear()
+            with mock.patch.object(portal, '_systemd_state', side_effect=active), \
+                 mock.patch.object(portal.subprocess, 'run', side_effect=lambda args, **kwargs:
+                     (calls.append(args) or SimpleNamespace(returncode=0))):
+                self.assertTrue(portal.sync_cert_runtime(root, cert, state))
+            self.assertEqual(calls, [['systemctl', 'try-restart', service] for service in
+                                     ('hysteria-server', 'xray', 'hy2-anytls', 'gost')])
             calls.clear()
             cert.write_bytes(b'third certificate')
             with mock.patch.object(portal, '_systemd_state', return_value='inactive'), \

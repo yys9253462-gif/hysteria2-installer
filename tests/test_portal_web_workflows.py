@@ -604,6 +604,13 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(removed, [])
 
+    def test_inactive_ufw_is_not_treated_as_blocked_port_failure(self):
+        with patch.object(portal.shutil, 'which', side_effect=lambda name: '/usr/sbin/ufw' if name == 'ufw' else None), \
+             patch.object(portal.subprocess, 'run', return_value=SimpleNamespace(
+                 returncode=0, stdout='Status: inactive', stderr='')) as run:
+            self.assertTrue(portal.firewall_port(8443, 'tcp', open_=True))
+        self.assertEqual(run.call_count, 1)
+
     def test_firewall_port_reports_command_failure(self):
         with patch.object(portal.shutil, 'which', side_effect=lambda name: '/usr/sbin/ufw' if name == 'ufw' else None), \
              patch.object(portal.subprocess, 'run', side_effect=[

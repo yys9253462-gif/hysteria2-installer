@@ -4074,20 +4074,16 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     except (OSError, ValueError):
         return False
     previous = state.get('loaded_cert_sha256')
-    if not isinstance(previous, str) or not previous:
-        state['loaded_cert_sha256'] = digest
-        try:
-            atomic_write_private(state_path, json.dumps(state, ensure_ascii=False).encode('utf-8'))
-        except OSError as exc:
-            print('[portal] 证书指纹记录失败: %s' % str(exc)[:120], file=sys.stderr)
-        return False
-    if previous == digest:
+    first_observation = not isinstance(previous, str) or not previous
+    if not first_observation and previous == digest:
         return False
     services = ('hysteria-server', 'xray', ANYTLS_SERVICE, TUIC_SERVICE, 'gost')
     failed = []
+    attempted = False
     for service in services:
         if _systemd_state(service) != 'active':
             continue
+        attempted = True
         try:
             result = subprocess.run(['systemctl', 'try-restart', service],
                                     capture_output=True, timeout=20)
@@ -4096,9 +4092,11 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         except Exception:
             failed.append(service)
     if failed:
-        print('[portal] 证书已更新，但服务重载失败（下次自愈会重试）: %s'
+        print('[portal] 证书运行态同步失败（下次自愈会重试）: %s'
               % ', '.join(failed), file=sys.stderr)
         return False
+    # Record the bytes confirmed by the successful reload attempt. If no service
+    # was active, this establishes the baseline for the next certificate update.
     state['loaded_cert_sha256'] = digest
     try:
         atomic_write_private(state_path, json.dumps(state, ensure_ascii=False).encode('utf-8'))
@@ -5802,7 +5800,9 @@ def firewall_port(port, proto='tcp', open_=True):
                             if result.returncode != 0:
                                 return False
                 handled = True
-        return handled or not (shutil.which('ufw') or shutil.which('firewall-cmd') or shutil.which('nft'))
+        # Installed but inactive firewall packages do not block this port. If no
+        # active restrictive backend owns the rule, there is nothing to change.
+        return True
     except Exception as exc:
         _log_ignored('firewall_port', exc)
         return False
