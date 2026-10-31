@@ -276,7 +276,25 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .ob-mini-btn.danger:hover { border-color: #d64545; color: #d64545; background: #fef5f5; }
 
 .ob-form-card { background: #fbfcfd; border-color: #c0ded4; box-shadow: 0 0 0 3px rgba(8,127,116,.06); }
-.ob-form-title { font-size: 14px; font-weight: 800; color: var(--ink); margin-bottom: 14px; }
+.ob-form-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.ob-form-title { font-size: 14px; font-weight: 800; color: var(--ink); }
+.ob-form-close { border: 0; background: transparent; font-size: 20px; line-height: 1; color: var(--muted); cursor: pointer; padding: 2px 6px; border-radius: 6px; }
+.ob-form-close:hover { color: var(--ink); background: #eef3f2; }
+.ob-quick .ob-input { border-style: dashed; background: #f6faf9; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12.5px; }
+.ob-quick.ok .ob-input { border-color: #6fbf9a; border-style: solid; }
+.ob-quick.ok > em { color: #2c8a4e; }
+.ob-quick.err > em { color: #d64545; }
+.ob-type-switch { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.ob-type-btn { height: 34px; padding: 0 16px; border-radius: 9px; border: 1.5px solid var(--line); background: #fff;
+  font-size: 12.5px; font-weight: 700; color: var(--muted); cursor: pointer; }
+.ob-type-btn:hover { border-color: var(--accent); color: var(--ink); }
+.ob-type-btn.active { border-color: var(--accent); background: #eef7f5; color: var(--accent); }
+.ob-pass-wrap { position: relative; display: block; }
+.ob-pass-wrap .ob-input { padding-right: 52px; }
+.ob-pass-eye { position: absolute; right: 6px; top: 50%; transform: translateY(-50%); height: 26px; padding: 0 8px;
+  border: 0; border-radius: 6px; background: #eef3f2; color: #496861; font-size: 11.5px; font-weight: 700; cursor: pointer; }
+.ob-name-field { max-width: 420px; }
+.ob-name-field .ob-input[readonly] { background: #f3f5f5; color: var(--muted); }
 .ob-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .ob-form-grid-3 { grid-template-columns: 2fr 1fr 1fr; }
 @media(max-width: 640px) { .ob-form-grid, .ob-form-grid-3 { grid-template-columns: 1fr; } .ob-mode-switch { width: 100%; } .ob-mode-btn { flex: 1; } }
@@ -870,6 +888,13 @@ setInterval(() => { if (!document.hidden) checkWarpStatus(); }, 10000);
 //    全部交互统一用 data-* 属性 + 事件委托。
 const obEls = {
   formCard: document.getElementById('ob-form-card'),
+  quick: document.getElementById('ob-quick'),
+  quickBox: document.getElementById('ob-quick-box'),
+  quickHint: document.getElementById('ob-quick-hint'),
+  nameHint: document.getElementById('ob-name-hint'),
+  btnTest: document.getElementById('btn-ob-test'),
+  btnClose: document.getElementById('btn-ob-close'),
+  btnEye: document.getElementById('btn-ob-pass-eye'),
   status: document.getElementById('ob-status'),
   btnNew: document.getElementById('btn-ob-new'),
   rulesCard: document.getElementById('ob-rules-card'),
@@ -905,9 +930,9 @@ const obEls = {
 };
 
 const OB_TYPE_LABEL = {
-  socks5: { label: 'SOCKS5', cls: 'ob-type-socks5', hint: '需填host:port，如 1.2.3.4:1080' },
-  http: { label: 'HTTP/HTTPS', cls: 'ob-type-http', hint: '需填完整地址，如 http://1.2.3.4:8080' },
-  direct: { label: '直连', cls: 'ob-type-direct', hint: '无需额外参数' },
+  socks5: { label: 'SOCKS5', cls: 'ob-type-socks5', hint: '填 host:port，如 1.2.3.4:1080（暂不支持 IPv6 地址）' },
+  http: { label: 'HTTP/HTTPS', cls: 'ob-type-http', hint: '填完整地址，如 http://1.2.3.4:8080' },
+  direct: { label: '直连', cls: 'ob-type-direct', hint: '走服务器本机网络，无需额外参数（一般用于分流规则里的例外）' },
 };
 
 // 🔴 密码绝不显示在列表里（门户有被截图的风险），只显示"已设置"
@@ -1014,6 +1039,11 @@ function obTypeSwitch() {
   const t = obEls.type ? obEls.type.value : 'socks5';
   if (obEls.blockSocks) obEls.blockSocks.hidden = (t !== 'socks5');
   if (obEls.blockHttp) obEls.blockHttp.hidden = (t !== 'http');
+  document.querySelectorAll('[data-ob-type]').forEach(b => {
+    const on = b.dataset.obType === t;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-checked', on ? 'true' : 'false');
+  });
   if (obEls.typeHint) {
     const meta = OB_TYPE_LABEL[t];
     if (meta) obEls.typeHint.textContent = meta.hint;
@@ -1125,8 +1155,163 @@ function obResetForm() {
   if (obEls.httpInsecure) obEls.httpInsecure.checked = false;
   if (obEls.formTitle) obEls.formTitle.textContent = '➕ 新增出站';
   if (obEls.formCard) obEls.formCard.hidden = true;
+  if (obEls.type) obEls.type.value = 'socks5';
+  if (obEls.quick) obEls.quick.value = '';
+  if (obEls.quickBox) { obEls.quickBox.hidden = false; obEls.quickBox.className = 'ob-field ob-quick'; }
+  if (obEls.quickHint) obEls.quickHint.textContent = OB_QUICK_HINT;
+  obNameLock(false);
+  obNameAuto = true;
+  obShowPass(false);
   obMsg('');
   obTypeSwitch();
+}
+
+// ---- 新增出站：快速填写 / 自动命名 / 测连通（2026-10-31）----
+const OB_QUICK_HINT = '支持 socks5:// · socks:// · http(s):// 链接，以及代理商常见的 host:port:user:pass 格式';
+let obNameAuto = true;   // 用户没手动改过名称时，随地址自动生成
+
+function obNameLock(locked) {
+  if (!obEls.name) return;
+  obEls.name.readOnly = !!locked;
+  if (obEls.nameHint) {
+    obEls.nameHint.textContent = locked
+      ? '编辑时不能改名；要换名称请删除后重新添加'
+      : '字母、数字与下划线，不能以数字开头；分流规则里用它来指定出站';
+  }
+}
+
+function obShowPass(show) {
+  if (!obEls.socksPass || !obEls.btnEye) return;
+  obEls.socksPass.type = show ? 'text' : 'password';
+  obEls.btnEye.textContent = show ? '隐藏' : '显示';
+  obEls.btnEye.setAttribute('aria-label', show ? '隐藏密码' : '显示密码');
+}
+
+function obDecode(s) {
+  try { return decodeURIComponent(s || ''); } catch (e) { return s || ''; }
+}
+
+// 识别常见代理写法；认不出返回 null。只解析、不发请求。
+function obParseLink(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  let m = s.match(/^(?:socks5h?|socks):\/\/(?:([^:@\/\s]*)(?::([^@\/\s]*))?@)?([^\/:@\s]+):(\d{1,5})\/?(?:[?#].*)?$/i);
+  if (m) return { type: 'socks5', host: m[3], addr: m[3] + ':' + m[4], user: obDecode(m[1]), pass: obDecode(m[2]) };
+  m = s.match(/^https?:\/\/(?:[^@\/\s]*@)?([^\/:@\s]+)(?::\d{1,5})?\/?$/i);
+  if (m) return { type: 'http', host: m[1], url: s.replace(/\/$/, '') };
+  m = s.match(/^([^\s:@\/]+):(\d{1,5}):([^\s:]+):(\S+)$/);           // host:port:user:pass
+  if (m) return { type: 'socks5', host: m[1], addr: m[1] + ':' + m[2], user: m[3], pass: m[4] };
+  m = s.match(/^([^\s:@\/]+):([^\s:@]+)@([^\s:@\/]+):(\d{1,5})$/);   // user:pass@host:port
+  if (m) return { type: 'socks5', host: m[3], addr: m[3] + ':' + m[4], user: m[1], pass: m[2] };
+  m = s.match(/^([^\s:@\/]+):(\d{1,5})$/);                           // host:port
+  if (m) return { type: 'socks5', host: m[1], addr: s, user: '', pass: '' };
+  return null;
+}
+
+function obSuggestName(type, host) {
+  let base = (type === 'http' ? 'http_' : 'socks_') + String(host || '').toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  base = base.replace(/_+$/, '').slice(0, 32);
+  const taken = new Set(Array.from(document.querySelectorAll('[data-ob-edit]')).map(b => b.dataset.obEdit));
+  let name = base, n = 2;
+  while (taken.has(name)) name = base.slice(0, 29) + '_' + (n++);
+  return name;
+}
+
+function obAutoName() {
+  if (!obNameAuto || !obEls.name || obEls.name.readOnly) return;
+  const t = obEls.type ? obEls.type.value : 'socks5';
+  let host = '';
+  if (t === 'socks5' && obEls.socksAddr) host = obEls.socksAddr.value.trim().replace(/:\d+$/, '');
+  else if (t === 'http' && obEls.httpUrl) {
+    const m = obEls.httpUrl.value.trim().match(/^https?:\/\/(?:[^@\/\s]*@)?([^\/:@\s]+)/i);
+    host = m ? m[1] : '';
+  }
+  obEls.name.value = t === 'direct' ? 'direct_local' : (host ? obSuggestName(t, host) : '');
+}
+
+function obApplyQuick() {
+  if (!obEls.quick) return;
+  const raw = obEls.quick.value;
+  const r = obParseLink(raw);
+  if (!raw.trim()) {
+    obEls.quickBox.className = 'ob-field ob-quick';
+    obEls.quickHint.textContent = OB_QUICK_HINT;
+    return;
+  }
+  if (!r) {
+    obEls.quickBox.className = 'ob-field ob-quick err';
+    obEls.quickHint.textContent = '没认出这个格式，请直接在下方逐项填写';
+    return;
+  }
+  if (obEls.type) obEls.type.value = r.type;
+  if (r.type === 'socks5') {
+    obEls.socksAddr.value = r.addr;
+    obEls.socksUser.value = r.user || '';
+    obEls.socksPass.value = r.pass || '';
+  } else {
+    obEls.httpUrl.value = r.url;
+  }
+  obTypeSwitch();
+  obAutoName();
+  obEls.quickBox.className = 'ob-field ob-quick ok';
+  obEls.quickHint.textContent = '✓ 已识别为 ' + (r.type === 'http' ? 'HTTP 代理' : 'SOCKS5 代理')
+    + (r.user ? '（带认证）' : '') + '，可点「测试连通」确认后再保存';
+}
+
+// 用表单当前填写的参数探测出口 IP —— 不保存、不改配置。
+async function obTestForm() {
+  const t = obEls.type ? obEls.type.value : 'socks5';
+  let kind = t, addr = '';
+  if (t === 'socks5') {
+    const a = obEls.socksAddr.value.trim();
+    if (!/^[^\s:]+:\d{1,5}$/.test(a)) { obMsg('SOCKS5 地址格式应为 host:port', 'err'); return; }
+    const u = obEls.socksUser.value.trim(), pw = obEls.socksPass.value.trim();
+    addr = (u || pw) ? encodeURIComponent(u) + ':' + encodeURIComponent(pw) + '@' + a : a;
+  } else if (t === 'http') {
+    addr = obEls.httpUrl.value.trim();
+    if (!/^https?:\/\/\S+$/i.test(addr)) { obMsg('HTTP 代理地址应以 http:// 或 https:// 开头', 'err'); return; }
+  } else {
+    kind = 'direct';
+  }
+  obEls.btnTest.disabled = true;
+  obMsg('测试中...', '');
+  try {
+    const q = new URLSearchParams({ kind: kind, addr: addr });
+    const res = await fetch(location.pathname + 'outbounds/probe?' + q.toString(), { credentials: 'same-origin' });
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || '测试失败');
+    if (json.ip) obMsg('✓ 连通，出口 IP：' + json.ip, 'ok');
+    else obMsg('✗ 连不通：请检查地址、端口与认证信息', 'err');
+  } catch (e) {
+    obMsg('测试失败：' + (e.message || e), 'err');
+  } finally {
+    obEls.btnTest.disabled = false;
+  }
+}
+
+document.querySelectorAll('[data-ob-type]').forEach(b => {
+  b.addEventListener('click', () => {
+    if (obEls.type) obEls.type.value = b.dataset.obType;
+    obTypeSwitch();
+    obAutoName();
+  });
+});
+if (obEls.quick) {
+  obEls.quick.addEventListener('input', obApplyQuick);
+  obEls.quick.addEventListener('paste', () => setTimeout(obApplyQuick, 0));
+}
+[obEls.socksAddr, obEls.httpUrl].forEach(el => { if (el) el.addEventListener('input', obAutoName); });
+if (obEls.name) obEls.name.addEventListener('input', () => { obNameAuto = !obEls.name.value.trim(); });
+if (obEls.btnEye) obEls.btnEye.addEventListener('click', () => obShowPass(obEls.socksPass.type === 'password'));
+if (obEls.btnTest) obEls.btnTest.addEventListener('click', obTestForm);
+if (obEls.btnClose) obEls.btnClose.addEventListener('click', () => obResetForm());
+if (obEls.formCard) {
+  // 表单里按回车 = 保存（快速填写框除外：回车只是确认识别）。
+  obEls.formCard.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' || e.isComposing || e.target === obEls.quick || e.target.tagName !== 'INPUT') return;
+    e.preventDefault();
+    if (obEls.btnSave && !obEls.btnSave.disabled) obEls.btnSave.click();
+  });
 }
 
 // 表单默认收起：点「新增」或「编辑」才展开，并滚到可见处。
@@ -1134,7 +1319,8 @@ function obOpenForm() {
   if (!obEls.formCard) return;
   obEls.formCard.hidden = false;
   obEls.formCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  if (obEls.name) obEls.name.focus({ preventScroll: true });
+  const first = (obEls.quickBox && !obEls.quickBox.hidden) ? obEls.quick : obEls.socksAddr;
+  if (first) first.focus({ preventScroll: true });
 }
 
 if (obEls.btnNew) {
@@ -1151,6 +1337,10 @@ function obFillForm(o) {
   if (obEls.httpUrl) obEls.httpUrl.value = o.url || '';
   if (obEls.httpInsecure) obEls.httpInsecure.checked = !!o.insecure;
   if (obEls.formTitle) obEls.formTitle.textContent = '✏️ 编辑出站：' + o.name;
+  // 编辑时名称锁定：保存按名称覆盖，改名会变成「新增一条 + 旧的还在」。
+  obNameLock(true);
+  obNameAuto = false;
+  if (obEls.quickBox) obEls.quickBox.hidden = true;
   obTypeSwitch();
   obOpenForm();
 }

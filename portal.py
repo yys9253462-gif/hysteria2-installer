@@ -2507,39 +2507,53 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
     </div>
 
-    <!-- 新增/编辑出站表单（点「新增」或「编辑」时展开） -->
+    <!-- 新增/编辑出站表单（点「新增」或「编辑」时展开）
+         2026-10-31：粘贴链接自动填写、类型改为分段按钮、保存前可先测连通。 -->
     <div class="ob-form-card" id="ob-form-card" hidden>
-      <div class="ob-form-title" id="ob-form-title">➕ 新增出站</div>
-      <div class="ob-form-grid">
-        <label class="ob-field">
-          <span>名称</span>
-          <input type="text" id="ob-name" class="ob-input" placeholder="例如：us_exit">
-          <em>只能用字母数字与下划线；横线会自动转为下划线</em>
-        </label>
-        <label class="ob-field">
-          <span>类型</span>
-          <select id="ob-type" class="ob-select">
-            <option value="socks5">SOCKS5 代理</option>
-            <option value="http">HTTP / HTTPS 代理</option>
-            <option value="direct">直连（服务器本地网络）</option>
-          </select>
-          <em id="ob-type-hint">需填 host:port</em>
-        </label>
+      <div class="ob-form-head">
+        <div class="ob-form-title" id="ob-form-title">➕ 新增出站</div>
+        <button class="ob-form-close" id="btn-ob-close" type="button" aria-label="收起">×</button>
       </div>
+
+      <label class="ob-field ob-quick" id="ob-quick-box">
+        <span>⚡ 粘贴代理链接，自动识别填写（可选）</span>
+        <input type="text" id="ob-quick" class="ob-input" autocomplete="off" spellcheck="false"
+               placeholder="socks5://user:pass@1.2.3.4:1080　·　http://1.2.3.4:8080　·　1.2.3.4:1080:user:pass">
+        <em id="ob-quick-hint">支持 socks5:// · socks:// · http(s):// 链接，以及代理商常见的 host:port:user:pass 格式</em>
+      </label>
+
+      <div class="ob-field">
+        <span>类型</span>
+        <div class="ob-type-switch" role="radiogroup" aria-label="出站类型">
+          <button type="button" class="ob-type-btn active" data-ob-type="socks5" role="radio">SOCKS5</button>
+          <button type="button" class="ob-type-btn" data-ob-type="http" role="radio">HTTP / HTTPS</button>
+          <button type="button" class="ob-type-btn" data-ob-type="direct" role="radio">直连</button>
+        </div>
+        <select id="ob-type" class="ob-select" hidden aria-hidden="true" tabindex="-1">
+          <option value="socks5">SOCKS5 代理</option>
+          <option value="http">HTTP / HTTPS 代理</option>
+          <option value="direct">直连（服务器本地网络）</option>
+        </select>
+        <em id="ob-type-hint">需填 host:port</em>
+      </div>
+
       <!-- SOCKS5 专用字段 -->
       <div class="ob-form-block" id="ob-block-socks5">
         <div class="ob-form-grid ob-form-grid-3">
           <label class="ob-field">
             <span>SOCKS5 地址</span>
-            <input type="text" id="ob-socks-addr" class="ob-input" placeholder="1.2.3.4:1080 或 [2001:db8::1]:1080">
+            <input type="text" id="ob-socks-addr" class="ob-input" placeholder="1.2.3.4:1080 或 proxy.example.com:1080" spellcheck="false">
           </label>
           <label class="ob-field">
             <span>用户名（可选）</span>
-            <input type="text" id="ob-socks-user" class="ob-input" placeholder="留空表示无认证" autocomplete="off">
+            <input type="text" id="ob-socks-user" class="ob-input" placeholder="留空表示无认证" autocomplete="off" spellcheck="false">
           </label>
           <label class="ob-field">
             <span>密码（可选）</span>
-            <input type="password" id="ob-socks-pass" class="ob-input" placeholder="留空表示无认证" autocomplete="new-password">
+            <span class="ob-pass-wrap">
+              <input type="password" id="ob-socks-pass" class="ob-input" placeholder="留空表示无认证" autocomplete="new-password">
+              <button type="button" class="ob-pass-eye" id="btn-ob-pass-eye" aria-label="显示密码">显示</button>
+            </span>
           </label>
         </div>
       </div>
@@ -2547,7 +2561,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       <div class="ob-form-block" id="ob-block-http" hidden>
         <label class="ob-field ob-field-wide">
           <span>HTTP 代理地址</span>
-          <input type="text" id="ob-http-url" class="ob-input" placeholder="http://1.2.3.4:8080">
+          <input type="text" id="ob-http-url" class="ob-input" placeholder="http://1.2.3.4:8080" spellcheck="false">
           <em>HTTP 出站不支持 UDP，UDP 流量会被拒绝</em>
         </label>
         <label class="ob-inline-check">
@@ -2555,8 +2569,16 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
           <span>跳过证书校验（代理是自签 https 证书时勾选）</span>
         </label>
       </div>
+
+      <label class="ob-field ob-name-field">
+        <span>名称</span>
+        <input type="text" id="ob-name" class="ob-input" placeholder="填好地址后自动生成，可改" spellcheck="false">
+        <em id="ob-name-hint">字母、数字与下划线，不能以数字开头；分流规则里用它来指定出站</em>
+      </label>
+
       <div class="ob-form-actions">
         <button class="button primary" id="btn-ob-save" type="button">保存并生效</button>
+        <button class="button" id="btn-ob-test" type="button">测试连通</button>
         <button class="button" id="btn-ob-cancel" type="button">取消</button>
         <span class="ob-form-msg" id="ob-form-msg"></span>
       </div>
