@@ -128,14 +128,16 @@ class TestEncodingHardening(unittest.TestCase):
                          '这些 write_text 没带 encoding：行 %s。'
                          'Windows 上会因 GBK 打死 HTTP handler' % bad)
 
-    def test_save_data_uses_utf8(self):
-        import inspect
-        src = inspect.getsource(portal.serve)
-        i = src.find('    def save_data():')
-        self.assertGreaterEqual(i, 0, 'serve() must define save_data')
-        end = src.find('\n    def ', i + 1)
-        body = src[i:end if end >= 0 else len(src)]
-        self.assertIn("encoding='utf-8'", body,
+    def test_save_data_serializes_portal_json_as_utf8(self):
+        import ast
+        src = Path(portal.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        serve = next(node for node in tree.body
+                     if isinstance(node, ast.FunctionDef) and node.name == 'serve')
+        save = next(node for node in ast.walk(serve)
+                    if isinstance(node, ast.FunctionDef) and node.name == 'save_data')
+        body = ast.get_source_segment(src, save)
+        self.assertIn(".encode('utf-8')", body,
                       'save_data 必须显式 UTF-8 —— 它写的是整个 portal.json')
 
 
