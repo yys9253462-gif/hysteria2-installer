@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 import urllib.parse
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -30,11 +31,11 @@ META = dict(
     hop_port_range='20000-40000', subscription_port=11690,
 )
 
-# portal.py 中 `self.path == prefix + '...'` 的全部 POST 端点。
-# 新增 POST 端点时必须同步这里。
+# portal.py 通过 prefix 分发的全部 Web POST 端点（含复用处理方法的端点）。
+# 新增路径时必须同步这里。
 POST_ENDPOINTS = {
     'do-upgrade', 'install-amneziawg', 'install-gost', 'install-warp',
-    'install-xray', 'login', 'logout', 'manage-amneziawg', 'manage-proxy',
+    'install-xray', 'login', 'logout', 'manage-amneziawg', 'manage-proxy', 'outbounds/probe',
     'manage-outbounds', 'manage-reality', 'manage-user', 'manage-vlessenc', 'manage-anytls', 'manage-tuic', 'install-core', 'uninstall-core',
     'manage-vmess', 'manage-warp', 'reboot-server', 'set-bbr',
 }
@@ -114,7 +115,7 @@ class EndpointAuthTest(unittest.TestCase):
         src = (Path(portal.__file__).parent / 'portal.py').read_text(encoding='utf-8')
         found = set()
         import re
-        for m in re.finditer(r"self\.path == prefix \+ '([a-z0-9-]+)'", src):
+        for m in re.finditer(r"self\.path == prefix \+ '([a-z0-9/-]+)'", src):
             found.add(m.group(1))
         self.assertEqual(found, POST_ENDPOINTS,
                          'portal.py 的 POST 端点与本测试清单不一致，请同步')
@@ -144,7 +145,7 @@ class EndpointAuthTest(unittest.TestCase):
         for ep in sorted(POST_ENDPOINTS - {'login', 'logout'}):
             with self.subTest(endpoint=ep):
                 status, body = self.request('POST', self.prefix + ep, {}, bad)
-                self.assertIn(status, (401, 403),
+                self.assertIn(status, (401, 403, 429),
                               f'{ep} 接受了错误的凭据（返回 {status}）')
                 self.assertNoLeak(body, f'POST {ep} (wrong auth)')
 
@@ -164,10 +165,22 @@ class EndpointAuthTest(unittest.TestCase):
             self.assertEqual(status, 200, (endpoint, body[:200]))
             self.assertTrue(json.loads(body)['ok'])
 
+    def test_probe_accepts_credentials_only_in_authenticated_post_body(self):
+        auth = 'Basic ' + base64.b64encode((self.access['username'] + ':' + self.access['password']).encode()).decode()
+        address = 'user:secret@proxy.example:1080'
+        status, body = self.request('POST', self.prefix + 'outbounds/probe',
+                                    {'kind': 'socks5', 'addr': address}, auth=auth)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(json.loads(body)['ok'])
+        # GET query-string probing is no longer a route, so credentials cannot be logged in the URL.
+        status, _ = self.request('GET', self.prefix + 'outbounds/probe?kind=socks5&addr=' +
+                                 urllib.parse.quote(address), auth=auth)
+        self.assertEqual(status, 404)
+
     def test_invalid_probe_never_falls_back_to_direct_egress(self):
         auth = 'Basic ' + base64.b64encode((self.access['username'] + ':' + self.access['password']).encode()).decode()
-        for query in ('kind=unrecognized', 'kind=socks5&addr='):
-            status, body = self.request('GET', self.prefix + 'outbounds/probe?' + query, auth=auth)
+        for form in ({'kind': 'unrecognized'}, {'kind': 'socks5', 'addr': ''}):
+            status, body = self.request('POST', self.prefix + 'outbounds/probe', form, auth=auth)
             self.assertEqual(status, 400, body)
 
     def test_invalid_api_payloads_return_json_not_a_broken_connection(self):

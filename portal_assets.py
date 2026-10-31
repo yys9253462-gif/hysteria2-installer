@@ -1126,9 +1126,12 @@ async function probeOutbound(kind, addr) {
   obEls.ip.textContent = '探测中...';
   if (obEls.ipNote) obEls.ipNote.textContent = '正在通过所选出站访问 ipify';
   try {
-    const q = new URLSearchParams({ kind: kind || 'direct', addr: addr || '' });
-    const res = await fetch(location.pathname + 'outbounds/probe?' + q.toString(),
-      { credentials: 'same-origin' });
+    const body = new URLSearchParams({ kind: kind || 'direct', addr: addr || '' });
+    const res = await fetch(location.pathname + 'outbounds/probe', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
     const json = await res.json();
     if (!json.ok) throw new Error(json.error || '探测失败');
     if (json.ip) {
@@ -1289,9 +1292,13 @@ async function obTestForm() {
   obEls.btnTest.disabled = true;
   obMsg('测试中...', '');
   try {
-    const q = new URLSearchParams({ kind: kind, addr: addr,
+    const body = new URLSearchParams({ kind: kind, addr: addr,
       insecure: (kind === 'http' && obEls.httpInsecure && obEls.httpInsecure.checked) ? 'true' : '' });
-    const res = await fetch(location.pathname + 'outbounds/probe?' + q.toString(), { credentials: 'same-origin' });
+    const res = await fetch(location.pathname + 'outbounds/probe', {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
     const json = await res.json();
     if (!json.ok) throw new Error(json.error || '测试失败');
     if (json.ip) obMsg('✓ 连通，出口 IP：' + json.ip, 'ok');

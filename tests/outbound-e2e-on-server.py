@@ -47,6 +47,14 @@ def req(path, data=None):
     return OP.open(r, timeout=60).read().decode('utf-8', 'ignore')
 
 
+def post_probe(**kw):
+    body = urllib.parse.urlencode(kw).encode()
+    r = urllib.request.Request(B + 'outbounds/probe', data=body)
+    r.add_header('Cookie', CK)
+    r.add_header('Content-Type', 'application/x-www-form-urlencoded')
+    return OP.open(r, timeout=60).read().decode('utf-8', 'ignore')
+
+
 def post(action, **kw):
     """POST 包装。🔴 校验失败时端点会返回 400 —— 那是**正确行为**，
     必须把响应体取出来（里面有给用户看的拒绝原因），不能当异常丢掉。"""
@@ -77,7 +85,7 @@ case('含三种类型', sorted(t['id'] for t in j.get('types', [])) == ['direct'
 case('含内建出站', 'direct_ipv4' in (j.get('builtin') or []), j.get('builtin'))
 
 print('\n=== 3) 出口 IP 探测 ===')
-p = json.loads(req('outbounds/probe?kind=direct'))
+p = json.loads(post_probe(kind='direct'))
 case('直连探测返回 ok', p.get('ok') is True, p)
 case('直连出口 IP 非空（%s）' % p.get('ip'), bool(p.get('ip')))
 

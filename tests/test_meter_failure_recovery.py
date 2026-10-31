@@ -106,13 +106,26 @@ class MeterRecoveryTests(unittest.TestCase):
                 {'hysteria': {'ok': True, 'sampled_at': '2099-01-01T00:00:00+00:00'}},
                 'hysteria'))
 
+    def test_first_meter_save_is_not_skipped_during_initial_minute(self):
+        tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
+        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                    and n.name == 'save_meter_data')
+        save = Mock()
+        clock = SimpleNamespace(monotonic=lambda: 5)
+        env = {'time': clock, '_meter_last_save': [None], 'METER_SAVE_INTERVAL': 60,
+               'save_data': save}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), '<meter-save>', 'exec'), env)
+        env['save_meter_data']()
+        save.assert_called_once_with()
+        self.assertEqual(env['_meter_last_save'][0], 5)
+
     def test_failed_save_does_not_throttle_immediate_retry(self):
         tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
         node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
                     and n.name == 'save_meter_data')
         save = Mock(side_effect=[OSError('disk full'), None])
         clock = SimpleNamespace(monotonic=lambda: 100)
-        env = {'time': clock, '_meter_last_save': [0.0], 'METER_SAVE_INTERVAL': 60,
+        env = {'time': clock, '_meter_last_save': [None], 'METER_SAVE_INTERVAL': 60,
                'save_data': save}
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<meter-save>', 'exec'), env)
         with self.assertRaises(OSError):

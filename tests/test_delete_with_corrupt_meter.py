@@ -36,6 +36,7 @@ def run_api_delete(usage_meter, user='probe'):
     if usage_meter is not None:
         state['usage_meter'] = copy.deepcopy(usage_meter)
     calls = []
+    global_denies = {'probe': {'198.51.100.10': 4102444800}}
     env = dict(data=state, data_lock=threading.RLock(),
                regenerate_page=lambda: calls.append('page'),
                reality_registry=lambda _: calls.append('registry'),
@@ -43,6 +44,7 @@ def run_api_delete(usage_meter, user='probe'):
                MASTER_USER_ID='admin_master',
                ip_tracker={user: {'1.1.1.1'}} if user != 'admin_master' else {},
                speed_tracker={user: [1]} if user != 'admin_master' else {},
+               global_ip_deny=global_denies,
                drop_meter_totals=portal.drop_meter_totals,
                pending_revocations=portal.pending_revocations,
                apply_access=lambda ids: calls.append(('revoke', ids)) or True)
@@ -63,8 +65,10 @@ def run_web_delete(usage_meter):
     if usage_meter is not None:
         state['usage_meter'] = copy.deepcopy(usage_meter)
     calls = []
+    global_denies = {'probe': {'198.51.100.10': 4102444800}}
     ns = dict(portal.__dict__, data=state, data_lock=threading.RLock(),
               ip_tracker={'probe': {'1.1.1.1'}}, speed_tracker={'probe': [1]},
+              global_ip_deny=global_denies,
               drop_meter_totals=portal.drop_meter_totals,
               pending_revocations=portal.pending_revocations,
               save_data=lambda: calls.append('save'),
@@ -105,7 +109,7 @@ def run_web_delete(usage_meter):
     handler = Handler()
     result = ns['_h_post_manage_user'](handler, '/test-token/')
     # 成功分支走 302 重定向（send_response），不返回状态码。
-    return handler.status if handler.status is not None else result, state, calls
+    return handler.status if handler.status is not None else result, state, calls, global_denies
 
 
 class DeleteWithCorruptMeterTests(unittest.TestCase):
@@ -119,8 +123,16 @@ class DeleteWithCorruptMeterTests(unittest.TestCase):
                 self.assertIn(('revoke', ['probe']), calls)
                 self.assertEqual(env['ip_tracker'], {})
                 self.assertEqual(env['speed_tracker'], {})
+                self.assertNotIn('probe', env['global_ip_deny'])
                 # 损坏的计量容器保留原件，不能被删除顺手清空或改写。
                 self.assertEqual(state['usage_meter'], bad)
+
+    def test_delete_clears_cross_node_ip_denies_before_same_id_recreation(self):
+        status, state, env, _calls = run_api_delete(None)
+        self.assertEqual(status, 200)
+        self.assertNotIn('probe', env['global_ip_deny'])
+        # Recreating the same ID must have no effective denies from its predecessor.
+        self.assertEqual(portal.active_ip_deny(env['global_ip_deny'], 'probe', 100), set())
 
     def test_missing_meter_still_deletes(self):
         status, state, env, calls = run_api_delete(None)
@@ -145,9 +157,10 @@ class DeleteWithCorruptMeterTests(unittest.TestCase):
     def test_web_delete_tolerates_corrupt_meter(self):
         for bad in BAD_METERS:
             with self.subTest(bad=bad):
-                status, state, calls = run_web_delete(bad)
+                status, state, calls, global_denies = run_web_delete(bad)
                 self.assertEqual(status, 302)
                 self.assertNotIn('probe', state['users'])
+                self.assertNotIn('probe', global_denies)
                 self.assertIn('sync', calls)
                 self.assertEqual(state['usage_meter'], bad)
 

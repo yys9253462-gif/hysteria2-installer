@@ -1585,7 +1585,7 @@ def _require_disk_space(path, need_bytes):
         raise RuntimeError('磁盘空间不足：需要约 %d MB，当前可用 %d MB'
                            % (need_bytes // (1024 * 1024), free // (1024 * 1024)))
 
-def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
+def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
     binary = Path(binary)
     current = subprocess.run([str(binary), 'version'], capture_output=True, text=True, timeout=5).stdout
     current_line = next((line.split(':', 1)[1].strip() for line in current.splitlines() if line.strip().startswith('Version:')), '')
@@ -1680,6 +1680,12 @@ def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hyste
         raise
     finally:
         candidate.unlink(missing_ok=True)
+
+
+def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
+    """Serialize replacement/restart/rollback against all portal restarts and core operations."""
+    with core_operation_lock:
+        return _upgrade_core_binary_locked(binary, backup_dir, allow_custom)
 
 
 def gost_tls_paths(root):
@@ -7027,11 +7033,13 @@ def serve(path):
     # 下次可按单调计数器补算；若两者同时重启，未落盘的旧 epoch 尾量无法补回，
     # 下次采样会记录 service_restart_unsampled_tail_unknown 缺口。
     METER_SAVE_INTERVAL = 60
-    _meter_last_save = [0.0]
+    _meter_last_save = [None]
 
     def save_meter_data():
         now = time.monotonic()
-        if now - _meter_last_save[0] < METER_SAVE_INTERVAL:
+        # Persist the first sample immediately after start/reboot so a quick portal
+        # restart cannot lose the new counter baseline or its accumulated usage.
+        if _meter_last_save[0] is not None and now - _meter_last_save[0] < METER_SAVE_INTERVAL:
             return
         save_data()
         _meter_last_save[0] = now
@@ -8778,6 +8786,9 @@ if __name__ == '__main__':
                     user_id = str(params.get('user_id', '')).strip()
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
+                    if user_id in RESERVED_USER_IDS:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Reserved user accounts cannot be renewed'})
                     try:
                         raw_days = params.get('extend_days', 30)
                         if isinstance(raw_days, bool) or not str(raw_days).isascii() or not str(raw_days).isdigit():
@@ -8876,6 +8887,9 @@ if __name__ == '__main__':
                             # 速率样本同理：不删的话，同名用户重建后第一轮
                             # 速率会沿用旧样本算出尖峰（2026-10-25 修）。
                             speed_tracker.pop(user_id, None)
+                            # 删除用户时同时清掉按 user_id 绑定的跨节点 IP 封禁，
+                            # 否则短期内同名重建会继续被前一个账号的封禁误伤。
+                            global_ip_deny.pop(user_id, None)
                             # 2026-10-03：同步删掉该用户的 Reality 身份。
                             # 不删的话 —— xray 里那个 UUID 还在，买家退了款
                             # 照样能用 Reality 连上，属于「钱退了货还在」。
@@ -9090,6 +9104,8 @@ if __name__ == '__main__':
             if self.path == prefix + 'manage-outbounds':
                 return self._ob_manage()
 
+            if self.path == prefix + 'outbounds/probe':
+                return self._ob_probe()
 
             return self.reply(404, b'Not found')
 
@@ -10919,6 +10935,8 @@ if __name__ == '__main__':
                             # 速率样本同理：不删的话，同名用户重建后第一轮
                             # 速率会沿用旧样本算出尖峰（2026-10-25 修）。
                             speed_tracker.pop(user_id, None)
+                            # IP deny 的作用域绑定 user_id；同名重建必须从干净状态开始。
+                            global_ip_deny.pop(user_id, None)
                     if delete_missing:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply(404, b'User not found')
@@ -11758,13 +11776,6 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             #    必须走管理员会话，不能仅凭 api_key 就能改流量出口。
             if subpath == 'outbounds/list':
                 return self._ob_list()
-            #🔴 self.path 是**含 query** 的原始路径：
-            #   `outbounds/probe?kind=direct` 会让 subpath 变成
-            #   `outbounds/probe?kind=direct`，等值比较直接落空 → 404。
-            #   本项目多个既有端点都有这个毛病，这里新端点自己扛住：先剥 query。
-            if subpath.split('?', 1)[0] == 'outbounds/probe':
-                return self._ob_probe()
-
             if subpath == 'cert-status':
                 return self._h_get_cert_status(subpath)
 
@@ -12409,19 +12420,25 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             })
 
         def _ob_probe(self):
-            """GET <prefix>outbounds/probe?kind=&addr= —— 探测真实出口 IP。
+            """POST <prefix>outbounds/probe —— 探测真实出口 IP。
 
             🔴 只探测、不改任何配置，可以放心反复点。
             这是用户判断"到底生效没有"的唯一依据。
             """
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
-            query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
-            kind = (query.get('kind', ['direct'])[0] or 'direct').strip().lower()
-            addr = (query.get('addr', [''])[0] or '').strip()
+            try:
+                length = int(self.headers.get('Content-Length', 0))
+                if not 0 <= length <= 8192:
+                    return self.reply_json(413, {'ok': False, 'error': 'Probe request exceeds 8 KiB'})
+                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
+            except (ValueError, TypeError, OSError):
+                return self.reply_json(400, {'ok': False, 'error': 'Invalid probe request'})
+            kind = (form.get('kind', ['direct'])[0] or 'direct').strip().lower()
+            addr = (form.get('addr', [''])[0] or '').strip()
             if kind not in ('direct', 'auto', 'warp', 'socks5', 'http') or (kind in ('socks5', 'http') and not addr):
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid outbound probe type or missing address'})
-            insecure = (query.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
+            insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})
 

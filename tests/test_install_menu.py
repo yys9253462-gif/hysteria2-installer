@@ -191,6 +191,73 @@ if [[ "$managed_singbox" == 1 ]]; then rm -f "$BINARY"; fi
             self.assertFalse(binary.exists())
 
 
+class UninstallOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_uninstall_preserves_unmanaged_xray_and_removes_its_sysctl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hy2 = root / 'etc/hysteria'
+            hy2.mkdir(parents=True)
+            units = root / 'etc/systemd/system'
+            units.mkdir(parents=True)
+            sysctl_dir = root / 'etc/sysctl.d'
+            sysctl_dir.mkdir(parents=True)
+            xray_unit = units / 'xray.service'
+            xray_unit.write_text('[Service]\nExecStart=/usr/local/bin/xray run -c /etc/xray/config.json\n')
+            sysctl = sysctl_dir / '99-hysteria2.conf'
+            sysctl.write_text('net.core.rmem_max = 1\n')
+            binary = root / 'usr/local/bin/xray'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('unmanaged-xray')
+            marker = 'systemctl disable --now xray 2>/dev/null || true'
+            start = INSTALL.index('        if [[ -f /etc/systemd/system/xray.service ]]',
+                                  INSTALL.index('uninstall_all() {'))
+            fragment = INSTALL[start:]
+            self.assertIn(marker, fragment)
+            fragment = fragment[:fragment.index('\n        # AnyTLS / TUIC')]
+            fragment += '\nrm -f /etc/sysctl.d/99-hysteria2.conf\n'
+            fragment = fragment.replace('/etc/systemd/system', str(units).replace('\\', '/'))
+            fragment = fragment.replace('/usr/local/bin/xray', str(binary).replace('\\', '/'))
+            fragment = fragment.replace('/etc/sysctl.d/99-hysteria2.conf',
+                                        str(sysctl).replace('\\', '/'))
+            script = root / 'uninstall.sh'
+            script.write_text('''#!/usr/bin/env bash
+HY2_DIR="$TEST_ROOT/etc/hysteria"
+systemctl() { :; }
+''' + fragment, encoding='utf-8')
+            bash = shutil.which('bash')
+            subprocess.run([bash, str(script)], check=True, env=dict(os.environ, TEST_ROOT=str(root)))
+            self.assertTrue(xray_unit.exists())
+            self.assertTrue(binary.exists())
+            self.assertFalse(sysctl.exists())
+            xray_unit.write_text(
+                '[Service]\nExecStart=%s run -c /etc/hysteria/xray.json\n' % binary.as_posix())
+            (hy2 / 'xray.json').write_text('{}')
+            subprocess.run([bash, str(script)], check=True, env=dict(os.environ, TEST_ROOT=str(root)))
+            self.assertFalse(xray_unit.exists())
+            self.assertFalse(binary.exists())
+
+
+class UninstallSysctlCleanupTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_owned_sysctl_tuning_is_removed_on_uninstall(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysctl_dir = root / 'etc/sysctl.d'
+            sysctl_dir.mkdir(parents=True)
+            sysctl = sysctl_dir / '99-hysteria2.conf'
+            sysctl.write_text('net.core.rmem_max = 8388608\n')
+            fragment = INSTALL[INSTALL.index('        # 仅删除安装器自己生成的持久化 sysctl 调优项'):]
+            fragment = fragment[:fragment.index('\n        clear_all_hopping_rules')]
+            fragment = fragment.replace('/etc/sysctl.d/99-hysteria2.conf', sysctl.as_posix())
+            script = root / 'cleanup.sh'
+            script.write_text('''#!/usr/bin/env bash
+clear_all_hopping_rules() { :; }
+''' + fragment, encoding='utf-8')
+            subprocess.run([shutil.which('bash'), str(script)], check=True)
+            self.assertFalse(sysctl.exists())
+
+
 class AdoptTest(unittest.TestCase):
     """「重新修改配置」沿用现有门户：Teyir 保存的凭据与控制台开的用户都不能变。"""
 

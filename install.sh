@@ -1609,8 +1609,20 @@ setup_cert_via_dns_api() {
         log_err "acme.sh 未产出 fullchain.cer，请检查上方报错。"
         return 1
     fi
-    log_info "acme.sh 签发成功。"
-    echo "$certdir/fullchain.cer|$certdir/${domain}.key" >&3
+    # 与 Nginx HTTP-01 路径一致：安装到 Hysteria 稳定读取的证书路径，
+    # 并给 acme.sh 注册 deploy/reload hook；否则 --cron 只换磁盘文件，
+    # Hysteria 仍会在内存里继续提供旧证书直到重启。
+    local out_cert="${HY2_CERT_DIR}/acme-${domain}.crt" out_key="${HY2_CERT_DIR}/acme-${domain}.key"
+    mkdir -p "$HY2_CERT_DIR"
+    if ! "$acct" --install-cert -d "$domain" --ecc \
+            --fullchain-file "$out_cert" --key-file "$out_key" \
+            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic" >/dev/null; then
+        log_err "DNS API 证书已签发，但安装或续期重载钩子配置失败。"
+        return 1
+    fi
+    chmod 600 "$out_key"
+    log_info "acme.sh DNS API 证书续期后会自动安装并重启相关服务。"
+    echo "$out_cert|$out_key" >&3
     return 0
 }
 
@@ -1729,6 +1741,7 @@ setup_acme_certificate() {
             log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
             log_info "续期：acme.sh --cron 需常驻，建议 crontab -e 加入："
             log_info "  ${acct:-/root/.acme.sh/acme.sh} --cron --home ${HOME}/.acme.sh > /dev/null 2>&1"
+            log_info "证书将安装到 Hysteria 固定读取路径，acme.sh 续期后会自动重启相关服务。"
             return 0
         elif [[ $_dnsres -eq 2 ]]; then
             log_err "============================================================"
@@ -4866,10 +4879,14 @@ uninstall_all() {
         systemctl disable hysteria-server 2>/dev/null || true
         systemctl disable --now hysteria-portal 2>/dev/null || true
         systemctl disable --now gost 2>/dev/null || true
-        # Reality 用的 xray 由门户安装（/etc/hysteria/xray.json），也要一起停掉，
-        # 否则配置目录删了它还在跑，Reality 用户要到重启后才断。
-        systemctl disable --now xray 2>/dev/null || true
-        rm -f /etc/systemd/system/xray.service /usr/local/bin/xray
+        # 只卸载门户安装的 Xray：独立部署的服务/二进制属于宿主机，
+        # 以该门户专属 ExecStart 识别所有权，即使 xray.json 已损坏/丢失也需清理单元。
+        if [[ -f /etc/systemd/system/xray.service ]] \
+                && grep -qF 'ExecStart=/usr/local/bin/xray run -c /etc/hysteria/xray.json' \
+                    /etc/systemd/system/xray.service; then
+            systemctl disable --now xray 2>/dev/null || true
+            rm -f /etc/systemd/system/xray.service /usr/local/bin/xray
+        fi
         # AnyTLS / TUIC 的 sing-box 同样由门户安装，配置在 /etc/hysteria/{anytls,tuic}.json。
         # 仅当本项目的 systemd 单元存在时才认领并删除共享二进制；无关联单元时
         # sing-box 可能由管理员供其它服务使用，卸载 Hysteria 不能动它。
@@ -4901,6 +4918,8 @@ uninstall_all() {
         rm -f /etc/systemd/system/hy2-cert-selfheal.timer
         rm -f /etc/systemd/system/hy2-cert-selfheal.path
         rm -f /usr/local/bin/hy2-cert-selfheal.sh
+        # 仅删除安装器自己生成的持久化 sysctl 调优项，恢复系统默认配置来源。
+        rm -f /etc/sysctl.d/99-hysteria2.conf
         clear_all_hopping_rules
         rm -f "$HY2_SERVICE"
         systemctl daemon-reload

@@ -58,7 +58,8 @@ class WebWorkflowTests(unittest.TestCase):
         self.reload = Mock(return_value=True)
         self.ns = dict(portal.__dict__, Path=fake_path, data=self.data, data_lock=threading.RLock(),
                        save_data=self.save, regenerate_page=self.save, meta_path=self.meta,
-                       portal_path=self.hdir / 'portal.json', ip_tracker={}, speed_tracker={}, MASTER_USER_ID='admin_master',
+                       portal_path=self.hdir / 'portal.json', ip_tracker={}, speed_tracker={},
+                       global_ip_deny={}, MASTER_USER_ID='admin_master',
                        VALID_USER_ID_RE=portal.re.compile(r'^[a-zA-Z0-9_.-]{1,64}$'),
                        reload_gost=self.reload, gost_status=Mock(return_value=True),
                        gost_operation_lock=threading.RLock(), reality_apply_lock=threading.Lock(),
@@ -101,6 +102,26 @@ class WebWorkflowTests(unittest.TestCase):
         else:
             method(self.handler, '/test-token/')
         return self.response
+
+    def test_api_renew_cannot_set_quota_on_master_account(self):
+        branch = next(n for n in ast.walk(TREE) if isinstance(n, ast.If)
+                      and isinstance(n.test, ast.Compare)
+                      and any(isinstance(c, ast.Constant) and c.value == 'users/renew'
+                              for c in n.test.comparators))
+        fn = ast.parse('def renew(self, params, now_ts):\n    pass').body[0]
+        fn.body = copy.deepcopy(branch.body)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
+                     '<renew>', 'exec'), self.ns)
+        user = {'password': 'master-test-only', 'status': 'active', 'expires_at': 2085974400,
+                'limit_bytes': 0, 'used_bytes': 0}
+        self.data['users']['admin_master'] = user
+        status, body = self.ns['renew'](self.handler,
+            {'user_id': 'admin_master', 'extend_days': 30, 'add_traffic_gb': 1}, 100)
+        self.assertEqual(status, 400)
+        self.assertIn('Reserved user accounts', body['error'])
+        self.assertEqual(user['limit_bytes'], 0)
+        self.save.assert_not_called()
+        self.sync.assert_not_called()
 
     def test_api_renew_rejects_corrupt_expiry_without_mutation(self):
         branch = next(n for n in ast.walk(TREE) if isinstance(n, ast.If)
