@@ -2456,69 +2456,59 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
   </div>
 
   <div class="subtab-pane" id="sub-outbound">
-  <!-- 区块 2.5: 自定义出站（全局出口 / 自定义 http·socks5 代理） -->
+  <!-- 区块 2.5: 自定义出站（全局出口 / 自定义 http·socks5 代理）
+       2026-10-31 改版：模式切换并入标题栏，出口探测与出站列表并排，新增表单默认收起。 -->
   <section class="card ob-card" style="margin-top:0">
     <div class="ob-head">
       <div class="ob-title-box">
-        <h2 class="ob-title">🌐 自定义出站（全局出口 · 第三方代理）</h2>
-        <p style="font-size:13px;margin:4px 0 0;color:var(--muted)">
-          让流量走你自己指定的出口：可把<b>全部流量</b>交给一个代理，或让特定域名分别走不同代理。
-        </p>
+        <h2 class="ob-title">🌐 自定义出站</h2>
+        <p class="ob-subtitle">让流量从你指定的出口出去：全部交给一个代理，或按域名分别走不同代理。</p>
       </div>
-      <span class="ob-mode-badge" id="ob-mode-badge">加载中...</span>
-    </div>
-
-    <!-- 出站模式：分流 / 全局 -->
-    <div class="ob-mode-card">
-      <div class="ob-mode-title">🎚️ 出站模式</div>
-      <div class="ob-mode-switch">
+      <div class="ob-mode-switch" role="group" aria-label="出站模式">
         <button class="ob-mode-btn active" id="btn-ob-mode-rules" data-mode="rules" type="button">
-          <b>按域名分流</b>
-          <span>名单内走指定出站，其余走直连</span>
+          <b>🎯 按域名分流</b>
         </button>
         <button class="ob-mode-btn" id="btn-ob-mode-global" data-mode="global" type="button">
-          <b>全局出口</b>
-          <span>所有流量都走第一个出站</span>
+          <b>🌍 全局出口</b>
         </button>
       </div>
-      <p class="ob-mode-note" id="ob-mode-note">
-        全局模式下，客户端访问任何网站都从你指定的出口出去（对解锁 AI、换 IP 场景最有效）。
-      </p>
     </div>
+    <p class="ob-mode-note" id="ob-mode-note">加载中...</p>
+    <span class="ob-form-msg ob-status" id="ob-status" role="status"></span>
 
-    <!-- 真实出口 IP 探测 -->
-    <div class="ob-probe-card">
-      <div class="ob-probe-left">
+    <div class="ob-grid">
+      <!-- 真实出口 IP 探测 -->
+      <div class="ob-probe-card">
         <div class="ob-probe-title">📍 当前真实出口 IP</div>
         <div class="ob-probe-ip" id="ob-outbound-ip">探测中...</div>
         <div class="ob-probe-sub" id="ob-outbound-ip-note">这是客户端流量出去时对方看到的地址</div>
+        <div class="ob-probe-actions">
+          <select id="ob-probe-kind" class="ob-select">
+            <option value="direct">直连（服务器本机）</option>
+            <option value="warp">WARP (127.0.0.1:19898)</option>
+            <option value="socks5">自定义 SOCKS5</option>
+            <option value="http">自定义 HTTP</option>
+          </select>
+          <input type="text" id="ob-probe-addr" class="ob-input"
+                 placeholder="1.2.3.4:1080 或 http://1.2.3.4:8080" hidden>
+          <button class="button" id="btn-ob-probe" type="button">探测出口</button>
+        </div>
       </div>
-      <div class="ob-probe-actions">
-        <select id="ob-probe-kind" class="ob-select" style="max-width:170px">
-          <option value="direct">直连（服务器本机）</option>
-          <option value="warp">WARP (127.0.0.1:19898)</option>
-          <option value="socks5">自定义 SOCKS5</option>
-          <option value="http">自定义 HTTP</option>
-        </select>
-        <input type="text" id="ob-probe-addr" class="ob-input" style="max-width:190px"
-               placeholder="1.2.3.4:1080 或 http://1.2.3.4:8080" hidden>
-        <button class="button" id="btn-ob-probe" type="button">探测出口</button>
+
+      <!-- 自定义出站列表 -->
+      <div class="ob-list-card">
+        <div class="ob-list-head">
+          <span class="ob-list-title">📦 已配置的出站 <span class="ob-count-badge" id="ob-count">0 个</span></span>
+          <button class="button primary ob-new-btn" id="btn-ob-new" type="button">＋ 新增出站</button>
+        </div>
+        <div class="ob-list" id="ob-list">
+          <span class="ob-empty">加载中...</span>
+        </div>
       </div>
     </div>
 
-    <!-- 自定义出站列表 -->
-    <div class="ob-list-card">
-      <div class="ob-list-head">
-        <span class="ob-list-title">📦 已配置的出站</span>
-        <span class="ob-count-badge" id="ob-count">0 个</span>
-      </div>
-      <div class="ob-list" id="ob-list">
-        <span style="font-size:12px;color:var(--muted)">加载中...</span>
-      </div>
-    </div>
-
-    <!-- 新增/编辑出站表单 -->
-    <div class="ob-form-card">
+    <!-- 新增/编辑出站表单（点「新增」或「编辑」时展开） -->
+    <div class="ob-form-card" id="ob-form-card" hidden>
       <div class="ob-form-title" id="ob-form-title">➕ 新增出站</div>
       <div class="ob-form-grid">
         <label class="ob-field">
@@ -2538,18 +2528,18 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
       <!-- SOCKS5 专用字段 -->
       <div class="ob-form-block" id="ob-block-socks5">
-        <label class="ob-field ob-field-wide">
-          <span>SOCKS5 地址</span>
-          <input type="text" id="ob-socks-addr" class="ob-input" placeholder="1.2.3.4:1080 或 1.2.3.4:1080">
-        </label>
-        <div class="ob-form-grid">
+        <div class="ob-form-grid ob-form-grid-3">
+          <label class="ob-field">
+            <span>SOCKS5 地址</span>
+            <input type="text" id="ob-socks-addr" class="ob-input" placeholder="1.2.3.4:1080 或 [2001:db8::1]:1080">
+          </label>
           <label class="ob-field">
             <span>用户名（可选）</span>
-            <input type="text" id="ob-socks-user" class="ob-input" placeholder="留空表示无认证">
+            <input type="text" id="ob-socks-user" class="ob-input" placeholder="留空表示无认证" autocomplete="off">
           </label>
           <label class="ob-field">
             <span>密码（可选）</span>
-            <input type="text" id="ob-socks-pass" class="ob-input" placeholder="留空表示无认证">
+            <input type="password" id="ob-socks-pass" class="ob-input" placeholder="留空表示无认证" autocomplete="new-password">
           </label>
         </div>
       </div>
@@ -2567,24 +2557,24 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
       <div class="ob-form-actions">
         <button class="button primary" id="btn-ob-save" type="button">保存并生效</button>
-        <button class="button" id="btn-ob-cancel" type="button" hidden>取消编辑</button>
+        <button class="button" id="btn-ob-cancel" type="button">取消</button>
         <span class="ob-form-msg" id="ob-form-msg"></span>
       </div>
     </div>
 
     <!-- 分流规则（每条可指定走哪个出站）-->
-    <div class="ob-rules-card">
+    <div class="ob-rules-card" id="ob-rules-card">
       <div class="ob-list-head">
-        <span class="ob-list-title">🎯 分流规则（仅在「按域名分流」模式下生效）</span>
-        <span class="ob-count-badge" id="ob-rules-count">0 条</span>
+        <span class="ob-list-title">🎯 分流规则 <span class="ob-count-badge" id="ob-rules-count">0 条</span></span>
+        <span class="ob-rules-hint" id="ob-rules-hint">仅在「按域名分流」模式下生效</span>
       </div>
       <div class="ob-add-form">
         <input type="text" id="ob-rule-domain" class="ob-input" placeholder="域名，如 openai.com">
-        <select id="ob-rule-outbound" class="ob-select" style="max-width:200px"></select>
+        <select id="ob-rule-outbound" class="ob-select"></select>
         <button class="button" id="btn-ob-rule-add" type="button">添加规则</button>
       </div>
       <div class="ob-rules-list" id="ob-rules-list">
-        <span style="font-size:12px;color:var(--muted)">加载中...</span>
+        <span class="ob-empty">加载中...</span>
       </div>
     </div>
   </section>

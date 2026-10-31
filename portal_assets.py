@@ -224,76 +224,86 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 /* ===== 自定义出站（Custom Outbounds）区块 =====
    与 WARP 区块同风格但独立命名，避免选择器互相污染。 */
 .ob-card { margin-top: 22px; }
-.ob-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
-.ob-title-box { min-width: 0; }
-.ob-title { font-size: 16px; font-weight: 800; color: var(--ink); margin: 0; }
-.ob-mode-badge { font-size: 12px; font-weight: 700; padding: 5px 13px; border-radius: 20px; background: #f0f5f4; color: var(--muted); border: 1px solid var(--line); white-space: nowrap; }
-.ob-mode-badge.global { background: #fff4e5; color: #8a5200; border-color: #ffd9a0; }
-.ob-mode-badge.rules { background: #eaf5ef; color: var(--accent); border-color: #c0ded4; }
+.ob-head { display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap; }
+.ob-title-box { min-width: 0; flex: 1 1 320px; }
+.ob-title { font-size: 17px; font-weight: 800; color: var(--ink); margin: 0; }
+.ob-subtitle { font-size: 13px; margin: 4px 0 0; color: var(--muted); }
+/* 模式切换：标题栏右侧的分段按钮 */
+.ob-mode-switch { display: inline-flex; padding: 4px; gap: 4px; border-radius: 12px; background: #eef3f2; border: 1px solid var(--line); }
+.ob-mode-btn { border: 0; background: transparent; padding: 8px 16px; border-radius: 9px; cursor: pointer; transition: background .15s, box-shadow .15s; }
+.ob-mode-btn b { font-size: 13px; font-weight: 750; color: var(--muted); white-space: nowrap; }
+.ob-mode-btn:hover b { color: var(--ink); }
+.ob-mode-btn.active { background: #fff; box-shadow: 0 1px 3px rgba(16,42,38,.14); }
+.ob-mode-btn.active b { color: var(--accent); }
+.ob-mode-btn.active[data-mode="global"] b { color: #8a5200; }
+.ob-mode-note { font-size: 12.5px; color: #496861; margin: 12px 0 16px; line-height: 1.6; padding: 9px 13px; border-radius: 10px; background: #f3f8f7; border-left: 3px solid var(--accent); }
+.ob-mode-note.global { background: #fff8ec; border-left-color: #e0a040; color: #6e4a12; }
 
-.ob-mode-card, .ob-probe-card, .ob-list-card, .ob-form-card, .ob-rules-card {
-  background: #fafcfb; border: 1px solid var(--line); border-radius: 16px;
-  padding: 18px 20px; margin-bottom: 16px;
-}
-.ob-mode-card { background: #f6faf9; border-color: #d3e7e2; }
-.ob-mode-title, .ob-list-title { font-size: 14px; font-weight: 800; color: var(--ink); margin-bottom: 12px; display: block; }
-.ob-mode-switch { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
-.ob-mode-btn { flex: 1; min-width: 220px; text-align: left; padding: 13px 16px; border-radius: 12px;
-  border: 1.5px solid var(--line); background: #fff; cursor: pointer; transition: all .15s ease; }
-.ob-mode-btn b { display: block; font-size: 13.5px; color: var(--ink); margin-bottom: 3px; font-weight: 800; }
-.ob-mode-btn span { font-size: 12px; color: var(--muted); }
-.ob-mode-btn:hover { border-color: var(--accent); }
-.ob-mode-btn.active { border-color: var(--accent); background: #eef7f5; box-shadow: 0 0 0 3px rgba(8,127,116,.08); }
-.ob-mode-note { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.6; }
-
-.ob-probe-card { display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap; background: #f8fbff; border-color: #d6e5f5; }
+.ob-grid { display: grid; grid-template-columns: minmax(260px, 2fr) 3fr; gap: 14px; margin-bottom: 14px; }
+@media(max-width: 860px) { .ob-grid { grid-template-columns: 1fr; } }
+.ob-probe-card, .ob-list-card, .ob-form-card, .ob-rules-card {
+  border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; background: #fff; min-width: 0; }
+.ob-form-card, .ob-rules-card { margin-bottom: 14px; }
+.ob-rules-card { margin-bottom: 0; transition: opacity .2s; }
+.ob-rules-card.inactive { opacity: .55; }
+.ob-probe-card { background: #f8fbff; border-color: #d6e5f5; display: flex; flex-direction: column; }
 .ob-probe-title { font-size: 12.5px; font-weight: 700; color: #2c5a86; margin-bottom: 6px; }
-.ob-probe-ip { font-size: 21px; font-weight: 800; color: #1b3f61; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: -.02em; }
+.ob-probe-ip { font-size: 22px; font-weight: 800; color: #1b3f61; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: -.02em; word-break: break-all; }
 .ob-probe-sub { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
-.ob-probe-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.ob-probe-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: auto; padding-top: 14px; }
+.ob-probe-actions .ob-select, .ob-probe-actions .ob-input { flex: 1 1 150px; min-width: 0; }
 
-.ob-list-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; gap: 10px; flex-wrap: wrap; }
-.ob-count-badge { font-size: 11.5px; font-weight: 700; padding: 3px 11px; border-radius: 20px; background: #eaf5ef; color: var(--accent); border: 1px solid #c0ded4; }
-.ob-list { display: flex; flex-direction: column; gap: 9px; }
+.ob-list-title { font-size: 14px; font-weight: 800; color: var(--ink); display: inline-flex; align-items: center; gap: 8px; }
+.ob-list-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 10px; flex-wrap: wrap; }
+.ob-new-btn { height: 32px; padding: 0 14px; font-size: 12.5px; }
+.ob-count-badge { font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 20px; background: #eaf5ef; color: var(--accent); border: 1px solid #c0ded4; }
+.ob-empty { font-size: 12.5px; color: var(--muted); line-height: 1.6; }
+.ob-list { display: flex; flex-direction: column; gap: 8px; }
 .ob-item { display: flex; justify-content: space-between; align-items: center; gap: 12px;
-  padding: 12px 15px; background: #fff; border: 1.5px solid var(--line); border-radius: 12px; flex-wrap: wrap; }
-.ob-item-main { min-width: 0; flex: 1; }
+  padding: 10px 13px; border: 1px solid var(--line); border-radius: 11px; background: #fbfcfd; flex-wrap: wrap; }
+.ob-item-main { min-width: 0; flex: 1 1 200px; }
 .ob-item-name { font-size: 13.5px; font-weight: 750; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .ob-item-meta { font-size: 12px; color: var(--muted); margin-top: 3px; word-break: break-all; }
 .ob-item-type { font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 6px; margin-left: 8px; vertical-align: middle; }
+.ob-item-first { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 6px; margin-left: 6px; background: #fff4e5; color: #8a5200; vertical-align: middle; }
 .ob-type-socks5 { background: #e8f0fd; color: #1d4e89; }
 .ob-type-http { background: #fdeee8; color: #9a4a1e; }
 .ob-type-direct { background: #eaf5ef; color: #2c6b52; }
-.ob-item-actions { display: flex; gap: 7px; flex-shrink: 0; }
+.ob-item-actions { display: flex; gap: 6px; flex-shrink: 0; }
 .ob-mini-btn { height: 28px; padding: 0 11px; font-size: 12px; font-weight: 650; border-radius: 8px;
-  border: 1px solid var(--line); background: #fff; color: var(--muted); cursor: pointer; transition: all .15s ease; }
+  border: 1px solid var(--line); background: #fff; color: var(--ink); cursor: pointer; }
 .ob-mini-btn:hover { border-color: var(--accent); color: var(--accent); }
 .ob-mini-btn.danger:hover { border-color: #d64545; color: #d64545; background: #fef5f5; }
 
-.ob-form-card { background: #fbfcfd; }
+.ob-form-card { background: #fbfcfd; border-color: #c0ded4; box-shadow: 0 0 0 3px rgba(8,127,116,.06); }
 .ob-form-title { font-size: 14px; font-weight: 800; color: var(--ink); margin-bottom: 14px; }
-.ob-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 4px; }
-@media(max-width: 640px) { .ob-form-grid { grid-template-columns: 1fr; } .ob-probe-card { flex-direction: column; align-items: flex-start; } }
+.ob-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.ob-form-grid-3 { grid-template-columns: 2fr 1fr 1fr; }
+@media(max-width: 640px) { .ob-form-grid, .ob-form-grid-3 { grid-template-columns: 1fr; } .ob-mode-switch { width: 100%; } .ob-mode-btn { flex: 1; } }
 .ob-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; min-width: 0; }
 .ob-field-wide { width: 100%; }
 .ob-field > span { font-size: 12px; font-weight: 700; color: #496861; }
 .ob-field > em { font-size: 11px; color: var(--muted); font-style: normal; line-height: 1.5; }
-.ob-input, .ob-select { height: 40px; padding: 0 13px; border: 1.5px solid var(--line); border-radius: 10px;
-  font-size: 13px; color: var(--ink); background: #fff; outline: none; transition: all .15s ease; width: 100%; }
+.ob-input, .ob-select { height: 38px; padding: 0 12px; border: 1.5px solid var(--line); border-radius: 10px;
+  font-size: 13px; background: #fff; color: var(--ink); outline: none; width: 100%; box-sizing: border-box; min-width: 0; }
 .ob-input:focus, .ob-select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(8,127,116,.12); }
 .ob-inline-check { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: #496861; margin-bottom: 12px; cursor: pointer; }
 .ob-form-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
 .ob-form-msg { font-size: 12px; font-weight: 650; }
 .ob-form-msg.ok { color: #2c8a4e; }
 .ob-form-msg.err { color: #d64545; }
+.ob-status { display: block; margin: -6px 0 12px; }
+.ob-status:empty { display: none; }
 
-.ob-add-form { display: flex; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
-.ob-add-form .ob-input { flex: 1; min-width: 160px; }
+.ob-rules-hint { font-size: 11.5px; color: var(--muted); }
+.ob-add-form { display: grid; grid-template-columns: 1fr minmax(140px, 220px) auto; gap: 10px; margin-bottom: 14px; }
+@media(max-width: 640px) { .ob-add-form { grid-template-columns: 1fr; } }
 .ob-rules-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .ob-rule-item { display: inline-flex; align-items: center; gap: 8px; padding: 6px 13px; background: #fff;
-  border: 1.5px solid #cfe0dc; border-radius: 20px; font-size: 12.5px; font-weight: 650; color: #184239; }
+  border: 1px solid var(--line); border-radius: 20px; font-size: 12.5px; color: var(--ink); }
 .ob-rule-domain { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .ob-rule-target { font-size: 11px; color: var(--muted); font-weight: 600; }
+.ob-rule-target::before { content: '→ '; }
 .ob-rule-del { color: #d64545; text-decoration: none; font-size: 15px; line-height: 1; font-weight: 800; cursor: pointer; border-radius: 50%; }
 .ob-rule-del:hover { color: #a82020; transform: scale(1.15); }
 .warp-domain-input { flex: 1; height: 42px; padding: 0 14px; border: 1.5px solid var(--line); border-radius: 10px; font-size: 13px; color: var(--ink); background: #fdfefe; outline: none; transition: all .15s ease; }
@@ -859,7 +869,10 @@ setInterval(() => { if (!document.hidden) checkWarpStatus(); }, 10000);
 //    所以任何 onclick="..." 内联事件都会被浏览器丢弃（表现为"按钮点了没反应"）。
 //    全部交互统一用 data-* 属性 + 事件委托。
 const obEls = {
-  badge: document.getElementById('ob-mode-badge'),
+  formCard: document.getElementById('ob-form-card'),
+  status: document.getElementById('ob-status'),
+  btnNew: document.getElementById('btn-ob-new'),
+  rulesCard: document.getElementById('ob-rules-card'),
   modeNote: document.getElementById('ob-mode-note'),
   btnRules: document.getElementById('btn-ob-mode-rules'),
   btnGlobal: document.getElementById('btn-ob-mode-global'),
@@ -919,17 +932,19 @@ function renderOutboundList(outs) {
   if (!obEls.list) return;
   if (obEls.count) obEls.count.textContent = outs.length + ' 个';
   if (!outs.length) {
-    obEls.list.innerHTML = '<span style="font-size:12px;color:var(--muted)">还没有自定义出站。'
-      + '在下方表单添加一个 SOCKS5 / HTTP 代理，再切到「全局出口」即可让所有流量走它。</span>';
+    obEls.list.innerHTML = '<span class="ob-empty">还没有自定义出站。'
+      + '点右上角「＋ 新增出站」添加一个 SOCKS5 / HTTP 代理，再切到「全局出口」即可让所有流量走它。</span>';
     return;
   }
-  obEls.list.innerHTML = outs.map(o => {
+  obEls.list.innerHTML = outs.map((o, idx) => {
     const t = OB_TYPE_LABEL[o.type] || { label: o.type, cls: '' };
     const testAddr = (o.type === 'socks5') ? (o.addr || '') : (o.url || '');
     return '<div class="ob-item">'
       + '<div class="ob-item-main">'
       + '<div class="ob-item-name">' + obEsc(o.name)
-      + '<span class="ob-item-type ' + t.cls + '">' + obEsc(t.label) + '</span></div>'
+      + '<span class="ob-item-type ' + t.cls + '">' + obEsc(t.label) + '</span>'
+      + (idx === 0 ? '<span class="ob-item-first" title="全局出口模式下所有流量走这个出站">全局出口</span>' : '')
+      + '</div>'
       + '<div class="ob-item-meta">' + obEsc(obMetaOf(o)) + '</div></div>'
       + '<div class="ob-item-actions">'
       + '<button class="ob-mini-btn" data-ob-test="' + obEsc(o.name) + '" data-ob-kind="' + obEsc(o.type)
@@ -969,7 +984,7 @@ function renderOutboundRules(rules, outs, builtin) {
   }
 
   if (!norm.length) {
-    obEls.rulesList.innerHTML = '<span style="font-size:12px;color:var(--muted)">暂无分流规则。'
+    obEls.rulesList.innerHTML = '<span class="ob-empty">暂无分流规则。'
       + '添加后该域名走指定出站，其余流量不受影响。</span>';
     return;
   }
@@ -984,13 +999,11 @@ function renderOutboundRules(rules, outs, builtin) {
 
 function obSetModeUI(mode) {
   const isGlobal = mode === 'global';
-  if (obEls.badge) {
-    obEls.badge.textContent = isGlobal ? '全局出口模式' : '按域名分流';
-    obEls.badge.className = 'ob-mode-badge ' + (isGlobal ? 'global' : 'rules');
-  }
+  if (obEls.rulesCard) obEls.rulesCard.classList.toggle('inactive', isGlobal);
   if (obEls.btnGlobal) obEls.btnGlobal.classList.toggle('active', isGlobal);
   if (obEls.btnRules) obEls.btnRules.classList.toggle('active', !isGlobal);
   if (obEls.modeNote) {
+    obEls.modeNote.classList.toggle('global', isGlobal);
     obEls.modeNote.textContent = isGlobal
       ? '全局模式：客户端访问任何网站都从列表里第一个出站出去。列表顺序即优先级。'
       : '按域名分流：名单内域名走指定出站，其余走直连（影响面可控，建议先用这个）。';
@@ -1007,10 +1020,16 @@ function obTypeSwitch() {
   }
 }
 
+// 表单展开时消息写在表单里（贴着出错的字段）；收起时写在标题栏下的状态行，
+// 否则「保存成功」「模式切换中」会写进看不见的表单。
 function obMsg(text, kind) {
-  if (!obEls.msg) return;
-  obEls.msg.textContent = text || '';
-  obEls.msg.className = 'ob-form-msg ' + (kind || '');
+  const formOpen = obEls.formCard && !obEls.formCard.hidden;
+  [obEls.msg, obEls.status].forEach(el => {
+    if (!el) return;
+    const target = (el === obEls.msg) === !!formOpen;
+    el.textContent = target ? (text || '') : '';
+    el.className = (el === obEls.msg ? 'ob-form-msg ' : 'ob-form-msg ob-status ') + (target ? (kind || '') : '');
+  });
 }
 
 // 🔴 端点走<prefix>manage-outbounds（网页会话认证），不是 /api/v1/。
@@ -1105,9 +1124,21 @@ function obResetForm() {
   if (obEls.httpUrl) obEls.httpUrl.value = '';
   if (obEls.httpInsecure) obEls.httpInsecure.checked = false;
   if (obEls.formTitle) obEls.formTitle.textContent = '➕ 新增出站';
-  if (obEls.btnCancel) obEls.btnCancel.hidden = true;
+  if (obEls.formCard) obEls.formCard.hidden = true;
   obMsg('');
   obTypeSwitch();
+}
+
+// 表单默认收起：点「新增」或「编辑」才展开，并滚到可见处。
+function obOpenForm() {
+  if (!obEls.formCard) return;
+  obEls.formCard.hidden = false;
+  obEls.formCard.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  if (obEls.name) obEls.name.focus({ preventScroll: true });
+}
+
+if (obEls.btnNew) {
+  obEls.btnNew.addEventListener('click', () => { obResetForm(); obOpenForm(); });
 }
 
 function obFillForm(o) {
@@ -1120,8 +1151,8 @@ function obFillForm(o) {
   if (obEls.httpUrl) obEls.httpUrl.value = o.url || '';
   if (obEls.httpInsecure) obEls.httpInsecure.checked = !!o.insecure;
   if (obEls.formTitle) obEls.formTitle.textContent = '✏️ 编辑出站：' + o.name;
-  if (obEls.btnCancel) obEls.btnCancel.hidden = false;
   obTypeSwitch();
+  obOpenForm();
 }
 
 async function setOutboundMode(mode) {
@@ -1156,8 +1187,8 @@ if (obEls.btnSave) {
         password: obEls.socksPass ? obEls.socksPass.value : '',
         insecure: (obEls.httpInsecure && obEls.httpInsecure.checked) ? 'true' : '',
       });
-      obMsg('已保存并生效 ✓', 'ok');
       obResetForm();
+      obMsg('已保存并生效 ✓', 'ok');
       await loadOutbounds();
     } catch (e) {
       // 🔴 失败必须原样显示原因 —— 服务可能已被回滚，用户需要知道
