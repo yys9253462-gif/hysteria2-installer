@@ -27,16 +27,18 @@ def api_delete_branch():
                         for v in n.test.comparators))
 
 
-def run_api_delete(usage_meter, user='probe'):
+def run_api_delete(usage_meter, user='probe', present=True):
     branch = api_delete_branch()
     fn = ast.parse('def delete(self, params):\n    pass').body[0]
     fn.body = copy.deepcopy(branch.body)
-    state = {'users': {user: {'password': 'test-only'},
-                       'admin_master': {'password': 'master-test-only'}}}
+    users = {'admin_master': {'password': 'master-test-only'}}
+    if present:
+        users[user] = {'password': 'test-only'}
+    state = {'users': users}
     if usage_meter is not None:
         state['usage_meter'] = copy.deepcopy(usage_meter)
     calls = []
-    global_denies = {'probe': {'198.51.100.10': 4102444800}}
+    global_denies = {user: {'198.51.100.10': 4102444800}}
     env = dict(data=state, data_lock=threading.RLock(),
                regenerate_page=lambda: calls.append('page'),
                reality_registry=lambda _: calls.append('registry'),
@@ -133,6 +135,12 @@ class DeleteWithCorruptMeterTests(unittest.TestCase):
         self.assertNotIn('probe', env['global_ip_deny'])
         # Recreating the same ID must have no effective denies from its predecessor.
         self.assertEqual(portal.active_ip_deny(env['global_ip_deny'], 'probe', 100), set())
+
+    def test_delete_of_absent_user_still_clears_stale_ip_denies(self):
+        status, state, env, calls = run_api_delete(None, user='ghost', present=False)
+        self.assertEqual(status, 200)
+        self.assertNotIn('ghost', state['users'])
+        self.assertNotIn('ghost', env['global_ip_deny'])
 
     def test_missing_meter_still_deletes(self):
         status, state, env, calls = run_api_delete(None)

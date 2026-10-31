@@ -2520,7 +2520,7 @@ HY2_BIN="/usr/local/bin/hysteria"
 
 if [[ "$TARGET" == "core" ]]; then
     # 菜单升级与门户终端升级共用锁，避免失败回滚覆盖另一入口成功的新核心。
-    exec 9>"${HY2_BIN}.update.lock"
+    exec 9>"${HY2_DIR}/.core-operation.lock"
     if ! flock -n 9; then
         echo "另一个核心升级正在运行，请稍后重试" >&2
         exit 1
@@ -2994,6 +2994,12 @@ setup_systemd() {
     fi
     
     # 系统内核网络与 UDP 缓冲优化 (BUGFIX #13: 同时持久化到 /etc/sysctl.d/)
+    # 共享路径已有非本安装器文件时禁止覆盖；卸载也只会移除 marker 所属文件。
+    if [[ -e /etc/sysctl.d/99-hysteria2.conf ]] \
+            && ! grep -qF '(由 hysteria2-installer 自动生成)' /etc/sysctl.d/99-hysteria2.conf; then
+        log_err "/etc/sysctl.d/99-hysteria2.conf 已存在且不属于本安装器，拒绝覆盖。"
+        return 1
+    fi
     cat > /etc/sysctl.d/99-hysteria2.conf <<EOF
 # Hysteria 2 内核网络与 UDP 缓冲调优 (由 hysteria2-installer 自动生成)
 net.core.rmem_max = 8388608
@@ -3882,9 +3888,6 @@ install_warp_local_proxy() {
             log_err "检测到现有 wireproxy 文件或服务，安装器不会覆盖它。请先确认其归属后再试。"
             return 1
         fi
-        # 标记仅在本项目确认拥有该二进制路径并准备新建时落盘。
-        : > "$HY2_WARP_OWNED_MARKER"
-        chmod 600 "$HY2_WARP_OWNED_MARKER"
         log_step "下载 wireproxy 二进制..."
         RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
         if command -v jq >/dev/null 2>&1; then
@@ -3943,6 +3946,11 @@ install_warp_local_proxy() {
         fi
         rm -rf "$TMP_DIR" "$TMP_EXTRACT"
         mv -f "${WP_BIN}.new" "$WP_BIN"
+    fi
+    # 只有可信 wireproxy 二进制已成功安装，才登记本项目所有权。
+    if [[ ! -e "$HY2_WARP_OWNED_MARKER" ]]; then
+        : > "$HY2_WARP_OWNED_MARKER"
+        chmod 600 "$HY2_WARP_OWNED_MARKER"
     fi
 
     # 3. 匿名注册 WARP 设备 (一次性)
@@ -4084,6 +4092,16 @@ install_gost() {
     log_step "准备安装 gost 入站代理引擎 (SOCKS5/HTTP/HTTPS)..."
     GOST_BIN="/usr/local/bin/gost"
     GOST_CONFIG="${HY2_DIR}/gost.yml"
+    GOST_UNIT="/etc/systemd/system/gost.service"
+    if [[ -e "$GOST_BIN" || -e "$GOST_UNIT" ]]; then
+        if [[ -f "$HY2_DIR/.hy2-gost-owned" && -f "$GOST_UNIT" ]] \
+                && grep -qF 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s' "$GOST_UNIT"; then
+            : # Recognized as an existing installer-managed GOST deployment; allow update.
+        else
+            log_err "检测到已有 GOST 二进制或服务但无法确认归属；为避免覆盖宿主服务，已停止安装。"
+            return 1
+        fi
+    fi
 
     # 获取最新版本
     # ⚠️ 同样要 `|| GOST_LATEST=""`：api.github.com 不可达时 curl 失败会让
@@ -4269,6 +4287,8 @@ ExecStartPost=/usr/local/lib/hy2-gost-selfcheck
 WantedBy=multi-user.target
 EOF
 
+    : > "$HY2_DIR/.hy2-gost-owned"
+    chmod 600 "$HY2_DIR/.hy2-gost-owned"
     systemctl daemon-reload
     systemctl enable gost >/dev/null 2>&1
     systemctl restart gost
@@ -4930,7 +4950,12 @@ uninstall_all() {
         systemctl stop hysteria-server 2>/dev/null || true
         systemctl disable hysteria-server 2>/dev/null || true
         systemctl disable --now hysteria-portal 2>/dev/null || true
-        systemctl disable --now gost 2>/dev/null || true
+        if [[ -f "$HY2_DIR/.hy2-gost-owned" && -f /etc/systemd/system/gost.service ]] \
+                && grep -qF 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s' \
+                    /etc/systemd/system/gost.service; then
+            systemctl disable --now gost 2>/dev/null || true
+            rm -f /etc/systemd/system/gost.service /usr/local/bin/gost /usr/local/lib/hy2-gost-selfcheck
+        fi
         # 只卸载门户安装的 Xray：独立部署的服务/二进制属于宿主机，
         # 以该门户专属 ExecStart 识别所有权，即使 xray.json 已损坏/丢失也需清理单元。
         if [[ -f /etc/systemd/system/xray.service ]] \
@@ -4973,7 +4998,6 @@ uninstall_all() {
         systemctl disable --now hy2-cert-selfheal.path 2>/dev/null || true
         systemctl disable --now hy2-cert-selfheal.service 2>/dev/null || true
         rm -f /etc/systemd/system/hysteria-portal.service
-        rm -f /etc/systemd/system/gost.service
         if [[ "$managed_wireproxy" == 1 ]]; then
             rm -f /etc/systemd/system/hy2-warp-watchdog.service
             rm -f /etc/systemd/system/hy2-warp-watchdog.timer
@@ -4982,20 +5006,23 @@ uninstall_all() {
         rm -f /etc/systemd/system/hy2-cert-selfheal.timer
         rm -f /etc/systemd/system/hy2-cert-selfheal.path
         rm -f /usr/local/bin/hy2-cert-selfheal.sh
-        # 只移除本安装器创建且带 owner marker 的 Nginx ACME challenge site。
-        local nginx_owner nginx_conf nginx_domain
-        for nginx_owner in "$HY2_DIR"/.hy2-nginx-acme-*.owned; do
-            [[ -f "$nginx_owner" ]] || continue
-            nginx_domain="${nginx_owner##*/.hy2-nginx-acme-}"
-            nginx_domain="${nginx_domain%.owned}"
-            nginx_conf="/etc/nginx/conf.d/hy2-acme-${nginx_domain}.conf"
-            if [[ -f "$nginx_conf" ]] \
-                    && grep -qF "由 hysteria2-installer 生成：只用于 Let's Encrypt 签发与续期 ${nginx_domain}" "$nginx_conf"; then
+        # 只移除可识别为安装器生成的 Nginx ACME challenge site；兼容旧版本
+        # 尚未写 owner marker 的配置，同时检查模板特征，绝不按文件名前缀盲删。
+        local nginx_conf nginx_domain nginx_removed=0
+        for nginx_conf in /etc/nginx/conf.d/hy2-acme-*.conf; do
+            [[ -f "$nginx_conf" ]] || continue
+            nginx_domain="${nginx_conf##*/hy2-acme-}"
+            nginx_domain="${nginx_domain%.conf}"
+            if grep -qF "由 hysteria2-installer 生成：只用于 Let's Encrypt 签发与续期 ${nginx_domain}" "$nginx_conf" \
+                    && grep -qF "server_name ${nginx_domain};" "$nginx_conf" \
+                    && grep -qF 'root /var/lib/hy2-acme-webroot;' "$nginx_conf" \
+                    && grep -qF 'return 404;' "$nginx_conf"; then
                 rm -f "$nginx_conf"
+                rm -f "$HY2_DIR/.hy2-nginx-acme-${nginx_domain}.owned"
+                nginx_removed=1
             fi
-            rm -f "$nginx_owner"
         done
-        if command -v nginx >/dev/null 2>&1; then
+        if [[ "$nginx_removed" == 1 ]] && command -v nginx >/dev/null 2>&1; then
             nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; } || true
         fi
         # 仅删除首次安装时存在 marker 的安装器资产；旧版没有 marker 时保留，避免误删用户文件。
@@ -5115,7 +5142,7 @@ flow_update_core() {
     require_installed || return 1
     # 与门户终端升级共享同一锁，串行保护备份、替换、重启和回滚整个事务。
     local update_lock_fd
-    exec {update_lock_fd}>"${HY2_BIN}.update.lock" || {
+    exec {update_lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
         log_err "无法创建核心升级锁。"; return 1; }
     if ! flock -n "$update_lock_fd"; then
         log_err "另一个核心升级正在运行，请稍后重试。"

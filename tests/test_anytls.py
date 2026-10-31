@@ -149,6 +149,17 @@ class AnytlsSyncTest(unittest.TestCase):
         self.assertFalse(self.sync(snapshot({'alice': {}})))
 
 
+class AnytlsStopConfirmationTests(unittest.TestCase):
+    def test_stop_confirmation_requires_successful_command_and_terminal_state(self):
+        from types import SimpleNamespace
+        for code, state, expected in ((1, 'inactive', False), (0, '', False),
+                                      (0, 'active', False), (0, 'inactive', True),
+                                      (0, 'failed', True)):
+            with self.subTest(code=code, state=state):
+                self.assertEqual(portal._service_stop_confirmed(
+                    SimpleNamespace(returncode=code), state), expected)
+
+
 class AnytlsPortTest(unittest.TestCase):
     def test_enabled_port_is_reserved_and_disabled_released(self):
         data = {'anytls_config': dict(ACFG)}

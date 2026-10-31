@@ -40,6 +40,7 @@ class SavedOutboundProbeTests(unittest.TestCase):
     @unittest.skipUnless(NODE, 'requires node')
     def test_saved_http_proxy_probe_respects_insecure_setting(self):
         script = portal.SCRIPT
+        self.assertIn('只检测所选出站端点的可达性', script)
         code = script[script.index('function renderOutboundList'):script.index('function renderOutboundRules')]
         probe = script[script.index('async function probeOutbound'):script.index('function obResetForm')]
 

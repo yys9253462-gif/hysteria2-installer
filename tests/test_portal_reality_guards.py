@@ -41,6 +41,36 @@ class TestRealityClientSyncGuards(unittest.TestCase):
                                                ['revoked'])
             self.assertFalse((root / 'xray.json').exists())
 
+    def test_revocation_transaction_uses_protocol_apply_lock(self):
+        from unittest.mock import patch
+        import contextlib
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            path = root / 'xray.json'
+            cfg = {'inbounds': [
+                {'tag': portal.REALITY_INBOUND_TAG, 'settings': {'clients': []}},
+                {'tag': portal.VMESS_INBOUND_TAG, 'settings': {'clients': []}},
+            ]}
+            path.write_text(json.dumps(cfg), encoding='utf-8')
+            (root / 'usage-meter-config.json').write_text(json.dumps(
+                {'hysteria': {'url': 'http://127.0.0.1:19996', 'secret': 'fixture'}}),
+                encoding='utf-8')
+            lock_state = []
+            protocol_lock = contextlib.nullcontext()
+            with patch.object(portal, '_systemd_state', return_value='inactive'), \
+                 patch.object(portal.subprocess, 'run') as run, \
+                 patch.object(portal, '_apply_xray_access_snapshot',
+                              side_effect=lambda *args: (lock_state.append(args[-1]) or True)), \
+                 patch.object(portal, 'reality_apply_lock', protocol_lock, create=True), \
+                 patch.object(portal.urllib.request, 'urlopen', return_value=type(
+                    'Response', (), {'__enter__': lambda self: self,
+                                     '__exit__': lambda *args: None,
+                                     'read': lambda self: b'{}'})()):
+                self.assertTrue(portal.enforce_node_access(
+                    root, {'users': {'gone': {'status': 'disabled'}}}, ['gone']))
+            self.assertEqual(len(lock_state), 1)
+            self.assertIs(lock_state[0], protocol_lock)
+
     def test_anytls_failure_does_not_skip_xray_revocation(self):
         from unittest.mock import patch
         calls = []

@@ -1125,7 +1125,7 @@ async function loadOutbounds() {
 async function probeOutbound(kind, addr, insecure = false) {
   if (!obEls.ip) return;
   obEls.ip.textContent = '探测中...';
-  if (obEls.ipNote) obEls.ipNote.textContent = '正在通过所选出站访问 ipify';
+  if (obEls.ipNote) obEls.ipNote.textContent = '只检测所选出站端点的可达性，不代表已配置分流规则的实际出口';
   try {
     const body = new URLSearchParams({ kind: kind || 'direct', addr: addr || '',
       insecure: insecure ? 'true' : '' });
@@ -1138,7 +1138,7 @@ async function probeOutbound(kind, addr, insecure = false) {
     if (!json.ok) throw new Error(json.error || '探测失败');
     if (json.ip) {
       obEls.ip.textContent = json.ip;
-      if (obEls.ipNote) obEls.ipNote.textContent = '所选出站的探测地址；实际连接还取决于当前分流规则';
+      if (obEls.ipNote) obEls.ipNote.textContent = '探测地址：' + json.ip + '；客户端实际出口仍取决于当前模式与分流规则';
     } else {
       obEls.ip.textContent = '探测失败';
       if (obEls.ipNote) {

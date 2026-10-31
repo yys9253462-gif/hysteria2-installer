@@ -1682,10 +1682,30 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         candidate.unlink(missing_ok=True)
 
 
+def core_operation_lock_path(directory='/etc/hysteria'):
+    return Path(os.environ.get('HY2_CORE_OPERATION_LOCK', str(Path(directory) / '.core-operation.lock')))
+
+
+def acquire_core_operation_lock(directory='/etc/hysteria'):
+    """Acquire a process-wide lock shared by install, upgrade, and uninstall paths."""
+    lock_fd = os.open(core_operation_lock_path(directory), os.O_CREAT | os.O_RDWR, 0o600)
+    if fcntl is not None:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(lock_fd)
+            raise RuntimeError('another core operation is running')
+    return lock_fd
+
+
 def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
-    """Serialize replacement/restart/rollback against all portal restarts and core operations."""
+    """Serialize replacement/restart/rollback against portal restarts and core operations."""
     with core_operation_lock:
-        return _upgrade_core_binary_locked(binary, backup_dir, allow_custom)
+        lock_fd = acquire_core_operation_lock(Path(backup_dir).parent)
+        try:
+            return _upgrade_core_binary_locked(binary, backup_dir, allow_custom)
+        finally:
+            os.close(lock_fd)
 
 
 def gost_tls_paths(root):
@@ -2487,9 +2507,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <div class="ob-grid">
       <!-- 真实出口 IP 探测 -->
       <div class="ob-probe-card">
-        <div class="ob-probe-title">📍 当前真实出口 IP</div>
+        <div class="ob-probe-title">📍 出站连通性探测</div>
         <div class="ob-probe-ip" id="ob-outbound-ip">探测中...</div>
-        <div class="ob-probe-sub" id="ob-outbound-ip-note">这是客户端流量出去时对方看到的地址</div>
+        <div class="ob-probe-sub" id="ob-outbound-ip-note">只检测所选出站端点的可达性，不代表已配置分流规则的实际出口</div>
         <div class="ob-probe-actions">
           <select id="ob-probe-kind" class="ob-select">
             <option value="direct">直连（服务器本机）</option>
@@ -5186,6 +5206,7 @@ _warp_probe_cache = {}
 
 
 _ACCESS_APPLIED = {}
+_ACCESS_APPLY_LOCK = threading.RLock()
 
 def user_access_denial(info, now=None):
     """Hy2、托管协议和分享页共用准入判据，并保留鉴权错误说明。"""
@@ -5736,6 +5757,31 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=()):
         wanted_by_tag[tag]=_client_builders[tag](snapshot)
     if not wanted_by_tag:
         return True
+    # Protocol handlers use reality_apply_lock for their read-modify-write. The
+    # revocation path must use the same lock; otherwise it can replace a newer
+    # client list with this stale snapshot and re-authorize a revoked account.
+    apply_lock = globals().get('reality_apply_lock')
+    if apply_lock is None:
+        # The production portal binds this lock in serve(); module-level isolated
+        # callers get a lock too, so the read/modify/write path still serializes.
+        apply_lock = _ACCESS_APPLY_LOCK
+    return _apply_xray_access_snapshot(root, xj, snapshot, blocked, cfg_path, cfg,
+                                       force_ids, wanted_by_tag, apply_lock)
+
+
+def _apply_xray_access_snapshot(root, xj, snapshot, blocked, cfg_path, meter_config,
+                                force_ids, wanted_by_tag, apply_lock):
+    # Keep the entire disk read/modify/validate/replace/restart transaction under
+    # the same protocol lock. Pass the lock explicitly for AST-isolated tests.
+    with apply_lock:
+        return _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path,
+                                                  meter_config, force_ids, wanted_by_tag)
+
+
+def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, meter_config,
+                                       force_ids, wanted_by_tag):
+    original=xj.read_bytes()
+    xcfg=json.loads(original)
     signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
     epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
     current={tag:xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings',{}).get('clients')
@@ -5751,7 +5797,9 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=()):
     candidate=xj.with_name('xray.expiry-candidate.json')
     candidate.write_text(json.dumps(xcfg,indent=2),encoding='utf-8')
     candidate.chmod(xj.stat().st_mode & 0o777)
-    binary=cfg.get('reality',{}).get('binary','/usr/local/bin/xray')
+    reality_cfg=meter_config.get('reality') if isinstance(meter_config, dict) else None
+    reality_cfg=reality_cfg if isinstance(reality_cfg, dict) else {}
+    binary=reality_cfg.get('binary','/usr/local/bin/xray')
     replaced=False
     try:
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
@@ -8881,6 +8929,9 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot delete the master account'})
                     with data_lock:
                         data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
+                        # Even an already-absent account may have a live IP-deny row;
+                        # successful idempotent deletion must clear that stale scope.
+                        global_ip_deny.pop(user_id, None)
                         if user_id in data.get('users', {}):
                             del data['users'][user_id]
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
@@ -8892,9 +8943,6 @@ if __name__ == '__main__':
                             # 速率样本同理：不删的话，同名用户重建后第一轮
                             # 速率会沿用旧样本算出尖峰（2026-10-25 修）。
                             speed_tracker.pop(user_id, None)
-                            # 删除用户时同时清掉按 user_id 绑定的跨节点 IP 封禁，
-                            # 否则短期内同名重建会继续被前一个账号的封禁误伤。
-                            global_ip_deny.pop(user_id, None)
                             # 2026-10-03：同步删掉该用户的 Reality 身份。
                             # 不删的话 —— xray 里那个 UUID 还在，买家退了款
                             # 照样能用 Reality 连上，属于「钱退了货还在」。
@@ -9845,13 +9893,18 @@ if __name__ == '__main__':
                 if not self._extend_deadline(300, heavy=True):
                     return self.reply_json(409, {'ok': False, 'error':
                         '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                ok, msg = install_xray_binary()
-                if not ok:
-                    return self.reply_json(500, {'ok': False, 'error': msg})
+                with core_operation_lock:
+                    core_lock_fd = acquire_core_operation_lock()
+                    try:
+                        ok, msg = install_xray_binary()
+                        if not ok:
+                            return self.reply_json(500, {'ok': False, 'error': msg})
 
-                write_xray_unit()
-                subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=30)
-                self._generate_and_apply_reality(True)
+                        write_xray_unit()
+                        subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=30)
+                        self._generate_and_apply_reality(True)
+                    finally:
+                        os.close(core_lock_fd)
 
                 # 不要谎报成功：xray 默认监听 TCP 443，若该端口已被别的服务
                 # （Caddy / Nginx 等）占用就根本起不来。必须核实服务状态 ——
@@ -10363,13 +10416,17 @@ if __name__ == '__main__':
                         '以下协议仍在使用 %s：%s。请先到对应协议页关闭后再卸载' % (name, '、'.join(in_use))})
                 unit_names, binary = units[name]
                 with core_operation_lock:
-                    for unit in unit_names:
-                        subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
-                        Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
-                    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
-                    for unit in unit_names:
-                        subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
-                    Path(binary).unlink(missing_ok=True)
+                    core_lock_fd = acquire_core_operation_lock()
+                    try:
+                        for unit in unit_names:
+                            subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
+                            Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
+                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                        for unit in unit_names:
+                            subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
+                        Path(binary).unlink(missing_ok=True)
+                    finally:
+                        os.close(core_lock_fd)
                 return self.reply_json(200, {'ok': True, 'message': '%s 已卸载' % name})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -10455,13 +10512,12 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'AnyTLS 本来就没有启用'})
                 with anytls_apply_lock:
-                    subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
-                                   capture_output=True, timeout=30)
-                    # 必须确认真的停了再删配置（2026-10-29 修）。
-                    # stop 失败（进程卡住 / D-Bus 超时）时，sing-box 仍带着旧
-                    # 用户表运行：被停用的用户照样能连，界面却显示「已关闭」。
+                    stop_result = subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
+                                                  capture_output=True, timeout=30)
+                    # 命令失败或状态查询无结果时无法证明旧进程退出；保留配置，
+                    # 不能误报已关闭，否则撤销用户仍可能用内存中的旧名单连接。
                     state = _systemd_state(ANYTLS_SERVICE)
-                    if state == 'active':
+                    if not _service_stop_confirmed(stop_result, state):
                         return self.reply_json(500, {'ok': False, 'error':
                             'AnyTLS 服务未能停止，配置已保留，请重试或查看 systemctl status %s'
                             % ANYTLS_SERVICE})
