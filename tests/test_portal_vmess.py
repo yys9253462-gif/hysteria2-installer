@@ -173,6 +173,23 @@ class ArtifactsVmessTests(unittest.TestCase):
         self.assertEqual(json.loads(clash)['proxy-groups'][0]['type'], 'url-test')
 
 
+class OutboundProbeTests(unittest.TestCase):
+    def test_proxy_insecure_is_only_added_when_requested(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout='203.0.113.1', stderr='')
+        with patch.object(portal.subprocess, 'run', side_effect=run):
+            self.assertEqual(portal.detect_outbound_ip('http', 'https://127.0.0.1:8080'),
+                             '203.0.113.1')
+            self.assertNotIn('--proxy-insecure', calls[-1])
+            self.assertEqual(portal.detect_outbound_ip('http', 'https://127.0.0.1:8080',
+                                                       proxy_insecure=True), '203.0.113.1')
+            self.assertIn('--proxy-insecure', calls[-1])
+
+
 class CertKeyLookupTests(unittest.TestCase):
     """证书与私钥的配对查找。
 

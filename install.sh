@@ -2482,6 +2482,12 @@ HY2_DIR="/etc/hysteria"
 HY2_BIN="/usr/local/bin/hysteria"
 
 if [[ "$TARGET" == "core" ]]; then
+    # 菜单升级与门户终端升级共用锁，避免失败回滚覆盖另一入口成功的新核心。
+    exec 9>"${HY2_BIN}.update.lock"
+    if ! flock -n 9; then
+        echo "另一个核心升级正在运行，请稍后重试" >&2
+        exit 1
+    fi
     # 自动识别架构下载官方最新发布版
     ARCH=$(uname -m)
     case "$ARCH" in
@@ -2535,7 +2541,7 @@ if [[ "$TARGET" == "core" ]]; then
         echo "  实际: $GOT" >&2
         exit 1
     fi
-    chmod +x "$TMP_FILE"
+    chmod 755 "$TMP_FILE"
     # 摘要之后再跑一次作为附加检查；坏包直接覆盖会让服务起不来、所有客户端断线。
     if ! "$TMP_FILE" version >/dev/null 2>&1; then
         echo "下载的 Hysteria 二进制无法运行，已放弃更新" >&2
@@ -4865,14 +4871,19 @@ uninstall_all() {
         systemctl disable --now xray 2>/dev/null || true
         rm -f /etc/systemd/system/xray.service /usr/local/bin/xray
         # AnyTLS / TUIC 的 sing-box 同样由门户安装，配置在 /etc/hysteria/{anytls,tuic}.json。
-        local sb_unit
+        # 仅当本项目的 systemd 单元存在时才认领并删除共享二进制；无关联单元时
+        # sing-box 可能由管理员供其它服务使用，卸载 Hysteria 不能动它。
+        local sb_unit managed_singbox=0
         for sb_unit in hy2-anytls hy2-tuic; do
             if [[ -f /etc/systemd/system/${sb_unit}.service ]]; then
+                managed_singbox=1
                 systemctl disable --now "$sb_unit" 2>/dev/null || true
                 rm -f "/etc/systemd/system/${sb_unit}.service"
             fi
         done
-        rm -f /usr/local/bin/sing-box
+        if [[ "$managed_singbox" == 1 ]]; then
+            rm -f /usr/local/bin/sing-box
+        fi
         # BUGFIX: 卸载时同时清理 WARP 相关服务与配置
         systemctl disable --now wireproxy 2>/dev/null || true
         systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true
@@ -5002,6 +5013,14 @@ flow_update_core() {
     check_root || return 1
     check_arch || return 1
     require_installed || return 1
+    # 与门户终端升级共享同一锁，串行保护备份、替换、重启和回滚整个事务。
+    local update_lock_fd
+    exec {update_lock_fd}>"${HY2_BIN}.update.lock" || {
+        log_err "无法创建核心升级锁。"; return 1; }
+    if ! flock -n "$update_lock_fd"; then
+        log_err "另一个核心升级正在运行，请稍后重试。"
+        return 1
+    fi
     local rollback_file
     rollback_file="$(mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
         log_err "创建核心备份失败，现有二进制未改动。"; return 1; }

@@ -149,16 +149,42 @@ class TuicSyncTest(unittest.TestCase):
         self.assertFalse(self.applied[-1][1], '整机停用期间收回不能把 sing-box 拉起来')
 
     def test_disabled_or_missing_is_ignored(self):
-        self.assertFalse(self.sync(snapshot({'alice': {}})))
+        self.assertFalse(self.sync(snapshot({'alice': {}}), active=False))
         self.write_config({'alice': {}, 'bob': {}})
         snap = snapshot({'alice': {}})
         snap['tuic_config']['enabled'] = False
         self.assertFalse(self.sync(snap))
 
+
     def test_corrupt_config_cannot_confirm_sync(self):
         (self.root / portal.TUIC_CONFIG_NAME).write_text('{broken', encoding='utf-8')
         with self.assertRaises(RuntimeError):
             self.sync(snapshot({'alice': {}}))
+
+    def test_missing_config_while_active_cannot_confirm_sync(self):
+        with self.assertRaisesRegex(RuntimeError, 'missing while service is active'):
+            self.sync(snapshot({'alice': {}}), active=True)
+        self.assertEqual(self.applied, [])
+
+    def test_missing_config_while_stopped_needs_no_sync(self):
+        self.assertFalse(self.sync(snapshot({'alice': {}}), active=False))
+
+    def test_missing_config_uses_service_state_to_detect_live_instance(self):
+        with mock.patch.object(portal, '_systemd_state', return_value='active'):
+            with self.assertRaisesRegex(RuntimeError, 'missing while service is active'):
+                portal.sync_tuic_users(self.root, snapshot({'alice': {}}))
+
+    def test_missing_config_disabled_snapshot_is_ignored(self):
+        self.assertFalse(self.sync({'tuic_config': {'enabled': False}, 'users': {}}, active=True))
+
+    def test_failed_stop_result_never_confirms_shutdown(self):
+        from types import SimpleNamespace
+        for code, state, expected in ((1, 'inactive', False), (0, '', False),
+                                      (0, 'active', False), (0, 'inactive', True),
+                                      (0, 'failed', True)):
+            with self.subTest(code=code, state=state):
+                self.assertEqual(portal._service_stop_confirmed(
+                    SimpleNamespace(returncode=code), state), expected)
 
     def test_enforce_node_access_reports_tuic_failure(self):
         with mock.patch.object(portal, 'sync_anytls_users'), \
@@ -178,8 +204,13 @@ class TuicPortTest(unittest.TestCase):
                 lo, hi = portal.TUIC_PORT_RANGE
                 self.assertTrue(lo <= port <= hi)
 
-    def test_keeps_own_port_and_avoids_busy(self):
-        self.assertEqual(portal.pick_tuic_port(44300, set(), listening={44300}), 44300)
+    def test_keeps_active_own_port_but_avoids_taken_saved_port(self):
+        self.assertEqual(portal.pick_tuic_port(44300, set(), listening={44300},
+                                               own_port_active=True), 44300)
+        self.assertNotEqual(portal.pick_tuic_port(44300, {44300}, listening=set(),
+                                                  own_port_active=True), 44300)
+        with mock.patch.object(portal.random, 'shuffle', lambda values: None):
+            self.assertEqual(portal.pick_tuic_port(44300, set(), listening={44300}), 41000)
         self.assertNotEqual(portal.pick_tuic_port(None, {41000}, listening=set()), 41000)
         busy = set(range(41000, 50000)) - {45555}
         self.assertEqual(portal.pick_tuic_port(None, set(), listening=busy), 45555)

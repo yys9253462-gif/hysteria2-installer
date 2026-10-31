@@ -299,6 +299,7 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .ob-form-grid-3 { grid-template-columns: 2fr 1fr 1fr; }
 @media(max-width: 640px) { .ob-form-grid, .ob-form-grid-3 { grid-template-columns: 1fr; } .ob-mode-switch { width: 100%; } .ob-mode-btn { flex: 1; } }
 .ob-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; min-width: 0; }
+.ob-field[hidden] { display: none !important; }
 .ob-field-wide { width: 100%; }
 .ob-field > span { font-size: 12px; font-weight: 700; color: #496861; }
 .ob-field > em { font-size: 11px; color: var(--muted); font-style: normal; line-height: 1.5; }
@@ -919,6 +920,7 @@ const obEls = {
   socksPass: document.getElementById('ob-socks-pass'),
   httpUrl: document.getElementById('ob-http-url'),
   httpInsecure: document.getElementById('ob-http-insecure'),
+  quickBox: document.getElementById('ob-quick-box'),
   btnSave: document.getElementById('btn-ob-save'),
   btnCancel: document.getElementById('btn-ob-cancel'),
   msg: document.getElementById('ob-form-msg'),
@@ -1234,11 +1236,22 @@ function obApplyQuick() {
   const raw = obEls.quick.value;
   const r = obParseLink(raw);
   if (!raw.trim()) {
-    obEls.quickBox.className = 'ob-field ob-quick';
-    obEls.quickHint.textContent = OB_QUICK_HINT;
+    if (!obEls.quickBox.hidden) {
+      obEls.quickBox.className = 'ob-field ob-quick';
+      obEls.quickHint.textContent = OB_QUICK_HINT;
+    }
     return;
   }
   if (!r) {
+    // 清掉上一次识别出的凭据，防止用户换成无效链接后误保存旧代理。
+    if (obEls.type) obEls.type.value = 'socks5';
+    if (obEls.socksAddr) obEls.socksAddr.value = '';
+    if (obEls.socksUser) obEls.socksUser.value = '';
+    if (obEls.socksPass) obEls.socksPass.value = '';
+    if (obEls.httpUrl) obEls.httpUrl.value = '';
+    if (obEls.httpInsecure) obEls.httpInsecure.checked = false;
+    obTypeSwitch();
+    obAutoName();
     obEls.quickBox.className = 'ob-field ob-quick err';
     obEls.quickHint.textContent = '没认出这个格式，请直接在下方逐项填写';
     return;
@@ -1276,7 +1289,8 @@ async function obTestForm() {
   obEls.btnTest.disabled = true;
   obMsg('测试中...', '');
   try {
-    const q = new URLSearchParams({ kind: kind, addr: addr });
+    const q = new URLSearchParams({ kind: kind, addr: addr,
+      insecure: (kind === 'http' && obEls.httpInsecure && obEls.httpInsecure.checked) ? 'true' : '' });
     const res = await fetch(location.pathname + 'outbounds/probe?' + q.toString(), { credentials: 'same-origin' });
     const json = await res.json();
     if (!json.ok) throw new Error(json.error || '测试失败');

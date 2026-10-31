@@ -915,7 +915,7 @@ def warp_acl_matches(config_text, enabled, rules):
     return config_text == build_warp_acl_config(config_text, enabled, rules)
 
 
-def detect_outbound_ip(kind='auto', addr='', timeout=6):
+def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
     """探测出站真实出口 IP —— 面板要显示"现在出去是哪个 IP"。
 
     🔴 这是用户判断"到底生效没有"的唯一依据。旧面板只显示 WARP 装没装，
@@ -934,8 +934,10 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6):
         # Explicitly override no_proxy: '*' would silently bypass this proxy.
         args = ['curl', '--disable', '--silent', '--show-error', '--fail',
                 '--connect-timeout', str(min(3, seconds)), '--max-time', str(seconds),
-                '--proxy', proxy_url, '--noproxy', '' if proxy_url else '*',
-                'https://api4.ipify.org?format=json']
+                '--proxy', proxy_url, '--noproxy', '' if proxy_url else '*']
+        if proxy_insecure:
+            args.append('--proxy-insecure')
+        args.append('https://api4.ipify.org?format=json')
         proc = subprocess.run(args, capture_output=True, text=True, timeout=seconds + 2)
         if proc.returncode != 0:
             return ''
@@ -4771,7 +4773,7 @@ def tuic_users(data):
 
 
 def build_tuic_config(tcfg, users, cert_file, key_file):
-    """sing-box 完整配置（只有一个 tuic 入站）；出站同样先 resolve 再拒内网。"""
+    """sing-box 完整配置（只有一个 tuic 入站）；出站先 resolve 再拒内网。"""
     return {
         'log': {'level': 'warn', 'timestamp': True},
         'inbounds': [{
@@ -4817,10 +4819,11 @@ def tuic_uri_for_user(tcfg, user_id, label=None):
     return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(label or ('TUIC-' + str(user_id)))}"
 
 
-def pick_tuic_port(preferred, blocked, listening=None):
-    """挑一个 UDP 端口：preferred 可用就沿用，否则从 TUIC_PORT_RANGE 里找空闲的。
+def pick_tuic_port(preferred, blocked, listening=None, own_port_active=False):
+    """挑一个 UDP 端口：可用的 preferred 优先，否则从 TUIC_PORT_RANGE 找空闲端口。
 
     返回 0 表示找不到。20000-40000 是 Hy2 端口跳跃区间，任何情况都不能用。
+    只有 TUIC 自己正在监听旧端口时，才允许该端口出现在监听表中。
     """
     listening = _listening_ports() if listening is None else listening
     bad = set()
@@ -4842,7 +4845,7 @@ def pick_tuic_port(preferred, blocked, listening=None):
         # 自己的旧端口：重新启用前 sing-box 已停，监听表里残留也不算冲突。
         return own or p not in listening
 
-    if usable(preferred, own=True):
+    if usable(preferred, own=own_port_active):
         return int(preferred)
     lo, hi = TUIC_PORT_RANGE
     candidates = list(range(lo, hi + 1))
@@ -4859,7 +4862,8 @@ def sync_tuic_users(root, snapshot, apply=None, service_active=None):
     if not isinstance(snapshot, dict):
         return False
     section = snapshot.get('tuic_config')
-    if not path.exists() or not (isinstance(section, dict) and section.get('enabled')):
+    enabled = isinstance(section, dict) and section.get('enabled')
+    if not enabled:
         return False
     if apply is None:
         def apply(cfg, cfg_path, restart=True):
@@ -4867,6 +4871,12 @@ def sync_tuic_users(root, snapshot, apply=None, service_active=None):
     if service_active is None:
         service_active = lambda: _systemd_state(TUIC_SERVICE) == 'active'  # noqa: E731
     with tuic_apply_lock:
+        if not enabled:
+            return False
+        if not path.exists():
+            if service_active():
+                raise RuntimeError('TUIC configuration missing while service is active; cannot confirm user sync')
+            return False
         try:
             config = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError) as exc:
@@ -5185,10 +5195,16 @@ def user_access_denial(info, now=None):
         for field in ('limit_bytes', 'used_bytes'):
             if isinstance(info.get(field), bool):
                 return 'Invalid user record'
-        if expires_at is not None and not float(expires_at) > now:
-            return 'User account expired'
+        if expires_at is not None:
+            expires_at = float(expires_at)
+            if not math.isfinite(expires_at):
+                return 'Invalid user record'
+            if not expires_at > now:
+                return 'User account expired'
         limit_bytes = int(info.get('limit_bytes', 0))
         used_bytes = int(info.get('used_bytes', 0))
+        if limit_bytes < 0 or used_bytes < 0:
+            return 'Invalid user record'
     except (ValueError, TypeError, OverflowError):
         return 'Invalid user record'
     if limit_bytes > 0 and used_bytes >= limit_bytes:
@@ -5504,6 +5520,10 @@ def _systemd_state(unit):
     except (OSError, subprocess.SubprocessError):
         return ''
 
+
+def _service_stop_confirmed(result, state):
+    """systemd stop 成功且服务状态明确为 inactive/failed 才视为已停止。"""
+    return result.returncode == 0 and state in ('inactive', 'failed')
 
 
 def _nft_input_chain():
@@ -10493,30 +10513,38 @@ if __name__ == '__main__':
                     blocked.add(int(value))
                 except (TypeError, ValueError):
                     pass
-            listen_port = pick_tuic_port(old.get('port'), blocked)
-            if not listen_port:
-                raise RuntimeError('在 %d-%d 内找不到空闲的 UDP 端口' % TUIC_PORT_RANGE)
-            new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
-                       'secret': old.get('secret') if isinstance(old.get('secret'), str) and old.get('secret')
-                       else secrets.token_hex(32)}
-            with data_lock:
-                preview = dict(data)
-                preview['tuic_config'] = new_cfg
-                users = tuic_users(preview)
-            unit_path = Path('/etc/systemd/system/%s.service' % TUIC_SERVICE)
-            if not unit_path.exists() or unit_path.read_text(encoding='utf-8') != TUIC_UNIT_CONTENT:
-                unit_path.write_text(TUIC_UNIT_CONTENT, encoding='utf-8')
-                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
             with tuic_apply_lock:
-                apply_anytls_config(build_tuic_config(new_cfg, users, cert_file, key_file),
-                                    portal_path.parent / TUIC_CONFIG_NAME, restart=True,
-                                    service=TUIC_SERVICE)
-                # 预检 + 启动成功之后再 enable，避免坏配置被设成开机自启。
-                subprocess.run(['systemctl', 'enable', TUIC_SERVICE],
-                               capture_output=True, timeout=30)
-            with data_lock:
-                data['tuic_config'] = new_cfg
-            save_data()
+                # 在服务锁内读取最新用户并完成启用提交。撤销线程要么先完成并反映在
+                # 此快照中，要么随后取得锁并从新启用的配置中移除该用户。
+                listen_port = pick_tuic_port(
+                    old.get('port'), blocked,
+                    own_port_active=_systemd_state(TUIC_SERVICE) == 'active')
+                if not listen_port:
+                    raise RuntimeError('在 %d-%d 内找不到空闲的 UDP 端口' % TUIC_PORT_RANGE)
+                new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
+                           'secret': old.get('secret') if isinstance(old.get('secret'), str) and old.get('secret')
+                           else secrets.token_hex(32)}
+                with data_lock:
+                    # 先发布启用状态，再写配置/启动服务。撤销线程若此时拍快照，
+                    # 会看到 enabled 并等待 tuic_apply_lock，而不会把这次同步误判成无事可做。
+                    data['tuic_config'] = new_cfg
+                    users = tuic_users(data)
+                try:
+                    unit_path = Path('/etc/systemd/system/%s.service' % TUIC_SERVICE)
+                    if not unit_path.exists() or unit_path.read_text(encoding='utf-8') != TUIC_UNIT_CONTENT:
+                        unit_path.write_text(TUIC_UNIT_CONTENT, encoding='utf-8')
+                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    apply_anytls_config(build_tuic_config(new_cfg, users, cert_file, key_file),
+                                        portal_path.parent / TUIC_CONFIG_NAME, restart=True,
+                                        service=TUIC_SERVICE)
+                    # 预检 + 启动成功之后再 enable，避免坏配置被设成开机自启。
+                    subprocess.run(['systemctl', 'enable', TUIC_SERVICE],
+                                   capture_output=True, timeout=30)
+                    save_data()
+                except Exception:
+                    with data_lock:
+                        data['tuic_config'] = old
+                    raise
             regenerate_page()
             firewall_port(listen_port, 'udp', open_=True)
             return new_cfg
@@ -10548,10 +10576,12 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'TUIC 本来就没有启用'})
                 with tuic_apply_lock:
-                    subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
-                                   capture_output=True, timeout=30)
-                    # 确认真的停了再删配置，否则被停用的用户仍能连。
-                    if _systemd_state(TUIC_SERVICE) == 'active':
+                    stop_result = subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
+                                                  capture_output=True, timeout=30)
+                    # 只有明确确认服务停止后才能删配置与汇报成功；命令失败或
+                    # systemd 状态无法确认时保留配置，避免旧进程继续接受用户连接。
+                    state = _systemd_state(TUIC_SERVICE)
+                    if not _service_stop_confirmed(stop_result, state):
                         return self.reply_json(500, {'ok': False, 'error':
                             'TUIC 服务未能停止，配置已保留，请重试或查看 systemctl status %s'
                             % TUIC_SERVICE})
@@ -12389,7 +12419,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             addr = (query.get('addr', [''])[0] or '').strip()
             if kind not in ('direct', 'auto', 'warp', 'socks5', 'http') or (kind in ('socks5', 'http') and not addr):
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid outbound probe type or missing address'})
-            ip = detect_outbound_ip(kind, addr)
+            insecure = (query.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
+            ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})
 
         def _ob_manage(self):
@@ -12430,9 +12461,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if not ok:
                         return self.reply_json(400, {'ok': False, 'error': err})
                     with data_lock:
-                        outs = [o for o in data.get('custom_outbounds', [])
-                                if o.get('name') != cleaned['name']]
-                        outs.append(cleaned)
+                        outs = list(data.get('custom_outbounds', []))
+                        existing_index = next(
+                            (i for i, outbound in enumerate(outs)
+                             if isinstance(outbound, dict) and outbound.get('name') == cleaned['name']),
+                            None)
+                        if existing_index is None:
+                            outs.append(cleaned)
+                        else:
+                            outs[existing_index] = cleaned
                         data['custom_outbounds'] = outs
                     msg = '出站「%s」已保存' % cleaned['name']
                 else:

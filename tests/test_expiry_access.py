@@ -67,6 +67,20 @@ class ShareAvailabilityConsistencyTests(unittest.TestCase):
   self.assertTrue(portal.user_access_allowed(u))
   self.assertTrue(portal.user_share_available(u))
 
+ def test_nonfinite_expiry_fails_closed(self):
+  for value in (float('inf'), float('-inf'), 'Infinity', '-Infinity', float('nan')):
+   with self.subTest(value=value):
+    u={'status':'active','expires_at':value}
+    self.assertFalse(portal.user_access_allowed(u, 100))
+    self.assertFalse(portal.user_share_available(u, 100))
+
+ def test_negative_quota_fields_fail_closed(self):
+  for key in ('limit_bytes', 'used_bytes'):
+   u={'status':'active','limit_bytes':10,'used_bytes':0,key:-1}
+   with self.subTest(key=key):
+    self.assertFalse(portal.user_access_allowed(u, 100))
+    self.assertFalse(portal.user_share_available(u, 100))
+
  def test_nonfinite_quota_fails_closed(self):
   for key in ('limit_bytes', 'used_bytes'):
    u={key: float('inf'), 'limit_bytes': 10} if key == 'used_bytes' else {key: float('inf')}

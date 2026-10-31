@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -30,12 +31,28 @@ class TerminalCoreRegressions(unittest.TestCase):
         self.payload.write_bytes(NEW)
         (self.root / 'hashes').write_text(hashlib.sha256(NEW).hexdigest() + '  hysteria-linux-amd64\n')
         self._command('uname', '#!/bin/sh\necho x86_64\n')
+        self._command('flock', '''#!/bin/sh
+[ "${LOCK_BUSY:-0}" = 1 ] && exit 1
+exit 0
+''')
+        self._command('jq', '''#!/bin/sh
+case "$*" in
+  *traffic_suspend*)
+    for arg in "$@"; do file="$arg"; done
+    if grep -q '"suspended": *true' "$file"; then echo true; else echo false; fi
+    ;;
+  *) echo app/v1.2.3 ;;
+esac
+''')
         self._command('systemctl', '''#!/bin/sh
 printf '%s\n' "$*" >> "$TEST_ROOT/calls"
 if [ "${FAIL_FIRST:-0}" = 1 ] && [ ! -f "$TEST_ROOT/failed-once" ]; then
   touch "$TEST_ROOT/failed-once"; exit 1
 fi
 exit 0
+''')
+        self._command('sha256sum', '''#!/bin/sh
+printf '%s  file\\n' "$(/usr/bin/sha256sum "$1" | cut -d' ' -f1 | tr -d '\\\\')"
 ''')
         self._command('curl', '''#!/bin/sh
 out=; url=
@@ -56,7 +73,9 @@ esac
         code = match.group(1).replace('/etc/hysteria', str(self.hy)).replace('/usr/local/bin/hysteria', str(self.binary))
         self.script = self.root / 'upgrade.sh'
         self.script.write_text(code, encoding='utf-8')
-        self.env = dict(os.environ, TEST_ROOT=str(self.root), PATH=str(self.fake) + ':' + os.environ.get('PATH', ''))
+        self.bash = shutil.which('bash')
+        self.env = dict(os.environ, TEST_ROOT=str(self.root), PATH=str(self.fake) + ':' + os.environ.get('PATH', ''),
+                        PYTHONIOENCODING='utf-8', LC_ALL='C.UTF-8')
 
     def _command(self, name, body):
         p = self.fake / name
@@ -64,8 +83,10 @@ esac
         p.chmod(0o755)
 
     def invoke(self, *args, **env):
-        return subprocess.run(['bash', str(self.script), *args], env=self.env | env,
-                              capture_output=True, text=True, timeout=15)
+        if not self.bash:
+            self.skipTest('requires Bash')
+        return subprocess.run([self.bash, str(self.script), *args], env=self.env | env,
+                              capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
 
     def calls(self):
         p = self.root / 'calls'
@@ -103,6 +124,20 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.binary.read_bytes(), OLD)
         self.assertEqual(self.calls(), ['restart hysteria-server', 'restart hysteria-server'])
+
+    @unittest.skipIf(os.name == 'nt', 'Windows filesystems do not preserve POSIX executable mode bits')
+    def test_successful_upgrade_preserves_normal_binary_permissions(self):
+        self.binary.chmod(0o755)
+        result = self.invoke('core')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.binary.read_bytes(), NEW)
+        self.assertEqual(self.binary.stat().st_mode & 0o777, 0o755)
+
+    def test_core_upgrade_lock_refuses_concurrent_run_before_download(self):
+        result = self.invoke('core', LOCK_BUSY='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.binary.read_bytes(), OLD)
+        self.assertEqual(self.calls(), [])
 
     def test_suspended_server_is_never_restarted(self):
         (self.hy / 'portal.json').write_text(json.dumps({'traffic_suspend': {'suspended': True}}))

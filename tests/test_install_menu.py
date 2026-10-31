@@ -157,6 +157,40 @@ class MenuSourceTest(unittest.TestCase):
         self.assertIn('请输入选项 [0-16]', INSTALL)
 
 
+class UninstallSingboxOwnershipTests(unittest.TestCase):
+    def test_uninstall_keeps_singbox_unless_managed_unit_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            units = root / 'etc/systemd/system'
+            units.mkdir(parents=True)
+            binary = root / 'usr/local/bin/sing-box'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('unrelated-singbox', encoding='utf-8')
+            script = root / 'uninstall.sh'
+            script.write_text('''#!/usr/bin/env bash
+set -e
+UNIT_DIR="$TEST_ROOT/etc/systemd/system"
+BINARY="$TEST_ROOT/usr/local/bin/sing-box"
+managed_singbox=0
+for sb_unit in hy2-anytls hy2-tuic; do
+    if [[ -f "$UNIT_DIR/${sb_unit}.service" ]]; then
+        managed_singbox=1
+        rm -f "$UNIT_DIR/${sb_unit}.service"
+    fi
+done
+if [[ "$managed_singbox" == 1 ]]; then rm -f "$BINARY"; fi
+''', encoding='utf-8')
+            env = dict(os.environ, TEST_ROOT=str(root))
+            bash = shutil.which('bash')
+            if not bash:
+                self.skipTest('requires Bash')
+            subprocess.run([bash, str(script)], check=True, env=env)
+            self.assertTrue(binary.exists())
+            (units / 'hy2-tuic.service').write_text('managed', encoding='utf-8')
+            subprocess.run([bash, str(script)], check=True, env=env)
+            self.assertFalse(binary.exists())
+
+
 class AdoptTest(unittest.TestCase):
     """「重新修改配置」沿用现有门户：Teyir 保存的凭据与控制台开的用户都不能变。"""
 

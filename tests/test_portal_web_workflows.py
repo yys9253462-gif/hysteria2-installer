@@ -76,6 +76,7 @@ class WebWorkflowTests(unittest.TestCase):
             _generate_and_apply_reality=Mock(), _reality_restart_allowed=Mock(return_value=True),
             check_rate_limit=lambda **kwargs: True, verify_api_key=lambda: True)
         self.handler._manage_proxy_operation = lambda action, params: extract_method('_manage_proxy_operation', self.ns)(self.handler, action, params)
+        self.handler._reply_with_egress_apply = lambda payload, kind='outbound': self.reply_json(200, payload)
         self.handler.reply_json = self.reply_json
         self.handler.reply = lambda status, body, *args, **kwargs: self.reply_json(status, body)
         self.handler.send_response = lambda status: setattr(self, 'response', (status, {}))
@@ -94,7 +95,11 @@ class WebWorkflowTests(unittest.TestCase):
         body = urlencode(params).encode()
         self.handler.headers = {'Content-Length': str(len(body))}
         self.handler.rfile = io.BytesIO(body)
-        extract_method(name, self.ns)(self.handler, '/test-token/')
+        method = extract_method(name, self.ns)
+        if name == '_ob_manage':
+            method(self.handler)
+        else:
+            method(self.handler, '/test-token/')
         return self.response
 
     def test_api_renew_rejects_corrupt_expiry_without_mutation(self):
@@ -306,6 +311,22 @@ class WebWorkflowTests(unittest.TestCase):
         status, _ = self.invoke('_h_post_manage_proxy', {'action': 'create', 'type': 'socks5',
                                'password': 'x' * 256})
         self.assertEqual(status, 400)
+
+    def test_editing_first_global_outbound_preserves_priority(self):
+        self.data.update({
+            'custom_outbounds': [
+                {'name': 'first_proxy', 'type': 'socks5', 'addr': '127.0.0.1:1080'},
+                {'name': 'second_proxy', 'type': 'socks5', 'addr': '127.0.0.1:1081'},
+            ],
+            'outbound_mode': 'global',
+        })
+        params = {'action': 'save', 'name': 'first_proxy', 'type': 'socks5',
+                  'addr': '127.0.0.1:2080'}
+        result = self.invoke('_ob_manage', params)
+        self.assertEqual(result[0], 200)
+        self.assertEqual([item['name'] for item in self.data['custom_outbounds']],
+                         ['first_proxy', 'second_proxy'])
+        self.assertEqual(self.data['custom_outbounds'][0]['addr'], '127.0.0.1:2080')
 
     def test_warp_dict_rule_delete_preserves_non_warp_routes(self):
         self.data['warp_rules'] = [{'domain': 'openai.com', 'outbound': 'warp_socks'},
