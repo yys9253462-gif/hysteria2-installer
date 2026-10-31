@@ -44,6 +44,7 @@ class SuspensionResumeTest(unittest.TestCase):
             return SimpleNamespace(returncode=0 if ok else 1, stdout='active\n')
         env = {'data': data, 'data_lock': threading.RLock(), 'save_data': mock.Mock(),
                're': re, 'subprocess': SimpleNamespace(run=run), 'time': time,
+               'copy': copy, 'AtomicWriteDurabilityError': portal.AtomicWriteDurabilityError,
                'TRAFFIC_SUSPEND_UNITS': ('hysteria-server', 'xray', 'gost', 'amneziawg-server'),
                '_unit_active': lambda unit: True}
         # 生产代码现在用模块级 suspend_state + 服务名正则清洗状态，

@@ -7151,12 +7151,26 @@ def serve(path):
                     os.close(core_lock_fd)
             with data_lock:
                 # 收回期间新排进来的待撤销项要保留，只清掉本轮已确认的。
-                remaining=pending_revocations(data) - pending
+                previous_pending = pending_revocations(data)
+                remaining = previous_pending - pending
                 if remaining:
-                    data['_pending_revocations']=sorted(remaining)
+                    data['_pending_revocations'] = sorted(remaining)
                 else:
-                    data.pop('_pending_revocations',None)
+                    data.pop('_pending_revocations', None)
+            try:
                 save_data()
+            except AtomicWriteDurabilityError:
+                # 文件已经替换；不恢复待撤权标记，否则重启后的内存与磁盘不一致。
+                raise
+            except OSError:
+                # 保留撤权重试记录并尽力重新落盘。调用方收到失败后也不能报告删除成功。
+                with data_lock:
+                    data['_pending_revocations'] = sorted(previous_pending | pending)
+                try:
+                    save_data()
+                except OSError:
+                    pass
+                return False
             last_enforced_blocked=blocked
             return True
     def expiry_access_worker():
@@ -7306,8 +7320,29 @@ def serve(path):
             else:
                 new_state = {'suspended': False}
         with data_lock:
+            previous_suspend_exists = 'traffic_suspend' in data
+            previous_suspend = copy.deepcopy(data.get('traffic_suspend'))
             data['traffic_suspend'] = new_state
-        save_data()
+        try:
+            save_data()
+        except AtomicWriteDurabilityError:
+            raise
+        except OSError:
+            with data_lock:
+                if previous_suspend_exists:
+                    data['traffic_suspend'] = previous_suspend
+                else:
+                    data.pop('traffic_suspend', None)
+            for unit, succeeded in results.items():
+                if not succeeded:
+                    continue
+                compensate = 'start' if suspend else 'stop'
+                try:
+                    subprocess.run(['systemctl', compensate, unit],
+                                   capture_output=True, timeout=20)
+                except OSError:
+                    pass
+            raise
         return new_state, results
 
     # 计量每 5 秒对每个来源采样一次。若每次都整份落盘（portal.json 含整页 HTML，
@@ -9211,28 +9246,62 @@ if __name__ == '__main__':
                     if user_id == MASTER_USER_ID:
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot delete the master account'})
                     with data_lock:
-                        data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
+                        previous_global_deny = copy.deepcopy(global_ip_deny.get(user_id))
+                        previous = {
+                            'user': copy.deepcopy(data.get('users', {}).get(user_id)),
+
+                            'pending': copy.deepcopy(data.get('_pending_revocations')),
+                            'meter': copy.deepcopy(data.get('usage_meter')),
+                            'ip': copy.deepcopy(ip_tracker.get(user_id)),
+                            'speed': copy.deepcopy(speed_tracker.get(user_id)),
+                        }
+                        previous_had_user = user_id in data.get('users', {})
+                        data['_pending_revocations'] = sorted(pending_revocations(data) | {user_id})
                         # Even an already-absent account may have a live IP-deny row;
                         # successful idempotent deletion must clear that stale scope.
                         global_ip_deny.pop(user_id, None)
-                        if user_id in data.get('users', {}):
+                        if previous_had_user:
                             del data['users'][user_id]
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
                             drop_meter_totals(data, user_id)
-                            if user_id in ip_tracker:
-                                del ip_tracker[user_id]
-                            # 速率样本同理：不删的话，同名用户重建后第一轮
-                            # 速率会沿用旧样本算出尖峰（2026-10-25 修）。
+                            ip_tracker.pop(user_id, None)
                             speed_tracker.pop(user_id, None)
-                            # 2026-10-03：同步删掉该用户的 Reality 身份。
-                            # 不删的话 —— xray 里那个 UUID 还在，买家退了款
-                            # 照样能用 Reality 连上，属于「钱退了货还在」。
                             reality_registry(data)
-                            deleted = True
-                        else:
-                            deleted = False
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        raise
+                    except OSError:
+                        with data_lock:
+                            if previous_had_user:
+                                data.setdefault('users', {})[user_id] = previous['user']
+                            if previous['pending'] is None:
+                                data.pop('_pending_revocations', None)
+                            else:
+                                data['_pending_revocations'] = previous['pending']
+                            if previous['meter'] is None:
+                                data.pop('usage_meter', None)
+                            else:
+                                data['usage_meter'] = previous['meter']
+                            if previous['ip'] is None:
+                                ip_tracker.pop(user_id, None)
+                            else:
+                                ip_tracker[user_id] = previous['ip']
+                            if previous['speed'] is None:
+                                speed_tracker.pop(user_id, None)
+                            else:
+                                speed_tracker[user_id] = previous['speed']
+                            if previous_global_deny is not None:
+                                global_ip_deny[user_id] = previous_global_deny
+                            if previous_global_deny is not None:
+                                global_ip_deny[user_id] = previous_global_deny
+                            if previous_had_user:
+                                reality_registry(data)
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'User deletion was not saved; no access changes were applied'})
+                    deleted = previous_had_user
                     regenerate_page()
                     if not apply_access([user_id]):
                         return self.reply_json(503, {'ok': False, 'error': 'Access revocation pending; retry required'})
@@ -9904,17 +9973,16 @@ if __name__ == '__main__':
                 ]
 
                 installed = False
+                assets_modified = False
                 errors = []
                 gost_unit_path = Path('/etc/systemd/system/gost.service')
                 gost_check_path = Path('/usr/local/lib/hy2-gost-selfcheck')
                 owner_marker_path = Path('/etc/hysteria/.hy2-gost-owned')
                 gost_config_path = Path('/etc/hysteria/gost.yml')
-                with data_lock:
-                    had_proxy_services = 'proxy_services' in data
-                    previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
                 cert_dir = Path('/etc/hysteria/gost-cert')
                 cert_files = (cert_dir / 'cert.pem', cert_dir / 'key.pem')
                 had_cert_dir = cert_dir.exists()
+                old_gost_active = _systemd_state('gost') == 'active'
                 with data_lock:
                     had_proxy_services = 'proxy_services' in data
                     previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
@@ -9952,6 +10020,7 @@ if __name__ == '__main__':
                                 shutil.copyfile(str(src_bin), str(staged))
                                 os.chmod(str(staged), 0o755)
                                 os.replace(str(staged), '/usr/local/bin/gost')
+                                assets_modified = True
                                 installed = True
                                 break
                             errors.append('%s: 包内没有 gost 可执行文件' % host)
@@ -9959,6 +10028,8 @@ if __name__ == '__main__':
                             errors.append('%s: %s: %s' % (host, type(e).__name__, e))
 
                 def restore_gost_assets():
+                    nonlocal assets_modified
+                    assets_modified = True
                     for asset_path, old_asset in old_assets.items():
                         if old_asset is None:
                             asset_path.unlink(missing_ok=True)
@@ -9967,14 +10038,23 @@ if __name__ == '__main__':
                             asset_path.parent.mkdir(parents=True, exist_ok=True)
                             asset_path.write_bytes(contents)
                             asset_path.chmod(mode)
-                    if not had_cert_dir:
-                        cert_dir.rmdir()
+                    if not had_cert_dir and cert_dir.exists():
+                        try:
+                            cert_dir.rmdir()
+                        except OSError:
+                            pass
                     with data_lock:
                         if had_proxy_services:
                             data['proxy_services'] = previous_proxy_services
                         else:
                             data.pop('proxy_services', None)
                     subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    if old_assets[gost_binary] is not None and old_gost_active:
+                        subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
+                        subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
+                    elif old_assets[gost_binary] is None:
+                        subprocess.run(['systemctl', 'disable', '--now', 'gost'],
+                                       capture_output=True, timeout=30)
 
                 if not installed:
                     # 把【每个源】的错误都报出来。
@@ -9985,6 +10065,7 @@ if __name__ == '__main__':
 
                 # 确保 systemd 服务存在
                 # 先落地启动自检脚本 (unit 的 ExecStartPost 会调用它), 再写 unit.
+                assets_modified = True
                 write_gost_selfcheck()
                 service_content = GOST_UNIT_CONTENT
                 Path('/etc/systemd/system/gost.service').write_text(service_content, encoding='utf-8')
@@ -9997,7 +10078,7 @@ if __name__ == '__main__':
                 # 重新生成 gost.yml 并启动服务
                 if not reload_gost():
                     restore_gost_assets()
-                    if old_assets[gost_binary] is not None:
+                    if old_gost_active:
                         reload_gost()
                     return self.reply_json(500, {'ok': False, 'error': 'GOST 已安装，但服务或监听端口未就绪；已恢复原资产'})
 
@@ -10005,16 +10086,16 @@ if __name__ == '__main__':
                 # `is-active` 为 active 但端口未绑定, 是本项目踩过的静默故障.
                 if not gost_status():
                     restore_gost_assets()
-                    if old_assets[gost_binary] is not None:
+                    if old_gost_active:
                         reload_gost()
                     return self.reply_json(500, {'ok': False,
                         'error': 'GOST 服务未启动成功；已恢复原资产，请查看 journalctl -u gost -n 20'})
                 return self.reply_json(200, {'ok': True, 'message': f'GOST {tag} 官方核心安装成功，服务已自动配置并启动！'})
             except Exception as e:
                 try:
-                    if 'old_assets' in locals():
+                    if 'old_assets' in locals() and assets_modified:
                         restore_gost_assets()
-                        if old_assets.get(gost_binary) is not None:
+                        if old_gost_active:
                             reload_gost()
                 except Exception as rollback_error:
                     return self.reply_json(500, {'ok': False, 'error':
@@ -10226,6 +10307,10 @@ if __name__ == '__main__':
 
                 bad_domain = False
                 with data_lock:
+                    previous_warp_state_exists = 'warp_enabled' in data
+                    previous_warp_rules_exists = 'warp_rules' in data
+                    previous_warp_state = copy.deepcopy(data.get('warp_enabled', False))
+                    previous_warp_rules = copy.deepcopy(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
                     rules = normalize_route_rules(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
                     if action == 'toggle':
                         data['warp_enabled'] = not bool(data.get('warp_enabled'))
@@ -10253,7 +10338,21 @@ if __name__ == '__main__':
                 if bad_domain:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        if previous_warp_state_exists:
+                            data['warp_enabled'] = previous_warp_state
+                        else:
+                            data.pop('warp_enabled', None)
+                        if previous_warp_rules_exists:
+                            data['warp_rules'] = previous_warp_rules
+                        else:
+                            data.pop('warp_rules', None)
+                    raise
 
                 return self._reply_with_warp_apply({
                     'enabled': new_state,
@@ -10695,6 +10794,9 @@ if __name__ == '__main__':
                         current = json.loads(xray_path.read_text(encoding='utf-8'))
                     except (OSError, ValueError):
                         current = config
+                    original_config = copy.deepcopy(current)
+                    with data_lock:
+                        old_state = copy.deepcopy(data.get('vmess_config'))
                     remove_managed_inbound(current, VMESS_INBOUND_TAG)
                     apply_xray_config_transaction(
                         current, config_path=str(xray_path),
@@ -10702,7 +10804,21 @@ if __name__ == '__main__':
                         restart=not unit_suspended('xray'))
                 with data_lock:
                     data.pop('vmess_config', None)
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    try:
+                        with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                            apply_xray_config_transaction(
+                                original_config, config_path=str(xray_path),
+                                binary='/usr/local/bin/xray', restart=not unit_suspended('xray'))
+                    finally:
+                        with data_lock:
+                            if old_state is not None:
+                                data['vmess_config'] = old_state
+                    raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
                 if closed_port and not close_protocol_port(closed_port, 'tcp', 'vmess_config'):
@@ -11308,6 +11424,9 @@ if __name__ == '__main__':
                         current = json.loads(xray_path.read_text(encoding='utf-8'))
                     except (OSError, ValueError):
                         current = config
+                    original_config = copy.deepcopy(current)
+                    with data_lock:
+                        old_state = copy.deepcopy(data.get('vlessenc_config'))
                     remove_managed_inbound(current, VLESSENC_INBOUND_TAG)
                     apply_xray_config_transaction(
                         current, config_path=str(xray_path),
@@ -11315,7 +11434,21 @@ if __name__ == '__main__':
                         restart=not unit_suspended('xray'))
                 with data_lock:
                     data.pop('vlessenc_config', None)
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    try:
+                        with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                            apply_xray_config_transaction(
+                                original_config, config_path=str(xray_path),
+                                binary='/usr/local/bin/xray', restart=not unit_suspended('xray'))
+                    finally:
+                        with data_lock:
+                            if old_state is not None:
+                                data['vlessenc_config'] = old_state
+                    raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
                 if closed_port and not close_protocol_port(closed_port, 'tcp', 'vlessenc_config'):
@@ -13088,6 +13221,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(400, {'ok': False, 'error': '缺少 action 参数'})
 
             msg = ''
+            with data_lock:
+                previous_egress = {key: (key in data, copy.deepcopy(data.get(key))) for key in
+                    ('custom_outbounds', 'warp_rules', 'outbound_mode')}
             # ---------- 出站增删改 ----------
             if action in ('save', 'delete'):
                 if action == 'save':
@@ -13189,7 +13325,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             else:
                 return self.reply_json(400, {'ok': False, 'error': '未知 action: ' + action})
 
-            save_data()
+            try:
+                save_data()
+            except AtomicWriteDurabilityError:
+                raise
+            except OSError as exc:
+                with data_lock:
+                    for key, (existed, value) in previous_egress.items():
+                        if existed:
+                            data[key] = value
+                        else:
+                            data.pop(key, None)
+                return self.reply_json(500, {'ok': False, 'error':
+                    'Unable to save outbound settings: %s' % exc})
             return self._reply_with_egress_apply({'message': msg}, kind='outbound')
 
         def _h_get_warp_status(self, subpath):

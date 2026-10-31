@@ -86,6 +86,7 @@ class WebWorkflowTests(unittest.TestCase):
             check_rate_limit=lambda **kwargs: True, verify_api_key=lambda: True)
         self.handler._manage_proxy_operation = lambda action, params: extract_method('_manage_proxy_operation', self.ns)(self.handler, action, params)
         self.handler._reply_with_egress_apply = lambda payload, kind='outbound': self.reply_json(200, payload)
+        self.handler._reply_with_warp_apply = lambda payload: self.reply_json(200, payload)
         self.handler.reply_json = self.reply_json
         self.handler.reply = lambda status, body, *args, **kwargs: self.reply_json(status, body)
         self.handler.send_response = lambda status: setattr(self, 'response', (status, {}))
@@ -347,6 +348,78 @@ class WebWorkflowTests(unittest.TestCase):
                 read_clients = body.index('inbound[\'settings\'][\'clients\'] = ' + builder)
                 self.assertGreater(read_clients, lock)
 
+    def test_vmess_disable_save_failure_restores_inbound_and_state(self):
+        path = self.hdir / 'xray.json'
+        original = {'inbounds': [{'tag': portal.VMESS_INBOUND_TAG, 'port': 2087,
+                                  'protocol': 'vmess', 'settings': {'clients': []}}],
+                    'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}
+        path.write_text(json.dumps(original), encoding='utf-8')
+        self.data['vmess_config'] = {'port': 2087, 'uri': 'vmess://fixture'}
+        self.ns['Path'] = lambda value: path if str(value) == '/etc/hysteria/xray.json' else Path(value)
+        self.ns['has_managed_inbound'] = portal.has_managed_inbound
+        self.ns['remove_managed_inbound'] = portal.remove_managed_inbound
+        self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
+        self.ns['core_operation_lock'] = threading.RLock()
+        self.ns['apply_xray_config_transaction'] = Mock(side_effect=lambda cfg, **kw:
+            Path(kw['config_path']).write_text(json.dumps(cfg), encoding='utf-8'))
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, body = self.invoke('_h_post_manage_vmess', {'action': 'disable'})
+        self.assertEqual(status, 500, body)
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8')), original)
+        self.assertEqual(self.data['vmess_config']['port'], 2087)
+
+    def test_tuic_disable_save_failure_restores_config_and_service(self):
+        config_path = self.hdir / portal.TUIC_CONFIG_NAME
+        old_file = b'{"inbounds":[{"type":"tuic","listen_port":41001}]}'
+        config_path.write_bytes(old_file)
+        old_state = {'enabled': True, 'port': 41001, 'secret': 'fixture'}
+        self.data['tuic_config'] = copy.deepcopy(old_state)
+        self.ns['portal_path'] = self.hdir / 'portal.json'
+        self.ns['TUIC_CONFIG_NAME'] = portal.TUIC_CONFIG_NAME
+        self.ns['TUIC_SERVICE'] = 'hy2-tuic'
+        self.ns['tuic_apply_lock'] = threading.RLock()
+        self.ns['_active_tuic_config'] = lambda: self.data.get('tuic_config')
+        self.ns['config_section'] = lambda data, key: data.get(key, {})
+        self.ns['_systemd_state'] = lambda _: 'inactive'
+        self.ns['_service_stop_confirmed'] = lambda result, state: True
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        self.run.reset_mock()
+        status, body = self.invoke('_h_post_manage_tuic', {'action': 'disable'})
+        self.assertEqual(status, 500, body)
+        self.assertEqual(self.data['tuic_config'], old_state)
+        self.assertEqual(config_path.read_bytes(), old_file)
+        self.assertIn(['systemctl', 'start', 'hy2-tuic'], [c.args[0] for c in self.run.call_args_list])
+
+    def test_warp_save_failure_restores_memory_and_skips_apply(self):
+        original = {'warp_enabled': False, 'warp_rules': [{'domain': 'example.com',
+                                                           'outbound': 'direct'}]}
+        self.data.update(copy.deepcopy(original))
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        scheduled = []
+        self.handler._reply_with_warp_apply = Mock(side_effect=lambda payload:
+            scheduled.append(payload) or self.reply_json(200, payload))
+        status, body = self.invoke('_h_post_manage_warp', {'action': 'enable'})
+        self.assertEqual(status, 500, body)
+        self.assertEqual({key: self.data[key] for key in original}, original)
+        self.assertEqual(scheduled, [])
+
+    def test_outbound_save_failure_restores_memory_and_skips_apply(self):
+        original = {'custom_outbounds': [{'name': 'existing', 'type': 'socks5',
+                                         'addr': '127.0.0.1:1080'}],
+                    'warp_rules': [{'domain': 'example.com', 'outbound': 'existing'}],
+                    'outbound_mode': 'rules'}
+        self.data.update(copy.deepcopy(original))
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        scheduled = []
+        self.handler._reply_with_egress_apply = Mock(side_effect=lambda payload, kind='outbound':
+            scheduled.append((payload, kind)) or self.reply_json(200, payload))
+        status, body = self.invoke('_ob_manage', {'action': 'delete', 'name': 'existing'})
+        self.assertEqual(status, 500, body)
+        for key, value in original.items():
+            self.assertEqual(self.data[key], value)
+        self.handler._reply_with_egress_apply.assert_not_called()
+        self.assertEqual(scheduled, [])
+
     def test_vmess_and_vless_save_failure_restore_xray_and_portal_state(self):
         for method_name, config_key, tag in (
                 ('_apply_vmess_enable', 'vmess_config', portal.VMESS_INBOUND_TAG),
@@ -604,6 +677,18 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertNotIn('qa-user', self.data['users'])
 
+    def test_api_delete_save_failure_restores_user_and_queues(self):
+        user = {'password': 'delete-me', 'status': 'active', 'used_bytes': 123}
+        self.data['users']['qa-user'] = copy.deepcopy(user)
+        self.data['_pending_revocations'] = ['other-user']
+        self.data['usage_meter'] = {'totals': {'qa-user': {'hysteria': 123}}}
+        portal.reality_registry(self.data)
+        before = copy.deepcopy(self.data)
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, body = self.invoke_api({'user_id': 'qa-user'}, 'users/delete')
+        self.assertEqual(status, 503, body)
+        self.assertEqual(self.data, before)
+
     def test_web_delete_persists_revocation_when_reality_sync_fails(self):
         old = {'password': 'original-test-only', 'used_bytes': 99}
         self.data['users']['qa-user'] = dict(old)
@@ -611,6 +696,34 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(self.invoke('_h_post_manage_user', {'action': 'delete', 'user_id': 'qa-user'})[0], 503)
         self.assertNotIn('qa-user', self.data['users'])
         self.assertIn('qa-user', self.data['_pending_revocations'])
+
+    def test_apply_access_save_failure_keeps_revocation_queued(self):
+        source = Path(portal.__file__).read_text(encoding='utf-8')
+        tree = ast.parse(source)
+        serve = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'serve')
+        apply_fn = next(n for n in ast.walk(serve)
+                        if isinstance(n, ast.FunctionDef) and n.name == 'apply_access')
+        ns = dict(self.ns)
+        state = {'users': {}, '_pending_revocations': ['qa-user']}
+        lock = threading.RLock()
+        ns.update(data=state, data_lock=lock, access_apply_lock=threading.RLock(),
+                  pending_revocations=portal.pending_revocations,
+                  blocked_user_ids=lambda: set(),
+                  copy=copy, acquire_core_operation_lock=Mock(return_value=41),
+                  os=SimpleNamespace(close=Mock()),
+                  enforce_node_access=Mock(return_value=True),
+                  save_data=Mock(side_effect=[OSError('disk full'), None]),
+                  core_lock_fd=None, portal_path=self.hdir / 'portal.json')
+        wrapper = ast.parse('def outer():\n    last_enforced_blocked = None\n    def apply_access(force_ids=(), core_lock_fd=None):\n        pass\n    return apply_access')
+        wrapper_fn = wrapper.body[0]
+        inner = next(n for n in ast.walk(wrapper_fn)
+                     if isinstance(n, ast.FunctionDef) and n.name == 'apply_access')
+        inner.body = copy.deepcopy(apply_fn.body)
+        exec(compile(ast.fix_missing_locations(wrapper), '<apply-access>', 'exec'), ns)
+        apply_fn = ns['outer']()
+        self.assertFalse(apply_fn())
+        self.assertIn('qa-user', state['_pending_revocations'])
+        self.assertEqual(ns['save_data'].call_count, 2)
 
     def test_http_proxy_username_with_colon_is_rejected(self):
         status, _ = self.invoke('_h_post_manage_proxy', {'action': 'create', 'type': 'http',

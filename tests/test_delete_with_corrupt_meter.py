@@ -49,7 +49,9 @@ def run_api_delete(usage_meter, user='probe', present=True):
                global_ip_deny=global_denies,
                drop_meter_totals=portal.drop_meter_totals,
                pending_revocations=portal.pending_revocations,
-               apply_access=lambda ids: calls.append(('revoke', ids)) or True)
+               apply_access=lambda ids: calls.append(('revoke', ids)) or True,
+               copy=copy, save_data=lambda: calls.append('save'),
+               AtomicWriteDurabilityError=portal.AtomicWriteDurabilityError)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
                  '<delete>', 'exec'), env)
 

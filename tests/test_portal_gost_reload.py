@@ -291,6 +291,20 @@ class GostUnitConsistency(unittest.TestCase):
         self.assertIn("Path('/etc/hysteria/.hy2-gost-owned')", body)
         self.assertIn("owner_marker.chmod(0o600)", body)
 
+    def test_install_failure_restores_assets_and_original_service_state(self):
+        source = PORTAL_SRC
+        start = source.index('        def _h_post_install_gost(self, prefix):')
+        end = source.index('        def _h_post_install_amneziawg(self, prefix):', start)
+        body = source[start:end]
+        self.assertIn('old_assets[asset_path] = (asset_path.read_bytes()', body)
+        self.assertIn('def restore_gost_assets():', body)
+        self.assertIn("old_gost_active = _systemd_state('gost') == 'active'", body)
+        self.assertIn("if old_assets[gost_binary] is not None and old_gost_active:", body)
+        self.assertIn('assets_modified = True', body)
+        restore = body[body.index('                def restore_gost_assets():'):body.index('                if not installed:')]
+        self.assertIn("systemctl', 'restart', 'gost", restore)
+        self.assertIn("systemctl', 'disable', '--now', 'gost", restore)
+
     def test_units_identical(self):
         """两处产物必须完全一致 —— 不一致正是本 bug 的起因。
 

@@ -4187,10 +4187,13 @@ install_gost() {
     GOST_ASSET_NAME="gost_${GOST_VER}_${GOST_ASSET}.tar.gz"
     local had_gost=0 old_gost="" old_unit="" old_check="" old_owner="" had_unit=0 had_check=0 had_owner=0
     local old_config="" old_cert="" old_key="" had_config=0 had_cert=0 had_key=0
+    local old_active=0 active_state
     [[ -f "$GOST_BIN" ]] && { had_gost=1; old_gost="$(mktemp)"; cp -p "$GOST_BIN" "$old_gost" || return 1; }
     [[ -f "$GOST_UNIT" ]] && { had_unit=1; old_unit="$(mktemp)"; cp -p "$GOST_UNIT" "$old_unit" || return 1; }
     [[ -f /usr/local/lib/hy2-gost-selfcheck ]] && { had_check=1; old_check="$(mktemp)"; cp -p /usr/local/lib/hy2-gost-selfcheck "$old_check" || return 1; }
     [[ -f "$HY2_DIR/.hy2-gost-owned" ]] && { had_owner=1; old_owner="$(mktemp)"; cp -p "$HY2_DIR/.hy2-gost-owned" "$old_owner" || return 1; }
+    active_state="$(systemctl is-active gost 2>/dev/null || true)"
+    [[ "$active_state" == active ]] && old_active=1
     [[ -f "$GOST_CONFIG" ]] && { had_config=1; old_config="$(mktemp)"; cp -p "$GOST_CONFIG" "$old_config" || return 1; }
     [[ -f "$HY2_DIR/gost-cert/cert.pem" ]] && { had_cert=1; old_cert="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/cert.pem" "$old_cert" || return 1; }
     [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; old_key="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/key.pem" "$old_key" || return 1; }
@@ -4206,7 +4209,12 @@ install_gost() {
         if [[ "$had_cert" == 1 ]]; then cp -p "$old_cert" "$HY2_DIR/gost-cert/cert.pem"; else rm -f "$HY2_DIR/gost-cert/cert.pem"; fi
         if [[ "$had_key" == 1 ]]; then cp -p "$old_key" "$HY2_DIR/gost-cert/key.pem"; else rm -f "$HY2_DIR/gost-cert/key.pem"; fi
         systemctl daemon-reload >/dev/null 2>&1 || true
-        if [[ "$had_gost" == 1 ]]; then systemctl restart gost >/dev/null 2>&1 || true; else systemctl disable --now gost >/dev/null 2>&1 || true; fi
+        if [[ "$had_gost" == 1 && "$old_active" == 1 ]]; then
+            systemctl enable gost >/dev/null 2>&1 || true
+            systemctl restart gost >/dev/null 2>&1 || true
+        else
+            systemctl disable --now gost >/dev/null 2>&1 || true
+        fi
         rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
     }
     _finish_gost_install() {
