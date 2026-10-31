@@ -4,6 +4,7 @@
 import ast
 import copy
 import contextlib
+import datetime
 import base64
 import hashlib
 import hmac
@@ -3801,6 +3802,27 @@ def _config_acme_cert_path(config_path):
     return base / 'certificates' / issuer / domain / (domain + '.crt')
 
 
+def certificate_covers_domain(domain, sans, common_name=''):
+    """Match exact DNS SANs or a single leftmost wildcard label."""
+    if not isinstance(domain, str) or not domain:
+        return False
+    host = domain.rstrip('.').lower()
+    names = sans if isinstance(sans, (list, tuple, set)) else []
+    if common_name:
+        names = list(names) + [common_name]
+    for raw in names:
+        if not isinstance(raw, str):
+            continue
+        name = raw.rstrip('.').lower()
+        if name == host:
+            return True
+        if name.startswith('*.') and host.endswith(name[1:]):
+            prefix = host[:-len(name[1:])]
+            if prefix and '.' not in prefix:
+                return True
+    return False
+
+
 def _resolve_live_cert(root, config_path='/etc/hysteria/config.yaml'):
     """返回 (cert_path, cn, sans, self_signed) —— 门户实际在用的那张证书。
 
@@ -4035,6 +4057,56 @@ def _cert_summary(root, meta, config_path='/etc/hysteria/config.yaml'):
         return {'ok': False}
 
 
+def sync_cert_runtime(root, cert_file, state_path=None):
+    """Reload active TLS listeners after the certificate file actually changes.
+
+    `try-restart` preserves disabled/suspended services: it refreshes processes that
+    already loaded the old certificate and never starts one that is currently off.
+    """
+    root = Path(root)
+    state_path = Path(state_path) if state_path else root / 'cert-selfheal.json'
+    try:
+        cert_file = Path(cert_file)
+        digest = hashlib.sha256(cert_file.read_bytes()).hexdigest()
+        state = json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else {}
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, ValueError):
+        return False
+    previous = state.get('loaded_cert_sha256')
+    if not isinstance(previous, str) or not previous:
+        state['loaded_cert_sha256'] = digest
+        try:
+            atomic_write_private(state_path, json.dumps(state, ensure_ascii=False).encode('utf-8'))
+        except OSError as exc:
+            print('[portal] 证书指纹记录失败: %s' % str(exc)[:120], file=sys.stderr)
+        return False
+    if previous == digest:
+        return False
+    services = ('hysteria-server', 'xray', ANYTLS_SERVICE, TUIC_SERVICE, 'gost')
+    failed = []
+    for service in services:
+        if _systemd_state(service) != 'active':
+            continue
+        try:
+            result = subprocess.run(['systemctl', 'try-restart', service],
+                                    capture_output=True, timeout=20)
+            if result.returncode != 0:
+                failed.append(service)
+        except Exception:
+            failed.append(service)
+    if failed:
+        print('[portal] 证书已更新，但服务重载失败（下次自愈会重试）: %s'
+              % ', '.join(failed), file=sys.stderr)
+        return False
+    state['loaded_cert_sha256'] = digest
+    try:
+        atomic_write_private(state_path, json.dumps(state, ensure_ascii=False).encode('utf-8'))
+    except OSError as exc:
+        print('[portal] 证书运行态指纹写入失败: %s' % str(exc)[:120], file=sys.stderr)
+    return True
+
+
 def record_cert_heal(root, state, before, after):
     """把一次自愈写成痕迹文件，供界面显示「上次自动对齐时间」。"""
     try:
@@ -4127,7 +4199,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     current_sn = str(m.get('server_name') or '').strip().lower()
     san_lower = [str(x).strip().lower() for x in (sans or [])]
     candidate = ''
-    if current_sn and (current_sn in san_lower or current_sn == str(cn or '').strip().lower()):
+    if current_sn and certificate_covers_domain(current_sn, san_lower, str(cn or '')):
         candidate = str(m.get('server_name')).strip()
     if not candidate:
         for san in sans or []:
@@ -5612,6 +5684,61 @@ def _nft_port_rule(proto, port):
     """匹配本模块写入的 accept 规则（用于幂等判断与删除）。"""
     return re.compile(r'\b%s\s+dport\s+%d\s+accept\b' % (re.escape(proto), int(port)))
 
+def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
+    """Whether another configured protocol still needs an open firewall port."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    data = data if isinstance(data, dict) else {}
+    keys = ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config', 'tuic_config')
+    for key in keys:
+        if key == exclude_key:
+            continue
+        section = data.get(key)
+        if isinstance(section, dict) and (key not in ('anytls_config', 'tuic_config') or section.get('enabled')):
+            try:
+                if int(section.get('port') or 0) == port:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    tags = {REALITY_INBOUND_TAG, VMESS_INBOUND_TAG, VLESSENC_INBOUND_TAG}
+    if isinstance(xray_config, dict):
+        for inbound in xray_config.get('inbounds', []):
+            if not isinstance(inbound, dict) or inbound.get('tag') not in tags:
+                continue
+            try:
+                if int(inbound.get('port') or 0) == port:
+                    section_key = {REALITY_INBOUND_TAG: 'reality_config',
+                                   VMESS_INBOUND_TAG: 'vmess_config',
+                                   VLESSENC_INBOUND_TAG: 'vlessenc_config'}[inbound['tag']]
+                    if section_key != exclude_key:
+                        return True
+            except (TypeError, ValueError):
+                continue
+    for service in (ANYTLS_SERVICE, TUIC_SERVICE):
+        config_path = Path('/etc/hysteria') / (ANYTLS_CONFIG_NAME if service == ANYTLS_SERVICE else TUIC_CONFIG_NAME)
+        if _systemd_state(service) == 'active' and config_path.exists():
+            try:
+                config = json.loads(config_path.read_text(encoding='utf-8'))
+                listeners = config.get('inbounds', []) if isinstance(config, dict) else []
+                if any(int(item.get('listen_port') or 0) == port for item in listeners
+                       if isinstance(item, dict)):
+                    return True
+            except (OSError, ValueError, TypeError):
+                return True
+    if proto == 'tcp':
+        for item in data.get('proxy_services', []) if isinstance(data.get('proxy_services'), list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                if int(item.get('port') or 0) == port:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    return False
+
+
 def firewall_port(port, proto='tcp', open_=True):
     """在本机防火墙（ufw / firewalld，仅当它们正在运行）上放行或收回一个端口。
 
@@ -5622,47 +5749,63 @@ def firewall_port(port, proto='tcp', open_=True):
     try:
         port = int(port)
     except (TypeError, ValueError):
-        return
+        return False
     if not 1 <= port <= 65535 or proto not in ('tcp', 'udp'):
-        return
+        return False
     spec = '%d/%s' % (port, proto)
     try:
         handled = False
         if shutil.which('ufw'):
-            status = subprocess.run(['ufw', 'status'], capture_output=True, text=True, timeout=10).stdout
-            if status.startswith('Status: active'):
+            status = subprocess.run(['ufw', 'status'], capture_output=True, text=True, timeout=10)
+            if status.returncode != 0:
+                return False
+            if status.stdout.startswith('Status: active'):
                 cmd = ['ufw', 'allow', spec] if open_ else ['ufw', 'delete', 'allow', spec]
-                subprocess.run(cmd, capture_output=True, timeout=15)
+                result = subprocess.run(cmd, capture_output=True, timeout=15)
+                if result.returncode != 0:
+                    return False
                 handled = True
         if shutil.which('firewall-cmd') and _systemd_state('firewalld') == 'active':
             flag = '--add-port=' if open_ else '--remove-port='
-            subprocess.run(['firewall-cmd', '--zone=public', flag + spec, '--permanent'],
-                           capture_output=True, timeout=15)
-            subprocess.run(['firewall-cmd', '--reload'], capture_output=True, timeout=15)
+            result = subprocess.run(['firewall-cmd', '--zone=public', flag + spec, '--permanent'],
+                                    capture_output=True, timeout=15)
+            if result.returncode != 0:
+                return False
+            result = subprocess.run(['firewall-cmd', '--reload'], capture_output=True, timeout=15)
+            if result.returncode != 0:
+                return False
             handled = True
         if not handled and shutil.which('nft'):
-            # 纯 nftables 主机：安装器只放行了 Hy2 的端口，门户新增的协议端口
-            # 必须在这里补上，否则外网连不上而本机一切正常（2026-10-29 修）。
             target = _nft_input_chain()
             if target:
                 fam, tbl, chain = target
                 listed = subprocess.run(['nft', '-a', 'list', 'chain', fam, tbl, chain],
-                                        capture_output=True, text=True, timeout=5).stdout
-                matched = [ln for ln in listed.splitlines() if _nft_port_rule(proto, port).search(ln)]
+                                        capture_output=True, text=True, timeout=5)
+                if listed.returncode != 0:
+                    return False
+                matched = [ln for ln in listed.stdout.splitlines()
+                           if _nft_port_rule(proto, port).search(ln)]
                 if open_:
                     if not matched:
-                        subprocess.run(['nft', 'add', 'rule', fam, tbl, chain,
-                                        proto, 'dport', str(port), 'accept'],
-                                       capture_output=True, timeout=10)
+                        result = subprocess.run(['nft', 'add', 'rule', fam, tbl, chain,
+                                                 proto, 'dport', str(port), 'accept'],
+                                                capture_output=True, timeout=10)
+                        if result.returncode != 0:
+                            return False
                 else:
                     for line in matched:
                         hm = re.search(r'# handle (\d+)', line)
                         if hm:
-                            subprocess.run(['nft', 'delete', 'rule', fam, tbl, chain,
-                                            'handle', hm.group(1)],
-                                           capture_output=True, timeout=10)
+                            result = subprocess.run(['nft', 'delete', 'rule', fam, tbl, chain,
+                                                     'handle', hm.group(1)],
+                                                    capture_output=True, timeout=10)
+                            if result.returncode != 0:
+                                return False
+                handled = True
+        return handled or not (shutil.which('ufw') or shutil.which('firewall-cmd') or shutil.which('nft'))
     except Exception as exc:
         _log_ignored('firewall_port', exc)
+        return False
 
 
 def password_taken(users, pwd, owner_uid):
@@ -5677,17 +5820,20 @@ def password_taken(users, pwd, owner_uid):
                and str(u.get('password', '')) == str(pwd)
                for uid, u in users.items())
 
-def enforce_node_access(root, snapshot, force_ids=(), apply_lock=None):
+def enforce_node_access(root, snapshot, force_ids=(), apply_lock=None,
+                         skip_anytls=False, skip_tuic=False):
     """分别尝试 AnyTLS、TUIC 与 Xray；任一路无法确认时保留待撤销状态。"""
     anytls_error = tuic_error = None
-    try:
-        sync_anytls_users(root, snapshot)
-    except Exception as exc:
-        anytls_error = exc
-    try:
-        sync_tuic_users(root, snapshot)
-    except Exception as exc:
-        tuic_error = exc
+    if not skip_anytls:
+        try:
+            sync_anytls_users(root, snapshot)
+        except Exception as exc:
+            anytls_error = exc
+    if not skip_tuic:
+        try:
+            sync_tuic_users(root, snapshot)
+        except Exception as exc:
+            tuic_error = exc
     result = _enforce_node_access_xray_hy2(root, snapshot, force_ids, apply_lock)
     if anytls_error is not None:
         raise RuntimeError('AnyTLS user sync could not be confirmed') from anytls_error
@@ -6804,14 +6950,27 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
         return False
 
     before = dict(m)
+    live_cert, _, _, _ = _resolve_live_cert(root, config_path)
+    cert_files = set()
+    tls_cert = _config_tls_cert_path(config_path)
+    if tls_cert:
+        cert_files.add(Path(tls_cert) if Path(tls_cert).is_absolute()
+                       else Path(config_path).parent / tls_cert)
+    cert_files.add(live_cert)
+    before_cert = {path: hashlib.sha256(path.read_bytes()).hexdigest()
+                   for path in cert_files if path.is_file()}
     changed = sync_cert_trust(m, root, meta_path, config_path=config_path)
     # sync_cert_trust 只在漂移时写盘；pin 的修正也一并在此处理（保持与 refresh 一致）。
     pin_before = m.get('pin_sha256')
     sync_pin(m, root, meta_path)
     if m.get('pin_sha256') != pin_before:
         changed = True
+    after_cert = {path: hashlib.sha256(path.read_bytes()).hexdigest()
+                  for path in cert_files if path.is_file()}
+    cert_changed = before_cert != after_cert
+    runtime_reloaded = sync_cert_runtime(root, live_cert) if cert_changed else False
 
-    if changed:
+    if changed or runtime_reloaded:
         # 留痕：让「刚刚自动对齐过一次」在门户卡片上可见，而不是悄无声息。
         record_cert_heal(root, None, before, m)
 
@@ -6905,6 +7064,15 @@ def serve(path):
     VALID_AWG_ENDPOINT_RE = re.compile(
         r'^[A-Za-z0-9_.\-]+(?::[0-9]{1,5})?$|^\[[0-9A-Fa-f:.]+\](?::[0-9]{1,5})?$')
 
+    def close_protocol_port(port, proto, exclude_key):
+        try:
+            xray_config = json.loads((portal_path.parent / 'xray.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            xray_config = None
+        if protocol_port_in_use(port, proto, data, xray_config, exclude_key):
+            return True
+        return firewall_port(port, proto, open_=False)
+
     def awg_endpoint_error(endpoint):
         if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
             return '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'
@@ -6953,7 +7121,8 @@ def serve(path):
                 if core_lock_fd is None:
                     core_lock_fd = acquire_core_operation_lock()
                     acquired_core_lock = True
-                enforce_node_access(portal_path.parent,snapshot,pending,reality_apply_lock)
+                enforce_node_access(portal_path.parent,snapshot,pending,reality_apply_lock,
+                                    skip_anytls=True, skip_tuic=True)
             except Exception as exc:
                 with data_lock:
                     data['_pending_revocations']=sorted(pending_revocations(data) | pending)
@@ -8087,6 +8256,7 @@ if __name__ == '__main__':
             """
             with data_lock:
                 rcfg_old = dict(config_section(data, 'reality_config'))
+            old_port = _valid_port(rcfg_old.get('port')) or 0
 
             priv_key = '' if force else rcfg_old.get('private_key', '')
             pub_key = '' if force else rcfg_old.get('public_key', '')
@@ -8242,10 +8412,21 @@ if __name__ == '__main__':
                                               binary=str(Path('/usr/local/bin/xray')),
                                               restart=restart and not unit_suspended('xray'))
                 with data_lock:
+                    previous_cfg = copy.deepcopy(config_section(data, 'reality_config'))
                     data['reality_config'] = new_rcfg
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        data['reality_config'] = previous_cfg
+                    raise
+            if old_port and old_port != new_rcfg.get('port'):
+                close_protocol_port(old_port, 'tcp', 'reality_config')
             # Reality 走 TCP；开着 ufw / firewalld 时不放行，外网就连不上。
-            firewall_port(new_rcfg.get('port'), 'tcp', open_=True)
+            if not firewall_port(new_rcfg.get('port'), 'tcp', open_=True):
+                raise RuntimeError('Reality 已配置，但防火墙放行端口失败')
             return clients
 
         server_version = 'Gateway'
@@ -9575,11 +9756,20 @@ if __name__ == '__main__':
                         'error': 'GOST 配置未成功应用或端口未监听，代理记录已恢复；请检查服务日志'}
                 if action == 'delete':
                     for item in working:
-                        if item.get('id') == proxy_id:
-                            firewall_port(item.get('port'), 'tcp', open_=False)
+                        if item.get('id') == proxy_id and not protocol_port_in_use(
+                                item.get('port'), 'tcp', data, exclude_key='proxy_services'):
+                            if not firewall_port(item.get('port'), 'tcp', open_=False):
+                                return 500, {'ok': False, 'applied': True,
+                                    'error': '代理已删除，但端口防火墙规则未能回收'}
                     return 200, {'ok': True, 'applied': True, 'message': 'Proxy service deleted'}
-                # 开着 ufw / firewalld 的系统上不放行的话，本机探测一切正常、外网却连不上。
-                firewall_port(port, 'tcp', open_=True)
+                # 开着防火墙的机器，端口放行失败时不能报成服务完全可用。
+                if not firewall_port(port, 'tcp', open_=True):
+                    with data_lock:
+                        data['proxy_services'] = previous
+                    save_data()
+                    reload_gost()
+                    return 500, {'ok': False, 'applied': False,
+                        'error': '防火墙放行失败，代理记录已恢复；请检查本机防火墙状态'}
                 m = read_meta_file(meta_path)
                 host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
                 host_part = '[' + host + ']' if ':' in host and not host.startswith('[') else host
@@ -10059,6 +10249,8 @@ if __name__ == '__main__':
                         return self.reply_json(500, {'ok': False, 'error':
                             'xray.json 不是合法 JSON，未做任何修改'})
                     reality_on = bool(cfg_now) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)
+                    with data_lock:
+                        old_reality_port = _valid_port(config_section(data, 'reality_config').get('port')) or 0
                     if reality_on:
                         with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                             try:
@@ -10071,6 +10263,10 @@ if __name__ == '__main__':
                                 binary='/usr/local/bin/xray',
                                 restart=not unit_suspended('xray'))
                         new_active = False
+                        if old_reality_port and not close_protocol_port(
+                                old_reality_port, 'tcp', 'reality_config'):
+                            return self.reply_json(500, {'ok': False, 'error':
+                                'Reality 已关闭，但旧端口防火墙规则未能回收'})
                     else:
                         if unit_suspended('xray'):
                             return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，Reality 将在控制台恢复节点时自动启动'})
@@ -10114,8 +10310,26 @@ if __name__ == '__main__':
                 raise RuntimeError('找不到可用 TLS 证书，%s 需要先配置证书' % protocol)
             if self_signed:
                 raise RuntimeError('当前为自签证书，%s 客户端无法校验；请先配置域名证书' % protocol)
+            validity = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout',
+                                       '-checkend', '0'], capture_output=True,
+                                      text=True, timeout=5)
+            if validity.returncode != 0:
+                raise RuntimeError('证书已过期或无效，%s 不能启用' % protocol)
+            starts = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout',
+                                     '-startdate'], capture_output=True,
+                                    text=True, timeout=5)
+            if starts.returncode != 0 or not starts.stdout.startswith('notBefore='):
+                raise RuntimeError('无法读取证书生效时间，%s 不能启用' % protocol)
+            try:
+                not_before = datetime.datetime.strptime(
+                    starts.stdout.strip().split('=', 1)[1], '%b %d %H:%M:%S %Y %Z'
+                ).replace(tzinfo=datetime.timezone.utc).timestamp()
+            except (ValueError, OverflowError):
+                raise RuntimeError('无法解析证书生效时间，%s 不能启用' % protocol)
+            if not_before > time.time():
+                raise RuntimeError('证书尚未生效，%s 不能启用' % protocol)
             names = set(sans or []) | ({cn} if cn else set())
-            if domain not in names:
+            if not certificate_covers_domain(domain, sans, cn):
                 raise RuntimeError('证书不包含域名 %s（现有: %s）' % (
                     domain, ', '.join(sorted(names)) or '无'))
             key_file = _find_cert_key(Path(cert_file), cfg_dir)
@@ -10203,6 +10417,8 @@ if __name__ == '__main__':
                 raise RuntimeError('Xray 核心未安装')
             # 核心锁必须先于协议锁，避免与撤销路径形成反向锁序。
             with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                with data_lock:
+                    inbound['settings']['clients'] = vmess_clients(data)
                 config = (json.loads(xray_path.read_text(encoding='utf-8'))
                           if xray_path.exists() else {'log': {'loglevel': 'warning'},
                                                       'outbounds': [{'protocol': 'freedom',
@@ -10221,7 +10437,8 @@ if __name__ == '__main__':
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
             # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
             regenerate_page()
-            firewall_port(listen_port, 'tcp', open_=True)
+            if not firewall_port(listen_port, 'tcp', open_=True):
+                raise RuntimeError('VMess 配置已保存，但防火墙放行端口失败')
             return new_cfg
 
         def _apply_vlessenc_enable(self):
@@ -10284,6 +10501,8 @@ if __name__ == '__main__':
                 raise RuntimeError('Xray 核心未安装')
             # 读-改-写使用统一顺序的核心与协议锁，防止并发卸载。
             with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                with data_lock:
+                    inbound['settings']['clients'] = vlessenc_clients(data)
                 config = (json.loads(xray_path.read_text(encoding='utf-8'))
                           if xray_path.exists() else {'log': {'loglevel': 'warning'},
                                                       'outbounds': [{'protocol': 'freedom',
@@ -10302,7 +10521,8 @@ if __name__ == '__main__':
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
             # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
             regenerate_page()
-            firewall_port(listen_port, 'tcp', open_=True)
+            if not firewall_port(listen_port, 'tcp', open_=True):
+                raise RuntimeError('VLESS Encryption 配置已保存，但防火墙放行端口失败')
             return new_cfg
 
         def _h_post_manage_vmess(self, prefix):
@@ -10357,8 +10577,9 @@ if __name__ == '__main__':
                 save_data()
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
-                if closed_port:
-                    firewall_port(closed_port, 'tcp', open_=False)
+                if closed_port and not close_protocol_port(closed_port, 'tcp', 'vmess_config'):
+                    return self.reply_json(500, {'ok': False, 'active': False,
+                        'error': 'VMess 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -10632,7 +10853,8 @@ if __name__ == '__main__':
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
             # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
             regenerate_page()
-            firewall_port(listen_port, 'tcp', open_=True)
+            if not firewall_port(listen_port, 'tcp', open_=True):
+                raise RuntimeError('AnyTLS 配置已保存，但防火墙放行端口失败')
             return new_cfg
 
         def _h_post_manage_anytls(self, prefix):
@@ -10698,8 +10920,9 @@ if __name__ == '__main__':
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
-                if closed_port:
-                    firewall_port(closed_port, 'tcp', open_=False)
+                if closed_port and not close_protocol_port(closed_port, 'tcp', 'anytls_config'):
+                    return self.reply_json(500, {'ok': False, 'active': False,
+                        'error': 'AnyTLS 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -10808,7 +11031,8 @@ if __name__ == '__main__':
                                            capture_output=True, timeout=30)
                     raise
             regenerate_page()
-            firewall_port(listen_port, 'udp', open_=True)
+            if not firewall_port(listen_port, 'udp', open_=True):
+                raise RuntimeError('TUIC 配置已保存，但防火墙放行端口失败')
             return new_cfg
 
         def _h_post_manage_tuic(self, prefix):
@@ -10876,8 +11100,9 @@ if __name__ == '__main__':
                                    capture_output=True, timeout=30)
                     raise
                 regenerate_page()
-                if closed_port:
-                    firewall_port(closed_port, 'udp', open_=False)
+                if closed_port and not close_protocol_port(closed_port, 'udp', 'tuic_config'):
+                    return self.reply_json(500, {'ok': False, 'active': False,
+                        'error': 'TUIC 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -10965,8 +11190,9 @@ if __name__ == '__main__':
                 save_data()
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
-                if closed_port:
-                    firewall_port(closed_port, 'tcp', open_=False)
+                if closed_port and not close_protocol_port(closed_port, 'tcp', 'vlessenc_config'):
+                    return self.reply_json(500, {'ok': False, 'active': False,
+                        'error': 'VLESS Encryption 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -11063,8 +11289,29 @@ if __name__ == '__main__':
                         subprocess.run(['sysctl', '-w', key + '=' + value], capture_output=True, timeout=3)
                     return self.reply_json(500, {'ok': False, 'error': 'BBR 应用失败，已恢复原文件并尝试恢复原运行参数'})
                 with data_lock:
+                    old_target = data.get('bbr_target_version')
+                    had_target = 'bbr_target_version' in data
                     data['bbr_target_version'] = ver
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    for path, content in originals.items():
+                        if content is None:
+                            path.unlink(missing_ok=True)
+                        else:
+                            path.write_bytes(content)
+                    for key, value in runtime.items():
+                        subprocess.run(['sysctl', '-w', key + '=' + value],
+                                       capture_output=True, timeout=3)
+                    with data_lock:
+                        if had_target:
+                            data['bbr_target_version'] = old_target
+                        else:
+                            data.pop('bbr_target_version', None)
+                    return self.reply_json(500, {'ok': False,
+                        'error': 'BBR 状态保存失败，已恢复原配置并尝试恢复原运行参数'})
                 return self.reply_json(200, {'ok': True, 'applied': True, 'current': target,
                     'message': 'BBR %s 已应用并核对实际算法为 %s，无需重启整机' % (ver.upper(), target)})
             except Exception as exc:
@@ -12904,14 +13151,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             # 与门户实际下发给客户端的 sni 对照：不一致说明又发生了漂移
             # （自愈单元没装 / 装的是旧版 / 证书刚换还没跑到）。
             live_sn = ''
-            for san in info.get('sans') or []:
-                if not san.startswith('*.') and _is_dns_name(san):
-                    live_sn = san
-                    break
-            if not live_sn and _is_dns_name(info.get('common_name') or ''):
-                live_sn = info['common_name']
+            meta_sn = str(info.get('server_name') or '')
+            if certificate_covers_domain(meta_sn, info.get('sans') or [],
+                                         info.get('common_name') or ''):
+                live_sn = meta_sn
+            else:
+                for san in info.get('sans') or []:
+                    if not san.startswith('*.') and _is_dns_name(san):
+                        live_sn = san
+                        break
+                if not live_sn and _is_dns_name(info.get('common_name') or ''):
+                    live_sn = info['common_name']
             info['live_server_name'] = live_sn
-            info['meta_matches_cert'] = bool(live_sn) and live_sn == info.get('server_name')
+            info['meta_matches_cert'] = bool(meta_sn) and certificate_covers_domain(
+                meta_sn, info.get('sans') or [], info.get('common_name') or '')
             info['warn_days'] = CERT_EXPIRY_WARN_DAYS
             info['critical_days'] = CERT_EXPIRY_CRITICAL_DAYS
             return self.reply_json(200, info)

@@ -131,8 +131,10 @@ class TestEncodingHardening(unittest.TestCase):
     def test_save_data_uses_utf8(self):
         import inspect
         src = inspect.getsource(portal.serve)
-        i = src.find('def save_data')
-        body = src[i:i + 900]
+        i = src.find('    def save_data():')
+        self.assertGreaterEqual(i, 0, 'serve() must define save_data')
+        end = src.find('\n    def ', i + 1)
+        body = src[i:end if end >= 0 else len(src)]
         self.assertIn("encoding='utf-8'", body,
                       'save_data 必须显式 UTF-8 —— 它写的是整个 portal.json')
 

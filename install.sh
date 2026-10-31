@@ -1532,7 +1532,7 @@ EOF
     mkdir -p "$HY2_CERT_DIR"
     if ! "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
-            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic" >/dev/null; then
+            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null; then
         log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败。"
         return 1
     fi
@@ -1627,7 +1627,7 @@ setup_cert_via_dns_api() {
     mkdir -p "$HY2_CERT_DIR"
     if ! "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
-            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic" >/dev/null; then
+            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null; then
         log_err "DNS API 证书已签发，但安装或续期重载钩子配置失败。"
         return 1
     fi
@@ -2109,25 +2109,26 @@ setup_system_firewall() {
 #    出事后用户唯一能做的事是手工翻备份目录，而他根本不知道备份存在哪。
 # 这里在动手之前把四个关键文件各留一份带时间戳的快照，并在菜单里告知位置。
 backup_state_before_reconfigure() {
-    local ts saved=0 failed=0 f
+    local ts snapshot_id saved=0 failed=0 f
     ts="$(date +%Y%m%d-%H%M%S)"
+    snapshot_id="${ts}-$$-${RANDOM}"
     # 配置、用户数据和自签证书一起快照：menu 4 会覆盖固定证书路径，
     # 若随后失败/中断，旧 config.yaml 仍可能引用旧证书指纹。
     for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
              "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
         [[ -f "$f" ]] || continue
-        if cp -a "$f" "${f}.bak-${ts}" 2>/dev/null; then
+        if cp -a "$f" "${f}.bak-${snapshot_id}" 2>/dev/null; then
             saved=$((saved + 1))
         else
             failed=$((failed + 1))
-            rm -f "${f}.bak-${ts}" 2>/dev/null || true
+            rm -f "${f}.bak-${snapshot_id}" 2>/dev/null || true
         fi
     done
     if (( failed > 0 )); then
         # 任何已有关键文件备份失败都中止后续写入，且保留之前可用的恢复点。
         for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
                  "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
-            [[ -n "$f" ]] && rm -f "${f}.bak-${ts}" 2>/dev/null || true
+            [[ -n "$f" ]] && rm -f "${f}.bak-${snapshot_id}" 2>/dev/null || true
         done
         log_err "关键配置快照有 ${failed} 个文件失败；已中止重配置，原服务配置未改动。"
         return 1
@@ -2154,7 +2155,7 @@ backup_state_before_reconfigure() {
         fi
         rm -f "$_snapshot_list"
     done
-    log_info "已备份 ${saved} 个关键文件（后缀 .bak-${ts}），改配置出问题可回滚。"
+    log_info "已备份 ${saved} 个关键文件（后缀 .bak-${snapshot_id}），改配置出问题可回滚。"
 }
 
 select_subscription_port() {

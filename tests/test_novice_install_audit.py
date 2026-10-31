@@ -313,6 +313,28 @@ class TestBackupBeforeReconfigure(unittest.TestCase):
         self.assertLess(branch.index('backup_state_before_reconfigure || exit 1'),
                         branch.index('install_dependencies'))
 
+    def test_snapshot_failure_keeps_previous_snapshot_with_same_timestamp(self):
+        helper = _extract_fn('backup_state_before_reconfigure')
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            protected = td / 'client_meta.json'
+            protected.write_text('current')
+            previous = Path(str(protected) + '.bak-20261101-120000-old')
+            previous.write_text('last known good')
+            script = (
+                'set -eo pipefail\n'
+                f'HY2_DIR="{td}"\n'
+                f'HY2_META_FILE="{protected}"\n'
+                f'HY2_CONFIG="{td}/config.yaml"\n'
+                f'HY2_CERT_DIR="{td}/cert"\n'
+                'date() { printf 20261101-120000; }\n'
+                'cp() { return 1; }\n'
+                'log_info(){ :; }; log_warn(){ :; }; log_err(){ :; }\n'
+                + helper + '\nbackup_state_before_reconfigure\n')
+            result = _run_shell(script)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(previous.read_text(), 'last known good')
+
     def test_snapshot_failure_aborts_reconfiguration(self):
         flow = INSTALL.read_text(encoding='utf-8')
         self.assertIn('backup_state_before_reconfigure || return 1', flow)

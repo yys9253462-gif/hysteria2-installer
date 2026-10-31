@@ -198,6 +198,49 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertFalse(body.get('ok'))
         self.assertNotIn('bbr_target_version', self.data)
 
+    def test_bbr_save_failure_rolls_back_sysctl_files_runtime_and_state(self):
+        old_target = {'bbr_target_version': 'v1'}
+        self.data.update(old_target)
+        congestion_reads = [0]
+        def run(args, **kw):
+            if args == ['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control']:
+                return SimpleNamespace(returncode=0, stdout='reno cubic bbr bbr2 bbr3', stderr='')
+            if args == ['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control']:
+                return SimpleNamespace(returncode=0, stdout='reno cubic bbr bbr2 bbr3', stderr='')
+            if args[:2] == ['sysctl', '-n']:
+                key = args[2]
+                if key == 'net.ipv4.tcp_congestion_control':
+                    congestion_reads[0] += 1
+                    value = 'cubic' if congestion_reads[0] == 1 else 'bbr2'
+                elif key == 'net.core.default_qdisc':
+                    value = 'fq'
+                else:
+                    value = '0'
+                return SimpleNamespace(returncode=0, stdout=value, stderr='')
+            if args[:2] == ['sysctl', '-p']:
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        self.run.side_effect = run
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        self.ns['subprocess'].run = self.run
+        with patch.dict('os.environ', {'HY2_BBR_TEST_ROOT': str(self.root)}):
+            # Redirect the production sysctl paths to a sandbox before the isolated handler runs.
+            paths = [self.root / 'etc/modules-load.d/bbr.conf', self.root / 'etc/sysctl.d/99-bbr.conf']
+            for path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('original', encoding='utf-8')
+            original_path = self.ns['Path']
+            def fake_path(value):
+                text = str(value)
+                if text in ('/etc/modules-load.d/bbr.conf', '/etc/sysctl.d/99-bbr.conf'):
+                    return self.root / text.lstrip('/')
+                return original_path(value)
+            self.ns['Path'] = fake_path
+            status, body = self.invoke('_h_post_set_bbr', {'version': 'v2'})
+            self.assertEqual(status, 500, body)
+            self.assertEqual(self.data['bbr_target_version'], 'v1')
+            self.assertEqual([p.read_text(encoding='utf-8') for p in paths], ['original', 'original'])
+
     def test_failed_sysctl_is_not_reported_as_reboot_success(self):
         def run(args, **kw):
             return SimpleNamespace(returncode=1 if '-p' in args else 0,
@@ -233,6 +276,32 @@ class WebWorkflowTests(unittest.TestCase):
         self.handler.rfile = io.BytesIO(body)
         return extract_method('_h_post_install_core', self.ns)(self.handler, '/test-token/')
 
+    def test_tls_certificate_validation_rejects_expired_and_future_certificates(self):
+        method = extract_method('_vmess_certificate', self.ns)
+        fixture_cert = self.root / 'fixture-cert.pem'
+        self.ns['_resolve_live_cert'] = Mock(return_value=(fixture_cert,
+            'node.example.com', ['node.example.com'], False))
+        fixture_cert.write_text('leaf\\nintermediate\\n', encoding='ascii')
+        self.ns['_find_cert_key'] = Mock(return_value=self.root / 'key.pem')
+        self.ns['_find_cert_key'].return_value.write_text('key', encoding='ascii')
+        future = SimpleNamespace(returncode=0, stdout='notBefore=Jan  1 00:00:00 2099 GMT\n')
+        self.ns['subprocess'].run = Mock(side_effect=[
+            SimpleNamespace(returncode=1, stdout='', stderr='expired'),
+            SimpleNamespace(returncode=0, stdout='notAfter=Jan  1 00:00:00 2099 GMT\n'),
+            future])
+        with self.assertRaisesRegex(RuntimeError, '过期或无效'):
+            method(self.handler, 'node.example.com', 'VMess')
+        with self.assertRaisesRegex(RuntimeError, '尚未生效'):
+            method(self.handler, 'node.example.com', 'VMess')
+
+    def test_api_enforce_node_access_uses_core_lock_without_reopening_it(self):
+        handler = extract_method('_sync_reality_clients', self.ns)
+        applied = []
+        core_fd = 31
+        self.ns['apply_access'] = lambda **kwargs: (applied.append(kwargs) or True)
+        self.assertTrue(handler(self.handler, core_lock_fd=core_fd))
+        self.assertEqual(applied, [{'core_lock_fd': core_fd}])
+
     def test_core_install_returns_conflict_when_cross_process_lock_is_held(self):
         self.ns['acquire_core_operation_lock'] = Mock(
             side_effect=RuntimeError('another core operation is running'))
@@ -241,6 +310,18 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertFalse(body['ok'])
         install.assert_not_called()
+
+    def test_vmess_and_vless_clients_are_refreshed_after_core_lock_acquisition(self):
+        source = Path(portal.__file__).read_text(encoding='utf-8')
+        for method, builder in (('_apply_vmess_enable', 'vmess_clients'),
+                               ('_apply_vlessenc_enable', 'vlessenc_clients')):
+            with self.subTest(method=method):
+                start = source.index('        def ' + method + '(')
+                end = source.find('\n        def ', start + 12)
+                body = source[start:end if end >= 0 else len(source)]
+                lock = body.index('with core_operation_lock, core_operation_file_lock(), reality_apply_lock:')
+                read_clients = body.index('inbound[\'settings\'][\'clients\'] = ' + builder)
+                self.assertGreater(read_clients, lock)
 
     def test_protocol_install_paths_share_cross_process_core_lock(self):
         source = Path(portal.__file__).read_text(encoding='utf-8')
@@ -490,11 +571,89 @@ class WebWorkflowTests(unittest.TestCase):
             calls.append(args)
             return SimpleNamespace(returncode=0,stdout='inactive' if args[:2]==['systemctl','is-active'] else 'fixture-epoch',stderr='')
         self.ns['apply_access']=lambda **kwargs:portal.enforce_node_access(self.hdir,{'users':{}},
-            apply_lock=self.ns.get('reality_apply_lock'))
+            apply_lock=self.ns.get('reality_apply_lock'), skip_anytls=True, skip_tuic=True)
         with patch.object(portal.subprocess,'run',side_effect=run):
             result=extract_method('_sync_reality_clients',self.ns)(self.handler)
         self.assertTrue(result)
         self.assertFalse(any(args[:2]==['systemctl','restart'] for args in calls))
+
+    def test_protocol_port_reference_keeps_shared_xray_listener_open(self):
+        config = {'inbounds': [
+            {'tag': portal.REALITY_INBOUND_TAG, 'port': 8443},
+            {'tag': portal.VMESS_INBOUND_TAG, 'port': 8443},
+        ]}
+        self.data['reality_config'] = {'port': 8443}
+        self.data['vmess_config'] = {'port': 8443}
+        with patch.object(portal, '_systemd_state', return_value='inactive'):
+            self.assertTrue(portal.protocol_port_in_use(
+                8443, 'tcp', self.data, config, exclude_key='reality_config'))
+
+    def test_gost_delete_keeps_shared_listener_firewall_rule(self):
+        self.data['proxy_services'] = [
+            {'id': 'proxy-a', 'type': 'http', 'port': 8443},
+            {'id': 'proxy-b', 'type': 'https', 'port': 8443},
+        ]
+        self.ns['gost_operation_lock'] = threading.RLock()
+        self.ns['save_data'] = Mock()
+        self.ns['reload_gost'] = Mock(return_value=True)
+        self.ns['protocol_port_in_use'] = lambda port, proto, data, **kwargs: True
+        removed = []
+        self.ns['firewall_port'] = lambda *a, **kw: removed.append((a, kw))
+        status, body = extract_method('_manage_proxy_operation', self.ns)(
+            self.handler, 'delete', {'id': 'proxy-a'})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(removed, [])
+
+    def test_firewall_port_reports_command_failure(self):
+        with patch.object(portal.shutil, 'which', side_effect=lambda name: '/usr/sbin/ufw' if name == 'ufw' else None), \
+             patch.object(portal.subprocess, 'run', side_effect=[
+                 SimpleNamespace(returncode=0, stdout='Status: active'),
+                 SimpleNamespace(returncode=1, stdout='')]):
+            self.assertFalse(portal.firewall_port(8443, 'tcp', open_=True))
+
+    def test_vmess_disable_reports_firewall_rule_removal_failure(self):
+        xray = {'inbounds': [{'tag': portal.VMESS_INBOUND_TAG, 'protocol': 'vmess',
+            'port': 2087, 'settings': {'clients': []}}]}
+        path = self.hdir / 'xray.json'
+        path.write_text(json.dumps(xray), encoding='utf-8')
+        self.data['vmess_config'] = {'port': 2087}
+        self.ns['Path'] = lambda value: path if str(value) == '/etc/hysteria/xray.json' else Path(value)
+        self.ns['has_managed_inbound'] = lambda cfg, tag: any(x.get('tag') == tag for x in cfg.get('inbounds', []))
+        self.ns['remove_managed_inbound'] = lambda cfg, tag: cfg.update(
+            inbounds=[x for x in cfg['inbounds'] if x.get('tag') != tag])
+        self.ns['apply_xray_config_transaction'] = Mock()
+        self.ns['unit_suspended'] = lambda _: False
+        self.ns['config_section'] = lambda data, key: self.data.get(key, {})
+        self.ns['save_data'] = Mock()
+        self.ns['regenerate_page'] = Mock()
+        self.ns['close_protocol_port'] = Mock(return_value=False)
+        status, body = self.invoke('_h_post_manage_vmess', {'action': 'disable'})
+        self.assertEqual(status, 500, body)
+        self.assertFalse(body['active'])
+        self.ns['close_protocol_port'].assert_called_once_with(2087, 'tcp', 'vmess_config')
+
+    def test_reality_disable_closes_old_firewall_port(self):
+        config = {'inbounds': [{'protocol': 'vless', 'tag': portal.REALITY_INBOUND_TAG,
+            'streamSettings': {'security': 'reality'}, 'settings': {'clients': []}}]}
+        (self.hdir / 'xray.json').write_text(json.dumps(config), encoding='utf-8')
+        self.data['reality_config']['port'] = 8443
+        self.ns['has_managed_inbound'] = lambda *_: True
+        self.ns['config_section'] = lambda data, key: self.data.get(key, {})
+        calls = []
+        def run(args, **kwargs):
+            if args[:3] == ['systemctl', 'is-active', 'xray']:
+                return SimpleNamespace(returncode=0, stdout='inactive', stderr='')
+            return SimpleNamespace(returncode=0, stdout='fixture', stderr='')
+        self.ns['apply_xray_config_transaction'] = Mock()
+        self.ns['firewall_port'] = lambda *a, **kw: (calls.append((a, kw)) or True)
+        self.ns['protocol_port_in_use'] = lambda *args, **kwargs: False
+        self.ns['close_protocol_port'] = lambda port, proto, key: (calls.append(((port, proto), {'open_': False, 'exclude_key': key})) or True)
+        self.ns['_systemd_state'] = lambda _: 'inactive'
+        with patch.object(portal, '_systemd_state', return_value='inactive'), \
+             patch.object(self.ns['subprocess'], 'run', side_effect=run):
+            status, body = self.invoke('_h_post_manage_reality', {'action': 'toggle'})
+        self.assertEqual(status, 200, body)
+        self.assertIn(((8443, 'tcp'), {'open_': False, 'exclude_key': 'reality_config'}), calls)
 
     def test_reality_generation_failure_preserves_old_keys_and_extra_routes(self):
         config = {'inbounds': [{'protocol': 'vless', 'streamSettings': {'security': 'reality'},

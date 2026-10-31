@@ -283,6 +283,8 @@ class HoppingRuleOwnershipTests(unittest.TestCase):
                 'set -eo pipefail\n'
                 'CALLS="$PWD/iptables.calls"\n'
                 'HY2_META_FILE="$PWD/missing-meta.json"\n'
+                'HY2_DIR="$PWD/etc/hysteria"\n'
+                'mkdir -p "$HY2_DIR"\n'
                 'iptables() {\n'
                 '  if [[ "$*" == "-t nat -S PREROUTING" ]]; then\n'
                 '    printf "%s\\n" "-A PREROUTING -p udp --dport 20000:40000 -m comment --comment hy2-installer -j REDIRECT --to-ports 14617" "-A PREROUTING -p udp --dport 30000:31000 -j REDIRECT --to-ports 9000"; return 0;\n'

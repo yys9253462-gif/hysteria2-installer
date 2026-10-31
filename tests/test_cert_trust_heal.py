@@ -435,7 +435,95 @@ class TestPortalSelfHealEntry(unittest.TestCase):
 # ----------------------------------------------------------------------------
 # portal.py::cert_status —— 证书状态 + 到期告警
 # ----------------------------------------------------------------------------
+class TestCertRuntimeReload(unittest.TestCase):
+    def test_changed_certificate_restarts_only_active_services_and_retries_failures(self):
+        import portal
+        from types import SimpleNamespace
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert = root / 'fullchain.pem'
+            state = root / 'cert-selfheal.json'
+            cert.write_bytes(b'old certificate')
+            self.assertFalse(portal.sync_cert_runtime(root, cert, state))
+            cert.write_bytes(b'new certificate')
+            calls = []
+            def active(service):
+                return 'inactive' if service == 'hy2-tuic' else 'active'
+            def run(args, **kwargs):
+                calls.append(args)
+                return SimpleNamespace(returncode=1 if args[-1] == 'gost' else 0)
+            with mock.patch.object(portal, '_systemd_state', side_effect=active), \
+                 mock.patch.object(portal.subprocess, 'run', side_effect=run):
+                self.assertFalse(portal.sync_cert_runtime(root, cert, state))
+            self.assertEqual(calls, [['systemctl', 'try-restart', service] for service in
+                                     ('hysteria-server', 'xray', 'hy2-anytls', 'gost')])
+            self.assertTrue(portal.sync_cert_runtime(root, cert, state))
+            calls.clear()
+            cert.write_bytes(b'third certificate')
+            with mock.patch.object(portal, '_systemd_state', return_value='inactive'), \
+                 mock.patch.object(portal.subprocess, 'run', side_effect=run):
+                self.assertTrue(portal.sync_cert_runtime(root, cert, state))
+            self.assertEqual(calls, [])
+            saved = json.loads(state.read_text(encoding='utf-8'))
+            self.assertEqual(saved['loaded_cert_sha256'], __import__('hashlib').sha256(
+                cert.read_bytes()).hexdigest())
+
+
 class TestCertStatus(unittest.TestCase):
+    def test_wildcard_certificate_covers_only_one_dns_label(self):
+        import portal
+        self.assertTrue(portal.certificate_covers_domain(
+            'node.example.com', ['*.example.com']))
+        self.assertFalse(portal.certificate_covers_domain(
+            'a.node.example.com', ['*.example.com']))
+        self.assertFalse(portal.certificate_covers_domain(
+            'example.com', ['*.example.com']))
+
+    def test_existing_sni_under_wildcard_remains_stable_during_selfheal(self):
+        p = self._portal()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            cert_dir = td / 'cert'
+            _make_public(cert_dir, cn='node.example.com')
+            cert_file = cert_dir / 'fullchain.pem'
+            # Use a public CA fixture with a wildcard SAN.
+            from cryptography import x509
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.x509.oid import NameOID
+            import datetime
+            ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, 'Fixture CA')])
+            ca_cert = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+                .public_key(ca_key.public_key()).serial_number(1)
+                .not_valid_before(datetime.datetime.utcnow()-datetime.timedelta(days=1))
+                .not_valid_after(datetime.datetime.utcnow()+datetime.timedelta(days=3650))
+                .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+                .sign(ca_key, hashes.SHA256()))
+            leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            leaf = (x509.CertificateBuilder()
+                .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, '*.example.com')]))
+                .issuer_name(ca_name).public_key(leaf_key.public_key()).serial_number(2)
+                .not_valid_before(datetime.datetime.utcnow()-datetime.timedelta(days=1))
+                .not_valid_after(datetime.datetime.utcnow()+datetime.timedelta(days=3650))
+                .add_extension(x509.SubjectAlternativeName([x509.DNSName('*.example.com')]), critical=False)
+                .sign(ca_key, hashes.SHA256()))
+            cert_file.write_bytes(leaf.public_bytes(serialization.Encoding.PEM)
+                + ca_cert.public_bytes(serialization.Encoding.PEM))
+            (cert_dir / 'leaf.key').write_bytes(leaf_key.private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption()))
+            cfg = td / 'config.yaml'
+            cfg.write_text('listen: :443\\ntls:\\n  cert: cert/fullchain.pem\\n  key: cert/leaf.key\\n', encoding='utf-8')
+            meta_path = td / 'client_meta.json'
+            meta = {'server_name': 'node.example.com', 'cert_type': 'custom',
+                    'is_insecure': False, 'pin_sha256': ''}
+            meta_path.write_text(json.dumps(meta), encoding='utf-8')
+            changed = p.sync_cert_trust(meta, td, str(meta_path), str(cfg))
+            self.assertFalse(changed)
+            self.assertEqual(meta['server_name'], 'node.example.com')
+
     def _portal(self):
         sys.path.insert(0, str(REPO))
         try:
