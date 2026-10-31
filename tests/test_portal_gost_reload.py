@@ -300,6 +300,8 @@ class GostUnitConsistency(unittest.TestCase):
         self.assertIn('def restore_gost_assets():', body)
         self.assertIn("old_gost_active = _systemd_state('gost') == 'active'", body)
         self.assertIn("if old_assets[gost_binary] is not None and old_gost_active:", body)
+        self.assertIn("old_gost_enabled = subprocess.run(", body)
+        self.assertIn("elif not old_gost_enabled or old_assets[gost_binary] is None:", body)
         self.assertIn('assets_modified = True', body)
         restore = body[body.index('                def restore_gost_assets():'):body.index('                if not installed:')]
         self.assertIn("systemctl', 'restart', 'gost", restore)

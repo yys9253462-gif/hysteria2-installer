@@ -614,6 +614,33 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(self.data['users']['qa-user'], original)
 
+    def test_core_uninstall_stop_failure_preserves_units_and_binary(self):
+        self.handler.is_authenticated = lambda: True
+        self.handler.rfile = io.BytesIO(urlencode({'name': 'xray'}).encode())
+        self.handler.headers = {'Content-Length': str(len(urlencode({'name': 'xray'})))}
+        self.ns['core_operation_lock'] = threading.RLock()
+        self.ns['acquire_core_operation_lock'] = Mock(return_value=27)
+        self.ns['os'] = SimpleNamespace(close=Mock())
+        self.handler._core_users = lambda _: []
+        binary = self.ns['Path']('/usr/local/bin/xray')
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text('xray binary', encoding='utf-8')
+        unit = self.ns['Path']('/etc/systemd/system/xray.service')
+        unit.parent.mkdir(parents=True, exist_ok=True)
+        unit.write_text('xray unit', encoding='utf-8')
+        commands = []
+        self.ns['subprocess'].run = Mock(side_effect=lambda args, **kw:
+            (commands.append(args) or SimpleNamespace(returncode=1 if args[:3] ==
+             ['systemctl', 'disable', '--now'] else 0)))
+        self.ns['_systemd_state'] = lambda _: 'active'
+        self.ns['_service_stop_confirmed'] = portal._service_stop_confirmed
+        status, body = extract_method('_h_post_uninstall_core', self.ns)(
+            self.handler, '/test-token/')
+        self.assertEqual(status, 500, body)
+        self.assertTrue(unit.exists())
+        self.assertTrue(binary.exists())
+        self.assertNotIn(['systemctl', 'daemon-reload'], commands)
+
     def test_core_uninstall_checks_protocols_after_acquiring_core_lock(self):
         self.handler.is_authenticated = lambda: True
         self.handler.rfile = io.BytesIO(urlencode({'name': 'xray'}).encode())
@@ -628,6 +655,8 @@ class WebWorkflowTests(unittest.TestCase):
             return []
         self.handler._core_users = users
         self.ns['subprocess'].run = Mock(return_value=SimpleNamespace(returncode=0))
+        self.ns['_systemd_state'] = lambda _: 'inactive'
+        self.ns['_service_stop_confirmed'] = portal._service_stop_confirmed
         self.ns['Path']('/usr/local/bin/xray').touch()
         original = extract_method('_h_post_uninstall_core', self.ns)
         status, body = original(self.handler, '/test-token/')

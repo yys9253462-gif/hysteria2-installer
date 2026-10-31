@@ -10111,6 +10111,9 @@ if __name__ == '__main__':
                 cert_files = (cert_dir / 'cert.pem', cert_dir / 'key.pem')
                 had_cert_dir = cert_dir.exists()
                 old_gost_active = _systemd_state('gost') == 'active'
+                old_gost_enabled = subprocess.run(
+                    ['systemctl', 'is-enabled', 'gost'], capture_output=True,
+                    text=True, timeout=5).stdout.strip() == 'enabled'
                 with data_lock:
                     had_proxy_services = 'proxy_services' in data
                     previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
@@ -10180,8 +10183,10 @@ if __name__ == '__main__':
                     if old_assets[gost_binary] is not None and old_gost_active:
                         subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
                         subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
-                    elif old_assets[gost_binary] is None:
+                    elif not old_gost_enabled or old_assets[gost_binary] is None:
                         subprocess.run(['systemctl', 'disable', '--now', 'gost'],
+                                       capture_output=True, timeout=30)
+                        subprocess.run(['systemctl', 'stop', 'gost'],
                                        capture_output=True, timeout=30)
 
                 if not installed:
@@ -11168,8 +11173,25 @@ if __name__ == '__main__':
                         if in_use:
                             return self.reply_json(409, {'ok': False, 'error':
                                 '以下协议仍在使用 %s：%s。请先到对应协议页关闭后再卸载' % (name, '、'.join(in_use))})
+                        stopped_units = []
                         for unit in unit_names:
-                            subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
+                            stop_result = subprocess.run(
+                                ['systemctl', 'disable', '--now', unit],
+                                capture_output=True, timeout=30)
+                            state = _systemd_state(unit)
+                            if not _service_stop_confirmed(stop_result, state):
+                                # A previous unit may already have stopped. Restore it
+                                # to avoid leaving a partial uninstall when a later
+                                # stop fails, and keep all units and binaries intact.
+                                for stopped in stopped_units:
+                                    subprocess.run(['systemctl', 'enable', stopped],
+                                                   capture_output=True, timeout=30)
+                                    subprocess.run(['systemctl', 'start', stopped],
+                                                   capture_output=True, timeout=30)
+                                return self.reply_json(500, {'ok': False, 'error':
+                                    '核心服务 %s 未能确认停止；已保留所有核心文件与服务单元' % unit})
+                            stopped_units.append(unit)
+                        for unit in unit_names:
                             Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
                         for unit in unit_names:
