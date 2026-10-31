@@ -336,7 +336,8 @@ class AwgctlArgumentTests(unittest.TestCase):
         script = ROOT / 'awgctl.sh'
         # 只跑到参数解析：用 require_root 之后的 die 之前就退出。
         result = subprocess.run([self.BASH, str(script), 'install', '--port'],
-                                capture_output=True, text=True, timeout=20)
+                                capture_output=True, text=True, encoding='utf-8',
+                                errors='replace', timeout=20)
         combined = (result.stdout or '') + (result.stderr or '')
         self.assertNotIn('unbound variable', combined)
         self.assertIn('缺少取值', combined)
