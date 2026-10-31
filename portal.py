@@ -2998,6 +2998,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       <div>
         <h2>🔐 证书状态与到期提醒</h2>
         <p style="font-size:13px">节点对外服务所用的 TLS 证书。临期与过期会在此提前告警，避免突然掉线</p>
+        <p id="cert-renewal-note" style="font-size:12px;color:var(--muted);margin:6px 0 0">证书续期方式检测中...</p>
       </div>
       <div style="display:flex;gap:10px;align-items:center">
         <span class="status-pill" id="cert-badge" style="background:#eaf5ef;color:var(--accent)">检测中...</span>
@@ -3887,6 +3888,7 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
         'server_name': meta.get('server_name', ''),
         'cert_type': meta.get('cert_type', ''),
         'is_insecure': bool(meta.get('is_insecure')),
+        'renewal_managed': meta.get('cert_type') == 'acme' and not bool(meta.get('is_insecure')),
         'pin_sha256': meta.get('pin_sha256', ''),
         'healed_at': 0,
         'heal_count': 0,

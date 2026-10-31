@@ -466,6 +466,34 @@ class TestCertStatus(unittest.TestCase):
             self.assertGreater(info["expires_in_days"], 3000)
             self.assertEqual(info["warn_level"], "ok")
             self.assertFalse(info["expired"])
+            self.assertFalse(info["renewal_managed"])
+
+    def test_builtin_acme_status_marks_renewal_as_managed(self):
+        p = self._portal()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            cert_dir = td / 'acme/certificates/acme-v02.api.letsencrypt.org-directory/node.example.com'
+            _make_public(cert_dir, cn='node.example.com')
+            (cert_dir / 'fullchain.pem').replace(cert_dir / 'node.example.com.crt')
+            (cert_dir / 'leaf.key').replace(cert_dir / 'node.example.com.key')
+            (td / 'config.yaml').write_text(
+                'listen: :443\nacme:\n  domains:\n    - node.example.com\n')
+            info = p.cert_status(td, {'server_name': 'node.example.com', 'cert_type': 'acme'},
+                                 str(td / 'config.yaml'))
+            self.assertTrue(info['ok'])
+            self.assertEqual(info['cert_type'], 'acme')
+            self.assertTrue(info['renewal_managed'])
+
+    def test_self_signed_status_does_not_claim_managed_renewal(self):
+        p = self._portal()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _make_self_signed(td / 'cert', cn='www.bing.com')
+            (td / 'config.yaml').write_text(
+                'listen: :443\ntls:\n  cert: cert/server.crt\n  key: cert/server.key\n')
+            info = p.cert_status(td, {'cert_type': 'self_signed', 'is_insecure': True},
+                                 str(td / 'config.yaml'))
+            self.assertFalse(info['renewal_managed'])
 
     def test_warn_and_critical_thresholds(self):
         """阈值必须真的驱动 warn_level，且与常量一致。
@@ -643,7 +671,7 @@ class TestRepoInvariants(unittest.TestCase):
                                 token="t" * 16, session_secret="s" * 32)
         for probe in ('cert-badge', 'cert-daysleft', 'cert-notafter', 'cert-cn',
                       'cert-sans', 'cert-issuer', 'cert-type', 'cert-servername',
-                      'cert-pin', 'cert-alert', 'cert-heal-note'):
+                      'cert-pin', 'cert-alert', 'cert-heal-note', 'cert-renewal-note'):
             self.assertIn('id="%s"' % probe, html, f"卡片缺少 #{probe}")
 
     def test_cert_js_poller_exists_and_is_wired(self):
@@ -655,6 +683,9 @@ class TestRepoInvariants(unittest.TestCase):
         self.assertIn("已过期", assets)
         self.assertIn("天后到期", assets)
         self.assertIn("cert-alert", assets)
+        self.assertIn('当前由 Hysteria 内置 ACME 管理', assets)
+        self.assertIn('当前使用外部或手动配置的正式证书', assets)
+        self.assertIn('当前为自签名证书：不会自动续期', assets)
 
     def test_csp_still_covers_modified_script(self):
         """CSP 是 SCRIPT 的 sha256 白名单 —— 改了 JS 就必须仍被覆盖，否则整站脚本被拦。"""

@@ -2094,6 +2094,7 @@ async function checkBbrStatus() {
 // ---------------------------------------------------------------------------
 const certBadge = document.getElementById('cert-badge');
 const certAlert = document.getElementById('cert-alert');
+const certRenewalNote = document.getElementById('cert-renewal-note');
 
 function certSetField(id, value) {
   const el = document.getElementById(id);
@@ -2126,6 +2127,17 @@ async function checkCertStatus() {
   certSetField('cert-issuer', certShortIssuer(json.issuer));
   certSetField('cert-type', json.self_signed ? '自签名证书' : (json.cert_type === 'acme' ? "Let's Encrypt (ACME)" : '正式证书'));
   certSetField('cert-notafter', json.not_after || '--');
+  if (certRenewalNote) {
+    if (!json.ok) {
+      certRenewalNote.textContent = '续期状态暂时无法确认：当前证书不可读取，请先修复证书文件。';
+    } else if (json.self_signed || json.is_insecure) {
+      certRenewalNote.textContent = '当前为自签名证书：不会自动续期；到期前请重新生成并更新客户端配置。';
+    } else if (json.cert_type === 'acme' && json.renewal_managed) {
+      certRenewalNote.textContent = '当前由 Hysteria 内置 ACME 管理：系统会在到期前自动尝试续期。请留意下方有效期与告警，确保域名解析和证书验证条件正常。';
+    } else {
+      certRenewalNote.textContent = '当前使用外部或手动配置的正式证书：是否自动续期取决于签发工具（如 Caddy / acme.sh）的续期任务，请确认任务正常运行。';
+    }
+  }
   certSetField('cert-servername', json.server_name || '--');
   certSetField('cert-pin', json.is_insecure ? (json.pin_sha256 ? json.pin_sha256.slice(0, 16) + '…' : '未设置') : '不需要（可信链）');
 
