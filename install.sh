@@ -2229,16 +2229,26 @@ PYPORT
     fi
 }
 
-# 删掉一条链里所有 Hy2 端口跳跃规则。
-# 只匹配 Hy2 自己的规则形态「UDP 端口区间 → REDIRECT 到单个端口」，
-# 不能按 "REDIRECT.*udp" 一把删：同机 Docker / 其他软件的 UDP 转发也会被误删。
+# 删掉带本安装器所有权标记的端口跳跃规则。
+# 仅靠协议/端口形状无法证明规则归属，清理必须要求 comment owner 标记。
 _clear_hop_chain() {
     local bin="$1" chain="$2" rule rules
+    local legacy_start="${3:-}" legacy_end="${4:-}" legacy_target="${5:-}"
     # 先把规则清单**完整**读出来再逐条删。
     # 旧实现 `grep ... | head -n 1` 在 set -o pipefail 下会让 grep 收到 SIGPIPE
     # 返回 141，while 条件第一次就为假 —— 规则多时只删掉一条、其余残留
     # （2026-10-29 修）。清单是一次性快照，边删边遍历也没有问题。
-    rules=$("$bin" -t nat -S "$chain" 2>/dev/null         | grep -E -- '-p udp .*--dport [0-9]+:[0-9]+ .*-j REDIRECT --to-ports [0-9]+$' || true)
+    rules=$("$bin" -t nat -S "$chain" 2>/dev/null \
+        | grep -E -- '-p udp .*--dport [0-9]+:[0-9]+ .*--comment hy2-installer.*-j REDIRECT --to-ports [0-9]+$' || true)
+    # Upgrade migration for pre-comment installer rules: only claim an exact match
+    # for the old persisted Hysteria hopping range and listener port.
+    if [[ "$legacy_start" =~ ^[0-9]+$ && "$legacy_end" =~ ^[0-9]+$ && "$legacy_target" =~ ^[0-9]+$ ]]; then
+        rules+=$'\n'"$("$bin" -t nat -S "$chain" 2>/dev/null \
+            | grep -F -- "--dport ${legacy_start}:${legacy_end}" \
+            | grep -E -- '-p udp .*--dport [0-9]+:[0-9]+ .* -j REDIRECT --to-ports [0-9]+$' \
+            | grep -F -- "--dport ${legacy_start}:${legacy_end}" \
+            | grep -F -- "--to-ports ${legacy_target}" || true)"
+    fi
     [ -n "$rules" ] || return 0
     while IFS= read -r rule; do
         [ -n "$rule" ] || continue
@@ -2247,15 +2257,43 @@ _clear_hop_chain() {
     done <<< "$rules"
 }
 
-clear_all_hopping_rules() {
-    # 彻底清理所有历史残留的 Hy2 端口跳跃规则，防止旧端口重定向死循环
-    # BUGFIX #12: 同时清理 PREROUTING + OUTPUT 链
-    _clear_hop_chain iptables PREROUTING
-    _clear_hop_chain iptables OUTPUT
-    if command -v ip6tables >/dev/null 2>&1; then
-        _clear_hop_chain ip6tables PREROUTING
-        _clear_hop_chain ip6tables OUTPUT
+persist_hopping_rules() {
+    # Mirror current in-memory rules to the same persistence backend used at setup;
+    # otherwise uninstall removes the live entries but reboot can restore them.
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || return 1
+    elif command -v service >/dev/null 2>&1 && service iptables status >/dev/null 2>&1; then
+        service iptables save >/dev/null 2>&1 || return 1
     fi
+}
+
+clear_all_hopping_rules() {
+    # Commented rules prove current installer ownership. For older unmarked rules,
+    # require both matching saved metadata and the legacy installer unit signature.
+    local legacy_start='' legacy_end='' legacy_target='' saved_range=''
+    if [[ -f "$HY2_META_FILE" && -f /etc/systemd/system/hy2-iptables.service ]] \
+            && grep -qF 'Description=Hysteria 2 Port Hopping iptables persistence' \
+                /etc/systemd/system/hy2-iptables.service; then
+        saved_range="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+        legacy_target="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+        if [[ "$saved_range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
+            legacy_start="${BASH_REMATCH[1]}"
+            legacy_end="${BASH_REMATCH[2]}"
+            if [[ ! "$legacy_target" =~ ^[0-9]{1,5}$ ]] \
+                    || ! grep -Fq -- "--dport ${legacy_start}:${legacy_end} -j REDIRECT --to-ports ${legacy_target}" \
+                        /etc/systemd/system/hy2-iptables.service; then
+                legacy_start=''; legacy_end=''; legacy_target=''
+            fi
+        fi
+    fi
+    # BUGFIX #12: 同时清理 PREROUTING + OUTPUT 链
+    _clear_hop_chain iptables PREROUTING "$legacy_start" "$legacy_end" "$legacy_target"
+    _clear_hop_chain iptables OUTPUT "$legacy_start" "$legacy_end" "$legacy_target"
+    if command -v ip6tables >/dev/null 2>&1; then
+        _clear_hop_chain ip6tables PREROUTING "$legacy_start" "$legacy_end" "$legacy_target"
+        _clear_hop_chain ip6tables OUTPUT "$legacy_start" "$legacy_end" "$legacy_target"
+    fi
+    persist_hopping_rules || log_warn "端口跳跃规则持久化状态未能同步，重启后请检查 netfilter-persistent 配置。"
     systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
 }
@@ -2288,11 +2326,11 @@ setup_iptables_port_hopping() {
     
     # 注入新规则 (IPv4 + IPv6)
     # BUGFIX #12: 同时加 PREROUTING + OUTPUT 链, 这样本机 loopback 拨测也能跳到主监听端口
-    iptables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -j REDIRECT --to-ports "${l_port}"
-    iptables -t nat -A OUTPUT     -p udp --dport "${s_port}:${e_port}" -j REDIRECT --to-ports "${l_port}"
+    iptables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
+    iptables -t nat -A OUTPUT     -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
     if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
-        ip6tables -t nat -A OUTPUT     -p udp --dport "${s_port}:${e_port}" -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
+        ip6tables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
+        ip6tables -t nat -A OUTPUT     -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
     fi
 
     # 保存规则持久化（兼顾 netfilter-persistent 与原生 systemd 自愈守护）
@@ -2312,7 +2350,7 @@ Before=hysteria-server.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c "iptables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -j REDIRECT --to-ports ${l_port}; iptables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -j REDIRECT --to-ports ${l_port}"
+ExecStart=/bin/bash -c "iptables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}; iptables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}"
 
 [Install]
 WantedBy=multi-user.target

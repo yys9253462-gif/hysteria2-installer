@@ -133,7 +133,11 @@ class AwgEndpointValidationTest(unittest.TestCase):
             r"VALID_AWG_ENDPOINT_RE\.fullmatch\(endpoint\)")
 
     def test_portal_conf_route_validates(self):
-        self.assertIn("Invalid endpoint format", PORTAL_SRC)
+        start = PORTAL_SRC.index("if awg_route in ('awg-conf', 'awg-qr.svg')")
+        end = PORTAL_SRC.index("self.send_header('Content-Type', 'text/plain; charset=utf-8')", start)
+        route = PORTAL_SRC[start:end]
+        self.assertIn('endpoint_error = awg_endpoint_error(endpoint)', route)
+        self.assertIn("return self.reply(400, endpoint_error.encode('utf-8'))", route)
 
     def test_awgctl_has_validate_endpoint(self):
         self.assertIn('validate_endpoint()', AWGCTL_SRC)

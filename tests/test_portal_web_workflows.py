@@ -242,6 +242,21 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertFalse(body['ok'])
         install.assert_not_called()
 
+    def test_protocol_install_paths_share_cross_process_core_lock(self):
+        source = Path(portal.__file__).read_text(encoding='utf-8')
+        for handler, action in (('_h_post_manage_vmess', "if action == 'enable':"),
+                                ('_h_post_manage_vlessenc', "if action == 'enable':"),
+                                ('_h_post_manage_anytls', "if action == 'enable':"),
+                                ('_h_post_manage_tuic', "if action == 'enable':")):
+            with self.subTest(handler=handler):
+                start = source.index('        def ' + handler + '(')
+                end = source.find('\n        def ', start + 12)
+                body = source[start:end if end >= 0 else len(source)]
+                action_start = body.index(action)
+                action_end = body.find("if not enabled:", action_start)
+                enable_body = body[action_start:action_end if action_end >= 0 else len(body)]
+                self.assertIn('core_operation_file_lock()', enable_body)
+
     def test_core_install_releases_cross_process_lock_after_operation(self):
         acquire = Mock(return_value=17)
         closed = []
@@ -293,6 +308,41 @@ class WebWorkflowTests(unittest.TestCase):
         status, _ = self.invoke_api({'user_id': 'qa-user', 'extend_days': 30}, 'users/renew')
         self.assertEqual(status, 503)
         self.assertEqual(self.data['users']['qa-user'], original)
+
+    def test_core_uninstall_checks_protocols_after_acquiring_core_lock(self):
+        self.handler.is_authenticated = lambda: True
+        self.handler.rfile = io.BytesIO(urlencode({'name': 'xray'}).encode())
+        self.handler.headers = {'Content-Length': str(len(urlencode({'name': 'xray'})))}
+        events = []
+        self.ns['core_operation_lock'] = threading.RLock()
+        self.ns['acquire_core_operation_lock'] = Mock(
+            side_effect=lambda: (events.append(('lock', None)) or 23))
+        self.ns['os'] = SimpleNamespace(close=lambda fd: events.append(('close', fd)))
+        def users(_):
+            events.append(('check', None))
+            return []
+        self.handler._core_users = users
+        self.ns['subprocess'].run = Mock(return_value=SimpleNamespace(returncode=0))
+        self.ns['Path']('/usr/local/bin/xray').touch()
+        original = extract_method('_h_post_uninstall_core', self.ns)
+        status, body = original(self.handler, '/test-token/')
+        self.assertEqual(status, 200, body)
+        self.assertEqual(events[0], ('lock', None))
+        self.assertEqual(events[1], ('check', None))
+        self.assertEqual(events[-1], ('close', 23))
+
+    def test_api_set_status_persists_and_rolls_back_on_save_failure(self):
+        original = {'password': 'qa-pass', 'status': 'active', 'expires_at': 2200000000}
+        self.data['users']['qa-user'] = copy.deepcopy(original)
+        status, body = self.invoke_api({'user_id': 'qa-user', 'active': False}, 'users/set_status')
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.data['users']['qa-user']['status'], 'disabled')
+        self.assertGreaterEqual(self.save.call_count, 2)  # persisted state + generated page
+        self.save.reset_mock()
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, body = self.invoke_api({'user_id': 'qa-user', 'active': True}, 'users/set_status')
+        self.assertEqual(status, 503, body)
+        self.assertEqual(self.data['users']['qa-user']['status'], 'disabled')
 
     def test_api_reconciles_absolute_usage_against_measured_ledger(self):
         self.data['users']['qa-user'] = {'password': 'original', 'used_bytes': 50,
@@ -439,7 +489,8 @@ class WebWorkflowTests(unittest.TestCase):
         def run(args,**kwargs):
             calls.append(args)
             return SimpleNamespace(returncode=0,stdout='inactive' if args[:2]==['systemctl','is-active'] else 'fixture-epoch',stderr='')
-        self.ns['apply_access']=lambda:portal.enforce_node_access(self.hdir,{'users':{}})
+        self.ns['apply_access']=lambda **kwargs:portal.enforce_node_access(self.hdir,{'users':{}},
+            apply_lock=self.ns.get('reality_apply_lock'))
         with patch.object(portal.subprocess,'run',side_effect=run):
             result=extract_method('_sync_reality_clients',self.ns)(self.handler)
         self.assertTrue(result)

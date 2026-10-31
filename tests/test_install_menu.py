@@ -273,6 +273,40 @@ class ReconfigureSnapshotRetentionTests(unittest.TestCase):
             self.assertTrue(all(any('00000%d' % i in name for name in names) for i in range(4, 8)))
 
 
+class HoppingRuleOwnershipTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_cleanup_deletes_only_marked_hysteria_rules_and_persists_removal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            calls = root / 'iptables.calls'
+            script = (
+                'set -eo pipefail\n'
+                'CALLS="$PWD/iptables.calls"\n'
+                'HY2_META_FILE="$PWD/missing-meta.json"\n'
+                'iptables() {\n'
+                '  if [[ "$*" == "-t nat -S PREROUTING" ]]; then\n'
+                '    printf "%s\\n" "-A PREROUTING -p udp --dport 20000:40000 -m comment --comment hy2-installer -j REDIRECT --to-ports 14617" "-A PREROUTING -p udp --dport 30000:31000 -j REDIRECT --to-ports 9000"; return 0;\n'
+                '  fi\n'
+                '  printf "%s\\n" "$*" >> "$CALLS"\n'
+                '}\n'
+                'ip6tables() { :; }\n'
+                'command() { if [[ "$1" == -v && "$2" == ip6tables ]]; then return 0; fi; builtin command "$@"; }\n'
+                'systemctl() { :; }\n'
+                'rm() { :; }\n'
+                'netfilter-persistent() { printf "%s\\n" "$*" >> "$CALLS"; }\n'
+                + extract_shell_function('_clear_hop_chain') + '\n'
+                + extract_shell_function('persist_hopping_rules') + '\n'
+                + extract_shell_function('clear_all_hopping_rules') + '\n'
+                'clear_all_hopping_rules\n')
+            result = subprocess.run([shutil.which('bash'), '-c', script], cwd=root,
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls_text = calls.read_text(encoding='utf-8')
+            self.assertIn('--comment hy2-installer', calls_text)
+            self.assertNotIn('--to-ports 9000', calls_text)
+            self.assertIn('save', calls_text)
+
+
 class UninstallOwnershipTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
     def test_uninstall_preserves_unmanaged_xray_and_removes_its_sysctl(self):

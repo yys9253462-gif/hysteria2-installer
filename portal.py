@@ -3,6 +3,7 @@
 """
 import ast
 import copy
+import contextlib
 import base64
 import hashlib
 import hmac
@@ -1684,6 +1685,16 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
 
 def core_operation_lock_path(directory='/etc/hysteria'):
     return Path(os.environ.get('HY2_CORE_OPERATION_LOCK', str(Path(directory) / '.core-operation.lock')))
+
+
+@contextlib.contextmanager
+def core_operation_file_lock(directory='/etc/hysteria'):
+    """Serialize every core binary and protocol-config transaction across processes."""
+    lock_fd = acquire_core_operation_lock(directory)
+    try:
+        yield
+    finally:
+        os.close(lock_fd)
 
 
 def acquire_core_operation_lock(directory='/etc/hysteria'):
@@ -6923,7 +6934,7 @@ def serve(path):
         return frozenset(uid for uid, u in user_table(data).items()
                          if not user_access_allowed(u))
 
-    def apply_access(force_ids=()):
+    def apply_access(force_ids=(), core_lock_fd=None):
         # access_apply_lock 串行化收回流程；data_lock 只在拍快照和写回结果时短暂持有。
         # 🔴 不能在持有 data_lock 时做 HTTP / systemctl：/auth 每个请求都要拿 data_lock，
         # 收回期间（最长 4s 查询 + 12s 重启）会卡住所有 Hy2 新连接的鉴权。
@@ -6935,7 +6946,13 @@ def serve(path):
                 pending=pending_revocations(data) | set(force_ids)
                 snapshot=copy.deepcopy(data)
                 blocked=blocked_user_ids()
+            acquired_core_lock = False
             try:
+                # All protocol revocation uses the core lock. A caller that already
+                # holds it passes the descriptor to avoid self-deadlocking flock.
+                if core_lock_fd is None:
+                    core_lock_fd = acquire_core_operation_lock()
+                    acquired_core_lock = True
                 enforce_node_access(portal_path.parent,snapshot,pending,reality_apply_lock)
             except Exception as exc:
                 with data_lock:
@@ -6943,6 +6960,9 @@ def serve(path):
                     save_data()
                 print('[expiry] access enforcement failed: '+type(exc).__name__,file=sys.stderr)
                 return False
+            finally:
+                if acquired_core_lock:
+                    os.close(core_lock_fd)
             with data_lock:
                 # 收回期间新排进来的待撤销项要保留，只清掉本轮已确认的。
                 remaining=pending_revocations(data) - pending
@@ -8023,10 +8043,10 @@ if __name__ == '__main__':
     )
 
     class Handler(BaseHTTPRequestHandler):
-        def _sync_reality_clients(self):
+        def _sync_reality_clients(self, core_lock_fd=None):
             # 名字保留（调用点很多），实际语义已扩展为「同步所有托管入站」：
             # Reality 与 VMess 的 clients 都由 enforce_node_access 一并收回。
-            return apply_access()
+            return apply_access(core_lock_fd=core_lock_fd)
 
         def _extend_deadline(self, seconds, heavy=False):
             """为本连接延长死线（见 ThreadingHTTPServer.extend_deadline 的说明）。
@@ -9024,14 +9044,25 @@ if __name__ == '__main__':
                     # 否则会出现"把面板自己锁在门外"的后果。
                     if user_id == MASTER_USER_ID and want != 'active':
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot disable the master account'})
+                    conflict = None
+                    durability_uncertain = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
                         missing = not u
                         if not missing:
+                            previous = copy.deepcopy(u)
                             before = u.get('status', 'active')
-                            previous = dict(u)
                             u['status'] = want
                             rotate_user_view_key_on_change(previous, u)
+                            try:
+                                save_data()
+                            except AtomicWriteDurabilityError:
+                                durability_uncertain = True
+                            except OSError:
+                                data['users'][user_id] = previous
+                                conflict = (503, 'User status save failed; disk state may require verification')
+                    if conflict is not None:
+                        return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
                     if missing:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(404, {'ok': False, 'error': 'User not found'})
@@ -9051,6 +9082,9 @@ if __name__ == '__main__':
                     # 每次都重启会撞 systemd 的 start-limit（10-03 踩过）。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if durability_uncertain:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'User status saved but durability uncertain; verify and retry'})
                     return self.reply_json(200, {
                         'ok': True,
                         'user_id': user_id,
@@ -9257,7 +9291,7 @@ if __name__ == '__main__':
                     spec = importlib.util.spec_from_file_location('reality_online_config', Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py')
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
-                    with reality_apply_lock:
+                    with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                         outcome = module.enable_reality_online(str(portal_path.parent / 'xray.json'), cfg['binary'], cfg['address'])
                     return self.reply_json(200, {'ok': True, 'reality_online': outcome})
 
@@ -9962,7 +9996,12 @@ if __name__ == '__main__':
                     return self.reply_json(409, {'ok': False, 'error':
                         '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 with core_operation_lock:
-                    core_lock_fd = acquire_core_operation_lock()
+                    try:
+                        core_lock_fd = acquire_core_operation_lock()
+                    except RuntimeError as exc:
+                        if str(exc) == 'another core operation is running':
+                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                        raise
                     try:
                         ok, msg = install_xray_binary()
                         if not ok:
@@ -9971,6 +10010,9 @@ if __name__ == '__main__':
                         write_xray_unit()
                         subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=30)
                         self._generate_and_apply_reality(True)
+                        if not self._sync_reality_clients(core_lock_fd=core_lock_fd):
+                            return self.reply_json(503, {'ok': False,
+                                'error': 'Reality client synchronization failed; retry required'})
                     finally:
                         os.close(core_lock_fd)
 
@@ -10018,7 +10060,7 @@ if __name__ == '__main__':
                             'xray.json 不是合法 JSON，未做任何修改'})
                     reality_on = bool(cfg_now) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)
                     if reality_on:
-                        with reality_apply_lock:
+                        with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                             try:
                                 current = json.loads(xray_path.read_text(encoding='utf-8'))
                             except (OSError, ValueError):
@@ -10032,8 +10074,8 @@ if __name__ == '__main__':
                     else:
                         if unit_suspended('xray'):
                             return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，Reality 将在控制台恢复节点时自动启动'})
-                        # _generate_and_apply_reality 内部已加锁并做事务重启。
-                        self._generate_and_apply_reality(True)
+                        with core_operation_lock, core_operation_file_lock():
+                            self._generate_and_apply_reality(True)
                         if not Path('/usr/local/bin/xray').exists():
                             return self.reply_json(500, {'ok': False, 'error': 'Xray 未安装'})
                         actual = subprocess.run(['systemctl', 'is-active', 'xray'],
@@ -10046,7 +10088,8 @@ if __name__ == '__main__':
                 elif action == 'reset':
                     # force=True：只有「重置密钥」按钮才真的换密钥对。
                     # 用户的 UUID 是 uuid5 派生的，不受密钥轮换影响。
-                    self._generate_and_apply_reality(True, force=True)
+                    with core_operation_lock, core_operation_file_lock():
+                        self._generate_and_apply_reality(True, force=True)
                     return self.reply_json(200, {'ok': True, 'message': '已重置密钥并重启生效'})
 
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
@@ -10158,9 +10201,8 @@ if __name__ == '__main__':
             xray_path = Path('/etc/hysteria/xray.json')
             if not Path('/usr/local/bin/xray').exists():
                 raise RuntimeError('Xray 核心未安装')
-            # 读-改-写与到期/停用撤销共用同一锁，避免并发操作把旧用户列表写回，
-            # 重新允许刚被撤销的账户连接；也避免丢失其它协议的入站。
-            with reality_apply_lock:
+            # 核心锁必须先于协议锁，避免与撤销路径形成反向锁序。
+            with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                 config = (json.loads(xray_path.read_text(encoding='utf-8'))
                           if xray_path.exists() else {'log': {'loglevel': 'warning'},
                                                       'outbounds': [{'protocol': 'freedom',
@@ -10240,8 +10282,8 @@ if __name__ == '__main__':
             xray_path = Path('/etc/hysteria/xray.json')
             if not Path('/usr/local/bin/xray').exists():
                 raise RuntimeError('Xray 核心未安装')
-            # 读-改-写整体在锁内（2026-10-24 修，理由同 Reality / VMess）。
-            with reality_apply_lock:
+            # 读-改-写使用统一顺序的核心与协议锁，防止并发卸载。
+            with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                 config = (json.loads(xray_path.read_text(encoding='utf-8'))
                           if xray_path.exists() else {'log': {'loglevel': 'warning'},
                                                       'outbounds': [{'protocol': 'freedom',
@@ -10290,7 +10332,8 @@ if __name__ == '__main__':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，VMess 将在控制台恢复节点时一并恢复'})
-                    cfg = self._apply_vmess_enable()
+                    with core_operation_lock, core_operation_file_lock():
+                        cfg = self._apply_vmess_enable()
                     return self.reply_json(200, {'ok': True, 'active': True,
                                                  'port': cfg['port'], 'uri': cfg['uri']})
                 if not enabled:
@@ -10298,9 +10341,8 @@ if __name__ == '__main__':
                                                  'message': 'VMess 本来就没有启用'})
                 with data_lock:
                     closed_port = int((data.get('vmess_config') or {}).get('port') or 0)
-                # 在锁内重新读取磁盘内容再删：handler 开头读到的 config 可能
-                # 已被另一个协议的启用覆盖，用旧副本写回会把它静默丢掉。
-                with reality_apply_lock:
+                # 在统一锁序内重读并删，防止并发启用丢配置或核心卸载竞态。
+                with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                     try:
                         current = json.loads(xray_path.read_text(encoding='utf-8'))
                     except (OSError, ValueError):
@@ -10487,14 +10529,22 @@ if __name__ == '__main__':
                          'sing-box': ((ANYTLS_SERVICE, TUIC_SERVICE), ANYTLS_BINARY)}
                 if name not in units:
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里卸载该核心'})
-                in_use = self._core_users(name)
-                if in_use:
-                    return self.reply_json(409, {'ok': False, 'error':
-                        '以下协议仍在使用 %s：%s。请先到对应协议页关闭后再卸载' % (name, '、'.join(in_use))})
                 unit_names, binary = units[name]
                 with core_operation_lock:
-                    core_lock_fd = acquire_core_operation_lock()
                     try:
+                        core_lock_fd = acquire_core_operation_lock()
+                    except RuntimeError as exc:
+                        if str(exc) == 'another core operation is running':
+                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                        raise
+                    try:
+                        # Keep the usage check inside the same process-wide lock as
+                        # protocol installation, so a concurrent enable cannot race
+                        # between this check and binary removal.
+                        in_use = self._core_users(name)
+                        if in_use:
+                            return self.reply_json(409, {'ok': False, 'error':
+                                '以下协议仍在使用 %s：%s。请先到对应协议页关闭后再卸载' % (name, '、'.join(in_use))})
                         for unit in unit_names:
                             subprocess.run(['systemctl', 'disable', '--now', unit], capture_output=True, timeout=30)
                             Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
@@ -10546,16 +10596,39 @@ if __name__ == '__main__':
                 unit_path.write_text(ANYTLS_UNIT_CONTENT, encoding='utf-8')
                 subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
             with anytls_apply_lock:
-                apply_anytls_config(build_anytls_config(new_cfg, users, cert_file, key_file),
-                                    portal_path.parent / ANYTLS_CONFIG_NAME, restart=True)
-                # 配置预检 + 启动成功之后再 enable（2026-10-29 修）。
-                # 旧实现先 enable 再校验：证书缺失时单元已被设为开机自启，
-                # 之后每次开机 sing-box 都会每 3 秒失败重启一次。
-                subprocess.run(['systemctl', 'enable', ANYTLS_SERVICE],
-                               capture_output=True, timeout=30)
-            with data_lock:
-                data['anytls_config'] = new_cfg
-            save_data()
+                previous_cfg = copy.deepcopy(config_section(data, 'anytls_config'))
+                cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
+                previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
+                was_enabled = _systemd_state(ANYTLS_SERVICE) == 'active'
+                try:
+                    apply_anytls_config(build_anytls_config(new_cfg, users, cert_file, key_file),
+                                        cfg_path, restart=True)
+                    subprocess.run(['systemctl', 'enable', ANYTLS_SERVICE],
+                                   capture_output=True, timeout=30, check=True)
+                    with data_lock:
+                        data['anytls_config'] = new_cfg
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    # The new portal data replaced the old file; durability is
+                    # uncertain, so keep the matching live service/config state.
+                    raise
+                except Exception:
+                    with data_lock:
+                        if previous_cfg:
+                            data['anytls_config'] = previous_cfg
+                        else:
+                            data.pop('anytls_config', None)
+                    if previous_file is None:
+                        cfg_path.unlink(missing_ok=True)
+                    else:
+                        cfg_path.write_bytes(previous_file)
+                    if was_enabled:
+                        subprocess.run(['systemctl', 'restart', ANYTLS_SERVICE],
+                                       capture_output=True, timeout=15)
+                    else:
+                        subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
+                                       capture_output=True, timeout=30)
+                    raise
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
             # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
             regenerate_page()
@@ -10581,7 +10654,8 @@ if __name__ == '__main__':
                     if suspended:
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，请在控制台恢复节点后再启用 AnyTLS'})
-                    cfg = self._apply_anytls_enable()
+                    with core_operation_lock, core_operation_file_lock():
+                        cfg = self._apply_anytls_enable()
                     return self.reply_json(200, {'ok': True, 'active': True, 'port': cfg['port'],
                                                  'uri': anytls_uri_for_user(cfg, MASTER_USER_ID,
                                                                             label='AnyTLS-' + cfg['domain'])})
@@ -10589,6 +10663,8 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'AnyTLS 本来就没有启用'})
                 with anytls_apply_lock:
+                    cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
+                    previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     stop_result = subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
                                                   capture_output=True, timeout=30)
                     # 命令失败或状态查询无结果时无法证明旧进程退出；保留配置，
@@ -10601,11 +10677,25 @@ if __name__ == '__main__':
                     (portal_path.parent / ANYTLS_CONFIG_NAME).unlink(missing_ok=True)
                 with data_lock:
                     acfg = dict(config_section(data, 'anytls_config'))
+                    old_acfg = copy.deepcopy(acfg)
                     closed_port = int(acfg.get('port') or 0)
                     # secret 与端口保留：再次启用时沿用，已下发的订阅不失效。
                     acfg['enabled'] = False
                     data['anytls_config'] = acfg
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        data['anytls_config'] = old_acfg
+                    if previous_file is not None:
+                        cfg_path.write_bytes(previous_file)
+                    subprocess.run(['systemctl', 'enable', ANYTLS_SERVICE],
+                                   capture_output=True, timeout=30)
+                    subprocess.run(['systemctl', 'start', ANYTLS_SERVICE],
+                                   capture_output=True, timeout=30)
+                    raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
                 if closed_port:
@@ -10690,16 +10780,32 @@ if __name__ == '__main__':
                     if not unit_path.exists() or unit_path.read_text(encoding='utf-8') != TUIC_UNIT_CONTENT:
                         unit_path.write_text(TUIC_UNIT_CONTENT, encoding='utf-8')
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    cfg_path = portal_path.parent / TUIC_CONFIG_NAME
+                    previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
+                    was_enabled = _systemd_state(TUIC_SERVICE) == 'active'
                     apply_anytls_config(build_tuic_config(new_cfg, users, cert_file, key_file),
-                                        portal_path.parent / TUIC_CONFIG_NAME, restart=True,
-                                        service=TUIC_SERVICE)
-                    # 预检 + 启动成功之后再 enable，避免坏配置被设成开机自启。
+                                        cfg_path, restart=True, service=TUIC_SERVICE)
                     subprocess.run(['systemctl', 'enable', TUIC_SERVICE],
-                                   capture_output=True, timeout=30)
+                                   capture_output=True, timeout=30, check=True)
                     save_data()
+                except AtomicWriteDurabilityError:
+                    # State file replacement already occurred; keep memory and
+                    # the running TUIC config aligned while reporting uncertainty.
+                    raise
                 except Exception:
                     with data_lock:
                         data['tuic_config'] = old
+                    if 'cfg_path' in locals():
+                        if previous_file is None:
+                            cfg_path.unlink(missing_ok=True)
+                        else:
+                            cfg_path.write_bytes(previous_file)
+                        if was_enabled:
+                            subprocess.run(['systemctl', 'restart', TUIC_SERVICE],
+                                           capture_output=True, timeout=15)
+                        else:
+                            subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
+                                           capture_output=True, timeout=30)
                     raise
             regenerate_page()
             firewall_port(listen_port, 'udp', open_=True)
@@ -10724,7 +10830,8 @@ if __name__ == '__main__':
                     if suspended:
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，请在控制台恢复节点后再启用 TUIC'})
-                    cfg = self._apply_tuic_enable()
+                    with core_operation_lock, core_operation_file_lock():
+                        cfg = self._apply_tuic_enable()
                     return self.reply_json(200, {'ok': True, 'active': True, 'port': cfg['port'],
                                                  'uri': tuic_uri_for_user(cfg, MASTER_USER_ID,
                                                                           label='TUIC-' + cfg['domain'])})
@@ -10732,6 +10839,8 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'TUIC 本来就没有启用'})
                 with tuic_apply_lock:
+                    cfg_path = portal_path.parent / TUIC_CONFIG_NAME
+                    previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     stop_result = subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
                                                   capture_output=True, timeout=30)
                     # 只有明确确认服务停止后才能删配置与汇报成功；命令失败或
@@ -10745,10 +10854,27 @@ if __name__ == '__main__':
                 with data_lock:
                     tcfg = dict(config_section(data, 'tuic_config'))
                     closed_port = _valid_port(tcfg.get('port')) or 0
+                    old_tcfg = copy.deepcopy(tcfg)
                     # secret 与端口保留：再次启用时沿用，已下发的订阅不失效。
                     tcfg['enabled'] = False
                     data['tuic_config'] = tcfg
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        data['tuic_config'] = old_tcfg
+                    cfg_path = portal_path.parent / TUIC_CONFIG_NAME
+                    if previous_file is None:
+                        cfg_path.unlink(missing_ok=True)
+                    else:
+                        cfg_path.write_bytes(previous_file)
+                    subprocess.run(['systemctl', 'enable', TUIC_SERVICE],
+                                   capture_output=True, timeout=30)
+                    subprocess.run(['systemctl', 'start', TUIC_SERVICE],
+                                   capture_output=True, timeout=30)
+                    raise
                 regenerate_page()
                 if closed_port:
                     firewall_port(closed_port, 'udp', open_=False)
@@ -10814,7 +10940,8 @@ if __name__ == '__main__':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，VLESS Encryption 将在控制台恢复节点时一并恢复'})
-                    cfg = self._apply_vlessenc_enable()
+                    with core_operation_lock, core_operation_file_lock():
+                        cfg = self._apply_vlessenc_enable()
                     return self.reply_json(200, {'ok': True, 'active': True,
                                                  'port': cfg['port'], 'uri': cfg['uri']})
                 if not enabled:
@@ -10822,9 +10949,8 @@ if __name__ == '__main__':
                                                  'message': 'VLESS Encryption 本来就没有启用'})
                 with data_lock:
                     closed_port = int((data.get('vlessenc_config') or {}).get('port') or 0)
-                # 在锁内重新读取磁盘内容再删：handler 开头读到的 config 可能
-                # 已被另一个协议的启用覆盖，用旧副本写回会把它静默丢掉。
-                with reality_apply_lock:
+                # 在统一锁序内重读并删，防止并发启用丢配置或核心卸载竞态。
+                with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                     try:
                         current = json.loads(xray_path.read_text(encoding='utf-8'))
                     except (OSError, ValueError):
