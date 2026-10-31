@@ -1313,7 +1313,7 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20):
     probe = ("import urllib.request; "
              "urllib.request.urlopen('http://127.0.0.1:%d/api/health', timeout=2).read()"
              % int(port))
-    restore = ' '.join('cp -f %s %s;' % (shlex.quote(str(bak)), shlex.quote(str(dest)))
+    restore = ' '.join('cp -p -f %s %s;' % (shlex.quote(str(bak)), shlex.quote(str(dest)))
                        for dest, bak in backups)
     remove = ' '.join('rm -f %s;' % shlex.quote(str(dest)) for dest in created)
     marker = shlex.quote('/etc/hysteria/portal-rollback-failed')
@@ -2585,6 +2585,20 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
           </label>
         </div>
       </div>
+      <!-- 直连地址族（Hysteria direct outbound 的 mode） -->
+      <div class="ob-form-block" id="ob-block-direct" hidden>
+        <label class="ob-field ob-field-wide">
+          <span>IP 地址族</span>
+          <select id="ob-direct-mode" class="ob-select">
+            <option value="auto">自动选择</option>
+            <option value="4">仅 IPv4</option>
+            <option value="6">仅 IPv6</option>
+            <option value="64">优先 IPv4，回退 IPv6</option>
+            <option value="46">优先 IPv6，回退 IPv4</option>
+          </select>
+        </label>
+      </div>
+
       <!-- HTTP 专用字段 -->
       <div class="ob-form-block" id="ob-block-http" hidden>
         <label class="ob-field ob-field-wide">
@@ -5652,7 +5666,7 @@ def password_taken(users, pwd, owner_uid):
                and str(u.get('password', '')) == str(pwd)
                for uid, u in users.items())
 
-def enforce_node_access(root, snapshot, force_ids=()):
+def enforce_node_access(root, snapshot, force_ids=(), apply_lock=None):
     """分别尝试 AnyTLS、TUIC 与 Xray；任一路无法确认时保留待撤销状态。"""
     anytls_error = tuic_error = None
     try:
@@ -5663,7 +5677,7 @@ def enforce_node_access(root, snapshot, force_ids=()):
         sync_tuic_users(root, snapshot)
     except Exception as exc:
         tuic_error = exc
-    result = _enforce_node_access_xray_hy2(root, snapshot, force_ids)
+    result = _enforce_node_access_xray_hy2(root, snapshot, force_ids, apply_lock)
     if anytls_error is not None:
         raise RuntimeError('AnyTLS user sync could not be confirmed') from anytls_error
     if tuic_error is not None:
@@ -5671,7 +5685,7 @@ def enforce_node_access(root, snapshot, force_ids=()):
     return result
 
 
-def _enforce_node_access_xray_hy2(root, snapshot, force_ids=()):
+def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None):
     """确认旧会话和 Xray 核心都已收回；失败不伪造销户成功。"""
     root = Path(root)
     # 快照里的 users 可能是 null/list（手工编辑或截断写入）：直接 .items()
@@ -5758,13 +5772,9 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=()):
     if not wanted_by_tag:
         return True
     # Protocol handlers use reality_apply_lock for their read-modify-write. The
-    # revocation path must use the same lock; otherwise it can replace a newer
-    # client list with this stale snapshot and re-authorize a revoked account.
-    apply_lock = globals().get('reality_apply_lock')
-    if apply_lock is None:
-        # The production portal binds this lock in serve(); module-level isolated
-        # callers get a lock too, so the read/modify/write path still serializes.
-        apply_lock = _ACCESS_APPLY_LOCK
+    # production closure passes that local lock explicitly; isolated callers use
+    # the module fallback so the transaction remains serialized in tests/tools.
+    apply_lock = apply_lock or _ACCESS_APPLY_LOCK
     return _apply_xray_access_snapshot(root, xj, snapshot, blocked, cfg_path, cfg,
                                        force_ids, wanted_by_tag, apply_lock)
 
@@ -6911,7 +6921,7 @@ def serve(path):
                 snapshot=copy.deepcopy(data)
                 blocked=blocked_user_ids()
             try:
-                enforce_node_access(portal_path.parent,snapshot,pending)
+                enforce_node_access(portal_path.parent,snapshot,pending,reality_apply_lock)
             except Exception as exc:
                 with data_lock:
                     data['_pending_revocations']=sorted(pending_revocations(data) | pending)
@@ -9530,7 +9540,20 @@ if __name__ == '__main__':
                 if not self._extend_deadline(600, heavy=True):
                     return self.reply_json(409, {'ok': False, 'error':
                         '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                if Path('/usr/local/bin/gost').exists():
+                gost_binary = Path('/usr/local/bin/gost')
+                gost_unit = Path('/etc/systemd/system/gost.service')
+                gost_owner = Path('/etc/hysteria/.hy2-gost-owned')
+                if gost_binary.exists() or gost_unit.exists():
+                    managed_unit = False
+                    try:
+                        managed_unit = (gost_unit.is_file() and
+                            'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
+                            in gost_unit.read_text(encoding='utf-8'))
+                    except OSError:
+                        pass
+                    if not (gost_owner.is_file() and managed_unit):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '检测到已有 GOST 文件或服务但无法确认归属；为避免覆盖宿主服务，已停止安装'})
                     version = subprocess.run(['/usr/local/bin/gost', '-V'], capture_output=True, timeout=5)
                     if version.returncode == 0:
                         if not reload_gost():
@@ -9626,6 +9649,9 @@ if __name__ == '__main__':
                 write_gost_selfcheck()
                 service_content = GOST_UNIT_CONTENT
                 Path('/etc/systemd/system/gost.service').write_text(service_content, encoding='utf-8')
+                owner_marker = Path('/etc/hysteria/.hy2-gost-owned')
+                owner_marker.touch(mode=0o600, exist_ok=True)
+                owner_marker.chmod(0o600)
                 subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
                 subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
 
@@ -10090,8 +10116,8 @@ if __name__ == '__main__':
             xray_path = Path('/etc/hysteria/xray.json')
             if not Path('/usr/local/bin/xray').exists():
                 raise RuntimeError('Xray 核心未安装')
-            # 读-改-写整体在锁内：否则并发启用另一个协议时，本次会用旧快照
-            # 覆盖磁盘、把对方静默丢掉（2026-10-24 修，理由同 Reality）。
+            # 读-改-写与到期/停用撤销共用同一锁，避免并发操作把旧用户列表写回，
+            # 重新允许刚被撤销的账户连接；也避免丢失其它协议的入站。
             with reality_apply_lock:
                 config = (json.loads(xray_path.read_text(encoding='utf-8'))
                           if xray_path.exists() else {'log': {'loglevel': 'warning'},

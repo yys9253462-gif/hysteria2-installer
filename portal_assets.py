@@ -920,6 +920,8 @@ const obEls = {
   socksPass: document.getElementById('ob-socks-pass'),
   httpUrl: document.getElementById('ob-http-url'),
   httpInsecure: document.getElementById('ob-http-insecure'),
+  directMode: document.getElementById('ob-direct-mode'),
+  blockDirect: document.getElementById('ob-block-direct'),
   quickBox: document.getElementById('ob-quick-box'),
   btnSave: document.getElementById('btn-ob-save'),
   btnCancel: document.getElementById('btn-ob-cancel'),
@@ -934,7 +936,7 @@ const obEls = {
 const OB_TYPE_LABEL = {
   socks5: { label: 'SOCKS5', cls: 'ob-type-socks5', hint: '填 host:port，如 1.2.3.4:1080（暂不支持 IPv6 地址）' },
   http: { label: 'HTTP/HTTPS', cls: 'ob-type-http', hint: '填完整地址，如 http://1.2.3.4:8080' },
-  direct: { label: '直连', cls: 'ob-type-direct', hint: '走服务器本机网络，无需额外参数（一般用于分流规则里的例外）' },
+  direct: { label: '直连', cls: 'ob-type-direct', hint: '走服务器本机网络，可设置 IPv4/IPv6 地址族（一般用于分流规则里的例外）' },
 };
 
 // 🔴 密码绝不显示在列表里（门户有被截图的风险），只显示"已设置"
@@ -1042,6 +1044,7 @@ function obTypeSwitch() {
   const t = obEls.type ? obEls.type.value : 'socks5';
   if (obEls.blockSocks) obEls.blockSocks.hidden = (t !== 'socks5');
   if (obEls.blockHttp) obEls.blockHttp.hidden = (t !== 'http');
+  if (obEls.blockDirect) obEls.blockDirect.hidden = (t !== 'direct');
   document.querySelectorAll('[data-ob-type]').forEach(b => {
     const on = b.dataset.obType === t;
     b.classList.toggle('active', on);
@@ -1160,6 +1163,7 @@ function obResetForm() {
   if (obEls.socksPass) obEls.socksPass.value = '';
   if (obEls.httpUrl) obEls.httpUrl.value = '';
   if (obEls.httpInsecure) obEls.httpInsecure.checked = false;
+  if (obEls.directMode) obEls.directMode.value = 'auto';
   if (obEls.formTitle) obEls.formTitle.textContent = '➕ 新增出站';
   if (obEls.formCard) obEls.formCard.hidden = true;
   if (obEls.type) obEls.type.value = 'socks5';
@@ -1359,6 +1363,7 @@ function obFillForm(o) {
   if (obEls.socksPass) obEls.socksPass.value = o.password || '';
   if (obEls.httpUrl) obEls.httpUrl.value = o.url || '';
   if (obEls.httpInsecure) obEls.httpInsecure.checked = !!o.insecure;
+  if (obEls.directMode) obEls.directMode.value = o.mode || 'auto';
   if (obEls.formTitle) obEls.formTitle.textContent = '✏️ 编辑出站：' + o.name;
   // 编辑时名称锁定：保存按名称覆盖，改名会变成「新增一条 + 旧的还在」。
   obNameLock(true);
@@ -1399,6 +1404,7 @@ if (obEls.btnSave) {
         username: obEls.socksUser ? obEls.socksUser.value : '',
         password: obEls.socksPass ? obEls.socksPass.value : '',
         insecure: (obEls.httpInsecure && obEls.httpInsecure.checked) ? 'true' : '',
+        mode: t === 'direct' && obEls.directMode ? obEls.directMode.value : '',
       });
       obResetForm();
       obMsg('已保存并生效 ✓', 'ok');
@@ -3238,15 +3244,26 @@ if (btnAddAwgPeer) {
     if (!name) { alert('请填写客户端名称'); return; }
     if (!/^[A-Za-z0-9_.-]{1,32}$/.test(name)) { alert('名称只允许字母、数字、点、下划线、连字符，且不超过 32 字符'); return; }
     if (!endpoint) { alert('请填写连接地址'); return; }
+    // Open the tab synchronously in the click gesture; browsers block window.open
+    // after an await because it no longer has transient user activation.
+    const confTab = window.open('about:blank', '_blank');
     btnAddAwgPeer.disabled = true;
     try {
       const json = await awgPost('manage-amneziawg', { action: 'peer_add', name: name, endpoint: endpoint });
       if (json.ok) {
         if (awgPeerName) awgPeerName.value = '';
-        showToast('已新增客户端 ' + name + '，正在打开配置', 'success');
-        window.open(location.pathname + 'awg-conf?name=' + encodeURIComponent(name), '_blank');
+        const confUrl = location.pathname + 'awg-conf?name=' + encodeURIComponent(name);
+        if (confTab) confTab.location = confUrl;
+        else showToast('客户端已新增，请用列表中的“配置”按钮打开配置', 'success');
+        if (confTab) showToast('已新增客户端 ' + name + '，正在打开配置', 'success');
         loadAwgState();
-      } else { alert(json.error || '新增失败'); }
+      } else {
+        if (confTab) confTab.close();
+        alert(json.error || '新增失败');
+      }
+    } catch (e) {
+      if (confTab) confTab.close();
+      throw e;
     } finally {
       btnAddAwgPeer.disabled = false;
     }

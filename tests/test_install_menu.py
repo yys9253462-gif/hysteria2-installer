@@ -22,6 +22,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+
+def extract_shell_function(name):
+    source = (ROOT / 'install.sh').read_text(encoding='utf-8')
+    start = source.index(name + '() {')
+    brace = source.index('{', start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == '{':
+            depth += 1
+        elif source[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError('unbalanced shell function: ' + name)
 import portal  # noqa: E402
 
 INSTALL = (ROOT / 'install.sh').read_text(encoding='utf-8')
@@ -191,6 +206,35 @@ if [[ "$managed_singbox" == 1 ]]; then rm -f "$BINARY"; fi
             self.assertFalse(binary.exists())
 
 
+class ReconfigureSnapshotRetentionTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_retains_five_old_snapshots_plus_current_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base = root / 'client_meta.json'
+            base.write_text('live')
+            for i in range(8):
+                path = Path(str(base) + '.bak-20250101-00000%d' % i)
+                path.write_text('snapshot-%d' % i)
+            script = (
+                'set -eo pipefail\n'
+                'HY2_DIR="."\n'
+                'HY2_META_FILE="client_meta.json"\n'
+                'HY2_CONFIG="missing.yaml"\n'
+                'HY2_CERT_DIR="cert"\n'
+                'log_info(){ :; }; log_warn(){ :; }; log_err(){ :; }\n'
+                + extract_shell_function('backup_state_before_reconfigure') + '\n'
+                'backup_state_before_reconfigure\n')
+            result = subprocess.run([shutil.which('bash'), '-c', script], cwd=root,
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            retained = sorted(root.glob('client_meta.json.bak-*'))
+            self.assertEqual(len(retained), 5)
+            names = {path.name for path in retained}
+            self.assertFalse(any('00000%d' % i in name for i in range(4) for name in names))
+            self.assertTrue(all(any('00000%d' % i in name for name in names) for i in range(4, 8)))
+
+
 class UninstallOwnershipTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
     def test_uninstall_preserves_unmanaged_xray_and_removes_its_sysctl(self):
@@ -287,30 +331,46 @@ systemctl() { :; }
 
 class UninstallSysctlCleanupTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def _run_cleanup(self, root, sysctl):
+        hy2 = root / 'etc/hysteria'
+        hy2.mkdir(parents=True, exist_ok=True)
+        (hy2 / '.hy2-installer-owned').write_text('owned')
+        sysctl_dir = root / 'etc/sysctl.d'
+        sysctl_dir.mkdir(parents=True, exist_ok=True)
+        fragment_start = INSTALL.index('        # 仅删除首次安装时存在 marker 的安装器资产',
+                                       INSTALL.index('uninstall_all() {'))
+        fragment = INSTALL[fragment_start:INSTALL.index('\n        clear_all_hopping_rules', fragment_start)]
+        fragment = fragment.replace('/etc/hysteria', 'etc/hysteria')
+        fragment = fragment.replace('/etc/sysctl.d/99-hysteria2.conf', 'etc/sysctl.d/99-hysteria2.conf')
+        fragment = fragment.replace('/usr/local/bin/gost', 'usr/local/bin/gost')
+        fragment = fragment.replace('(由 hysteria2-installer 自动生成)', '(owned marker)')
+        script = root / 'cleanup.sh'
+        script.write_text('''#!/usr/bin/env bash
+HY2_DIR="etc/hysteria"
+clear_all_hopping_rules() { :; }
+cleanup() {
+''' + fragment + '\n}\ncleanup\n', encoding='utf-8')
+        subprocess.run([shutil.which('bash'), str(script)], cwd=root, check=True,
+                       env=dict(os.environ, TEST_ROOT=str(root)))
+
     def test_owned_sysctl_tuning_is_removed_on_uninstall(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            hy2 = root / 'etc/hysteria'
-            hy2.mkdir(parents=True)
-            (hy2 / '.hy2-installer-owned').write_text('owned')
-            sysctl_dir = root / 'etc/sysctl.d'
-            sysctl_dir.mkdir(parents=True)
-            sysctl = sysctl_dir / '99-hysteria2.conf'
-            sysctl.write_text('net.core.rmem_max = 8388608\n')
-            start = INSTALL.index('        if [[ -f "$HY2_DIR/.hy2-installer-owned" ]]',
-                                  INSTALL.index('uninstall_all() {'))
-            fragment = INSTALL[start:INSTALL.index('\n        clear_all_hopping_rules', start)]
-            fragment = fragment.replace('/etc/hysteria', str(hy2).replace('\\', '/'))
-            fragment = fragment.replace('/etc/sysctl.d/99-hysteria2.conf', sysctl.as_posix())
-            self.assertIn('rm -f ' + sysctl.as_posix(), fragment)
-            script = root / 'cleanup.sh'
-            script.write_text('''#!/usr/bin/env bash
-HY2_DIR="$TEST_ROOT/etc/hysteria"
-clear_all_hopping_rules() { :; }
-''' + fragment, encoding='utf-8')
-            env = dict(os.environ, TEST_ROOT=str(root))
-            subprocess.run([shutil.which('bash'), str(script)], check=True, env=env)
+            sysctl = root / 'etc/sysctl.d/99-hysteria2.conf'
+            sysctl.parent.mkdir(parents=True)
+            sysctl.write_text('# Hysteria 2 tuning (owned marker)\n')
+            self._run_cleanup(root, sysctl)
             self.assertFalse(sysctl.exists())
+
+    def test_marker_alone_does_not_delete_replaced_sysctl_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sysctl = root / 'etc/sysctl.d/99-hysteria2.conf'
+            sysctl.parent.mkdir(parents=True)
+            content = '# administrator-owned settings\nnet.core.rmem_max = 1234\n'
+            sysctl.write_text(content)
+            self._run_cleanup(root, sysctl)
+            self.assertEqual(sysctl.read_text(), content)
 
 
 class AdoptTest(unittest.TestCase):

@@ -24,7 +24,22 @@ def apply_sample(state, source, epoch, counters, sampled_at):
         clean[uid] = {'tx': tx, 'rx': rx}
     # 先完整验证，失败时不能留下部分写入。
     new = copy.deepcopy(state)
-    sources = new.setdefault('sources', {})
+    sources_were_corrupt = 'sources' in new and not isinstance(new.get('sources'), dict)
+    gaps_were_corrupt = 'gaps' in new and not isinstance(new.get('gaps'), list)
+    sources = new.get('sources')
+    if not isinstance(sources, dict):
+        sources = {}
+        new['sources'] = sources
+    gaps = new.get('gaps')
+    if not isinstance(gaps, list):
+        gaps = []
+        new['gaps'] = gaps
+    if sources_were_corrupt:
+        gaps.append({'source': source, 'at': sampled_at,
+                     'reason': 'corrupt_sources_reset'})
+    if gaps_were_corrupt:
+        gaps.append({'source': source, 'at': sampled_at,
+                     'reason': 'corrupt_gaps_reset'})
     previous = sources.get(source)
     # 旧备份 / 截断写入可能留下缺 epoch 或 counters 的残缺状态，直接取键会
     # KeyError，而 runtime 每个 poll 周期都会重试 → 计量永久失效，只能手工
@@ -40,6 +55,7 @@ def apply_sample(state, source, epoch, counters, sampled_at):
             new.setdefault('gaps', []).append(
                 {'source': source, 'at': sampled_at,
                  'reason': 'corrupt_state_reset'})
+
     totals = new.setdefault('totals', {})
     # 加上增量前校验原值，负数/布尔值不能被一次采样洗成正常整数。
     for uid in clean:

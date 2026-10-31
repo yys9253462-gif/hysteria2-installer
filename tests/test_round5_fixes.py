@@ -94,26 +94,30 @@ class SelfUpdateRollbackTest(unittest.TestCase):
         py.chmod(0o755)
         dest = td / 'portal.py'
         dest.write_text('new')
+        dest.chmod(0o644)
         bak = td / 'portal.py.bak'
         bak.write_text('old')
+        bak.chmod(0o600)
         added = td / 'added.py'
         added.write_text('new file')
         script = portal.portal_update_restart_script(1, [(dest, bak)], [added], wait_seconds=2)
         script = script.replace('sleep 1', 'sleep 0')
         env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'])
         subprocess.run(['bash', '-c', script], env=env, timeout=30, check=False)
-        return dest.read_text(), added.exists(), log.read_text()
+        return dest.read_text(), added.exists(), log.read_text(), dest.stat().st_mode & 0o777
 
     def test_unhealthy_update_rolls_back_and_restarts(self):
-        content, added_exists, calls = self.run_script(healthy=False)
+        content, added_exists, calls, mode = self.run_script(healthy=False)
         self.assertEqual(content, 'old')
+        self.assertEqual(mode, 0o600)
         self.assertFalse(added_exists)
         self.assertEqual(calls.count('systemctl restart hysteria-portal'), 2)
         self.assertIn('logger', calls)
 
     def test_healthy_update_is_kept(self):
-        content, added_exists, calls = self.run_script(healthy=True)
+        content, added_exists, calls, mode = self.run_script(healthy=True)
         self.assertEqual(content, 'new')
+        self.assertEqual(mode, 0o644)
         self.assertTrue(added_exists)
         self.assertEqual(calls.count('systemctl restart hysteria-portal'), 1)
 

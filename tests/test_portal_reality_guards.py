@@ -61,13 +61,12 @@ class TestRealityClientSyncGuards(unittest.TestCase):
                  patch.object(portal.subprocess, 'run') as run, \
                  patch.object(portal, '_apply_xray_access_snapshot',
                               side_effect=lambda *args: (lock_state.append(args[-1]) or True)), \
-                 patch.object(portal, 'reality_apply_lock', protocol_lock, create=True), \
                  patch.object(portal.urllib.request, 'urlopen', return_value=type(
                     'Response', (), {'__enter__': lambda self: self,
                                      '__exit__': lambda *args: None,
                                      'read': lambda self: b'{}'})()):
                 self.assertTrue(portal.enforce_node_access(
-                    root, {'users': {'gone': {'status': 'disabled'}}}, ['gone']))
+                    root, {'users': {'gone': {'status': 'disabled'}}}, ['gone'], protocol_lock))
             self.assertEqual(len(lock_state), 1)
             self.assertIs(lock_state[0], protocol_lock)
 

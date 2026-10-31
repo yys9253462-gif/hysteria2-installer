@@ -44,6 +44,7 @@ def _source_fresh(health, source, max_age=30):
 
 
 _recent_gaps_cache = {'key': None, 'value': []}
+_recent_gaps_lock = threading.Lock()
 
 
 def _recent_gaps(m, window_seconds=86400):
@@ -55,7 +56,9 @@ def _recent_gaps(m, window_seconds=86400):
     与「计量真的坏了」（2026-10-29 修）。
     没有时间戳的条目按「最近」处理（保守，宁可报异常）。
     """
-    gaps = m.get('gaps') or []
+    gaps = m.get('gaps', [])
+    if not isinstance(gaps, list):
+        return [{'reason': 'invalid_gaps_container'}]
     if not gaps:
         return []
     # 结果只取决于全局 gaps，而 summary()/hot_summary() 会**按用户**各调一次，
@@ -64,8 +67,9 @@ def _recent_gaps(m, window_seconds=86400):
     # 缺口列表可能整体替换，也可能在时间戳相同时发生改变；不能只看长度
     # 和最后一条时间，否则会把旧列表的健康结果复用到新的状态。
     cache_key = (gaps, int(time.time() // 30), window_seconds)
-    if _recent_gaps_cache.get('key') == cache_key:
-        return _recent_gaps_cache['value']
+    with _recent_gaps_lock:
+        if _recent_gaps_cache.get('key') == cache_key:
+            return _recent_gaps_cache['value']
     cutoff = time.time() - window_seconds
     recent = []
     for gap in gaps:
@@ -81,7 +85,8 @@ def _recent_gaps(m, window_seconds=86400):
         if when >= cutoff:
             recent.append(gap)
     # 内容快照保留原地修改检测；命中时直接比较结构，避免逐用户序列化整表。
-    _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=recent)
+    with _recent_gaps_lock:
+        _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=recent)
     return recent
 
 def _users_view(data):
@@ -310,20 +315,23 @@ class PortalMeter:
             fresh=bool(enabled) and all(s not in getattr(self, 'failed_sources', set()) and _source_fresh(health, s) for s in enabled)
             measured=_measurement_total(m,enabled,uid)
             initialized=measured is not None
+            gaps=m.get('gaps', [])
+            if not isinstance(gaps, list):
+                gaps=[{'reason': 'invalid_gaps_container'}]
             user=_users_view(self.data).get(uid,{})
             legacy=user.get('legacy_auth_value',user.get('used_bytes',0)) if isinstance(user,dict) else None
             return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),
                 'measurement_ok':initialized and fresh and not _recent_gaps(m),
                 'measurement_current_ok': initialized and fresh,
-                'measurement_complete': initialized and not m.get('gaps'),
+                'measurement_complete': initialized and not gaps,
                 'current_online': copy.deepcopy(self.live_snapshot.get('users',{}).get(uid,{})) if self.live_snapshot is not None and time.time()-self.live_sampled_at < 45 else {'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'},
                 'online_ip_scope': 'recent_authentication',
                 'online_devices': self.online_counts.get(uid, 0) if self.online_counts is not None and time.time()-self.online_sampled_at < 30 else None,
                 'online_devices_scope': 'hysteria_core_instances_only',
                 'measurement_scope':'since_measurement_started',
                 'measurement_sources':{s:copy.deepcopy(health.get(s, {})) for s in enabled},
-                'measurement_gaps':copy.deepcopy(m.get('gaps',[])),
+                'measurement_gaps':copy.deepcopy(gaps),
                 'legacy_auth_value':legacy}
 
     def hot_summary(self, uid):

@@ -80,6 +80,42 @@ class MeterStateBoundaryTests(unittest.TestCase):
         self.assertNotIn('u', self.data['usage_meter']['totals'])
         self.assertEqual(self.data['usage_meter']['admin_note'], 'concurrent change')
 
+    def test_corrupt_sources_container_recovers_with_gap(self):
+        for bad in (None, [], 'broken', 7):
+            with self.subTest(sources=bad):
+                state = {'sources': bad, 'totals': {'u': {'hysteria': 10}}}
+                outcome = runtime.core.apply_sample(state, 'hysteria', 'epoch',
+                    {'u': {'tx': 25, 'rx': 0}}, '2026-11-01T00:00:00+00:00')
+                self.assertTrue(outcome['baseline_only'])
+                self.assertEqual(runtime.core.total_bytes(state, 'u'), 10)
+                self.assertIsInstance(state['sources'], dict)
+                self.assertEqual(state['gaps'][-1]['reason'], 'corrupt_sources_reset')
+
+    def test_corrupt_gaps_container_recovers_without_losing_usage(self):
+        for bad in (None, [], 'broken', 7):
+            if bad == []:
+                continue
+            with self.subTest(gaps=bad):
+                state = {'sources': {'hysteria': {'epoch': 'epoch',
+                    'counters': {'u': {'tx': 5, 'rx': 0}}, 'sampled_users': ['u']}},
+                    'gaps': bad, 'totals': {'u': {'hysteria': 10}}}
+                outcome = runtime.core.apply_sample(state, 'hysteria', 'epoch',
+                    {'u': {'tx': 15, 'rx': 0}}, '2026-11-01T00:00:00+00:05:00')
+                self.assertEqual(runtime.core.total_bytes(state, 'u'), 20)
+                self.assertIsInstance(state['gaps'], list)
+                self.assertTrue(any(g['reason'] == 'corrupt_gaps_reset' for g in state['gaps']))
+                self.assertEqual(outcome['deltas']['u'], (10, 0))
+
+    def test_invalid_gaps_never_report_complete_or_healthy(self):
+        meter = self.make_meter()
+        meter.poll()
+        self.data['usage_meter']['gaps'] = None
+        summary = meter.summary('u')
+        self.assertFalse(summary['measurement_ok'])
+        self.assertFalse(summary['measurement_complete'])
+        self.assertTrue(any(g.get('reason') == 'invalid_gaps_container'
+                            for g in summary['measurement_gaps']))
+
     def test_empty_saved_epoch_rebases_without_charging_process_history(self):
         state = {'sources': {'hysteria': {'epoch': '', 'counters': {'u': {'tx': 5, 'rx': 0}}}},
                  'totals': {'u': {'hysteria': 10}}}

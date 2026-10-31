@@ -38,9 +38,58 @@ SOURCE_FILES = ('portal.py', 'portal_assets.py')
 
 class SavedOutboundProbeTests(unittest.TestCase):
     @unittest.skipUnless(NODE, 'requires node')
+    def test_editing_direct_outbound_preserves_address_family_mode(self):
+        script = portal.SCRIPT
+        code = script[script.index('function obFillForm'):script.index('async function setOutboundMode')]
+        save_start = script.index("obEls.btnSave.addEventListener('click'")
+        save_end = script.index("if (obEls.list)", save_start)
+        save = script[save_start:save_end]
+        harness = r'''
+const assert = require('assert');
+const elements = {};
+const control = id => elements[id] ||= {value:'', hidden:false, classList:{toggle:()=>{}},
+ setAttribute:()=>{}, addEventListener:()=>{}, scrollIntoView:()=>{}, focus:()=>{},
+ className:'', readOnly:false, textContent:''};
+const document = {getElementById:control, querySelectorAll:()=>[]};
+const window = {confirm:()=>true}; const OB_TYPE_LABEL={direct:{hint:'direct'}};
+const OB_QUICK_HINT='quick'; let sent;
+const obApi = async (action, params) => {sent={action,params}; return {ok:true};};
+const obMsg=()=>{}; const loadOutbounds=async()=>{};
+const obSetModeUI=()=>{}; const obNameLock=()=>{}; const obShowPass=()=>{};
+const obTypeSwitch=()=>{}; const obOpenForm=()=>{}; const obResetForm=()=>{};
+let obNameAuto=false; let saveHandler;
+const obEls={name:control('name'),type:control('type'),socksAddr:control('addr'),
+ socksUser:control('user'),socksPass:control('pass'),httpUrl:control('url'),
+ httpInsecure:control('insecure'),directMode:control('directMode'),formTitle:control('title'),
+ quickBox:{hidden:false},formCard:{hidden:false},btnSave:{disabled:false},btnCancel:null,
+ quick:null,socksPass:{type:'password'},btnEye:null,msg:null,status:null};
+'''
+        checks = r'''
+(async()=>{
+obEls.type.value='direct'; obEls.directMode.value='4';
+obFillForm({name:'direct_ipv4',type:'direct',mode:'4'});
+assert.strictEqual(obEls.directMode.value,'4');
+obEls.btnSave = {disabled:false, addEventListener:(event,fn)=>saveHandler=fn};
+'''
+        # Call the production save handler through its generated listener setup.
+        save_body = save[save.index('    obMsg(\'保存中'):save.rindex('  });')]
+        checks += 'const saveListener = async () => {\n' + save_body + '\n};\n' + r'''
+await saveListener();
+assert.strictEqual(sent.params.mode,'4');
+})().catch(e=>{console.error(e);process.exitCode=1});
+'''
+        result = subprocess.run([NODE,'-e',harness+code+checks],capture_output=True,
+                                text=True,encoding='utf-8')
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_saved_http_proxy_probe_respects_insecure_setting(self):
         script = portal.SCRIPT
-        self.assertIn('只检测所选出站端点的可达性', script)
+        self.assertIn('只检测所选出站端点的可达性，不代表已配置分流规则的实际出口',
+                      portal.page_html({'server_name':'node.example','public_ip':'127.0.0.1',
+                          'listen_port':443,'auth_password':'synthetic','obfs_password':'',
+                          'is_insecure':False}, 'h://', 's', '{}', '{}', users={}, token='t',
+                          session_secret='s'))
         code = script[script.index('function renderOutboundList'):script.index('function renderOutboundRules')]
         probe = script[script.index('async function probeOutbound'):script.index('function obResetForm')]
 
@@ -83,6 +132,50 @@ assert(!captured.body.includes('username') && !captured.body.includes('password'
         result = subprocess.run([NODE,'-e',harness+code+probe+checks],capture_output=True,
                                 text=True,encoding='utf-8')
         self.assertEqual(result.returncode,0,result.stderr)
+
+
+class AwgPeerPopupBehaviorTests(unittest.TestCase):
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_peer_add_opens_config_tab_during_click_and_closes_on_failure(self):
+        script = portal.SCRIPT
+        start = script.index('if (btnAddAwgPeer) {')
+        end = script.index('\n}', start) + 2
+        code = script[start:end]
+        harness = r'''
+const assert = require('assert');
+let handler, nextTab = {location:'about:blank', closed:false, close(){this.closed=true;}};
+let resolvePost; const opened=[]; const alerts=[]; const toasts=[];
+const btnAddAwgPeer={disabled:false,addEventListener:(event,fn)=>handler=fn};
+const awgPeerName={value:'peer-1'}, awgPeerEndpoint={value:'vpn.example:51820'};
+const window={open:(url,target)=>{opened.push([url,target]);return nextTab;}};
+const location={pathname:'/token/'};
+const alert=text=>alerts.push(text); const showToast=(...args)=>toasts.push(args);
+const loadAwgState=()=>{};
+let response={ok:true};
+const awgPost=(...args)=>new Promise(resolve=>{resolvePost=()=>resolve(response);});
+'''
+        checks = r'''
+(async()=>{
+const pending=handler();
+assert.deepStrictEqual(opened,[['about:blank','_blank']]);
+assert.strictEqual(btnAddAwgPeer.disabled,true);
+response={ok:true}; resolvePost(); await pending;
+assert.strictEqual(nextTab.location,'/token/awg-conf?name=peer-1');
+assert.strictEqual(btnAddAwgPeer.disabled,false);
+assert.strictEqual(awgPeerName.value,'');
+assert.strictEqual(toasts.length,1);
+const failedTab={location:'about:blank',closed:false,close(){this.closed=true;}};
+nextTab=failedTab; awgPeerName.value='peer-2';
+response={ok:false,error:'rejected'};
+const failed=handler(); resolvePost(); await failed;
+assert.strictEqual(failedTab.closed,true, 'failure should close the pre-opened tab');
+assert(alerts.includes('rejected'), 'failure should be reported');
+assert.strictEqual(btnAddAwgPeer.disabled,false, 'button should be restored');
+})().catch(e=>{console.error(e);process.exitCode=1});
+'''
+        result = subprocess.run([NODE, '-e', harness + code + checks], capture_output=True,
+                                text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 class VersionUiBehaviorTests(unittest.TestCase):

@@ -280,6 +280,17 @@ class GostUnitConsistency(unittest.TestCase):
         self.portal_unit = _const('GOST_UNIT_CONTENT')
         self.shell_unit = _shell_unit()
 
+    def test_web_install_establishes_marker_only_after_managed_unit_write(self):
+        source = PORTAL_SRC
+        start = source.index('        def _h_post_install_gost(self, prefix):')
+        end = source.index('        def _h_post_install_amneziawg(self, prefix):', start)
+        body = source[start:end]
+        unit_write = body.index("Path('/etc/systemd/system/gost.service').write_text")
+        marker_write = body.index("owner_marker.touch(mode=0o600, exist_ok=True)")
+        self.assertLess(unit_write, marker_write)
+        self.assertIn("Path('/etc/hysteria/.hy2-gost-owned')", body)
+        self.assertIn("owner_marker.chmod(0o600)", body)
+
     def test_units_identical(self):
         """两处产物必须完全一致 —— 不一致正是本 bug 的起因。
 

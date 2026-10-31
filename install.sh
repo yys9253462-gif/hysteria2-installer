@@ -2136,13 +2136,23 @@ backup_state_before_reconfigure() {
         log_warn "没有可快照的现有配置文件（可能是首次安装）。"
         return 0
     fi
-    # 只在新快照全部成功后裁剪，且保留最近 5 个旧快照 + 本次快照。
-    local _old
+    # 每个文件只保留最近 5 份快照（含本次）：超出的按时间戳排序后删除。
+    local _old _snapshot_list _snapshot_count
     for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
              "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
-        while IFS= read -r _old; do
-            [[ -n "$_old" ]] && rm -f "$_old" 2>/dev/null || true
-        done < <(ls -1t "${f}".bak-* 2>/dev/null | tail -n +7)
+        # The list filename must not match the *.bak-* snapshot glob itself.
+        _snapshot_list="${f}.snapshot-list-$$"
+        : > "$_snapshot_list" || continue
+        for _old in "${f}".bak-*; do
+            [[ -f "$_old" ]] && printf '%s\n' "$_old" >> "$_snapshot_list"
+        done
+        _snapshot_count="$(wc -l < "$_snapshot_list")"
+        if (( _snapshot_count > 5 )); then
+            sort -r "$_snapshot_list" | tail -n +6 | while IFS= read -r _old; do
+                [[ -n "$_old" ]] && rm -f -- "$_old" 2>/dev/null || true
+            done
+        fi
+        rm -f "$_snapshot_list"
     done
     log_info "已备份 ${saved} 个关键文件（后缀 .bak-${ts}），改配置出问题可回滚。"
 }
@@ -5026,7 +5036,9 @@ uninstall_all() {
             nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; } || true
         fi
         # 仅删除首次安装时存在 marker 的安装器资产；旧版没有 marker 时保留，避免误删用户文件。
-        if [[ -f "$HY2_DIR/.hy2-installer-owned" ]]; then
+        if [[ -f "$HY2_DIR/.hy2-installer-owned" \
+                && -f /etc/sysctl.d/99-hysteria2.conf ]] \
+                && grep -qF '(由 hysteria2-installer 自动生成)' /etc/sysctl.d/99-hysteria2.conf; then
             rm -f /etc/sysctl.d/99-hysteria2.conf
         fi
         clear_all_hopping_rules
@@ -5035,7 +5047,6 @@ uninstall_all() {
 
         log_step "清理二进制与配置目录..."
         rm -f "$HY2_BIN"
-        rm -f /usr/local/bin/gost
         rm -rf "$HY2_DIR"
         # 只删 wgcf / wireproxy 自己的文件：/etc/wireguard 是系统 WireGuard 的公共目录，
         # 机主自己的 wg0.conf 之类不能被一并删掉。目录空了才移除。
