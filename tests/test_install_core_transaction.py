@@ -89,6 +89,9 @@ jq() {{
         *) echo "unexpected jq" >&2; return 99 ;;
     esac
 }}
+flock() {{
+    [[ "$*" == '-n 9' || "$*" == '-n 10' ]] || return 99
+}}
 systemctl() {{
     [[ "$*" == 'restart hysteria-server' ]] || return 99
     # 记录重启时实际存在的二进制，证明回滚重启用的是本次旧版本。
@@ -150,7 +153,7 @@ mv() {{
             self.assertEqual(files.get(name), content, name + ' must be preserved')
 
     def assert_clean(self, files):
-        self.assertFalse([name for name in files if any(
+        self.assertFalse([name for name in files if name != 'hysteria.update.lock' and any(
             token in name for token in ('.rollback.', '.update.', '.new'))], files.keys())
 
     def test_backup_failure_aborts_before_replace_or_restart(self):

@@ -2,6 +2,7 @@
 import ast
 import hashlib
 import hmac
+import math
 import secrets
 import time
 import unittest
@@ -9,7 +10,7 @@ from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[1] / 'portal.py'
 TREE = ast.parse(SOURCE.read_text(encoding='utf-8'))
-ENV = dict(hashlib=hashlib, hmac=hmac, secrets=secrets, time=time)
+ENV = dict(hashlib=hashlib, hmac=hmac, math=math, secrets=secrets, time=time)
 for node in TREE.body:
     if isinstance(node, ast.FunctionDef) and node.name in {
         'user_view_key', 'rotate_user_view_key_on_change', 'user_share_available',
