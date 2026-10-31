@@ -708,7 +708,7 @@ class TestRepoInvariants(unittest.TestCase):
 
     def test_refresh_and_regenerate_both_sync_artifacts(self):
         text = PORTAL.read_text(encoding="utf-8")
-        for fn, nxt in (("def refresh(meta_path", "def selfheal("),
+        for fn, nxt in (("def _refresh_portal_state(meta_path", "def refresh(meta_path"),
                         ("def regenerate_page()", "def sign_session(")):
             i = text.index(fn)
             j = text.index(nxt, i)

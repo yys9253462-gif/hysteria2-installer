@@ -94,7 +94,8 @@ class MeterRecoveryTests(unittest.TestCase):
         fallback.exists.return_value = False
         env = {'data': {'users': {}}, 'data_lock': threading.RLock(),
                'json': __import__('json'), 'portal_path': Path('/fixture/portal.json'),
-               'atomic_write_private': write, 'Path': Mock(return_value=fallback)}
+               'atomic_write_private': write, 'Path': Mock(return_value=fallback),
+               'portal_state_file_lock': lambda *_: __import__('contextlib').nullcontext()}
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<portal-save>', 'exec'), env)
         with self.assertRaises(OSError):
             env['save_data']()

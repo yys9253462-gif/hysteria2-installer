@@ -109,6 +109,32 @@ class PortalTest(unittest.TestCase):
         self.assertFalse(20000 <= selected <= 40000,
                          '订阅端口不得落在 Hysteria 的端口跳跃区间 20000-40000')
 
+    def test_refresh_keeps_concurrent_user_updates(self):
+        import copy as _copy
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            meta = root / 'meta.json'
+            meta.write_text(json.dumps({'public_ip': '192.0.2.1', 'server_name': 'hy2.example.com',
+                                        'listen_port': 27490, 'auth_password': 'pw', 'obfs_password': 'obfs',
+                                        'is_insecure': True, 'subscription_port': 8443}))
+            portal.prepare(meta, 1111)
+            initial = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
+            latest = _copy.deepcopy(initial)
+            latest['users']['concurrent-user'] = {'password': 'new-user'}
+            latest['usage_meter'] = {'totals': {'concurrent-user': {'hysteria': 123}}}
+            original_artifacts = portal.artifacts
+            def interleaved_artifacts(*args, **kwargs):
+                portal.atomic_write_private(root / 'portal.json',
+                    json.dumps(latest, ensure_ascii=False).encode('utf-8'))
+                return original_artifacts(*args, **kwargs)
+            with mock.patch.object(portal, 'artifacts', side_effect=interleaved_artifacts):
+                portal.refresh(meta)
+            refreshed = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
+            self.assertEqual(refreshed['users']['concurrent-user'], {'password': 'new-user'})
+            self.assertEqual(refreshed['usage_meter'], latest['usage_meter'])
+            self.assertIn('page_digest', refreshed)
+
     def test_authenticated_routes_and_throttling(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

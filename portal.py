@@ -1684,6 +1684,22 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         candidate.unlink(missing_ok=True)
 
 
+def portal_state_lock_path(directory='/etc/hysteria'):
+    return Path(directory) / '.portal-state.lock'
+
+
+@contextlib.contextmanager
+def portal_state_file_lock(directory='/etc/hysteria'):
+    """Serialize whole-file portal.json refreshes with service persistence writes."""
+    lock_fd = os.open(portal_state_lock_path(directory), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(lock_fd)
+
+
 def core_operation_lock_path(directory='/etc/hysteria'):
     return Path(os.environ.get('HY2_CORE_OPERATION_LOCK', str(Path(directory) / '.core-operation.lock')))
 
@@ -4091,8 +4107,10 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     except (OSError, ValueError):
         return False
     previous = state.get('loaded_cert_sha256')
-    first_observation = not isinstance(previous, str) or not previous
-    if not first_observation and previous == digest:
+    # If this is the first observation, an already-running listener may have loaded
+    # the previous certificate before the fingerprint state file existed. Reload it
+    # once so the process is known to match the current certificate bytes.
+    if isinstance(previous, str) and previous == digest:
         return False
     services = ('hysteria-server', 'xray', ANYTLS_SERVICE, TUIC_SERVICE, 'gost')
     failed = []
@@ -6808,7 +6826,7 @@ def sync_download_artifacts(data, uri, clash, sing, qr=_QR_UNSET):
     return data
 
 
-def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
+def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先修信任模型再对齐 pin。
@@ -6819,6 +6837,7 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
 
     path = root / 'portal.json'
     data = json.loads(path.read_text(encoding='utf-8'))
+    original_data = copy.deepcopy(data)
     # 凭据文件缺失/损坏时重建（保 token、API Key、用户），而不是让
     # 「刷新页面」「证书自愈」这类日常操作直接抛异常（2026-10-30 修）。
     access, _rebuilt = ensure_portal_access(root, m, data)
@@ -6869,11 +6888,59 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     
     # 域名 / 订阅端口改过之后，交给控制台的门户地址也要跟上（token 与凭据不变）。
     access_url = f"https://{host}:{resolve_subscription_port(m)[0]}/{data['token']}/"
+    # Start from the latest persisted state and overlay the credentials/auth fields
+    # that ensure_portal_access may have repaired in this refresh snapshot.
+    # This preserves user, usage and service writes from the portal process.
+    try:
+        latest = json.loads(path.read_text(encoding='utf-8'))
+        if isinstance(latest, dict):
+            for key in ('clash', 'sing', 'qr', 'page_digest'):
+                if key in data:
+                    latest[key] = data[key]
+            for key in ('api_key', 'auth_hash', 'session_secret', 'port'):
+                if data.get(key) != original_data.get(key):
+                    latest[key] = data[key]
+            if _rebuilt:
+                latest['auth_hash'] = data['auth_hash']
+            latest.pop('page', None)
+            data = latest
+    except (OSError, ValueError):
+        pass
+    _access_file = root / 'portal-access.json'
+    if _access_file.exists():
+        try:
+            latest_access = json.loads(_access_file.read_text(encoding='utf-8'))
+            if isinstance(latest_access, dict):
+                access = latest_access
+        except (OSError, ValueError):
+            pass
     if access.get('url') != access_url:
         access['url'] = access_url
-        atomic_write_private(root / 'portal-access.json', json.dumps(access, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(_access_file, json.dumps(access, ensure_ascii=False).encode('utf-8'))
     atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
 
+
+def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
+    """Refresh derived portal state without racing live persistence writers."""
+    root = Path(meta_path).parent
+    portal_file = root / 'portal.json'
+    access_file = root / 'portal-access.json'
+    with portal_state_file_lock(root):
+        old_portal = portal_file.read_bytes()
+        old_access = access_file.read_bytes() if access_file.exists() else None
+        try:
+            _refresh_portal_state(meta_path, config_path)
+        except Exception:
+            try:
+                atomic_write_private(portal_file, old_portal)
+                if old_access is None:
+                    access_file.unlink(missing_ok=True)
+                else:
+                    atomic_write_private(access_file, old_access)
+            except OSError as rollback_error:
+                print('[portal] refresh credential/state rollback failed: %s'
+                      % rollback_error, file=sys.stderr)
+            raise
 
 
 def ensure_portal_access(root, meta, data):
@@ -6985,7 +7052,15 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     after_cert = {path: hashlib.sha256(path.read_bytes()).hexdigest()
                   for path in cert_files if path.is_file()}
     cert_changed = before_cert != after_cert
-    runtime_reloaded = sync_cert_runtime(root, live_cert) if cert_changed else False
+    runtime_state = root / 'cert-selfheal.json'
+    has_runtime_fingerprint = False
+    if runtime_state.exists():
+        try:
+            _runtime_data = json.loads(runtime_state.read_text(encoding='utf-8'))
+            has_runtime_fingerprint = bool(_runtime_data.get('loaded_cert_sha256'))
+        except (OSError, ValueError, AttributeError):
+            pass
+    runtime_reloaded = sync_cert_runtime(root, live_cert) if cert_changed or not has_runtime_fingerprint else False
 
     if changed or runtime_reloaded:
         # 留痕：让「刚刚自动对齐过一次」在门户卡片上可见，而不是悄无声息。
@@ -7000,6 +7075,75 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
             print('[portal] 证书自愈已修 meta，但同步门户页面失败: %s' % str(e)[:160],
                   file=sys.stderr)
     return changed
+
+
+def recover_xray_service_on_start(data, config_path='/etc/hysteria/xray.json', run=subprocess.run,
+                                  systemd_state=None, suspended=None):
+    """Restore Xray when its enabled inbound config is valid but service is stopped."""
+    systemd_state = systemd_state or _systemd_state
+    suspended = suspended or _unit_suspended
+    path = Path(config_path)
+    if not path.exists():
+        return False
+    config = json.loads(path.read_text(encoding='utf-8'))
+    desired = {REALITY_INBOUND_TAG: reality_clients(data),
+               VMESS_INBOUND_TAG: vmess_clients(data),
+               VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
+    current = {}
+    for tag in MANAGED_INBOUND_TAGS:
+        index, inbound = managed_inbound_index(config, tag)
+        if index >= 0:
+            current[tag] = inbound.get('settings', {}).get('clients') or []
+    mismatch = any(desired[tag] != (current.get(tag) or []) for tag in current)
+    service_stopped = bool(current) and systemd_state('xray') != 'active'
+    if (mismatch or service_stopped) and not suspended('xray'):
+        run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+        run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
+        return True
+    return False
+
+
+def repair_missing_api_key(portal_path, data):
+    """Keep portal.json and portal-access.json on one API key after repair."""
+    portal_path = Path(portal_path)
+    access_path = portal_path.parent / 'portal-access.json'
+    old_portal = portal_path.read_bytes()
+    old_access = access_path.read_bytes() if access_path.exists() else None
+    old_key = data.get('api_key')
+    new_key = secrets.token_hex(24)
+    phase = 'access'
+    try:
+        if old_access is not None:
+            access = json.loads(old_access.decode('utf-8'))
+            access['api_key'] = new_key
+            atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
+        data['api_key'] = new_key
+        phase = 'portal'
+        atomic_write_private(portal_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+    except AtomicWriteDurabilityError as exc:
+        if phase == 'portal':
+            data['api_key'] = new_key
+        else:
+            data['api_key'] = old_key
+            if old_access is not None:
+                try:
+                    atomic_write_private(access_path, old_access)
+                except OSError as restore_error:
+                    print('[portal] portal-access.json API Key 回滚失败: %s'
+                          % restore_error, file=sys.stderr)
+        print('[portal] API Key 文件目录同步失败: %s' % exc, file=sys.stderr)
+        raise SystemExit('[portal] API Key 修复耐久性不确定；请核对凭据文件')
+    except Exception as exc:
+        data['api_key'] = old_key
+        try:
+            if old_access is None:
+                access_path.unlink(missing_ok=True)
+            else:
+                atomic_write_private(access_path, old_access)
+            atomic_write_private(portal_path, old_portal)
+        except OSError as restore_error:
+            print('[portal] API Key 文件回滚失败: %s' % restore_error, file=sys.stderr)
+        raise SystemExit('[portal] API Key 修复未能同时保存到两个凭据文件: %s' % exc)
 
 
 def serve(path):
@@ -7034,19 +7178,7 @@ def serve(path):
     # 重新生成后要**落盘**（portal.json 与 portal-access.json 两处），
     # 否则每次重启都换一个新 key，控制台永远对不上。
     if not isinstance(data.get('api_key'), str) or not data['api_key']:
-        data['api_key'] = secrets.token_hex(24)
-        try:
-            atomic_write_private(portal_path,
-                                 json.dumps(data, ensure_ascii=False).encode('utf-8'))
-            _access_file = portal_path.parent / 'portal-access.json'
-            if _access_file.exists():
-                _access = json.loads(_access_file.read_text(encoding='utf-8'))
-                _access['api_key'] = data['api_key']
-                atomic_write_private(_access_file,
-                                     json.dumps(_access, ensure_ascii=False).encode('utf-8'))
-            print('[portal] api_key 缺失或无效，已重新生成并落盘', file=sys.stderr)
-        except OSError as _e:
-            print('[portal] api_key 重新生成后写盘失败: %s' % _e, file=sys.stderr)
+        repair_missing_api_key(portal_path, data)
     meta_path = portal_path.parent / 'client_meta.json'
 
     data_lock = threading.RLock()
@@ -7190,7 +7322,7 @@ def serve(path):
             time.sleep(5)
 
     def save_data():
-        with data_lock:
+        with data_lock, portal_state_file_lock(portal_path.parent):
             # ⚠️ 必须显式 encoding='utf-8'（2026-10-03 实测）。
             # Path.write_text 不给 encoding 时跟随 locale：Linux 上是 UTF-8
             # 没事，但 Windows 上是 GBK —— 页面里含 `₂` 之类字符时
@@ -9196,8 +9328,6 @@ if __name__ == '__main__':
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
-                    if conflict is not None:
-                        return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
                     if not durability_uncertain:
                         regenerate_page()
                     # 续费后立即同步协议客户端：过期用户续费后不必等 5 秒的
@@ -9293,8 +9423,6 @@ if __name__ == '__main__':
                                 speed_tracker.pop(user_id, None)
                             else:
                                 speed_tracker[user_id] = previous['speed']
-                            if previous_global_deny is not None:
-                                global_ip_deny[user_id] = previous_global_deny
                             if previous_global_deny is not None:
                                 global_ip_deny[user_id] = previous_global_deny
                             if previous_had_user:
@@ -10257,9 +10385,28 @@ if __name__ == '__main__':
 
         def _reply_with_egress_apply(self, payload, kind='outbound'):
             with data_lock:
+                previous = {key: (key in data, copy.deepcopy(data.get(key))) for key in
+                            ('egress_applying', '_egress_pending')}
                 data['egress_applying'] = True
                 data['_egress_pending'] = _egress_pending_count(data.get('_egress_pending')) + 1
-            save_data()
+            try:
+                save_data()
+            except AtomicWriteDurabilityError as exc:
+                # The request's config was already saved by its caller and this
+                # pending marker may also be on disk. Keep state and apply anyway.
+                print('[portal] egress queue durability uncertain: %s' % exc,
+                      file=sys.stderr, flush=True)
+            except OSError as exc:
+                # The config change is durable from the caller's save_data; failure
+                # to save a transient queue marker must not leave it unapplied.
+                with data_lock:
+                    for key, (existed, value) in previous.items():
+                        if existed:
+                            data[key] = value
+                        else:
+                            data.pop(key, None)
+                print('[portal] egress queue marker not saved; applying anyway: %s' % exc,
+                      file=sys.stderr, flush=True)
             def worker():
                 with warp_apply_lock:
                     try:
@@ -10267,6 +10414,7 @@ if __name__ == '__main__':
                     except Exception as exc:
                         applied, error = False, '应用出站失败: %s' % type(exc).__name__
                     with data_lock:
+                        previous = copy.deepcopy(data)
                         pending = max(0, _egress_pending_count(data.get('_egress_pending')) - 1)
                         if pending:
                             data['_egress_pending'] = pending
@@ -10281,7 +10429,15 @@ if __name__ == '__main__':
                         else:
                             data.pop(key, None)
                             data.pop('egress_apply_error', None)
-                    save_data()
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        raise
+                    except OSError:
+                        with data_lock:
+                            data.clear()
+                            data.update(previous)
+                        raise
                     if not applied:
                         print('[portal] egress apply failed: %s' % error, file=sys.stderr, flush=True)
             try:
@@ -10602,6 +10758,7 @@ if __name__ == '__main__':
                 raise RuntimeError('Xray 核心未安装')
             # 核心锁必须先于协议锁，避免与撤销路径形成反向锁序。
             with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                was_active = _systemd_state('xray') == 'active'
                 with data_lock:
                     inbound['settings']['clients'] = vmess_clients(data)
                 original_config = (json.loads(xray_path.read_text(encoding='utf-8'))
@@ -10632,7 +10789,7 @@ if __name__ == '__main__':
                         else:
                             apply_xray_config_transaction(
                                 original_config, config_path=str(xray_path),
-                                binary='/usr/local/bin/xray', restart=not unit_suspended('xray'))
+                                binary='/usr/local/bin/xray', restart=was_active and not unit_suspended('xray'))
                 finally:
                     with data_lock:
                         if old_state is None:
@@ -10707,6 +10864,7 @@ if __name__ == '__main__':
                 raise RuntimeError('Xray 核心未安装')
             # 读-改-写使用统一顺序的核心与协议锁，防止并发卸载。
             with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                was_active = _systemd_state('xray') == 'active'
                 with data_lock:
                     inbound['settings']['clients'] = vlessenc_clients(data)
                 original_config = (json.loads(xray_path.read_text(encoding='utf-8'))
@@ -10737,7 +10895,7 @@ if __name__ == '__main__':
                         else:
                             apply_xray_config_transaction(
                                 original_config, config_path=str(xray_path),
-                                binary='/usr/local/bin/xray', restart=not unit_suspended('xray'))
+                                binary='/usr/local/bin/xray', restart=was_active and not unit_suspended('xray'))
                 finally:
                     with data_lock:
                         if old_state is None:
@@ -13583,13 +13741,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # Web 登录专用失败桶（2026-10-25）：见 login_rate_limited() 的说明。
     server.login_failures = []
 
-    # 启动兜底：如果上一次运行时有 clients 变更被「节流」跳过
-    # （历史上的节流机制已移除），配置写进 xray.json 了但服务没重载。
-    # 这里在 serve 之前无条件对一次 —— 幂等、便宜（约 100ms）。
-    #
-    # ⚠️ 顺带解封 start-limit：上一版因为频繁 restart 撞上
-    # systemd 的 start-limit，xray 停在 failed 且无法自愈。
-    # reset-failed 是标准的解封手段，不影响正常运行中的服务。
+    # 启动时比较完整托管客户端列表；服务已停止但配置匹配时也尝试恢复。
     try:
         if Path('/etc/hysteria/xray.json').exists():
             with data_lock:
@@ -13599,26 +13751,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             _got = {}
             try:
                 _cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                # 同样覆盖所有托管入站：只补 Reality 的话，VMess-only 节点重启后
-                # 新增用户永远进不了白名单（要等到下次有人开户才可能碰巧修好）。
                 for _tag in MANAGED_INBOUND_TAGS:
                     _idx, _inb = managed_inbound_index(_cfg, _tag)
                     if _idx >= 0:
                         _got[_tag] = _inb.get('settings', {}).get('clients') or []
             except Exception:
                 _got = {}
-            # 比较**完整 clients**（含 UUID / flow），而不是只比 email：
-            # 注册表被重建或配置被手工改过时，email 相同但 UUID 已变，
-            # 只比 email 会认为「已同步」而放过（2026-10-29 修）。
-            # 只遍历 _got 里实际存在的入站 —— 解析失败时 _got 为空，
-            # 此时不做判断，避免每次启动都盲目重启 Xray。
-            if any(_want[t] != (_got.get(t) or []) for t in _got):
+            _mismatch = any(_want[tag] != (_got.get(tag) or []) for tag in _got)
+            _stopped = bool(_got) and _systemd_state('xray') != 'active'
+            if (_mismatch or _stopped) and not unit_suspended('xray'):
                 subprocess.run(['systemctl', 'reset-failed', 'xray'],
                                capture_output=True, timeout=5)
                 subprocess.run(['systemctl', 'restart', 'xray'],
                                capture_output=True, timeout=10)
-                print('[portal] 启动时补同步了 xray clients',
-                      file=sys.stderr)
+                print('[portal] 启动时恢复了 xray 服务或补同步 clients', file=sys.stderr)
     except Exception as e:
         print('[portal] 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
 

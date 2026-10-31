@@ -112,6 +112,29 @@ class WebWorkflowTests(unittest.TestCase):
             method(self.handler, '/test-token/')
         return self.response
 
+    def test_api_key_repair_rolls_back_access_file_when_portal_save_fails(self):
+        portal_file = self.hdir / 'portal.json'
+        old_portal = {'auth_hash': 'a' * 64, 'api_key': '', 'users': {}}
+        portal_file.write_text(json.dumps(old_portal), encoding='utf-8')
+        access_path = self.hdir / 'portal-access.json'
+        old_access = {'username': 'admin', 'password': 'secret', 'api_key': 'old-key'}
+        access_path.write_text(json.dumps(old_access), encoding='utf-8')
+        real_atomic_write = portal.atomic_write_private
+        calls = []
+        failed = [False]
+        def atomic_write(path, payload):
+            calls.append(Path(path))
+            if Path(path) == portal_file and not failed[0]:
+                failed[0] = True
+                raise OSError('disk full')
+            return real_atomic_write(path, payload)
+        with patch.object(portal, 'atomic_write_private', side_effect=atomic_write):
+            with self.assertRaises(SystemExit):
+                portal.repair_missing_api_key(portal_file, copy.deepcopy(old_portal))
+        self.assertEqual(json.loads(access_path.read_text(encoding='utf-8')), old_access)
+        self.assertEqual(json.loads(portal_file.read_text(encoding='utf-8')), old_portal)
+        self.assertGreaterEqual(calls.count(access_path), 2)
+
     def test_api_renew_cannot_set_quota_on_master_account(self):
         branch = next(n for n in ast.walk(TREE) if isinstance(n, ast.If)
                       and isinstance(n.test, ast.Compare)
@@ -348,6 +371,34 @@ class WebWorkflowTests(unittest.TestCase):
                 read_clients = body.index('inbound[\'settings\'][\'clients\'] = ' + builder)
                 self.assertGreater(read_clients, lock)
 
+    def test_xray_startup_restarts_stopped_service_with_matching_clients(self):
+        config = {'inbounds': [
+            {'tag': portal.REALITY_INBOUND_TAG, 'settings': {'clients': []}},
+            {'tag': portal.VMESS_INBOUND_TAG, 'settings': {'clients': []}},
+        ]}
+        path = self.hdir / 'xray.json'
+        path.write_text(json.dumps(config), encoding='utf-8')
+        calls = []
+        result = portal.recover_xray_service_on_start(
+            {'users': {}}, path, run=lambda args, **kw:
+                calls.append(args) or SimpleNamespace(returncode=0),
+            systemd_state=lambda _: 'inactive', suspended=lambda _: False)
+        self.assertTrue(result)
+        self.assertEqual(calls, [['systemctl', 'reset-failed', 'xray'],
+                                 ['systemctl', 'restart', 'xray']])
+
+    def test_xray_startup_does_not_restart_suspended_service(self):
+        config = {'inbounds': [{'tag': portal.VMESS_INBOUND_TAG,
+                                'settings': {'clients': []}}]}
+        path = self.hdir / 'xray.json'
+        path.write_text(json.dumps(config), encoding='utf-8')
+        calls = []
+        result = portal.recover_xray_service_on_start(
+            {'users': {}}, path, run=lambda *a, **kw: calls.append(a),
+            systemd_state=lambda _: 'inactive', suspended=lambda _: True)
+        self.assertFalse(result)
+        self.assertEqual(calls, [])
+
     def test_vmess_disable_save_failure_restores_inbound_and_state(self):
         path = self.hdir / 'xray.json'
         original = {'inbounds': [{'tag': portal.VMESS_INBOUND_TAG, 'port': 2087,
@@ -360,6 +411,7 @@ class WebWorkflowTests(unittest.TestCase):
         self.ns['remove_managed_inbound'] = portal.remove_managed_inbound
         self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
         self.ns['core_operation_lock'] = threading.RLock()
+        self.ns['_systemd_state'] = lambda _: 'inactive'
         self.ns['apply_xray_config_transaction'] = Mock(side_effect=lambda cfg, **kw:
             Path(kw['config_path']).write_text(json.dumps(cfg), encoding='utf-8'))
         self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
@@ -367,6 +419,31 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 500, body)
         self.assertEqual(json.loads(path.read_text(encoding='utf-8')), original)
         self.assertEqual(self.data['vmess_config']['port'], 2087)
+
+    def test_vmess_enable_save_failure_keeps_previously_stopped_xray_off(self):
+        self.ns['Path'] = lambda value: (self.hdir / 'xray.json' if str(value) == '/etc/hysteria/xray.json'
+                                        else self.root / 'usr/local/bin/xray' if str(value) == '/usr/local/bin/xray'
+                                        else Path(value))
+        self.ns['Path']('/usr/local/bin/xray').touch()
+        self.ns['read_meta_file'] = lambda _: {'server_name': 'node.example.com', 'public_ip': '203.0.113.10'}
+        self.ns['_is_dns_name'] = lambda _: True
+        self.handler._vmess_certificate = lambda *a: ('cert.pem', 'key.pem', 'node.example.com')
+        self.handler._vmess_ws_path = lambda: '/fixture'
+        self.ns['managed_reserved_ports'] = lambda *a, **kw: set()
+        self.ns['_pick_reality_port'] = lambda **kw: (2087, '')
+        self.ns['vmess_clients'] = lambda _: [{'id': 'fixture', 'email': 'placeholder'}]
+        self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
+        self.ns['core_operation_lock'] = threading.RLock()
+        self.ns['_systemd_state'] = lambda _: 'inactive'
+        self.ns['apply_xray_config_with_meter'] = Mock(side_effect=lambda cfg, target, *_:
+            target.write_text(json.dumps(cfg), encoding='utf-8'))
+        self.ns['apply_xray_config_transaction'] = Mock(side_effect=lambda cfg, **kw:
+            Path(kw['config_path']).write_text(json.dumps(cfg), encoding='utf-8'))
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, _ = self.invoke('_h_post_manage_vmess', {'action': 'enable'})
+        self.assertEqual(status, 500)
+        self.assertFalse(any(call.args[0] == ['systemctl', 'restart', 'xray']
+                             for call in self.run.call_args_list))
 
     def test_tuic_disable_save_failure_restores_config_and_service(self):
         config_path = self.hdir / portal.TUIC_CONFIG_NAME
@@ -402,6 +479,20 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 500, body)
         self.assertEqual({key: self.data[key] for key in original}, original)
         self.assertEqual(scheduled, [])
+
+    def test_egress_schedule_save_failure_still_starts_apply_worker(self):
+        self.ns['save_data'] = Mock(side_effect=[OSError('disk full')])
+        self.ns['_egress_pending_count'] = lambda value: max(0, int(value or 0))
+        thread = Mock()
+        self.ns['threading'] = SimpleNamespace(Thread=Mock(return_value=thread))
+        self.handler.reply_json = Mock(side_effect=self.reply_json)
+        apply = extract_method('_reply_with_egress_apply', self.ns)
+        apply(self.handler, {'message': 'queued'})
+        self.handler.reply_json.assert_called_once()
+        self.assertNotIn('egress_applying', self.data)
+        self.assertNotIn('_egress_pending', self.data)
+        self.ns['threading'].Thread.assert_called_once()
+        thread.start.assert_called_once()
 
     def test_outbound_save_failure_restores_memory_and_skips_apply(self):
         original = {'custom_outbounds': [{'name': 'existing', 'type': 'socks5',
@@ -890,6 +981,31 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertIn({'protocol': 'blackhole', 'tag': 'block-private'},
                       proposed['outbounds'])
         self.assertNotEqual(proposed['outbounds'][0]['protocol'], 'blackhole')
+
+    def test_startup_recovery_restarts_xray_when_matching_config_service_is_stopped(self):
+        config = {'inbounds': [{'tag': portal.REALITY_INBOUND_TAG,
+                                'settings': {'clients': []}}]}
+        calls = []
+        data = {'users': {'admin_master': {'status': 'active'}}}
+        restarted = portal.recover_xray_service_on_start(
+            data, self.hdir / 'xray.json',
+            run=lambda args, **kw: calls.append(args) or SimpleNamespace(returncode=0),
+            systemd_state=lambda _: 'inactive', suspended=lambda _: False)
+        self.assertFalse(restarted)  # no config file
+        path = self.hdir / 'xray.json'
+        path.write_text(json.dumps(config), encoding='utf-8')
+        restarted = portal.recover_xray_service_on_start(
+            data, path,
+            run=lambda args, **kw: calls.append(args) or SimpleNamespace(returncode=0),
+            systemd_state=lambda _: 'inactive', suspended=lambda _: False)
+        self.assertTrue(restarted)
+        self.assertEqual(calls[-2:], [['systemctl', 'reset-failed', 'xray'],
+                                      ['systemctl', 'restart', 'xray']])
+        calls.clear()
+        self.assertFalse(portal.recover_xray_service_on_start(
+            data, path, run=lambda args, **kw: calls.append(args),
+            systemd_state=lambda _: 'inactive', suspended=lambda _: True))
+        self.assertEqual(calls, [])
 
     def test_xray_transaction_invalid_config_keeps_original_bytes(self):
         path = self.hdir / 'xray.json'

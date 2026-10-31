@@ -455,6 +455,30 @@ class TestCertRuntimeReload(unittest.TestCase):
             self.assertEqual(calls, [['systemctl', 'try-restart', 'xray']])
             self.assertTrue(state.exists())
 
+    def test_certificate_changed_before_first_selfheal_restarts_active_service(self):
+        import portal
+        from types import SimpleNamespace
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert = root / 'fullchain.pem'
+            cert.write_bytes(b'certificate replaced before initial selfheal')
+            meta_path = root / 'client_meta.json'
+            meta_path.write_text('{}', encoding='utf-8')
+            state = root / 'cert-selfheal.json'
+            calls = []
+            with mock.patch.object(portal, '_resolve_live_cert', return_value=(cert, '', [], False)), \
+                 mock.patch.object(portal, 'sync_cert_trust', return_value=False), \
+                 mock.patch.object(portal, 'sync_pin', side_effect=lambda *_: None), \
+                 mock.patch.object(portal, '_systemd_state',
+                                   side_effect=lambda service: 'active' if service == 'xray' else 'inactive'), \
+                 mock.patch.object(portal.subprocess, 'run', side_effect=lambda args, **kwargs:
+                     (calls.append(args) or SimpleNamespace(returncode=0))), \
+                 mock.patch.object(portal, 'record_cert_heal'):
+                self.assertFalse(portal.selfheal(str(meta_path), config_path=str(root / 'config.yaml')))
+            self.assertEqual(calls, [['systemctl', 'try-restart', 'xray']])
+            self.assertTrue(state.exists())
+
     def test_changed_certificate_restarts_only_active_services_and_retries_failures(self):
         import portal
         from types import SimpleNamespace
@@ -752,8 +776,8 @@ class TestRepoInvariants(unittest.TestCase):
     def test_refresh_calls_sync_cert_trust(self):
         """refresh 只调 sync_pin 是不够的 —— 必须也修信任模型四字段。"""
         text = PORTAL.read_text(encoding="utf-8")
-        i = text.index("def refresh(meta_path")
-        j = text.index("def selfheal(", i)
+        i = text.index("def _refresh_portal_state(meta_path")
+        j = text.index("def refresh(meta_path", i)
         body = text[i:j]
         self.assertIn("sync_cert_trust(m, root, meta_path", body)
 
