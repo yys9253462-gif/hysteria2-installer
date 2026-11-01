@@ -50,6 +50,8 @@ HY2_CERT_TYPE=3 HY2_DOMAIN=hy2.example.com HY2_EMAIL=me@example.com bash install
 
 证书方式选 `3` 前，先把域名 A 记录指向本机，并在云安全组放行 **TCP 80** 和安装结束时显示的**订阅端口**。脚本会先校验 DNS 解析，不指向本机时默认中止。
 
+80 端口已被 **Nginx** 占用时会自动借 Nginx 签发：该域名已有站点就用 acme.sh 的 `--nginx` 模式（不改动原配置），没有则新增一份独立的验证配置；Nginx 现有配置有错时不会动它，签发失败会撤掉新增的配置。借 Nginx 走不通或被其它程序占用时，会尝试用 acme.sh 的 DNS API 签发（需提供 DNS 服务商凭据）。
+
 ## 📋 管理
 
 再次执行脚本即可打开管理菜单：
@@ -111,6 +113,7 @@ PANEL_ADMIN_TOKEN=<JWT> python3 panel-join.py --register --panel https://你的�
 | POST | `/api/v1/users/renew` | 续期、加流量 |
 | POST | `/api/v1/users/set_status` | 启用 / 停用 |
 | POST | `/api/v1/users/delete` | 注销 |
+| POST | `/api/v1/users/ip-deny` | 跨节点设备上限：下发超额 IP（整份替换，带有效期） |
 | GET / POST | `/api/v1/users/list` | 全部用户及用量 |
 | GET | `/api/v1/users/get/<user_id>` | 单个用户 |
 | GET / POST | `/api/v1/proxy-services/list`、`add`、`delete` | GOST 入站代理 |
