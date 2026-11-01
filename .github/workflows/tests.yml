@@ -146,4 +146,8 @@ jobs:
         run: bash tests/test_awgctl.sh
 
       - name: Python 测试套件
+        # 门户的核心操作锁默认在 /etc/hysteria/.core-operation.lock；runner 上没有该目录
+        # （本机跑测试也不该去抢真实节点的锁），用 portal.py 预留的环境变量指到临时目录。
+        env:
+          HY2_CORE_OPERATION_LOCK: ${{ runner.temp }}/core-operation.lock
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v

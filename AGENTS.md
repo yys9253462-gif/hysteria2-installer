@@ -65,7 +65,9 @@ usage-meter-xray-config-20261007-v1.py
 
 - 新增行为要有回归测试，且**锁住行为而不是匹配源码字符串**。
 - 测试里单独摘出执行的代码片段（`ast` 提取），需要把用到的名字补进环境。
-- 完整回归：`python -m unittest discover -s tests -p 'test_*.py'`。
+- 完整回归：`HY2_CORE_OPERATION_LOCK=/tmp/hy2-core.lock python -m unittest discover -s tests -p 'test_*.py'`。
+  不设这个变量时门户会去拿 `/etc/hysteria/.core-operation.lock`：非 root 会失败，
+  在真实节点上跑则会和线上的核心操作抢锁。
 - CI 还会跑 shell 语法、安装交互、证书矩阵、下载冒烟，见 `.github/workflows/tests.yml`。
 
 ## 发布

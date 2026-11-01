@@ -167,7 +167,7 @@ PANEL_ADMIN_TOKEN=<JWT> python3 panel-join.py --register --panel https://你的�
 
 ```bash
 bash -n install.sh
-python3 -m unittest discover -s tests -p 'test_*.py'
+HY2_CORE_OPERATION_LOCK=/tmp/hy2-core.lock python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 改代码前请先读 [AGENTS.md](AGENTS.md)。
