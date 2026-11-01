@@ -10539,6 +10539,19 @@ if __name__ == '__main__':
                 if action not in known_actions:
                     return self.reply_json(400, {'ok': False, 'error': '未知操作: ' + (action or '(空)')})
 
+                # peer_add 的参数同理先于安装状态校验：输入本身非法时应直接指出
+                # 哪里错，而不是笼统地报「尚未安装」。
+                if action == 'peer_add':
+                    name = (form.get('name', [''])[0] or '').strip()
+                    endpoint = (form.get('endpoint', [''])[0] or '').strip()
+                    if not VALID_AWG_NAME_RE.match(name):
+                        return self.reply_json(400, {'ok': False, 'error': '客户端名称只允许字母、数字、点、下划线、连字符，长度 1-32'})
+                    if not endpoint:
+                        return self.reply_json(400, {'ok': False, 'error': '必须提供连接地址'})
+                    endpoint_error = awg_endpoint_error(endpoint)
+                    if endpoint_error:
+                        return self.reply_json(400, {'ok': False, 'error': endpoint_error})
+
                 if not awg_installed():
                     return self.reply_json(400, {'ok': False, 'error': 'AmneziaWG 尚未安装'})
                 if not ensure_awgctl():
@@ -10552,15 +10565,7 @@ if __name__ == '__main__':
                             '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
 
                 if action == 'peer_add':
-                    name = (form.get('name', [''])[0] or '').strip()
-                    endpoint = (form.get('endpoint', [''])[0] or '').strip()
-                    if not VALID_AWG_NAME_RE.match(name):
-                        return self.reply_json(400, {'ok': False, 'error': '客户端名称只允许字母、数字、点、下划线、连字符，长度 1-32'})
-                    if not endpoint:
-                        return self.reply_json(400, {'ok': False, 'error': '必须提供连接地址'})
-                    endpoint_error = awg_endpoint_error(endpoint)
-                    if endpoint_error:
-                        return self.reply_json(400, {'ok': False, 'error': endpoint_error})
+                    # name / endpoint 已在安装状态检查之前校验过。
                     # peer-add 会生成密钥并渲染服务端配置，90 秒超时。
                     if not self._extend_deadline(120, heavy=True):
                         return self.reply_json(409, {'ok': False, 'error':

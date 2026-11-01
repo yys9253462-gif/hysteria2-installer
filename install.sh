@@ -1631,7 +1631,13 @@ setup_cert_via_dns_api() {
         log_err "DNS API 证书已签发，但安装或续期重载钩子配置失败。"
         return 1
     fi
-    chmod 600 "$out_key"
+    # acme.sh 返回 0 不代表文件真的落地：路径不可写或参数被上游改名时，
+    # 后面会把不存在的路径写进 config.yaml，Hysteria 起不来。
+    if [[ ! -s "$out_cert" || ! -s "$out_key" ]]; then
+        log_err "acme.sh 报告安装成功，但 ${out_cert} 或 ${out_key} 不存在或为空。"
+        return 1
+    fi
+    chmod 600 "$out_key" || { log_err "无法收紧私钥权限: ${out_key}"; return 1; }
     log_info "acme.sh DNS API 证书续期后会自动安装并重启相关服务。"
     echo "$out_cert|$out_key" >&3
     return 0

@@ -1394,20 +1394,32 @@ setup_cert_via_dns_api example.com || echo "RC=$?"
             # 安装失败后不得继续调用 acme.sh 签发
             self.assertNotIn('使用 Cloudflare DNS API 签发', out)
 
-    def test_existing_acme_is_checked_not_reinstalled(self):
-        """已有 acme.sh 且核验通过：走 check_existing，绝不调用安装器，继续签发。"""
+    @staticmethod
+    def _fake_acme(path, install_writes=True):
+        """假 acme.sh：记录参数；--install-cert 时按参数复制证书（或故意不写）。"""
+        body = r'''#!/bin/bash
+echo "ACME-ARGS: $*" >&2
+if [[ " $* " == *" --install-cert "* ]]; then
+    [[ "${FAKE_ACME_WRITE:-1}" == 1 ]] || exit 0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --fullchain-file) cp "$HOME/.acme.sh/example.com_ecc/fullchain.cer" "$2"; shift ;;
+            --key-file) cp "$HOME/.acme.sh/example.com_ecc/example.com.key" "$2"; shift ;;
+        esac
+        shift
+    done
+fi
+exit 0
+'''
+        if not install_writes:
+            body = body.replace('${FAKE_ACME_WRITE:-1}', '0')
+        path.write_text(body, encoding='utf-8', newline='\n')
+        path.chmod(0o755)
+
+    def _dns_api_script(self, home, cert_dir):
         fn = extract_install_fn('setup_cert_via_dns_api')
         ensure = extract_install_fn('hy2_acme_ensure')
-        with tempfile.TemporaryDirectory() as td:
-            home = Path(td) / 'home'
-            (home / '.acme.sh').mkdir(parents=True)
-            (home / '.acme.sh' / 'acme.sh').write_text('#!/bin/sh\n', encoding='utf-8')
-            (home / '.acme.sh' / 'acme.sh').chmod(0o755)
-            cert_dir = home / 'hy2-certs'
-            (home / '.acme.sh' / 'example.com_ecc').mkdir()
-            (home / '.acme.sh' / 'example.com_ecc' / 'fullchain.cer').write_text('CERT')
-            (home / '.acme.sh' / 'example.com_ecc' / 'example.com.key').write_text('KEY')
-            script = f'''
+        return f'''
 HOME="{home}"
 HY2_CERT_DIR="{cert_dir}"
 HY2_CF_TOKEN="tok"; HY2_CF_EMAIL="a@b.c"
@@ -1417,16 +1429,41 @@ hy2_acme_install_verified() {{ echo "INSTALLER-CALLED"; return 0; }}
 hy2_acme_check_existing() {{ echo "CHECK-EXISTING"; return 0; }}
 {ensure}
 {fn}
-setup_cert_via_dns_api example.com || true
+rc=0; setup_cert_via_dns_api example.com || rc=$?
+echo "RC=$rc"
 '''
-            out = run_bash(script)
+
+    def _dns_api_home(self, td, install_writes=True):
+        home = Path(td) / 'home'
+        (home / '.acme.sh' / 'example.com_ecc').mkdir(parents=True)
+        (home / '.acme.sh' / 'example.com_ecc' / 'fullchain.cer').write_text('CERT')
+        (home / '.acme.sh' / 'example.com_ecc' / 'example.com.key').write_text('KEY')
+        self._fake_acme(home / '.acme.sh' / 'acme.sh', install_writes)
+        return home, home / 'hy2-certs'
+
+    def test_existing_acme_is_checked_not_reinstalled(self):
+        """已有 acme.sh 且核验通过：走 check_existing，绝不调用安装器，继续签发。"""
+        with tempfile.TemporaryDirectory() as td:
+            home, cert_dir = self._dns_api_home(td)
+            out = run_bash(self._dns_api_script(home, cert_dir))
             self.assertIn('CHECK-EXISTING', out, out)
             self.assertNotIn('INSTALLER-CALLED', out, out)
             self.assertIn('使用 Cloudflare DNS API 签发', out)
-            self.assertTrue((cert_dir / 'acme-example.com.crt').exists())
-            self.assertTrue((cert_dir / 'acme-example.com.key').exists())
+            self.assertIn('RC=0', out, out)
+            self.assertEqual((cert_dir / 'acme-example.com.crt').read_text(), 'CERT')
+            self.assertEqual((cert_dir / 'acme-example.com.key').read_text(), 'KEY')
+            self.assertEqual((cert_dir / 'acme-example.com.key').stat().st_mode & 0o777, 0o600)
             self.assertIn('--install-cert', out)
             self.assertIn('--reloadcmd', out)
+
+    def test_dns_api_fails_when_install_cert_writes_nothing(self):
+        """--install-cert 返回 0 却没落地文件：必须失败，不能把不存在的路径交给 Hysteria。"""
+        with tempfile.TemporaryDirectory() as td:
+            home, cert_dir = self._dns_api_home(td, install_writes=False)
+            out = run_bash(self._dns_api_script(home, cert_dir))
+            self.assertIn('RC=1', out, out)
+            self.assertIn('不存在或为空', out, out)
+            self.assertNotIn('acme-example.com.crt|', out, out)
 
     def test_existing_acme_verification_failure_blocks_issue(self):
         """已有 acme.sh 核验失败：setup_cert_via_dns_api 必须返回 1 且不签发。"""

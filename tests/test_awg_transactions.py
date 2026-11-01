@@ -72,7 +72,8 @@ STATE_ACTIVE=inactive
 STATE_ENABLED=disabled
 awg_transaction_restore
 [[ "$STATE_ACTIVE" == active && "$STATE_ENABLED" == enabled ]]
-[[ "$(stat -c %a "$AWG_DIR")" == 755 ]]
+# 快照前是 750、事务中被改成 700：回滚必须恢复快照时的 750。
+[[ "$(stat -c %a "$AWG_DIR")" == 750 ]]
 for path in "$AWG_META_FILE" "$AWG_CONFIG" "$AWG_PEERS_FILE" "$AWG_SERVICE" \
              "$AWG_VERSION_FILE" "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
     [[ "$(cat "$path")" == "original:$(basename "$path")" ]]

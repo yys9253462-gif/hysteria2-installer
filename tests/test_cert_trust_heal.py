@@ -488,7 +488,10 @@ class TestCertRuntimeReload(unittest.TestCase):
             cert = root / 'fullchain.pem'
             state = root / 'cert-selfheal.json'
             cert.write_bytes(b'old certificate')
-            self.assertTrue(portal.sync_cert_runtime(root, cert, state))
+            # 基线：没有服务在跑，只记录指纹。必须桩掉 systemd，
+            # 否则装着 hysteria 的开发机会真的去 try-restart 本机服务。
+            with mock.patch.object(portal, '_systemd_state', return_value='inactive'):
+                self.assertTrue(portal.sync_cert_runtime(root, cert, state))
             cert.write_bytes(b'new certificate')
             calls = []
             def active(service):

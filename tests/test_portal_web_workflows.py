@@ -77,7 +77,10 @@ class WebWorkflowTests(unittest.TestCase):
                        _active_vmess_config=lambda: self.data.get('vmess_config'),
                        _active_vlessenc_config=lambda: self.data.get('vlessenc_config'),
                        _active_anytls_config=lambda: None,
-                       _active_tuic_config=lambda: None)
+                       _active_tuic_config=lambda: None,
+                       # 真实 firewall_port 会探测本机 ufw/firewalld/nft 并执行；
+                       # 默认桩成成功，需要验证防火墙行为的用例自己再覆盖。
+                       firewall_port=Mock(return_value=True))
         self.sync = Mock(return_value=True)
         self.handler = SimpleNamespace(is_authenticated=lambda: True, server=SimpleNamespace(),
             _sync_reality_clients=self.sync, _reply_with_warp_apply=lambda payload: self.reply_json(200, payload),

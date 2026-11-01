@@ -344,7 +344,11 @@ if [[ ! -s "${WORK}/live-calls" ]]; then ok; else bad "peer-add 渲染失败后�
 # 用一个有内容的列表验证删除失败也会完整回滚。
 jq '.peers += [{name:"deletefail",address:"10.66.66.9",private_key:"p",public_key:"pub-deletefail",preshared_key:"k",endpoint:"vpn.example.com",created_at:"t",enabled:true}]' \
     "$AWG_PEERS_FILE" > "${AWG_PEERS_FILE}.tmp" && mv "${AWG_PEERS_FILE}.tmp" "$AWG_PEERS_FILE"
+# 基线渲染必须成功；上面为 peer-add 失败场景桩掉了 detect_wan_iface，这里先恢复，
+# 拍完基线再重新桩成失败，只让 cmd_peer_del 内部的渲染失败。
+detect_wan_iface() { echo eth0; }
 render_server_config
+detect_wan_iface() { return 1; }
 cp -p "$AWG_PEERS_FILE" "${WORK}/peers.before"
 cp -p "$AWG_CONFIG" "${WORK}/config.before"
 : > "${WORK}/live-calls"
@@ -388,7 +392,9 @@ endpoint_ok() { ( validate_endpoint "$1" ) >/dev/null 2>&1; }
 for ep in vpn.example.com:20000 vpn.example.com:025000 '[2001:db8::1]:040000' vpn.example.com:00000 vpn.example.com:65536; do
     if endpoint_ok "$ep"; then bad "非法 Endpoint 端口被放行: $ep"; else ok; fi
 done
-for ep in vpn.example.com:019999 vpn.example.com:040001 '[2001:db8::1]:050000'; do
+# 端口最多 5 位（与 portal.py 的 awg_endpoint_error 一致），所以合法样例必须是
+# 5 位以内的前导零写法；08080 若被当成八进制，bash 算术会直接报错。
+for ep in vpn.example.com:08080 vpn.example.com:01999 '[2001:db8::1]:05000'; do
     if endpoint_ok "$ep"; then ok; else bad "合法十进制 Endpoint 端口被拒绝: $ep"; fi
 done
 
