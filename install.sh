@@ -2049,19 +2049,19 @@ setup_system_firewall() {
             # （2026-10-29 修）。用「数字边界」正则避免 14617 命中 146170。
             local _nft_rules _changed=0
             _nft_rules="$(nft list chain "$nft_fam" "$nft_tbl" "$nft_chain" 2>/dev/null)"
-            _nft_has() { grep -qE "(^|[^0-9])$1([^0-9]|$)" <<<"$2"; }
-            _nft_ensure() {   # $1=proto $2=dport 表达式 $3=匹配串
-                _nft_has "$3" "$_nft_rules" && return 0
+            _nft_has() { grep -qE "(^|[[:space:]])$1[[:space:]]+dport[[:space:]]+$2([[:space:]]|$)" <<<"$3"; }
+            _nft_ensure() {   # $1=proto $2=dport 表达式 $3=规则列表
+                _nft_has "$1" "$2" "$3" && return 0
                 nft add rule "$nft_fam" "$nft_tbl" "$nft_chain" "$1" dport "$2" accept >/dev/null 2>&1 || true
                 _changed=1
             }
-            _nft_ensure udp "${port}" "udp dport ${port}"
+            _nft_ensure udp "${port}" "$_nft_rules"
             if [[ -n "$s_port" && -n "$e_port" ]]; then
-                _nft_ensure udp "${s_port}-${e_port}" "${s_port}-${e_port}"
+                _nft_ensure udp "${s_port}-${e_port}" "$_nft_rules"
             fi
-            _nft_ensure tcp "${HY2_SUB_PORT}" "tcp dport ${HY2_SUB_PORT}"
+            _nft_ensure tcp "${HY2_SUB_PORT}" "$_nft_rules"
             if [[ "$CERT_TYPE" == "acme" ]]; then
-                _nft_ensure tcp 80 "tcp dport 80"
+                _nft_ensure tcp 80 "$_nft_rules"
             fi
             if [[ "$_changed" == "1" ]]; then
                 log_info "nftables ($nft_fam $nft_tbl/$nft_chain) 已放行 tcp ${HY2_SUB_PORT} + udp ${port}$([[ -n "$s_port" ]] && echo " + udp ${s_port}-${e_port}")。"

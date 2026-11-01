@@ -215,6 +215,22 @@ class RefreshPortalFailureTests(unittest.TestCase):
             self.assertNotIn('网页已更新', run.stdout)
 
 
+class NftablesProtocolMatchTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_tcp_rule_does_not_suppress_required_udp_rule(self):
+        helper = r'''
+_nft_has() { grep -qE "(^|[[:space:]])$1[[:space:]]+dport[[:space:]]+$2([[:space:]]|$)" <<<"$3"; }
+'''
+        namespace = {'grep': shutil.which('grep')}
+        rules = 'tcp dport 50000 accept # handle 1\n'
+        result = subprocess.run([shutil.which('bash'), '-c', helper + '''
+_nft_has udp 50000 "$RULES" && exit 9
+_nft_has tcp 50000 "$RULES"
+'''], capture_output=True, text=True,
+            env=dict(os.environ, RULES=rules))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class AwgUninstallWrapperTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
     def test_controller_failure_is_propagated_and_controller_is_preserved(self):

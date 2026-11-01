@@ -196,9 +196,6 @@ awg_transaction_restore() {
     else
         rmdir "$AWG_DIR" 2>/dev/null || true
     fi
-    if [[ -f "$AWG_TRANSACTION_DIR/original-dir.absent" ]]; then
-        rmdir "$AWG_DIR" 2>/dev/null || true
-    fi
     index=4
     for path in "${binaries[@]}"; do
         if [[ -f "$AWG_TRANSACTION_DIR/bin.$index.present" ]]; then
@@ -210,7 +207,7 @@ awg_transaction_restore() {
         index=$((index + 1))
     done
     unit_dir="$(dirname "$AWG_SERVICE")"
-    if [[ -d "$unit_dir" ]]; then
+    if [[ -d "$unit_dir" && -f "$AWG_TRANSACTION_DIR/0.present" ]]; then
         systemctl daemon-reload || return 1
     fi
     state_file="$AWG_TRANSACTION_DIR/service-state"
@@ -775,7 +772,11 @@ peer_apply_live_add() {
     local pskf
     pskf="$(mktemp)"
     printf '%s\n' "$psk" > "$pskf"
-    "$AWG_BIN" set "$AWG_LINK" peer "$pub" preshared-key "$pskf" allowed-ips "${addr}/32" 2>/dev/null || true
+    if ! "$AWG_BIN" set "$AWG_LINK" peer "$pub" preshared-key "$pskf" allowed-ips "${addr}/32" 2>/dev/null; then
+        rm -f "$pskf"
+        log_err "客户端已写入文件，但未能同步到运行中的 AWG 接口；请执行 hy2-awgctl resync。"
+        return 0
+    fi
     rm -f "$pskf"
     return 0
 }
@@ -783,7 +784,10 @@ peer_apply_live_add() {
 peer_apply_live_del() {
     local pub="$1"
     service_active || return 0
-    "$AWG_BIN" set "$AWG_LINK" peer "$pub" remove 2>/dev/null || true
+    if ! "$AWG_BIN" set "$AWG_LINK" peer "$pub" remove 2>/dev/null; then
+        log_err "客户端已从文件和服务端配置删除，但运行接口未能同步移除；请执行 hy2-awgctl resync。"
+        return 0
+    fi
     return 0
 }
 
@@ -1467,15 +1471,46 @@ EOF
 # 会改 peers / 配置 / 二进制的命令互斥执行。门户是多线程的，命令行也可能同时在用：
 # 两个 peer-add 并发时都读到同一份 peers.json，会分到同一个隧道 IP 或互相覆盖丢客户端。
 acquire_lock() {
-    command -v flock >/dev/null 2>&1 || return 0
+    builtin command -v flock >/dev/null 2>&1 || die "缺少 flock，无法安全串行化 AWG 修改；请安装 util-linux 后重试"
     local lock_file="${AWG_LOCK_FILE:-/run/hy2-awgctl.lock}"
-    exec 9>"$lock_file" 2>/dev/null || return 0
+    exec 9>"$lock_file" 2>/dev/null || die "无法打开 AWG 操作锁 ${lock_file}，拒绝并发修改"
     flock -w 300 9 || die "另一个 hy2-awgctl 操作仍在进行，请稍后重试"
 }
 
 main() {
     local cmd="${1:-}"
     [[ $# -gt 0 ]] && shift || true
+
+    # Report malformed arguments before checking optional host dependencies.
+    case "$cmd" in
+        install)
+            local pending=0 option
+            for option in "$@"; do
+                if [[ "$pending" == 1 ]]; then pending=0; continue; fi
+                case "$option" in
+                    --line|--port|--endpoint|--client|--server-name) pending=1 ;;
+                    --*) ;;
+                    *) die "install 未知参数: $option" ;;
+                esac
+            done
+            [[ "$pending" == 0 ]] || die "install 选项缺少取值"
+            ;;
+        update)
+            local expect_value=0 arg
+            for arg in "$@"; do
+                if [[ "$expect_value" == 1 ]]; then expect_value=0; continue; fi
+                if [[ "$arg" == --line ]]; then expect_value=1; fi
+            done
+            [[ "$expect_value" == 0 ]] || die "--line 缺少取值（应为 2 或 3）"
+            ;;
+        peer-add)
+            parse_name_endpoint "$@"
+            set -- "$PARSED_NAME" "$PARSED_ENDPOINT"
+            ;;
+        peer-del)
+            [[ -n "${1:-}" ]] || die "用法: hy2-awgctl peer-del <名称>"
+            ;;
+    esac
 
     case "$cmd" in
         install|update|uninstall|resync|peer-add|peer-del) acquire_lock ;;

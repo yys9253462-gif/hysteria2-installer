@@ -133,6 +133,33 @@ if awg_transaction_snapshot; then exit 1; fi
 ''')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_lock_is_required_when_flock_is_missing(self):
+        result = self.run_shell(r'''
+command() {
+    if [[ "$1" == -v && "$2" == flock ]]; then return 1; fi
+    builtin command "$@"
+}
+builtin() {
+    if [[ "$1" == command && "$2" == -v && "$3" == flock ]]; then return 1; fi
+    command "$@"
+}
+if acquire_lock; then exit 1; fi
+''')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_live_peer_apply_failures_are_reported(self):
+        result = self.run_shell(r'''
+service_active() { return 0; }
+cat > "$AWG_BIN" <<'STUB'
+#!/bin/sh
+exit 1
+STUB
+chmod +x "$AWG_BIN"
+if ! peer_apply_live_add pub psk 10.66.66.2; then exit 1; fi
+if ! peer_apply_live_del pub; then exit 1; fi
+''')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_transaction_exit_trap_restores_files_after_failure(self):
         result = self.run_shell(r'''
 STATE_ACTIVE=active
