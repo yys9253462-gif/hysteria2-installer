@@ -13451,8 +13451,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'error_label': '节点未安装 ping，无法测速',
                     'results': [],
                 })
-            # 18 个靶点 × 3 包，单个 ping 最坏 10 秒：并行后耗时约等于
-            # 最慢的单个靶点，但 30 秒死线仍可能不够（丢包重传多的线路）。
+            # 18 个靶点 × 10 包，单个 ping 约 11 秒、最坏 20 秒：8 路并行共 3 批，
+            # 约 35 秒、最坏 60 秒，30 秒死线不够。
             self._extend_deadline(120)
 
             # 并行探测（2026-10-25 修）。旧实现串行 ping 18 个靶点，
@@ -13499,9 +13499,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 解析会全面失效 —— 实测 zh_CN 下丢包率解析不到，
                 # de_DE 下连 avg 都解析不到（逗号当小数点），测速永远显示「未测得」。
                 # -n 则保证 host 不会被当成命令选项。
+                # 10 个包（2026-11-01 由 3 包改）：3 包时丢包率只有 0/33/67/100%
+                # 四档，丢一个包就跳 33%。10 包间隔 1 秒约 11 秒，超时给 20 秒。
                 proc = subprocess.run(
-                    ['ping', '-n', '-c', '3', '-W', '2', host],
-                    capture_output=True, text=True, timeout=10,
+                    ['ping', '-n', '-c', '10', '-W', '2', host],
+                    capture_output=True, text=True, timeout=20,
                     env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
             except Exception:
                 return None, None
