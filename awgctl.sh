@@ -38,6 +38,7 @@ AWG_META_FILE="${AWG_DIR}/awg_meta.json"
 AWG_PEERS_FILE="${AWG_DIR}/awg_peers.json"
 AWG_VERSION_FILE="${AWG_DIR}/binaries.VERSION"
 AWG_CTL_INSTALLED="/usr/local/bin/hy2-awgctl"
+AWG_TRANSACTION_DIR=""
 
 AWG_REPO="${AWG_REPO:-yys9253462-gif/hysteria2-installer}"
 AWG_RELEASE_TAG="${AWG_RELEASE_TAG:-awg-binaries}"
@@ -130,6 +131,126 @@ is_installed() {
 
 service_active() {
     systemctl is-active --quiet "$AWG_SERVICE_NAME" 2>/dev/null
+}
+
+awg_transaction_snapshot() {
+    local path index=0 state_file
+    AWG_TRANSACTION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hy2-awg-transaction.XXXXXX")" || return 1
+    chmod 700 "$AWG_TRANSACTION_DIR" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+    AWG_TRANSACTION_DIR_MODE=0
+    if [[ -d "$AWG_DIR" ]]; then
+        AWG_TRANSACTION_DIR_MODE="$(stat -c '%a' "$AWG_DIR" 2>/dev/null || stat -f '%Lp' "$AWG_DIR" 2>/dev/null || echo 755)"
+        : > "$AWG_TRANSACTION_DIR/original-dir.present" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+    else
+        : > "$AWG_TRANSACTION_DIR/original-dir.absent" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+    fi
+    for path in "$AWG_META_FILE" "$AWG_CONFIG" "$AWG_PEERS_FILE" "$AWG_SERVICE"; do
+        if [[ -e "$path" ]]; then
+            cp -a "$path" "$AWG_TRANSACTION_DIR/$index" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+            : > "$AWG_TRANSACTION_DIR/$index.present" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+        fi
+        index=$((index + 1))
+    done
+    index=4
+    for path in "$AWG_VERSION_FILE" "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
+        if [[ -e "$path" ]]; then
+            cp -a "$path" "$AWG_TRANSACTION_DIR/bin.$index" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+            : > "$AWG_TRANSACTION_DIR/bin.$index.present" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+        fi
+        index=$((index + 1))
+    done
+    state_file="$AWG_TRANSACTION_DIR/service-state"
+    if ! printf '%s\n%s\n' \
+        "$(systemctl is-active "$AWG_SERVICE_NAME" 2>/dev/null || true)" \
+        "$(systemctl is-enabled "$AWG_SERVICE_NAME" 2>/dev/null || true)" > "$state_file"; then
+        rm -rf "$AWG_TRANSACTION_DIR"
+        AWG_TRANSACTION_DIR=""
+        return 1
+    fi
+}
+
+awg_transaction_restore() {
+    local index=0 path state_file active enabled unit_dir
+    local -a paths=("$AWG_META_FILE" "$AWG_CONFIG" "$AWG_PEERS_FILE" "$AWG_SERVICE")
+    local -a binaries=("$AWG_VERSION_FILE" "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN")
+    [[ -n "${AWG_TRANSACTION_DIR:-}" && -d "$AWG_TRANSACTION_DIR" ]] || return 1
+    state_file="$AWG_TRANSACTION_DIR/service-state"
+    active="$(sed -n '1p' "$state_file")"
+    enabled="$(sed -n '2p' "$state_file")"
+    if [[ "$enabled" == "not-found" ]]; then
+        systemctl stop "$AWG_SERVICE_NAME" 2>/dev/null || true
+        systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null || true
+    fi
+    for path in "${paths[@]}"; do
+        if [[ -f "$AWG_TRANSACTION_DIR/$index.present" ]]; then
+            mkdir -p "$(dirname "$path")" || return 1
+            cp -a "$AWG_TRANSACTION_DIR/$index" "$path" || return 1
+        else
+            rm -f "$path" || return 1
+        fi
+        index=$((index + 1))
+    done
+    if [[ -f "$AWG_TRANSACTION_DIR/original-dir.present" ]]; then
+        mkdir -p "$AWG_DIR" || return 1
+        chmod "$AWG_TRANSACTION_DIR_MODE" "$AWG_DIR" || return 1
+    else
+        rmdir "$AWG_DIR" 2>/dev/null || true
+    fi
+    if [[ -f "$AWG_TRANSACTION_DIR/original-dir.absent" ]]; then
+        rmdir "$AWG_DIR" 2>/dev/null || true
+    fi
+    index=4
+    for path in "${binaries[@]}"; do
+        if [[ -f "$AWG_TRANSACTION_DIR/bin.$index.present" ]]; then
+            mkdir -p "$(dirname "$path")" || return 1
+            cp -a "$AWG_TRANSACTION_DIR/bin.$index" "$path" || return 1
+        else
+            rm -f "$path" || return 1
+        fi
+        index=$((index + 1))
+    done
+    unit_dir="$(dirname "$AWG_SERVICE")"
+    if [[ -d "$unit_dir" ]]; then
+        systemctl daemon-reload || return 1
+    fi
+    state_file="$AWG_TRANSACTION_DIR/service-state"
+    active="$(sed -n '1p' "$state_file")"
+    enabled="$(sed -n '2p' "$state_file")"
+    case "$enabled" in
+        enabled) systemctl enable "$AWG_SERVICE_NAME" || return 1 ;;
+        enabled-runtime) systemctl enable --runtime "$AWG_SERVICE_NAME" || return 1 ;;
+        disabled) systemctl disable "$AWG_SERVICE_NAME" || return 1 ;;
+        static|indirect|not-found|'') systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null || return 1 ;;
+        masked) systemctl mask "$AWG_SERVICE_NAME" || return 1 ;;
+        *) return 1 ;;
+    esac
+    if [[ "$enabled" != "not-found" ]]; then
+        case "$active" in
+            active) systemctl restart "$AWG_SERVICE_NAME" || return 1 ;;
+            inactive|failed) systemctl stop "$AWG_SERVICE_NAME" || return 1 ;;
+            '') ;;
+            *) return 1 ;;
+        esac
+    fi
+    rm -rf "$AWG_TRANSACTION_DIR"
+    AWG_TRANSACTION_DIR=""
+}
+
+awg_transaction_finish() {
+    if [[ -n "${AWG_TRANSACTION_DIR:-}" ]]; then
+        rm -rf "$AWG_TRANSACTION_DIR"
+        AWG_TRANSACTION_DIR=""
+    fi
+}
+
+awg_transaction_on_exit() {
+    local rc=$?
+    if [[ $rc -ne 0 && -n "${AWG_TRANSACTION_DIR:-}" ]]; then
+        if ! awg_transaction_restore; then
+            log_err "事务失败且原状态恢复不完整，请立即检查 ${AWG_DIR} 与 ${AWG_SERVICE_NAME}"
+        fi
+    fi
+    return "$rc"
 }
 
 # 协议线：2 = AWG 2.x，3 = AWG 3.x
@@ -924,10 +1045,11 @@ cmd_install() {
 
     log_step "安装 AmneziaWG（协议线 AWG ${line}.x，架构 ${arch}，UDP ${port}）"
 
-    # 失败时 download_binaries 已回滚旧二进制；不检查返回码会继续重启服务、
-    # 误报安装/更新成功（2026-10-29 修）。
-    download_binaries "$line" "$arch" || die "二进制安装失败，现有版本保持不变"
-    preflight_binaries || exit 1
+    # 二进制、meta、配置及服务共同构成一个安装事务。
+    awg_transaction_snapshot || die "无法为 AWG 安装创建回滚快照"
+    trap awg_transaction_on_exit EXIT
+    download_binaries "$line" "$arch"
+    preflight_binaries
 
     # 服务端密钥（已存在则保留，避免让全部客户端失效）
     local priv pub
@@ -983,7 +1105,7 @@ cmd_install() {
     fi
 
     write_service
-    systemctl enable "$AWG_SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl enable "$AWG_SERVICE_NAME" >/dev/null 2>&1
 
     # 接口已存在时先拆掉，避免 awg-quick 报 "already exists"
     if ip link show dev "$AWG_LINK" >/dev/null 2>&1; then
@@ -992,11 +1114,7 @@ cmd_install() {
     fi
 
     log_step "启动 AmneziaWG 服务..."
-    if ! systemctl restart "$AWG_SERVICE_NAME"; then
-        log_err "服务启动失败，最近日志："
-        journalctl -u "$AWG_SERVICE_NAME" -n 25 --no-pager >&2 || true
-        exit 1
-    fi
+    systemctl restart "$AWG_SERVICE_NAME"
     sleep 2
 
     if ! service_active; then
@@ -1008,6 +1126,10 @@ cmd_install() {
         || die "服务显示 active 但 ${AWG_LINK} 接口不存在，请检查 journalctl -u ${AWG_SERVICE_NAME}"
 
     allow_firewall "$port"
+
+    # 服务与端口已确认就绪，事务提交后首个客户端输出失败不再回滚服务器安装。
+    awg_transaction_finish
+    trap - EXIT
 
     # 首个客户端
     local ep
@@ -1028,6 +1150,8 @@ cmd_install() {
         fi
     fi
 
+    awg_transaction_finish
+    trap - EXIT
     log_info "AmneziaWG 安装完成。"
     log_info "别忘了在云厂商安全组放行 UDP ${port}。"
     echo ""
@@ -1180,10 +1304,10 @@ cmd_update() {
     local old_line
     old_line="$(version_line)"
 
-    # 失败时 download_binaries 已回滚旧二进制；不检查返回码会继续重启服务、
-    # 误报安装/更新成功（2026-10-29 修）。
-    download_binaries "$line" "$arch" || die "二进制安装失败，现有版本保持不变"
-    preflight_binaries || exit 1
+    awg_transaction_snapshot || die "无法为 AWG 更新创建回滚快照"
+    trap 'rc=$?; if [[ $rc -ne 0 && -n "${AWG_TRANSACTION_DIR:-}" ]]; then awg_transaction_restore || log_err "更新失败且 AWG 原状态恢复不完整，请立即检查 ${AWG_DIR}"; fi' EXIT
+    download_binaries "$line" "$arch"
+    preflight_binaries
     meta_set arch "$arch"
 
     if [[ "$old_line" != "$line" ]]; then
@@ -1221,9 +1345,15 @@ cmd_update() {
         render_server_config
     fi
 
-    systemctl restart "$AWG_SERVICE_NAME"
+    if ! systemctl restart "$AWG_SERVICE_NAME"; then
+        log_err "更新后服务重启失败，最近日志："
+        journalctl -u "$AWG_SERVICE_NAME" -n 25 --no-pager >&2 || true
+        exit 1
+    fi
     sleep 2
     if service_active; then
+        awg_transaction_finish
+        trap - EXIT
         log_info "更新完成，服务运行正常。"
     else
         log_err "更新后服务启动失败："
