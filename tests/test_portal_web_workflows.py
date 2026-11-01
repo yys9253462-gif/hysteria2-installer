@@ -406,7 +406,8 @@ class WebWorkflowTests(unittest.TestCase):
             systemd_state=lambda _: 'inactive', suspended=lambda _: False)
         self.assertTrue(result)
         self.assertEqual(calls, [['systemctl', 'reset-failed', 'xray'],
-                                 ['systemctl', 'restart', 'xray']])
+                                 ['systemctl', 'restart', 'xray'],
+                                 ['systemctl', 'enable', 'xray']])
 
     def test_xray_startup_does_not_restart_suspended_service(self):
         config = {'inbounds': [{'tag': portal.VMESS_INBOUND_TAG,
@@ -441,7 +442,34 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text(encoding='utf-8')), original)
         self.assertEqual(self.data['vmess_config']['port'], 2087)
 
-    def test_vmess_enable_save_failure_keeps_previously_stopped_xray_off(self):
+    def test_vmess_enable_restores_portal_state_when_xray_rollback_restart_fails(self):
+        self.ns['Path'] = lambda value: (self.hdir / 'xray.json' if str(value) == '/etc/hysteria/xray.json'
+                                        else self.root / 'usr/local/bin/xray' if str(value) == '/usr/local/bin/xray'
+                                        else Path(value))
+        self.ns['Path']('/usr/local/bin/xray').touch()
+        self.ns['Path']('/etc/hysteria/xray.json').write_text(
+            json.dumps({'inbounds': [], 'outbounds': [{'protocol': 'freedom'}]}), encoding='utf-8')
+        self.ns['read_meta_file'] = lambda _: {'server_name': 'node.example.com', 'public_ip': '203.0.113.10'}
+        self.ns['_is_dns_name'] = lambda _: True
+        self.handler._vmess_certificate = lambda *a: ('cert.pem', 'key.pem', 'node.example.com')
+        self.handler._vmess_ws_path = lambda: '/fixture'
+        self.ns['managed_reserved_ports'] = lambda *a, **kw: set()
+        self.ns['_pick_reality_port'] = lambda **kw: (2087, '')
+        self.ns['vmess_clients'] = lambda _: [{'id': 'fixture', 'email': 'placeholder'}]
+        self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
+        self.ns['core_operation_lock'] = threading.RLock()
+        self.ns['_systemd_state'] = lambda _: 'active'
+        self.ns['apply_xray_config_with_meter'] = Mock(side_effect=lambda cfg, target, *_:
+            target.write_text(json.dumps(cfg), encoding='utf-8'))
+        self.ns['apply_xray_config_transaction'] = Mock(side_effect=RuntimeError('rollback restart failed'))
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        before = copy.deepcopy(self.data)
+        with self.assertRaisesRegex(RuntimeError, 'rollback restart failed'):
+            extract_method('_apply_vmess_enable', self.ns)(self.handler)
+        self.assertNotIn('vmess_config', self.data)
+        self.assertEqual(self.data['users'], before['users'])
+
+    def test_vmess_enable_keeps_previously_stopped_xray_off(self):
         self.ns['Path'] = lambda value: (self.hdir / 'xray.json' if str(value) == '/etc/hysteria/xray.json'
                                         else self.root / 'usr/local/bin/xray' if str(value) == '/usr/local/bin/xray'
                                         else Path(value))
@@ -1080,8 +1108,9 @@ class WebWorkflowTests(unittest.TestCase):
             run=lambda args, **kw: calls.append(args) or SimpleNamespace(returncode=0),
             systemd_state=lambda _: 'inactive', suspended=lambda _: False)
         self.assertTrue(restarted)
-        self.assertEqual(calls[-2:], [['systemctl', 'reset-failed', 'xray'],
-                                      ['systemctl', 'restart', 'xray']])
+        self.assertEqual(calls, [['systemctl', 'reset-failed', 'xray'],
+                                 ['systemctl', 'restart', 'xray'],
+                                 ['systemctl', 'enable', 'xray']])
         calls.clear()
         self.assertFalse(portal.recover_xray_service_on_start(
             data, path, run=lambda args, **kw: calls.append(args),

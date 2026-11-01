@@ -11,6 +11,7 @@ import ast
 import copy
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -34,12 +35,29 @@ def nested_function(name):
     return next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef) and n.name == name)
 
 
+def extract_shell_function(name):
+    source = (ROOT / 'awgctl.sh').read_text(encoding='utf-8')
+    start = source.index(name + '() {')
+    brace = source.index('{', start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == '{':
+            depth += 1
+        elif source[index] == '}':
+            depth -= 1
+            if depth == 0:
+                return source[start:index + 1]
+    raise AssertionError('unbalanced shell function: ' + name)
+
+
 class SuspensionResumeTest(unittest.TestCase):
-    def build(self, data, failing=()):
+    def build(self, data, failing=(), raising=None):
         calls = []
 
         def run(cmd, **kwargs):
             calls.append(cmd)
+            if raising == tuple(cmd):
+                raise subprocess.TimeoutExpired(cmd, 20)
             ok = not (cmd[1] == 'start' and cmd[2] in failing)
             return SimpleNamespace(returncode=0 if ok else 1, stdout='active\n')
         env = {'data': data, 'data_lock': threading.RLock(), 'save_data': mock.Mock(),
@@ -87,6 +105,24 @@ class SuspensionResumeTest(unittest.TestCase):
         self.assertTrue(state['suspended'])
         self.assertIn('amneziawg-server', state['units'])
         self.assertIn(['systemctl', 'stop', 'amneziawg-server'], calls)
+
+    def test_suspend_timeout_is_recorded_and_later_units_are_still_stopped(self):
+        data = {}
+        suspend, calls = self.build(data, raising=('systemctl', 'stop', 'xray'))
+        state, results = suspend(True)
+        self.assertTrue(state['suspended'])
+        self.assertIn('xray', state['units'])
+        self.assertFalse(results['xray'])
+        self.assertIn(['systemctl', 'stop', 'gost'], calls)
+
+    def test_resume_timeout_keeps_failed_unit_retryable(self):
+        data = {'traffic_suspend': {'suspended': True, 'units': ['hysteria-server', 'xray'], 'since': 1}}
+        resume, calls = self.build(data, raising=('systemctl', 'start', 'xray'))
+        state, results = resume(False)
+        self.assertTrue(state['suspended'])
+        self.assertEqual(state['units'], ['xray'])
+        self.assertFalse(results['xray'])
+        self.assertIn(['systemctl', 'start', 'hysteria-server'], calls)
 
 
 class RevocationWhileSuspendedTest(unittest.TestCase):
@@ -207,6 +243,70 @@ class AwgctlLockTest(unittest.TestCase):
                   'flock(){ command flock -w 1 "${@:3}"; }; acquire_lock' % (ROOT / 'awgctl.sh', lock))
         result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
+
+
+@unittest.skipIf(shutil.which('bash') is None, 'requires Bash')
+class AwgctlUninstallSafetyTests(unittest.TestCase):
+    def run_uninstall(self, stop_succeeds, active='active', enabled='enabled'):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bin_dir = root / 'bin'
+            bin_dir.mkdir()
+            calls = root / 'calls.log'
+            for path in (root / 'etc/amnezia/amneziawg', root / 'usr/local/bin'):
+                path.mkdir(parents=True, exist_ok=True)
+            (root / 'etc/amnezia/amneziawg/awg0.conf').write_text('client data')
+            (root / 'etc/systemd/system/amneziawg-server.service').parent.mkdir(parents=True)
+            (root / 'etc/systemd/system/amneziawg-server.service').write_text('unit')
+            (root / 'usr/local/bin/amneziawg-go').write_text('binary')
+            script = """
+set -euo pipefail
+AWG_DIR="$TEST_ROOT/etc/amnezia/amneziawg"
+AWG_LINK=awg0
+AWG_CONFIG="$AWG_DIR/awg0.conf"
+AWG_GO_BIN="$TEST_ROOT/usr/local/bin/amneziawg-go"
+AWG_BIN="$TEST_ROOT/usr/local/bin/awg"
+AWG_QUICK_BIN="$TEST_ROOT/usr/local/bin/awg-quick"
+AWG_SERVICE_NAME=amneziawg-server
+AWG_SERVICE="$TEST_ROOT/etc/systemd/system/amneziawg-server.service"
+AWG_CTL_INSTALLED="$TEST_ROOT/usr/local/bin/hy2-awgctl"
+require_root(){ :; }
+die(){ printf '%s\\n' "$*" >&2; exit 1; }
+log_step(){ :; }; log_info(){ :; }; log_warn(){ :; }; log_err(){ :; }
+SYSTEMCTL_STOP_RC="$STOP_RC"; SYSTEMCTL_ACTIVE="$ACTIVE_STATE"; SYSTEMCTL_ENABLED="$ENABLED_STATE"
+systemctl(){
+  printf '%s\\n' "$*" >> "$TEST_ROOT/calls.log"
+  case "$*" in
+    'stop amneziawg-server') return "$SYSTEMCTL_STOP_RC" ;;
+    'is-active --quiet amneziawg-server') [[ "$SYSTEMCTL_ACTIVE" == active ]]; return $? ;;
+    'is-active amneziawg-server') printf '%s\\n' "$SYSTEMCTL_ACTIVE"; return 0 ;;
+    'is-enabled amneziawg-server') printf '%s\\n' "$SYSTEMCTL_ENABLED"; return 0 ;;
+    *) return 0 ;;
+  esac
+}
+""" + extract_shell_function('cmd_uninstall') + "\ncmd_uninstall --keep-binaries\n"
+            runner = root / 'run.sh'
+            runner.write_text(script, encoding='utf-8')
+            env = dict(os.environ, TEST_ROOT=str(root), STOP_RC='0' if stop_succeeds else '1',
+                       ACTIVE_STATE=active, ENABLED_STATE=enabled)
+            result = subprocess.run([shutil.which('bash'), str(runner)], capture_output=True,
+                                    text=True, encoding='utf-8', errors='replace', env=env)
+            assets = {name: (root / name).exists() for name in (
+                'etc/amnezia/amneziawg/awg0.conf',
+                'etc/systemd/system/amneziawg-server.service',
+                'usr/local/bin/amneziawg-go')}
+            return result, assets
+
+    def test_stop_failure_keeps_all_awg_assets(self):
+        result, assets = self.run_uninstall(False)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(all(assets.values()), result.stdout + result.stderr)
+
+    def test_confirmed_stop_allows_uninstall(self):
+        result, assets = self.run_uninstall(True, active='inactive')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(assets['etc/amnezia/amneziawg/awg0.conf'])
+        self.assertFalse(assets['etc/systemd/system/amneziawg-server.service'])
 
 
 class AwgctlLockWiringTest(unittest.TestCase):

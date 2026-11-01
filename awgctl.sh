@@ -1004,8 +1004,22 @@ cmd_uninstall() {
     require_root
 
     log_step "停止并移除 AmneziaWG 服务..."
-    systemctl stop "$AWG_SERVICE_NAME" 2>/dev/null || true
-    systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null || true
+    local was_active=0 was_enabled=0 state enabled_state
+    systemctl is-active --quiet "$AWG_SERVICE_NAME" 2>/dev/null && was_active=1 || true
+    enabled_state="$(systemctl is-enabled "$AWG_SERVICE_NAME" 2>/dev/null || true)"
+    [[ "$enabled_state" == enabled ]] && was_enabled=1
+    if ! systemctl stop "$AWG_SERVICE_NAME" 2>/dev/null; then
+        die "无法停止 ${AWG_SERVICE_NAME}，保留服务单元、二进制和客户端配置。"
+    fi
+    state="$(systemctl is-active "$AWG_SERVICE_NAME" 2>/dev/null || true)"
+    if [[ "$state" != inactive && "$state" != failed ]]; then
+        die "无法确认 ${AWG_SERVICE_NAME} 已停止（state=${state:-unknown}），保留全部资产。"
+    fi
+    if ! systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null; then
+        if [[ "$was_enabled" == 1 ]]; then systemctl enable "$AWG_SERVICE_NAME" >/dev/null 2>&1 || true; fi
+        if [[ "$was_active" == 1 ]]; then systemctl start "$AWG_SERVICE_NAME" >/dev/null 2>&1 || true; fi
+        die "无法禁用 ${AWG_SERVICE_NAME}，服务已按原状态恢复且未删除资产。"
+    fi
 
     # awg-quick down 会执行 PostDown，顺带清掉 FORWARD 与 MASQUERADE 规则
     if command -v ip >/dev/null 2>&1 && ip link show dev "$AWG_LINK" >/dev/null 2>&1; then

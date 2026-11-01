@@ -1814,7 +1814,8 @@ def _unit_failure_hint(unit, lines=6):
 
 
 def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
-                                  binary='/usr/local/bin/xray', restart=True):
+                                  binary='/usr/local/bin/xray', restart=True,
+                                  enable=True):
     """Validate a candidate before replacing; restore prior config on start failure."""
     path = Path(config_path)
     original = path.read_bytes() if path.exists() else None
@@ -1848,9 +1849,16 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                     text=True, timeout=5).stdout.strip()
             if started.returncode != 0 or active != 'active':
                 raise RuntimeError('Xray 启动失败，已恢复原配置' + _unit_failure_hint('xray'))
-            # 核心管理页单独安装 Xray 时只写单元不 enable；第一次真正有配置跑起来
-            # 才设开机自启（幂等）。
-            subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
+            # Existing installations may already be intentionally disabled. Callers
+            # that enable a protocol in a user request may enable Xray; startup
+            # reconciliation preserves the service's original enable state.
+            if enable:
+                enabled = subprocess.run(['systemctl', 'enable', 'xray'],
+                                         capture_output=True, text=True, timeout=15)
+                if enabled.returncode != 0:
+                    raise RuntimeError('Xray 自启动设置失败: %s' %
+                                       ((enabled.stderr or '').strip()[-240:] or
+                                        'systemctl enable exited with %d' % enabled.returncode))
     except Exception:
         if replaced:
             if original is None:
@@ -7171,6 +7179,8 @@ def recover_xray_service_on_start(data, config_path='/etc/hysteria/xray.json', r
     if (mismatch or service_stopped) and not suspended('xray'):
         run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
         run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
+        if mismatch:
+            run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
         return True
     return False
 
@@ -7523,15 +7533,24 @@ def serve(path):
                     if _u not in units and _unit_active(_u):
                         units.append(_u)
             for u in units:
-                r = subprocess.run(['systemctl', 'stop', u], capture_output=True, timeout=20)
-                results[u] = r.returncode == 0
-            new_state = {'suspended': True, 'units': units,
+                try:
+                    r = subprocess.run(['systemctl', 'stop', u], capture_output=True, timeout=20)
+                    results[u] = r.returncode == 0
+                except Exception:
+                    results[u] = False
+            # Keep every service selected for suspension so a later resume can
+            # start the ones that stopped successfully; failed stops are still
+            # reported separately in results for the controller to retry.
+            new_state = {'suspended': True, 'units': list(units),
                          'since': state.get('since') or int(time.time())}
         else:
             for u in state.get('units') or []:
-                subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
-                r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
-                results[u] = r.returncode == 0
+                try:
+                    subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
+                    r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
+                    results[u] = r.returncode == 0
+                except Exception:
+                    results[u] = False
             # 没启动成功的服务必须留在停用记录里：原来一律清空，控制台下一轮重试
             # 时已无服务可启、直接回成功，该服务就一直停着而控制台以为已恢复。
             remaining = [u for u, ok in results.items() if not ok]
@@ -10890,7 +10909,8 @@ if __name__ == '__main__':
                         else:
                             apply_xray_config_transaction(
                                 original_config, config_path=str(xray_path),
-                                binary='/usr/local/bin/xray', restart=was_active and not unit_suspended('xray'))
+                                binary='/usr/local/bin/xray', restart=was_active and not unit_suspended('xray'),
+                                enable=False)
                 finally:
                     with data_lock:
                         if old_state is None:
@@ -10996,7 +11016,8 @@ if __name__ == '__main__':
                         else:
                             apply_xray_config_transaction(
                                 original_config, config_path=str(xray_path),
-                                binary='/usr/local/bin/xray', restart=was_active and not unit_suspended('xray'))
+                                binary='/usr/local/bin/xray', restart=was_active and not unit_suspended('xray'),
+                                enable=False)
                 finally:
                     with data_lock:
                         if old_state is None:
