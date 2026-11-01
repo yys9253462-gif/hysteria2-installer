@@ -5765,6 +5765,71 @@ def _service_stop_confirmed(result, state):
     return result.returncode == 0 and state in ('inactive', 'failed')
 
 
+def _systemd_service_snapshot(unit):
+    """Capture active and boot-enable states independently for rollback."""
+    try:
+        active = subprocess.run(['systemctl', 'is-active', unit], capture_output=True,
+                                text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        active = ''
+    try:
+        enabled = subprocess.run(['systemctl', 'is-enabled', unit], capture_output=True,
+                                 text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        enabled = ''
+    return {'active': active, 'enabled': enabled}
+
+
+def _restore_systemd_service_state(unit, snapshot):
+    """Restore and verify the active and enabled states from a snapshot."""
+    active = snapshot.get('active')
+    enabled = snapshot.get('enabled')
+    if active not in ('active', 'inactive', 'failed') or enabled not in (
+            'enabled', 'disabled', 'static', 'indirect', 'not-found'):
+        return False
+    try:
+        results = []
+        if enabled in ('enabled', 'disabled'):
+            results.append(subprocess.run(
+                ['systemctl', 'enable' if enabled == 'enabled' else 'disable', unit],
+                capture_output=True, timeout=30))
+        if enabled != 'not-found':
+            results.append(subprocess.run(
+                ['systemctl', 'start' if active == 'active' else 'stop', unit],
+                capture_output=True, timeout=30))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if any(result.returncode != 0 for result in results):
+        return False
+    restored = _systemd_service_snapshot(unit)
+    active_ok = (restored['active'] == ('active' if active == 'active' else 'inactive')
+                 if enabled != 'not-found' else restored['active'] in ('', 'inactive'))
+    return active_ok and restored['enabled'] == enabled
+
+
+def _restore_systemd_unit_file(path, original, mode=0o644):
+    """Restore a unit file atomically, or remove it when it was newly created."""
+    path = Path(path)
+    if original is None:
+        path.unlink(missing_ok=True)
+        return
+    fd, temp_name = tempfile.mkstemp(prefix='.' + path.name + '.rollback.', dir=str(path.parent))
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'wb') as stream:
+            fd = None
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def _nft_input_chain():
     """找到 nftables 里 hook input 且 policy drop 的链，返回 (family, table, chain)。
 
@@ -8685,7 +8750,8 @@ if __name__ == '__main__':
             with reality_apply_lock:
                 previous_xray_bytes = xray_path.read_bytes() if xray_path.exists() else None
                 previous_xray = json.loads(previous_xray_bytes) if previous_xray_bytes is not None else None
-                previous_service_active = _systemd_state('xray') == 'active'
+                previous_service_state = _systemd_service_snapshot('xray')
+                previous_service_active = previous_service_state['active'] == 'active'
                 if xray_path.exists():
                     # 只按 tag 替换 Reality 自己那一条；VMess 入站、统计 api 入站、
                     # routing、outbounds 一律原样保留。旧版无 tag 的 Reality 由
@@ -8727,13 +8793,12 @@ if __name__ == '__main__':
                         data['reality_config'] = previous_cfg
                     if previous_xray is None:
                         xray_path.unlink(missing_ok=True)
-                        if not previous_service_active:
-                            subprocess.run(['systemctl', 'disable', '--now', 'xray'],
-                                           capture_output=True, timeout=20)
                     else:
                         apply_xray_config_transaction(
                             previous_xray, config_path=str(xray_path),
-                            binary='/usr/local/bin/xray', restart=previous_service_active)
+                            binary='/usr/local/bin/xray', restart=False, enable=False)
+                    if not _restore_systemd_service_state('xray', previous_service_state):
+                        raise RuntimeError('Reality 保存失败，且 Xray 原服务状态未能完整恢复')
                     raise
             if old_port and old_port != new_rcfg.get('port'):
                 close_protocol_port(old_port, 'tcp', 'reality_config')
@@ -11405,15 +11470,19 @@ if __name__ == '__main__':
                 preview['anytls_config'] = new_cfg
                 users = anytls_users(preview)
             unit_path = Path('/etc/systemd/system/%s.service' % ANYTLS_SERVICE)
-            if not unit_path.exists() or unit_path.read_text(encoding='utf-8') != ANYTLS_UNIT_CONTENT:
-                unit_path.write_text(ANYTLS_UNIT_CONTENT, encoding='utf-8')
-                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
             with anytls_apply_lock:
+                previous_unit = unit_path.read_bytes() if unit_path.exists() else None
+                unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
+                unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
                 previous_cfg = copy.deepcopy(config_section(data, 'anytls_config'))
                 cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
                 previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
-                was_enabled = _systemd_state(ANYTLS_SERVICE) == 'active'
+                service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                 try:
+                    if previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8'):
+                        unit_path.write_text(ANYTLS_UNIT_CONTENT, encoding='utf-8')
+                        unit_changed = True
+                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30, check=True)
                     apply_anytls_config(build_anytls_config(new_cfg, users, cert_file, key_file),
                                         cfg_path, restart=True)
                     subprocess.run(['systemctl', 'enable', ANYTLS_SERVICE],
@@ -11435,12 +11504,12 @@ if __name__ == '__main__':
                         cfg_path.unlink(missing_ok=True)
                     else:
                         cfg_path.write_bytes(previous_file)
-                    if was_enabled:
-                        subprocess.run(['systemctl', 'restart', ANYTLS_SERVICE],
-                                       capture_output=True, timeout=15)
-                    else:
-                        subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
-                                       capture_output=True, timeout=30)
+                    if unit_changed:
+                        _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
+                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
+                                       timeout=30, check=True)
+                    if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                        raise RuntimeError('AnyTLS 启用失败，且原服务状态未能完整恢复')
                     raise
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
             # 包含新协议，否则要手动刷新页面才看得到（2026-10-29 修）。
@@ -11479,6 +11548,7 @@ if __name__ == '__main__':
                 with anytls_apply_lock:
                     cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
+                    service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                     stop_result = subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
                                                   capture_output=True, timeout=30)
                     # 命令失败或状态查询无结果时无法证明旧进程退出；保留配置，
@@ -11505,10 +11575,8 @@ if __name__ == '__main__':
                         data['anytls_config'] = old_acfg
                     if previous_file is not None:
                         cfg_path.write_bytes(previous_file)
-                    subprocess.run(['systemctl', 'enable', ANYTLS_SERVICE],
-                                   capture_output=True, timeout=30)
-                    subprocess.run(['systemctl', 'start', ANYTLS_SERVICE],
-                                   capture_output=True, timeout=30)
+                    if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                        raise RuntimeError('AnyTLS 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
@@ -11592,12 +11660,15 @@ if __name__ == '__main__':
                     users = tuic_users(data)
                 try:
                     unit_path = Path('/etc/systemd/system/%s.service' % TUIC_SERVICE)
-                    if not unit_path.exists() or unit_path.read_text(encoding='utf-8') != TUIC_UNIT_CONTENT:
-                        unit_path.write_text(TUIC_UNIT_CONTENT, encoding='utf-8')
-                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    previous_unit = unit_path.read_bytes() if unit_path.exists() else None
+                    unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
+                    unit_changed = previous_unit != TUIC_UNIT_CONTENT.encode('utf-8')
                     cfg_path = portal_path.parent / TUIC_CONFIG_NAME
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
-                    was_enabled = _systemd_state(TUIC_SERVICE) == 'active'
+                    service_state = _systemd_service_snapshot(TUIC_SERVICE)
+                    if unit_changed:
+                        unit_path.write_text(TUIC_UNIT_CONTENT, encoding='utf-8')
+                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30, check=True)
                     apply_anytls_config(build_tuic_config(new_cfg, users, cert_file, key_file),
                                         cfg_path, restart=True, service=TUIC_SERVICE)
                     subprocess.run(['systemctl', 'enable', TUIC_SERVICE],
@@ -11615,12 +11686,12 @@ if __name__ == '__main__':
                             cfg_path.unlink(missing_ok=True)
                         else:
                             cfg_path.write_bytes(previous_file)
-                        if was_enabled:
-                            subprocess.run(['systemctl', 'restart', TUIC_SERVICE],
-                                           capture_output=True, timeout=15)
-                        else:
-                            subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
-                                           capture_output=True, timeout=30)
+                        if unit_changed:
+                            _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
+                            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
+                                           timeout=30, check=True)
+                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                            raise RuntimeError('TUIC 启用失败，且原服务状态未能完整恢复')
                     raise
             regenerate_page()
             if not firewall_port(listen_port, 'udp', open_=True):
@@ -11657,6 +11728,7 @@ if __name__ == '__main__':
                 with tuic_apply_lock:
                     cfg_path = portal_path.parent / TUIC_CONFIG_NAME
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
+                    service_state = _systemd_service_snapshot(TUIC_SERVICE)
                     stop_result = subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
                                                   capture_output=True, timeout=30)
                     # 只有明确确认服务停止后才能删配置与汇报成功；命令失败或
@@ -11686,10 +11758,8 @@ if __name__ == '__main__':
                         cfg_path.unlink(missing_ok=True)
                     else:
                         cfg_path.write_bytes(previous_file)
-                    subprocess.run(['systemctl', 'enable', TUIC_SERVICE],
-                                   capture_output=True, timeout=30)
-                    subprocess.run(['systemctl', 'start', TUIC_SERVICE],
-                                   capture_output=True, timeout=30)
+                    if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                        raise RuntimeError('TUIC 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 regenerate_page()
                 if closed_port and not close_protocol_port(closed_port, 'udp', 'tuic_config'):

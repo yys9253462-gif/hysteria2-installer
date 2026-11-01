@@ -531,13 +531,124 @@ class WebWorkflowTests(unittest.TestCase):
         self.ns['config_section'] = lambda data, key: data.get(key, {})
         self.ns['_systemd_state'] = lambda _: 'inactive'
         self.ns['_service_stop_confirmed'] = lambda result, state: True
+        self.ns['_systemd_service_snapshot'] = lambda _: {'active': 'active', 'enabled': 'disabled'}
+        self.ns['_restore_systemd_service_state'] = Mock(return_value=True)
         self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
         self.run.reset_mock()
         status, body = self.invoke('_h_post_manage_tuic', {'action': 'disable'})
         self.assertEqual(status, 500, body)
         self.assertEqual(self.data['tuic_config'], old_state)
         self.assertEqual(config_path.read_bytes(), old_file)
-        self.assertIn(['systemctl', 'start', 'hy2-tuic'], [c.args[0] for c in self.run.call_args_list])
+        self.ns['_restore_systemd_service_state'].assert_called_once_with(
+            'hy2-tuic', {'active': 'active', 'enabled': 'disabled'})
+        self.assertNotIn(['systemctl', 'enable', 'hy2-tuic'], [c.args[0] for c in self.run.call_args_list])
+
+    def test_anytls_disable_save_failure_restores_disabled_boot_state(self):
+        config_path = self.hdir / portal.ANYTLS_CONFIG_NAME
+        original_file = b'{"inbounds":[{"type":"anytls"}]}'
+        config_path.write_bytes(original_file)
+        original_cfg = {'enabled': True, 'port': 2096, 'secret': 'fixture'}
+        self.data['anytls_config'] = copy.deepcopy(original_cfg)
+        self.ns.update({
+            'ANYTLS_CONFIG_NAME': portal.ANYTLS_CONFIG_NAME,
+            'ANYTLS_SERVICE': 'hy2-anytls',
+            'anytls_apply_lock': threading.RLock(),
+            '_active_anytls_config': lambda: self.data.get('anytls_config'),
+            '_systemd_state': lambda _: 'inactive',
+            '_systemd_service_snapshot': lambda _: {'active': 'active', 'enabled': 'disabled'},
+            '_restore_systemd_service_state': Mock(return_value=True),
+            '_service_stop_confirmed': lambda result, state: True,
+            'config_section': lambda data, key: data.get(key, {}),
+            'save_data': Mock(side_effect=OSError('disk full')),
+        })
+        status, body = self.invoke('_h_post_manage_anytls', {'action': 'disable'})
+        self.assertEqual(status, 500, body)
+        self.assertEqual(self.data['anytls_config'], original_cfg)
+        self.assertEqual(config_path.read_bytes(), original_file)
+        self.ns['_restore_systemd_service_state'].assert_called_once_with(
+            'hy2-anytls', {'active': 'active', 'enabled': 'disabled'})
+
+    def test_anytls_enable_failure_restores_new_or_existing_unit(self):
+        for old_unit in (None, b'custom previous unit'):
+            with self.subTest(old_unit=old_unit):
+                unit_path = self.root / 'etc/systemd/system/hy2-anytls.service'
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_path.unlink(missing_ok=True)
+                if old_unit is not None:
+                    unit_path.write_bytes(old_unit)
+                original_cfg = {'enabled': False, 'port': 2096, 'secret': 'fixture'}
+                self.data['anytls_config'] = copy.deepcopy(original_cfg)
+                self.ns.update({
+                    'ANYTLS_SERVICE': 'hy2-anytls',
+                    'ANYTLS_CONFIG_NAME': portal.ANYTLS_CONFIG_NAME,
+                    'ANYTLS_UNIT_CONTENT': portal.ANYTLS_UNIT_CONTENT,
+                    'anytls_apply_lock': threading.RLock(),
+                    'read_meta_file': lambda _: {'server_name': 'node.example.com'},
+                    '_is_dns_name': lambda _: True,
+                    '_singbox_version': lambda: portal.ANYTLS_MIN_SINGBOX,
+                    'managed_reserved_ports': lambda *a, **kw: set(),
+                    '_pick_reality_port': lambda **kw: (2096, ''),
+                    'anytls_users': lambda _: [],
+                    'build_anytls_config': lambda *a: {},
+                    'apply_anytls_config': Mock(),
+                    '_systemd_service_snapshot': lambda _: {'active': 'inactive', 'enabled': 'disabled'},
+                    '_restore_systemd_service_state': Mock(return_value=True),
+                    'save_data': Mock(side_effect=OSError('disk full')),
+                    'config_section': lambda data, key: data.get(key, {}),
+                })
+                self.handler._vmess_certificate = lambda *a: ('cert.pem', 'key.pem', 'node.example.com')
+                commands = []
+                def run(args, **kwargs):
+                    commands.append(args)
+                    if args[:2] == ['systemctl', 'enable']:
+                        return SimpleNamespace(returncode=0)
+                    return SimpleNamespace(returncode=0)
+                self.ns['subprocess'].run = run
+                with patch.object(portal.subprocess, 'run', side_effect=run):
+                    with self.assertRaisesRegex(OSError, 'disk full'):
+                        extract_method('_apply_anytls_enable', self.ns)(self.handler)
+                self.assertEqual(self.data['anytls_config'], original_cfg)
+                self.assertEqual(unit_path.read_bytes() if old_unit is not None else None, old_unit)
+                self.assertIn(['systemctl', 'daemon-reload'], commands)
+
+    def test_tuic_enable_failure_restores_new_or_existing_unit(self):
+        for old_unit in (None, b'custom previous unit'):
+            with self.subTest(old_unit=old_unit):
+                unit_path = self.root / 'etc/systemd/system/hy2-tuic.service'
+                unit_path.parent.mkdir(parents=True, exist_ok=True)
+                unit_path.unlink(missing_ok=True)
+                if old_unit is not None:
+                    unit_path.write_bytes(old_unit)
+                old_cfg = {'enabled': False, 'port': 41000, 'secret': 'fixture'}
+                self.data['tuic_config'] = copy.deepcopy(old_cfg)
+                self.ns.update({
+                    'TUIC_SERVICE': 'hy2-tuic', 'TUIC_CONFIG_NAME': portal.TUIC_CONFIG_NAME,
+                    'TUIC_UNIT_CONTENT': portal.TUIC_UNIT_CONTENT,
+                    'tuic_apply_lock': threading.RLock(),
+                    'read_meta_file': lambda _: {'server_name': 'node.example.com', 'listen_port': 443},
+                    '_is_dns_name': lambda _: True,
+                    '_singbox_version': lambda: portal.ANYTLS_MIN_SINGBOX,
+                    'pick_tuic_port': lambda *a, **kw: 41001,
+                    'tuic_users': lambda _: [], 'build_tuic_config': lambda *a: {},
+                    'apply_anytls_config': Mock(),
+                    '_systemd_state': lambda _: 'inactive',
+                    '_systemd_service_snapshot': lambda _: {'active': 'inactive', 'enabled': 'disabled'},
+                    '_restore_systemd_service_state': Mock(return_value=True),
+                    'save_data': Mock(side_effect=OSError('disk full')),
+                    'config_section': lambda data, key: data.get(key, {}),
+                })
+                self.handler._vmess_certificate = lambda *a: ('cert.pem', 'key.pem', 'node.example.com')
+                commands = []
+                def run(args, **kwargs):
+                    commands.append(args)
+                    return SimpleNamespace(returncode=0)
+                self.ns['subprocess'].run = run
+                with patch.object(portal.subprocess, 'run', side_effect=run):
+                    with self.assertRaisesRegex(OSError, 'disk full'):
+                        extract_method('_apply_tuic_enable', self.ns)(self.handler)
+                self.assertEqual(self.data['tuic_config'], old_cfg)
+                self.assertEqual(unit_path.read_bytes() if old_unit is not None else None, old_unit)
+                self.assertIn(['systemctl', 'daemon-reload'], commands)
 
     def test_warp_save_failure_restores_memory_and_skips_apply(self):
         original = {'warp_enabled': False, 'warp_rules': [{'domain': 'example.com',
@@ -1116,6 +1227,50 @@ class WebWorkflowTests(unittest.TestCase):
             status, body = self.invoke('_h_post_manage_reality', {'action': 'toggle'})
         self.assertEqual(status, 200, body)
         self.assertIn(((8443, 'tcp'), {'open_': False, 'exclude_key': 'reality_config'}), calls)
+
+    def test_reality_save_failure_restores_xray_config_and_service_states(self):
+        xray_path = self.hdir / 'xray.json'
+        original = {'inbounds': [{'tag': 'managed-old'}], 'outbounds': [{'protocol': 'freedom'}]}
+        xray_path.write_text(json.dumps(original), encoding='utf-8')
+        old_reality = copy.deepcopy(self.data['reality_config'])
+        service = {'active': 'inactive', 'enabled': 'disabled'}
+        commands = []
+
+        def run(args, **kwargs):
+            commands.append(args)
+            if args[:2] == ['systemctl', 'is-active']:
+                return SimpleNamespace(returncode=0, stdout=service['active'])
+            if args[:2] == ['systemctl', 'is-enabled']:
+                return SimpleNamespace(returncode=0, stdout=service['enabled'])
+            if args[:2] == ['systemctl', 'enable']:
+                service['enabled'] = 'enabled'
+            elif args[:2] == ['systemctl', 'disable']:
+                service['enabled'] = 'disabled'
+            elif args[:2] == ['systemctl', 'start']:
+                service['active'] = 'active'
+            elif args[:2] == ['systemctl', 'stop'] or args[:3] == ['systemctl', 'disable', '--now']:
+                service['active'] = 'inactive'
+            return SimpleNamespace(returncode=0, stdout='')
+
+        self.ns['Path'] = lambda value: xray_path if str(value) == '/etc/hysteria/xray.json' else Path(value)
+        self.ns['managed_reserved_ports'] = lambda *a, **kw: set()
+        self.ns['_pick_reality_port'] = lambda **kw: (8443, '')
+        self.ns['add_private_network_guard'] = lambda cfg: cfg
+        self.ns['_systemd_service_snapshot'] = portal._systemd_service_snapshot
+        self.ns['_restore_systemd_service_state'] = portal._restore_systemd_service_state
+        self.ns['apply_xray_config_transaction'] = Mock(side_effect=lambda cfg, **kw:
+            (xray_path.write_text(json.dumps(cfg), encoding='utf-8'),
+             service.update(active='active', enabled='enabled')))
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        self.ns['subprocess'].run = run
+        with patch.object(portal.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(OSError, 'disk full'):
+                extract_method('_generate_and_apply_reality', self.ns)(self.handler)
+        self.assertEqual(json.loads(xray_path.read_text(encoding='utf-8')), original)
+        self.assertEqual(self.data['reality_config'], old_reality)
+        self.assertEqual(service, {'active': 'inactive', 'enabled': 'disabled'})
+        self.assertIn(['systemctl', 'disable', 'xray'], commands)
+        self.assertIn(['systemctl', 'stop', 'xray'], commands)
 
     def test_reality_generation_failure_preserves_old_keys_and_extra_routes(self):
         config = {'inbounds': [{'protocol': 'vless', 'streamSettings': {'security': 'reality'},
