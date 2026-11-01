@@ -9966,12 +9966,27 @@ if __name__ == '__main__':
                 with data_lock:
                     _job_now = data.get('core_upgrade')
                     _busy = isinstance(_job_now, dict) and _job_now.get('state') == 'running'
+                    _previous_core_job_exists = 'core_upgrade' in data
+                    _previous_core_job = copy.deepcopy(_job_now)
                     if not _busy:
                         data['core_upgrade'] = {'state': 'running', 'started_at': int(time.time())}
                 if _busy:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(409, {'ok': False, 'error': '核心更新仍在运行，请等待完成'})
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    # The running marker was replaced; continue the worker so the
+                    # persisted state cannot remain stuck at running forever.
+                    pass
+                except OSError:
+                    with data_lock:
+                        if _previous_core_job_exists:
+                            data['core_upgrade'] = _previous_core_job
+                        else:
+                            data.pop('core_upgrade', None)
+                    return self.reply_json(503, {'ok': False,
+                        'error': '无法保存核心更新任务状态；未启动更新，请重试'})
                 def upgrade_worker():
                     try:
                         result = upgrade_core_binary(allow_custom=allow_custom)

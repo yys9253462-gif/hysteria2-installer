@@ -359,6 +359,29 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertFalse(body['ok'])
         install.assert_not_called()
 
+    def test_core_upgrade_marker_save_failure_rolls_back_and_does_not_start_worker(self):
+        self.handler._extend_deadline = lambda *args, **kwargs: True
+        self.ns['core_operation_lock'] = threading.RLock()
+        self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
+        self.ns['core_upgrade_lock'] = threading.RLock()
+        self.ns['portal_upgrade_lock'] = threading.Lock()
+        self.ns['data'] = self.data
+        self.handler._h_post_do_upgrade_impl = lambda _prefix: extract_method(
+            '_h_post_do_upgrade_impl', self.ns)(self.handler, _prefix)
+        before = copy.deepcopy(self.data)
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        created = []
+        self.ns['threading'] = SimpleNamespace(Thread=lambda **kwargs:
+            (created.append(kwargs) or SimpleNamespace(start=Mock())))
+        self.handler.path = '/test-token/do-upgrade'
+        self.handler.headers = {'Content-Length': str(len(urlencode({'target': 'core'})))}
+        self.handler.rfile = io.BytesIO(urlencode({'target': 'core'}).encode())
+        status, body = extract_method('_h_post_do_upgrade', self.ns)(
+            self.handler, '/test-token/')
+        self.assertEqual(status, 503, body)
+        self.assertEqual(self.data, before)
+        self.assertEqual(created, [])
+
     def test_xray_install_enable_failure_does_not_apply_reality(self):
         self.handler._extend_deadline = lambda *args, **kwargs: True
         self.ns['core_operation_lock'] = threading.RLock()
