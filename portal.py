@@ -9176,9 +9176,10 @@ if __name__ == '__main__':
                                 raise ValueError()
                         for key in ('duration_days', 'ip_limit', 'expires_at', 'limit_bytes', 'used_bytes'):
                             if key in params:
-                                if isinstance(params[key], bool):
+                                value = params[key]
+                                if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
                                     raise ValueError()
-                                params[key] = int(params[key])
+                                params[key] = int(value)
                                 if params[key] < (1 if key == 'duration_days' else 0):
                                     raise ValueError()
                         if 'traffic_gb' in params:

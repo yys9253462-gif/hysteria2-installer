@@ -100,8 +100,15 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
             recorded = previous['sampled_users']
             if isinstance(recorded, list) and all(isinstance(uid, str) for uid in recorded):
                 sampled_users = set(recorded)
+    baseline_sampled = set()
     for uid, pair in clean.items():
         old = cursors.get(uid)
+        if active_users is not None and uid in active_users and uid not in sampled_users:
+            # First observation after disable/delete is a fresh baseline; traffic
+            # accumulated while the account was absent is not charged retroactively.
+            cursors[uid] = pair
+            baseline_sampled.add(uid)
+            continue
         if first_sample:
             delta = 0  # 不声称此前进程内的历史计数属于新计量窗口。
         elif new_epoch or uid not in cursors:
@@ -128,12 +135,12 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
         #     会算出荒谬的速率尖峰。
         #   - 零字节增量也通知速率端点，及时清除上一轮非零速度。
         if (old is not None and not new_epoch and not first_sample
-                and uid in sampled_users
+                and uid in sampled_users and uid not in baseline_sampled
                 and uid not in reset_users and uid not in corrupt_users):
             deltas[uid] = (pair['tx'] - old['tx'], pair['rx'] - old['rx'])
     # 消失的用户保持旧游标：临时空响应不能让再次出现的累计值重复计数。
     sources[source] = {'epoch': epoch, 'counters': cursors, 'sampled_at': sampled_at,
-                       'sampled_users': list(clean)}
+                       'sampled_users': sorted(set(clean) | baseline_sampled)}
     if first_sample:
         sources[source]['baseline_at'] = sampled_at
     elif 'baseline_at' in previous:

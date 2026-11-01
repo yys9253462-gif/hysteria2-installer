@@ -191,6 +191,9 @@ class MeterAccountingTest(unittest.TestCase):
         self.data['users']['admin_master']['status'] = 'active'
         self.counters['hysteria']['admin_master'] = {'tx': 150, 'rx': 0}
         self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 100)
+        self.counters['hysteria']['admin_master'] = {'tx': 160, 'rx': 0}
+        self.meter.poll()
         self.assertEqual(self.data['users']['admin_master']['used_bytes'], 110)
 
     def test_core_and_runtime_revision_match(self):
