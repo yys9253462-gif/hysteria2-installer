@@ -70,6 +70,65 @@ class NftRuleMatchTests(unittest.TestCase):
         self.assertFalse(rule.search('udp dport 2087 accept'))
 
 
+class AtomicConfigRollbackTests(unittest.TestCase):
+    def test_old_config_survives_partial_rollback_write_failure(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'tuic.json'
+            original = b'{"inbounds":[{"type":"tuic"}]}\n'
+            path.write_bytes(b'candidate')
+            real_fsync = portal.os.fsync
+            def fail_file_fsync(fd):
+                raise OSError('disk full')
+            with mock.patch.object(portal.os, 'fsync', side_effect=fail_file_fsync):
+                with self.assertRaises(OSError):
+                    portal._restore_config_atomically(path, original)
+            self.assertEqual(path.read_bytes(), b'candidate')
+            self.assertEqual(list(Path(td).glob('.tuic.json.rollback.*.tmp')), [])
+
+    def test_atomic_rollback_replaces_candidate_with_full_old_bytes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'anytls.json'
+            original = b'{"inbounds":[{"type":"anytls"}]}\n'
+            path.write_bytes(b'candidate')
+            portal._restore_config_atomically(path, original)
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(Path(td).glob('.anytls.json.rollback.*.tmp')), [])
+
+
+class PortalStateLockTests(unittest.TestCase):
+    def test_lock_is_reentrant_in_one_thread_and_serializes_threads(self):
+        import threading
+        lock = portal.portal_state_file_lock
+        root = Path(__import__('tempfile').mkdtemp())
+        try:
+            entered = threading.Event()
+            release = threading.Event()
+            completed = threading.Event()
+            def first():
+                with lock(root):
+                    with lock(root):
+                        entered.set()
+                        release.wait(2)
+            def second():
+                entered.wait(2)
+                with lock(root):
+                    completed.set()
+            a = threading.Thread(target=first)
+            b = threading.Thread(target=second)
+            a.start(); b.start()
+            self.assertTrue(entered.wait(2))
+            self.assertFalse(completed.wait(0.05))
+            release.set()
+            a.join(2); b.join(2)
+            self.assertTrue(completed.is_set())
+        finally:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+
+
 class AdoptWithoutAccessFileTests(unittest.TestCase):
     """portal-access.json 丢失时 adopt 必须重建凭据，而不是清空用户。"""
 

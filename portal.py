@@ -1684,20 +1684,50 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         candidate.unlink(missing_ok=True)
 
 
+_portal_state_lock_guard = threading.Lock()
+_portal_state_locks = {}
+_portal_state_lock_local = threading.local()
+
+
 def portal_state_lock_path(directory='/etc/hysteria'):
     return Path(directory) / '.portal-state.lock'
 
 
 @contextlib.contextmanager
 def portal_state_file_lock(directory='/etc/hysteria'):
-    """Serialize whole-file portal.json refreshes with service persistence writes."""
-    lock_fd = os.open(portal_state_lock_path(directory), os.O_CREAT | os.O_RDWR, 0o600)
+    """Serialize portal state writes across threads/processes, reentrant per thread."""
+    path = portal_state_lock_path(directory).resolve()
+    with _portal_state_lock_guard:
+        thread_lock = _portal_state_locks.setdefault(path, threading.RLock())
+    thread_lock.acquire()
+    held = getattr(_portal_state_lock_local, 'held', None)
+    if held is None:
+        held = _portal_state_lock_local.held = {}
+    depth = held.get(path, 0)
+    if depth:
+        held[path] = depth + 1
+        try:
+            yield
+        finally:
+            held[path] -= 1
+            thread_lock.release()
+        return
+    lock_fd = None
     try:
+        lock_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        yield
+        held[path] = 1
+        try:
+            yield
+        finally:
+            held.pop(path, None)
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
     finally:
-        os.close(lock_fd)
+        if lock_fd is not None:
+            os.close(lock_fd)
+        thread_lock.release()
 
 
 def core_operation_lock_path(directory='/etc/hysteria'):
@@ -4805,6 +4835,33 @@ def anytls_uri_for_user(acfg, user_id, label=None):
     return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
 
 
+def _restore_config_atomically(config_path, original):
+    """Restore old configuration with the same private atomic-write guarantees."""
+    config_path = Path(config_path)
+    fd, temp_name = tempfile.mkstemp(prefix='.' + config_path.name + '.rollback.',
+                                     suffix='.tmp', dir=str(config_path.parent))
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, 'wb') as stream:
+            fd = None
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, config_path)
+        if hasattr(os, 'O_DIRECTORY'):
+            dir_fd = os.open(config_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
                         service=ANYTLS_SERVICE):
     """原子应用 sing-box 配置：预检 → 替换 → 重启 → 核对，任何一步失败就回滚。
@@ -4832,9 +4889,15 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
             if original is None:
                 config_path.unlink(missing_ok=True)
             else:
-                config_path.write_bytes(original)
+                _restore_config_atomically(config_path, original)
             if restart and original is not None:
-                run(['systemctl', 'restart', service], capture_output=True, timeout=15)
+                try:
+                    run(['systemctl', 'reset-failed', service], capture_output=True, timeout=5)
+                    run(['systemctl', 'restart', service], capture_output=True, timeout=15, check=True)
+                except Exception as rollback_exc:
+                    raise RuntimeError(
+                        '%s restart failed and the previous config was restored, but its service could not be restarted: %s'
+                        % (service, rollback_exc)) from rollback_exc
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -10570,7 +10633,14 @@ if __name__ == '__main__':
                             return self.reply_json(500, {'ok': False, 'error': msg})
 
                         write_xray_unit()
-                        subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=30)
+                        enable_result = subprocess.run(
+                            ['systemctl', 'enable', 'xray'], capture_output=True,
+                            text=True, timeout=30)
+                        if enable_result.returncode != 0:
+                            return self.reply_json(500, {'ok': False, 'error':
+                                'Xray 已安装，但开机自启设置失败：%s' %
+                                ((enable_result.stderr or '').strip()[-300:] or
+                                 'systemctl enable xray exited with %d' % enable_result.returncode)})
                         self._generate_and_apply_reality(True)
                         if not self._sync_reality_clients(core_lock_fd=core_lock_fd):
                             return self.reply_json(503, {'ok': False,

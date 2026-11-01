@@ -359,6 +359,27 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertFalse(body['ok'])
         install.assert_not_called()
 
+    def test_xray_install_enable_failure_does_not_apply_reality(self):
+        self.handler._extend_deadline = lambda *args, **kwargs: True
+        self.ns['core_operation_lock'] = threading.RLock()
+        self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
+        self.ns['acquire_core_operation_lock'] = Mock(return_value=29)
+        self.ns['os'] = SimpleNamespace(close=Mock())
+        self.ns['install_xray_binary'] = Mock(return_value=(True, 'installed'))
+        self.ns['write_xray_unit'] = Mock()
+        self.handler._generate_and_apply_reality = Mock()
+        self.run.side_effect = lambda args, **kwargs: SimpleNamespace(
+            returncode=1 if args[:3] == ['systemctl', 'enable', 'xray'] else 0,
+            stdout='active', stderr='enable failed')
+        self.ns['subprocess'].run = self.run
+        self.handler.rfile = io.BytesIO(b'')
+        self.handler.headers = {'Content-Length': '0'}
+        status, body = extract_method('_h_post_install_xray', self.ns)(
+            self.handler, '/test-token/')
+        self.assertEqual(status, 500, body)
+        self.assertIn('开机自启设置失败', body['error'])
+        self.handler._generate_and_apply_reality.assert_not_called()
+
     def test_vmess_and_vless_clients_are_refreshed_after_core_lock_acquisition(self):
         source = Path(portal.__file__).read_text(encoding='utf-8')
         for method, builder in (('_apply_vmess_enable', 'vmess_clients'),
