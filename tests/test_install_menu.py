@@ -153,6 +153,68 @@ class MenuTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
 
 
+class RefreshPortalFailureTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_portal_fetch_failure_stops_refresh_before_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hy2 = root / 'etc/hysteria'
+            hy2.mkdir(parents=True)
+            (hy2 / 'portal.json').write_text('{}', encoding='utf-8')
+            calls = []
+            script = (
+                'set -e\n'
+                'HY2_DIR="$TEST_ROOT/etc/hysteria"\n'
+                'log_err(){ printf "ERR:%s\\n" "$*"; }\n'
+                'log_info(){ printf "INFO:%s\\n" "$*"; }\n'
+                'log_warn(){ :; }\n'
+                'portal_ensure_py(){ return 1; }\n'
+                'systemctl(){ printf "%s\\n" "$*" >> "$TEST_ROOT/calls"; }\n'
+                'chmod(){ :; }\n'
+                + extract_shell_function('refresh_portal') + '\n'
+                'refresh_portal\n')
+            run = subprocess.run([shutil.which('bash'), '-c', script],
+                                 env=dict(os.environ, TEST_ROOT=str(root)),
+                                 capture_output=True, text=True, encoding='utf-8', errors='replace')
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn('完整性验证失败', run.stdout)
+            call_log = (root / 'calls').read_text(encoding='utf-8') if (root / 'calls').exists() else ''
+            self.assertNotIn('restart hysteria-portal', call_log)
+            self.assertNotIn('网页已更新', run.stdout)
+
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_portal_refresh_python_failure_stops_before_service_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hy2 = root / 'etc/hysteria'
+            hy2.mkdir(parents=True)
+            (hy2 / 'portal.json').write_text('{}', encoding='utf-8')
+            calls = []
+            script = (
+                'set -e\n'
+                'HY2_DIR="$TEST_ROOT/etc/hysteria"\n'
+                'HY2_META_FILE="$TEST_ROOT/meta.json"\n'
+                'log_err(){ printf "ERR:%s\\n" "$*"; }\n'
+                'log_info(){ printf "INFO:%s\\n" "$*"; }\n'
+                'log_warn(){ :; }\n'
+                'portal_ensure_py(){ :; }\n'
+                'sync_cert_meta(){ :; }\n'
+                'setup_cert_selfheal(){ :; }\n'
+                'python3(){ return 7; }\n'
+                'systemctl(){ printf "%s\\n" "$*" >> "$TEST_ROOT/calls"; }\n'
+                'chmod(){ :; }\n'
+                + extract_shell_function('refresh_portal') + '\n'
+                'refresh_portal\n')
+            run = subprocess.run([shutil.which('bash'), '-c', script],
+                                 env=dict(os.environ, TEST_ROOT=str(root)),
+                                 capture_output=True, text=True, encoding='utf-8', errors='replace')
+            self.assertNotEqual(run.returncode, 0)
+            self.assertIn('portal.py refresh 失败', run.stdout)
+            call_log = (root / 'calls').read_text(encoding='utf-8') if (root / 'calls').exists() else ''
+            self.assertNotIn('restart hysteria-portal', call_log)
+            self.assertNotIn('网页已更新', run.stdout)
+
+
 class MenuSourceTest(unittest.TestCase):
     def test_reconfigure_defaults_to_current_mode_and_key(self):
         # 商城版固定启用 Agent；重装 / 改配置时必须沿用旧 Key，否则控制台凭据失效。

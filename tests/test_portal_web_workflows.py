@@ -654,7 +654,7 @@ class WebWorkflowTests(unittest.TestCase):
             events.append(('check', None))
             return []
         self.handler._core_users = users
-        self.ns['subprocess'].run = Mock(return_value=SimpleNamespace(returncode=0))
+        self.ns['subprocess'].run = Mock(return_value=SimpleNamespace(returncode=0, stdout='enabled'))
         self.ns['_systemd_state'] = lambda _: 'inactive'
         self.ns['_service_stop_confirmed'] = portal._service_stop_confirmed
         self.ns['Path']('/usr/local/bin/xray').touch()

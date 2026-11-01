@@ -697,7 +697,7 @@ class TestRepoInvariants(unittest.TestCase):
     def test_install_has_sync_cert_meta_and_it_is_wired(self):
         text = INSTALL.read_text(encoding="utf-8")
         self.assertIn("sync_cert_meta() {", text)
-        self.assertIn("sync_cert_meta\n", text)  # called
+        self.assertIn("sync_cert_meta; then", text)  # checked before refresh
         self.assertIn("证书信任模型已自愈", text)
         # do_upgrade.sh portal path must self-heal too
         self.assertIn("证书信任模型已自愈:", text)
@@ -708,7 +708,10 @@ class TestRepoInvariants(unittest.TestCase):
         self.assertIn("setup_cert_selfheal() {", text)
         # called from setup_portal (fresh install) and refresh_portal (existing install)
         self.assertIn("    setup_cert_selfheal\n", text)
-        self.assertIn("setup_cert_selfheal >/dev/null 2>&1 || true", text)
+        self.assertIn("setup_cert_selfheal >/dev/null 2>&1 || log_warn", text)
+        self.assertIn('if ! portal_ensure_py; then', text)
+        self.assertIn('if ! python3 "$HY2_DIR/portal.py" refresh "$HY2_META_FILE"; then', text)
+        self.assertIn('if ! sync_cert_meta; then', text)
         # timer (30 min safety net) + path unit (instant on cert change)
         self.assertIn("hy2-cert-selfheal.timer", text)
         self.assertIn("hy2-cert-selfheal.path", text)

@@ -3694,15 +3694,27 @@ refresh_portal() {
     # 只要求 portal.json：portal-access.json 丢失时 refresh 会重建一份凭据
     # （保留 token / API Key / 用户），不该让「刷新页面」直接失败（2026-10-30 修）。
     [[ -f "$HY2_DIR/portal.json" ]] || { log_err "未找到已有网页配置，请先安装。"; return 1; }
-    portal_ensure_py
+    if ! portal_ensure_py; then
+        log_err "门户文件更新或完整性验证失败，保留现有门户服务。"
+        return 1
+    fi
     chmod 644 "$HY2_DIR/portal.py"
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先自愈信任模型再 refresh，
     # 否则 refresh 出来的订阅仍带漂移的 sni。
-    sync_cert_meta
+    if ! sync_cert_meta; then
+        log_err "证书元数据同步失败，未刷新门户。"
+        return 1
+    fi
     # 老装机此前没有证书自愈单元 —— 借着刷新顺带补齐（幂等，重复调用无副作用）。
-    setup_cert_selfheal >/dev/null 2>&1 || true
-    python3 "$HY2_DIR/portal.py" refresh "$HY2_META_FILE" || true
-    systemctl restart hysteria-portal || true
+    setup_cert_selfheal >/dev/null 2>&1 || log_warn "证书自愈单元未能补齐，门户刷新继续；请稍后检查 systemd。"
+    if ! python3 "$HY2_DIR/portal.py" refresh "$HY2_META_FILE"; then
+        log_err "portal.py refresh 失败，未报告刷新成功。"
+        return 1
+    fi
+    if ! systemctl restart hysteria-portal; then
+        log_err "门户重启命令失败；原服务状态可能仍在运行，请检查日志。"
+        return 1
+    fi
     if ! systemctl is-active --quiet hysteria-portal; then
         log_err "门户重启失败（Hy2 鉴权后端不可用），请运行 'journalctl -u hysteria-portal -e' 查看日志。"
         return 1
@@ -4187,13 +4199,15 @@ install_gost() {
     GOST_ASSET_NAME="gost_${GOST_VER}_${GOST_ASSET}.tar.gz"
     local had_gost=0 old_gost="" old_unit="" old_check="" old_owner="" had_unit=0 had_check=0 had_owner=0
     local old_config="" old_cert="" old_key="" had_config=0 had_cert=0 had_key=0
-    local old_active=0 active_state
+    local old_active=0 old_enabled=0 active_state
     [[ -f "$GOST_BIN" ]] && { had_gost=1; old_gost="$(mktemp)"; cp -p "$GOST_BIN" "$old_gost" || return 1; }
     [[ -f "$GOST_UNIT" ]] && { had_unit=1; old_unit="$(mktemp)"; cp -p "$GOST_UNIT" "$old_unit" || return 1; }
     [[ -f /usr/local/lib/hy2-gost-selfcheck ]] && { had_check=1; old_check="$(mktemp)"; cp -p /usr/local/lib/hy2-gost-selfcheck "$old_check" || return 1; }
     [[ -f "$HY2_DIR/.hy2-gost-owned" ]] && { had_owner=1; old_owner="$(mktemp)"; cp -p "$HY2_DIR/.hy2-gost-owned" "$old_owner" || return 1; }
     active_state="$(systemctl is-active gost 2>/dev/null || true)"
     [[ "$active_state" == active ]] && old_active=1
+    active_state="$(systemctl is-enabled gost 2>/dev/null || true)"
+    [[ "$active_state" == enabled ]] && old_enabled=1
     [[ -f "$GOST_CONFIG" ]] && { had_config=1; old_config="$(mktemp)"; cp -p "$GOST_CONFIG" "$old_config" || return 1; }
     [[ -f "$HY2_DIR/gost-cert/cert.pem" ]] && { had_cert=1; old_cert="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/cert.pem" "$old_cert" || return 1; }
     [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; old_key="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/key.pem" "$old_key" || return 1; }
@@ -4209,11 +4223,15 @@ install_gost() {
         if [[ "$had_cert" == 1 ]]; then cp -p "$old_cert" "$HY2_DIR/gost-cert/cert.pem"; else rm -f "$HY2_DIR/gost-cert/cert.pem"; fi
         if [[ "$had_key" == 1 ]]; then cp -p "$old_key" "$HY2_DIR/gost-cert/key.pem"; else rm -f "$HY2_DIR/gost-cert/key.pem"; fi
         systemctl daemon-reload >/dev/null 2>&1 || true
-        if [[ "$had_gost" == 1 && "$old_active" == 1 ]]; then
+        if [[ "$old_enabled" == 1 ]]; then
             systemctl enable gost >/dev/null 2>&1 || true
+        else
+            systemctl disable gost >/dev/null 2>&1 || true
+        fi
+        if [[ "$had_gost" == 1 && "$old_active" == 1 ]]; then
             systemctl restart gost >/dev/null 2>&1 || true
         else
-            systemctl disable --now gost >/dev/null 2>&1 || true
+            systemctl stop gost >/dev/null 2>&1 || true
         fi
         rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
     }

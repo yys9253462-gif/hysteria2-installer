@@ -6980,6 +6980,13 @@ def adopt(meta_path, port, node_api_key=None):
     其余数据原样保留，再交给 refresh() 按新的节点参数重建页面与订阅。
     """
     root = Path(meta_path).parent
+    with portal_state_file_lock(root):
+        _adopt_locked(meta_path, port, node_api_key)
+    refresh(meta_path)
+
+
+def _adopt_locked(meta_path, port, node_api_key=None):
+    root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     path = root / 'portal.json'
     data = json.loads(path.read_text(encoding='utf-8'))
@@ -7008,7 +7015,9 @@ def adopt(meta_path, port, node_api_key=None):
         access['api_key'] = node_api_key
         atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
     atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
-    refresh(meta_path)
+    # _adopt_locked already holds portal_state_file_lock; refresh serializes its
+    # own phase, so leave the shared lock before invoking it.
+    return
 
 
 def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
@@ -11173,6 +11182,13 @@ if __name__ == '__main__':
                         if in_use:
                             return self.reply_json(409, {'ok': False, 'error':
                                 '以下协议仍在使用 %s：%s。请先到对应协议页关闭后再卸载' % (name, '、'.join(in_use))})
+                        unit_states = {}
+                        for unit in unit_names:
+                            active = _systemd_state(unit) == 'active'
+                            enabled_state = subprocess.run(
+                                ['systemctl', 'is-enabled', unit], capture_output=True,
+                                text=True, timeout=5).stdout.strip()
+                            unit_states[unit] = (active, enabled_state == 'enabled')
                         stopped_units = []
                         for unit in unit_names:
                             stop_result = subprocess.run(
@@ -11180,16 +11196,17 @@ if __name__ == '__main__':
                                 capture_output=True, timeout=30)
                             state = _systemd_state(unit)
                             if not _service_stop_confirmed(stop_result, state):
-                                # A previous unit may already have stopped. Restore it
-                                # to avoid leaving a partial uninstall when a later
-                                # stop fails, and keep all units and binaries intact.
-                                for stopped in stopped_units:
-                                    subprocess.run(['systemctl', 'enable', stopped],
-                                                   capture_output=True, timeout=30)
-                                    subprocess.run(['systemctl', 'start', stopped],
-                                                   capture_output=True, timeout=30)
+                                # Restore the original active and enabled states for
+                                # every unit, including the one whose stop failed.
+                                for restore_unit, (was_active, was_enabled) in unit_states.items():
+                                    if was_enabled:
+                                        subprocess.run(['systemctl', 'enable', restore_unit],
+                                                       capture_output=True, timeout=30)
+                                    if was_active:
+                                        subprocess.run(['systemctl', 'start', restore_unit],
+                                                       capture_output=True, timeout=30)
                                 return self.reply_json(500, {'ok': False, 'error':
-                                    '核心服务 %s 未能确认停止；已保留所有核心文件与服务单元' % unit})
+                                    '核心服务 %s 未能确认停止；已恢复原服务状态并保留所有文件' % unit})
                             stopped_units.append(unit)
                         for unit in unit_names:
                             Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
