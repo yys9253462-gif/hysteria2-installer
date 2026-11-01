@@ -6,6 +6,8 @@ startup 段旧写法 `(data.get('core_upgrade') or {}).get('state')`：值是 7 
 """
 import ast
 import copy
+import json
+import tempfile
 from pathlib import Path
 import threading
 import unittest
@@ -15,22 +17,10 @@ TREE = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
 
 
 def startup_statements():
-    """serve() 里紧跟在 `_core_job = ...` 之后的几条语句。"""
-    serve = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == 'serve')
-    start = next(i for i, node in enumerate(serve.body)
-                 if isinstance(node, ast.Assign)
-                 and any(isinstance(t, ast.Name) and t.id == '_core_job'
-                         for t in node.targets))
-    statements = []
-    for node in serve.body[start:]:
-        statements.append(copy.deepcopy(node))
-        # pop 写在 `elif` 里，是 If 节点的一部分，不是独立语句。
-        if (isinstance(node, ast.If) and len(statements) > 1
-                and any(isinstance(inner, ast.Call)
-                        and isinstance(inner.func, ast.Attribute)
-                        and inner.func.attr == 'pop' for inner in ast.walk(node))):
-            break
-    return statements
+    """Extract the persistent startup recovery helper."""
+    node = next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
+                and n.name == 'persist_interrupted_core_job')
+    return [copy.deepcopy(node)]
 
 
 def upgrade_status_branch():
@@ -44,29 +34,43 @@ class CoreUpgradeStateTests(unittest.TestCase):
     MISSING = object()
 
     def run_startup(self, value):
-        data = {} if value is self.MISSING else {'core_upgrade': copy.deepcopy(value)}
-        env = {'data': data}
-        exec(compile(ast.fix_missing_locations(
-            ast.Module(body=startup_statements(), type_ignores=[])), '<startup>', 'exec'), env)
-        return env['data']
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'portal.json'
+            data = {} if value is self.MISSING else {'core_upgrade': copy.deepcopy(value)}
+            path.write_text(json.dumps(data), encoding='utf-8')
+            data = json.loads(path.read_text(encoding='utf-8'))
+            env = {'data': data, 'Path': Path, 'portal_state_file_lock':
+                   lambda *_: __import__('contextlib').nullcontext(),
+                   'atomic_write_private': lambda file_path, payload:
+                       Path(file_path).write_bytes(payload), 'json': json}
+            exec(compile(ast.fix_missing_locations(
+                ast.Module(body=startup_statements(), type_ignores=[])), '<startup>', 'exec'), env)
+            env['persist_interrupted_core_job'](path, data)
+            return env['data'], json.loads(path.read_text(encoding='utf-8'))
 
     def test_corrupt_state_does_not_block_startup(self):
         for bad in (None, 7, 'x', ['a'], True):
             with self.subTest(bad=bad):
-                self.assertNotIn('core_upgrade', self.run_startup(bad))
+                memory, disk = self.run_startup(bad)
+                self.assertNotIn('core_upgrade', memory)
+                self.assertNotIn('core_upgrade', disk)
 
     def test_missing_state_is_left_alone(self):
-        self.assertNotIn('core_upgrade', self.run_startup(self.MISSING))
+        memory, disk = self.run_startup(self.MISSING)
+        self.assertNotIn('core_upgrade', memory)
+        self.assertNotIn('core_upgrade', disk)
 
     def test_running_job_is_marked_interrupted(self):
-        data = self.run_startup({'state': 'running', 'started_at': 1})
-        self.assertEqual(data['core_upgrade']['state'], 'interrupted')
-        self.assertEqual(data['core_upgrade']['started_at'], 1)
-        self.assertIn('error', data['core_upgrade'])
+        memory, disk = self.run_startup({'state': 'running', 'started_at': 1})
+        self.assertEqual(memory['core_upgrade']['state'], 'interrupted')
+        self.assertEqual(disk['core_upgrade']['state'], 'interrupted')
+        self.assertEqual(disk['core_upgrade']['started_at'], 1)
+        self.assertIn('error', disk['core_upgrade'])
 
     def test_completed_job_is_preserved(self):
-        data = self.run_startup({'state': 'completed', 'tag': 'v2'})
-        self.assertEqual(data['core_upgrade'], {'state': 'completed', 'tag': 'v2'})
+        memory, disk = self.run_startup({'state': 'completed', 'tag': 'v2'})
+        self.assertEqual(memory['core_upgrade'], {'state': 'completed', 'tag': 'v2'})
+        self.assertEqual(disk['core_upgrade'], {'state': 'completed', 'tag': 'v2'})
 
     def test_upgrade_status_endpoint_handles_corrupt_state(self):
         branch = upgrade_status_branch()

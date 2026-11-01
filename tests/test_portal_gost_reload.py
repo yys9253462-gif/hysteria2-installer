@@ -302,10 +302,20 @@ class GostUnitConsistency(unittest.TestCase):
         self.assertIn("if old_assets[gost_binary] is not None and old_gost_active:", body)
         self.assertIn("old_gost_enabled = subprocess.run(", body)
         self.assertIn("elif not old_gost_enabled or old_assets[gost_binary] is None:", body)
+        self.assertIn("subprocess.run(['systemctl', 'stop', 'gost']", body)
         self.assertIn('assets_modified = True', body)
         restore = body[body.index('                def restore_gost_assets():'):body.index('                if not installed:')]
         self.assertIn("systemctl', 'restart', 'gost", restore)
         self.assertIn("systemctl', 'disable', '--now', 'gost", restore)
+
+    def test_gost_rollback_stops_new_service_when_old_service_was_inactive(self):
+        source = PORTAL_SRC
+        start = source.index('        def _h_post_install_gost(self, prefix):')
+        end = source.index('        def _h_post_install_amneziawg(self, prefix):', start)
+        body = source[start:end]
+        restore = body[body.index('                def restore_gost_assets():'):body.index('                if not installed:')]
+        self.assertIn("elif not old_gost_enabled or old_assets[gost_binary] is None:", restore)
+        self.assertIn("subprocess.run(['systemctl', 'stop', 'gost']", restore)
 
     def test_units_identical(self):
         """两处产物必须完全一致 —— 不一致正是本 bug 的起因。

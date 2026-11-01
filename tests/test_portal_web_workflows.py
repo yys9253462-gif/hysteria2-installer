@@ -614,6 +614,17 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(self.data['users']['qa-user'], original)
 
+    def test_interrupted_core_upgrade_status_persists_across_restarts(self):
+        path = self.hdir / 'portal.json'
+        original = {'core_upgrade': {'state': 'running', 'version': 'v9.9.9'}}
+        path.write_text(json.dumps(original), encoding='utf-8')
+        first = json.loads(path.read_text(encoding='utf-8'))
+        self.assertTrue(portal.persist_interrupted_core_job(path, first))
+        second = json.loads(path.read_text(encoding='utf-8'))
+        self.assertFalse(portal.persist_interrupted_core_job(path, second))
+        self.assertEqual(second['core_upgrade']['state'], 'interrupted')
+        self.assertIn('重启打断', second['core_upgrade']['error'])
+
     def test_core_uninstall_stop_failure_preserves_units_and_binary(self):
         self.handler.is_authenticated = lambda: True
         self.handler.rfile = io.BytesIO(urlencode({'name': 'xray'}).encode())
@@ -632,7 +643,24 @@ class WebWorkflowTests(unittest.TestCase):
         self.ns['subprocess'].run = Mock(side_effect=lambda args, **kw:
             (commands.append(args) or SimpleNamespace(returncode=1 if args[:3] ==
              ['systemctl', 'disable', '--now'] else 0)))
-        self.ns['_systemd_state'] = lambda _: 'active'
+        states = {'hy2-anytls': 'active', 'hy2-tuic': 'active'}
+        def run(args, **kwargs):
+            commands.append(args)
+            if args[:2] == ['systemctl', 'is-enabled']:
+                return SimpleNamespace(returncode=0,
+                    stdout='disabled' if args[2] == 'hy2-anytls' else 'enabled')
+            if args[:3] == ['systemctl', 'disable', '--now'] and args[3] == 'hy2-tuic':
+                return SimpleNamespace(returncode=1)
+            if args[:2] == ['systemctl', 'disable'] and args[2] == 'hy2-anytls':
+                states['hy2-anytls'] = 'inactive'
+            if args[:2] == ['systemctl', 'start'] and args[2] == 'hy2-anytls':
+                states['hy2-anytls'] = 'active'
+            return SimpleNamespace(returncode=0)
+        self.handler.rfile = io.BytesIO(urlencode({'name': 'sing-box'}).encode())
+        self.handler.headers = {'Content-Length': str(len(urlencode({'name': 'sing-box'})))}
+        self.handler._core_users = lambda _: []
+        self.ns['subprocess'].run = Mock(side_effect=run)
+        self.ns['_systemd_state'] = lambda unit: states[unit]
         self.ns['_service_stop_confirmed'] = portal._service_stop_confirmed
         status, body = extract_method('_h_post_uninstall_core', self.ns)(
             self.handler, '/test-token/')
@@ -640,6 +668,9 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertTrue(unit.exists())
         self.assertTrue(binary.exists())
         self.assertNotIn(['systemctl', 'daemon-reload'], commands)
+        self.assertIn(['systemctl', 'disable', 'hy2-anytls'], commands)
+        self.assertIn(['systemctl', 'start', 'hy2-anytls'], commands)
+        self.assertNotIn(['systemctl', 'enable', 'hy2-anytls'], commands)
 
     def test_core_uninstall_checks_protocols_after_acquiring_core_lock(self):
         self.handler.is_authenticated = lambda: True

@@ -6982,7 +6982,7 @@ def adopt(meta_path, port, node_api_key=None):
     root = Path(meta_path).parent
     with portal_state_file_lock(root):
         _adopt_locked(meta_path, port, node_api_key)
-    refresh(meta_path)
+        refresh(meta_path)
 
 
 def _adopt_locked(meta_path, port, node_api_key=None):
@@ -7155,6 +7155,27 @@ def repair_missing_api_key(portal_path, data):
         raise SystemExit('[portal] API Key 修复未能同时保存到两个凭据文件: %s' % exc)
 
 
+def persist_interrupted_core_job(portal_path, data):
+    """Persist startup recovery so an interrupted job cannot reappear on restart."""
+    job = data.get('core_upgrade')
+    if not isinstance(job, dict):
+        if 'core_upgrade' in data:
+            data.pop('core_upgrade', None)
+            changed = True
+        else:
+            changed = False
+    elif job.get('state') == 'running':
+        data['core_upgrade'] = dict(job, state='interrupted',
+            error='门户重启打断更新任务，请核对当前核心版本后重试')
+        changed = True
+    else:
+        changed = False
+    if changed:
+        with portal_state_file_lock(Path(portal_path).parent):
+            atomic_write_private(portal_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+    return changed
+
+
 def serve(path):
     portal_path = Path(path)
     data = json.loads(portal_path.read_text(encoding='utf-8'))
@@ -7197,16 +7218,12 @@ def serve(path):
     gost_operation_lock = threading.RLock()
     for key in ('warp_applying', 'egress_applying', '_egress_pending'):
         data.pop(key, None)  # pending worker threads cannot survive a process restart
-    # core_upgrade 被手工改成 7 / "x" 时 `.get` 抛 AttributeError，门户直接起不来
-    # —— 而门户同时是 Hy2 鉴权后端。非 dict 一律视为没有进行中的任务。
-    _core_job = data.get('core_upgrade')
-    if not isinstance(_core_job, dict):
-        _core_job = None
-    if _core_job is not None and _core_job.get('state') == 'running':
-        data['core_upgrade'] = dict(_core_job, state='interrupted',
-            error='门户重启打断更新任务，请核对当前核心版本后重试')
-    elif _core_job is None and 'core_upgrade' in data:
-        data.pop('core_upgrade', None)
+    # core_upgrade 损坏或门户重启打断任务时立即落盘，否则下一次重启仍会
+    # 读到 state=running，更新页面无法知道上次核心替换已中断。
+    try:
+        persist_interrupted_core_job(portal_path, data)
+    except OSError as exc:
+        raise SystemExit('[portal] 无法保存核心更新恢复状态: %s' % exc)
     ip_tracker = {}
     IP_TIMEOUT_SECONDS = 180
     # 跨节点统一设备上限：控制台下发的 {uid: {ip: 过期时间}}，只在内存里（见 parse_ip_deny）。
@@ -11189,25 +11206,26 @@ if __name__ == '__main__':
                                 ['systemctl', 'is-enabled', unit], capture_output=True,
                                 text=True, timeout=5).stdout.strip()
                             unit_states[unit] = (active, enabled_state == 'enabled')
-                        stopped_units = []
                         for unit in unit_names:
                             stop_result = subprocess.run(
                                 ['systemctl', 'disable', '--now', unit],
                                 capture_output=True, timeout=30)
                             state = _systemd_state(unit)
                             if not _service_stop_confirmed(stop_result, state):
-                                # Restore the original active and enabled states for
-                                # every unit, including the one whose stop failed.
+                                # Restore every unit's original active and enabled
+                                # state, including units already stopped in this pass.
                                 for restore_unit, (was_active, was_enabled) in unit_states.items():
                                     if was_enabled:
                                         subprocess.run(['systemctl', 'enable', restore_unit],
                                                        capture_output=True, timeout=30)
-                                    if was_active:
-                                        subprocess.run(['systemctl', 'start', restore_unit],
+                                    else:
+                                        subprocess.run(['systemctl', 'disable', restore_unit],
                                                        capture_output=True, timeout=30)
+                                    action = 'start' if was_active else 'stop'
+                                    subprocess.run(['systemctl', action, restore_unit],
+                                                   capture_output=True, timeout=30)
                                 return self.reply_json(500, {'ok': False, 'error':
                                     '核心服务 %s 未能确认停止；已恢复原服务状态并保留所有文件' % unit})
-                            stopped_units.append(unit)
                         for unit in unit_names:
                             Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
