@@ -1873,12 +1873,11 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                 subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
             else:
                 subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
-            if original is not None:
-                if was_active:
-                    subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
-                    subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
-                else:
-                    subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
+            if original is not None and was_active:
+                subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+                subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
+            elif not was_active:
+                subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -5785,14 +5784,19 @@ def _restore_systemd_service_state(unit, snapshot):
     active = snapshot.get('active')
     enabled = snapshot.get('enabled')
     if active not in ('active', 'inactive', 'failed') or enabled not in (
-            'enabled', 'disabled', 'static', 'indirect', 'not-found'):
+            'enabled', 'disabled', 'enabled-runtime', 'static', 'indirect', 'not-found'):
         return False
     try:
         results = []
-        if enabled in ('enabled', 'disabled'):
-            results.append(subprocess.run(
-                ['systemctl', 'enable' if enabled == 'enabled' else 'disable', unit],
-                capture_output=True, timeout=30))
+        if enabled in ('enabled', 'disabled', 'enabled-runtime'):
+            action = 'enable' if enabled == 'enabled' else 'disable'
+            if enabled == 'enabled-runtime':
+                results.append(subprocess.run(
+                    ['systemctl', 'enable', '--runtime', unit],
+                    capture_output=True, timeout=30))
+            else:
+                results.append(subprocess.run(
+                    ['systemctl', action, unit], capture_output=True, timeout=30))
         if enabled != 'not-found':
             results.append(subprocess.run(
                 ['systemctl', 'start' if active == 'active' else 'stop', unit],
@@ -8751,7 +8755,6 @@ if __name__ == '__main__':
                 previous_xray_bytes = xray_path.read_bytes() if xray_path.exists() else None
                 previous_xray = json.loads(previous_xray_bytes) if previous_xray_bytes is not None else None
                 previous_service_state = _systemd_service_snapshot('xray')
-                previous_service_active = previous_service_state['active'] == 'active'
                 if xray_path.exists():
                     # 只按 tag 替换 Reality 自己那一条；VMess 入站、统计 api 入站、
                     # routing、outbounds 一律原样保留。旧版无 tag 的 Reality 由
@@ -11555,6 +11558,10 @@ if __name__ == '__main__':
                     # 不能误报已关闭，否则撤销用户仍可能用内存中的旧名单连接。
                     state = _systemd_state(ANYTLS_SERVICE)
                     if not _service_stop_confirmed(stop_result, state):
+                        if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                            return self.reply_json(500, {'ok': False, 'error':
+                                'AnyTLS 停止失败且原服务状态未能恢复；配置已保留，请检查 systemctl status %s'
+                                % ANYTLS_SERVICE})
                         return self.reply_json(500, {'ok': False, 'error':
                             'AnyTLS 服务未能停止，配置已保留，请重试或查看 systemctl status %s'
                             % ANYTLS_SERVICE})
@@ -11682,6 +11689,8 @@ if __name__ == '__main__':
                     with data_lock:
                         data['tuic_config'] = old
                     if 'cfg_path' in locals():
+                        if 'previous_file' not in locals():
+                            raise
                         if previous_file is None:
                             cfg_path.unlink(missing_ok=True)
                         else:
@@ -11735,6 +11744,10 @@ if __name__ == '__main__':
                     # systemd 状态无法确认时保留配置，避免旧进程继续接受用户连接。
                     state = _systemd_state(TUIC_SERVICE)
                     if not _service_stop_confirmed(stop_result, state):
+                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                            return self.reply_json(500, {'ok': False, 'error':
+                                'TUIC 停止失败且原服务状态未能恢复；配置已保留，请检查 systemctl status %s'
+                                % TUIC_SERVICE})
                         return self.reply_json(500, {'ok': False, 'error':
                             'TUIC 服务未能停止，配置已保留，请重试或查看 systemctl status %s'
                             % TUIC_SERVICE})

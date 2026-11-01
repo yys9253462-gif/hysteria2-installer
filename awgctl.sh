@@ -666,6 +666,16 @@ peer_apply_live_del() {
     return 0
 }
 
+restore_peer_files() {
+    local peers_backup="$1" config_backup="$2" had_config="$3"
+    cp -p "$peers_backup" "$AWG_PEERS_FILE" || return 1
+    if [[ "$had_config" == "1" ]]; then
+        cp -p "$config_backup" "$AWG_CONFIG" || return 1
+    else
+        rm -f "$AWG_CONFIG"
+    fi
+}
+
 cmd_peer_add() {
     local name="${1:-}" endpoint="${2:-}"
     require_root
@@ -685,7 +695,17 @@ cmd_peer_add() {
     peers_init
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
-    local priv pub psk addr tmp
+    local priv pub psk addr tmp peers_backup config_backup had_config=0
+    config_backup="${AWG_DIR}/.conf-backup.$$"
+    peers_backup="${AWG_DIR}/.peers-backup.$$"
+    (umask 077; cp -p "$AWG_PEERS_FILE" "$peers_backup") || { rm -f "$peers_backup"; die "无法备份客户端列表"; }
+    if [[ -f "$AWG_CONFIG" ]]; then
+        (umask 077; cp -p "$AWG_CONFIG" "$config_backup") || { rm -f "$peers_backup" "$config_backup"; die "无法备份服务端配置"; }
+        had_config=1
+    else
+        : > "$config_backup"
+        chmod 600 "$config_backup"
+    fi
     priv="$(genkey)"
     pub="$(pubkey_of "$priv")"
     psk="$(genpsk)"
@@ -701,7 +721,13 @@ cmd_peer_add() {
     chmod 600 "$tmp"
     mv -f "$tmp" "$AWG_PEERS_FILE"
 
-    render_server_config
+    if ! (render_server_config); then
+        restore_peer_files "$peers_backup" "$config_backup" "$had_config" \
+            || die "客户端创建失败，且无法恢复原客户端与服务端配置，请立即检查 ${AWG_DIR}"
+        rm -f "$peers_backup" "$config_backup"
+        die "服务端配置渲染失败，客户端创建已回滚"
+    fi
+    rm -f "$peers_backup" "$config_backup"
     peer_apply_live_add "$pub" "$psk" "$addr"
 
     log_info "客户端已创建: ${name}  (隧道地址 ${addr})"
@@ -722,15 +748,31 @@ cmd_peer_del() {
     [[ -n "$name" ]] || die "用法: hy2-awgctl peer-del <名称>"
     peer_exists "$name" || die "客户端不存在: ${name}"
 
-    local pub tmp
+    local pub tmp peers_backup config_backup had_config=0
     pub="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .public_key' "$AWG_PEERS_FILE")"
+    peers_backup="${AWG_DIR}/.peers-backup.$$"
+    config_backup="${AWG_DIR}/.conf-backup.$$"
+    (umask 077; cp -p "$AWG_PEERS_FILE" "$peers_backup") || { rm -f "$peers_backup"; die "无法备份客户端列表"; }
+    if [[ -f "$AWG_CONFIG" ]]; then
+        (umask 077; cp -p "$AWG_CONFIG" "$config_backup") || { rm -f "$peers_backup" "$config_backup"; die "无法备份服务端配置"; }
+        had_config=1
+    else
+        : > "$config_backup"
+        chmod 600 "$config_backup"
+    fi
 
     tmp="$(mktemp "${AWG_DIR}/.peers.XXXXXX")"
     jq --arg n "$name" '.peers |= map(select(.name != $n))' "$AWG_PEERS_FILE" > "$tmp"
     chmod 600 "$tmp"
     mv -f "$tmp" "$AWG_PEERS_FILE"
 
-    render_server_config
+    if ! (render_server_config); then
+        restore_peer_files "$peers_backup" "$config_backup" "$had_config" \
+            || die "客户端删除失败，且无法恢复原客户端与服务端配置，请立即检查 ${AWG_DIR}"
+        rm -f "$peers_backup" "$config_backup"
+        die "服务端配置渲染失败，客户端删除已回滚"
+    fi
+    rm -f "$peers_backup" "$config_backup"
     peer_apply_live_del "$pub"
     log_info "客户端已删除: ${name}"
 }

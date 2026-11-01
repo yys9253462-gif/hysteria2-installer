@@ -650,6 +650,73 @@ class WebWorkflowTests(unittest.TestCase):
                 self.assertEqual(unit_path.read_bytes() if old_unit is not None else None, old_unit)
                 self.assertIn(['systemctl', 'daemon-reload'], commands)
 
+    def test_anytls_and_tuic_partial_stop_failure_restore_service_state(self):
+        for protocol in ('anytls', 'tuic'):
+            with self.subTest(protocol=protocol):
+                service = 'hy2-' + protocol
+                key = protocol + '_config'
+                lock_name = protocol + '_apply_lock'
+                old = {'enabled': True, 'port': 2096, 'secret': 'fixture'}
+                self.data[key] = copy.deepcopy(old)
+                self.ns.update({
+                    'ANYTLS_CONFIG_NAME': portal.ANYTLS_CONFIG_NAME,
+                    'TUIC_CONFIG_NAME': portal.TUIC_CONFIG_NAME,
+                    'ANYTLS_SERVICE': 'hy2-anytls', 'TUIC_SERVICE': 'hy2-tuic',
+                    lock_name: threading.RLock(),
+                    '_active_anytls_config': lambda: self.data.get('anytls_config'),
+                    '_active_tuic_config': lambda: self.data.get('tuic_config'),
+                    'config_section': lambda data, section: data.get(section, {}),
+                    '_systemd_service_snapshot': Mock(return_value={
+                        'active': 'active', 'enabled': 'enabled'}),
+                    '_restore_systemd_service_state': Mock(return_value=True),
+                    '_systemd_state': lambda _: 'active',
+                    '_service_stop_confirmed': lambda result, state: False,
+                    'save_data': Mock(),
+                })
+                self.run.reset_mock()
+                method_name = '_h_post_manage_' + protocol
+                status, _ = self.invoke(method_name, {'action': 'disable'})
+                self.assertEqual(status, 500)
+                self.assertEqual(self.data[key], old)
+                self.ns['_restore_systemd_service_state'].assert_called_with(
+                    service, {'active': 'active', 'enabled': 'enabled'})
+
+    def test_tuic_config_read_error_keeps_original_exception_and_state(self):
+        old = {'enabled': True, 'port': 41000, 'secret': 'fixture'}
+        self.data['tuic_config'] = copy.deepcopy(old)
+        self.ns.update({
+            'TUIC_SERVICE': 'hy2-tuic', 'TUIC_CONFIG_NAME': portal.TUIC_CONFIG_NAME,
+            'TUIC_UNIT_CONTENT': portal.TUIC_UNIT_CONTENT,
+            'tuic_apply_lock': threading.RLock(),
+            'portal_path': self.hdir / 'portal.json',
+            'read_meta_file': lambda _: {'server_name': 'node.example.com', 'listen_port': 443},
+            '_is_dns_name': lambda _: True,
+            '_singbox_version': lambda: portal.ANYTLS_MIN_SINGBOX,
+            'pick_tuic_port': lambda *a, **kw: 41001,
+            'tuic_users': lambda _: [],
+            'config_section': lambda data, key: data.get(key, {}),
+            '_systemd_service_snapshot': lambda _: {'active': 'inactive', 'enabled': 'disabled'},
+            '_restore_systemd_service_state': Mock(return_value=True),
+            'apply_anytls_config': Mock(),
+        })
+        self.handler._vmess_certificate = lambda *a: ('cert.pem', 'key.pem', 'node.example.com')
+        class BrokenConfigPath:
+            def exists(self):
+                return True
+            def read_bytes(self):
+                raise PermissionError('cannot read TUIC config')
+        class ConfigParent:
+            def __truediv__(self, _):
+                return BrokenConfigPath()
+        self.ns['portal_path'] = SimpleNamespace(parent=ConfigParent())
+        (self.root / 'etc/systemd/system').mkdir(parents=True, exist_ok=True)
+        real_path = self.ns['Path']
+        self.ns['Path'] = lambda value: (real_path(self.root / 'etc/systemd/system/hy2-tuic.service')
+            if str(value) == '/etc/systemd/system/hy2-tuic.service' else real_path(value))
+        with self.assertRaisesRegex(PermissionError, 'cannot read TUIC config'):
+            extract_method('_apply_tuic_enable', self.ns)(self.handler)
+        self.assertEqual(self.data['tuic_config'], old)
+
     def test_warp_save_failure_restores_memory_and_skips_apply(self):
         original = {'warp_enabled': False, 'warp_rules': [{'domain': 'example.com',
                                                            'outbound': 'direct'}]}
@@ -1357,6 +1424,56 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertIn(['systemctl', 'disable', 'xray'], commands)
         self.assertIn(['systemctl', 'stop', 'xray'], commands)
         self.assertEqual(commands.count(['systemctl', 'restart', 'xray']), 1)
+
+    def test_xray_transaction_without_original_config_stops_failed_candidate(self):
+        path = self.hdir / 'xray-new.json'
+        commands = []
+        state = {'active': False}
+        def run(args, **kwargs):
+            commands.append(args)
+            if args[:3] == ['systemctl', 'is-active', 'xray']:
+                return SimpleNamespace(returncode=0, stdout='active' if state['active'] else 'inactive')
+            if args[:3] == ['systemctl', 'is-enabled', 'xray']:
+                return SimpleNamespace(returncode=0, stdout='disabled')
+            if args[:1] == ['xray-fixture']:
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            if args[:2] == ['systemctl', 'restart']:
+                state['active'] = True
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            if args[:2] == ['systemctl', 'enable']:
+                return SimpleNamespace(returncode=1, stdout='', stderr='enable failed')
+            if args[:2] == ['systemctl', 'stop']:
+                state['active'] = False
+            return SimpleNamespace(returncode=0, stdout='inactive', stderr='')
+        with patch.object(portal.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, '自启动设置失败'):
+                portal.apply_xray_config_transaction({'inbounds': [{'tag': 'vless-reality-in'}]},
+                    str(path), 'xray-fixture', restart=True)
+        self.assertFalse(path.exists())
+        self.assertFalse(state['active'])
+        self.assertIn(['systemctl', 'stop', 'xray'], commands)
+
+    def test_systemd_restore_preserves_enabled_runtime_state(self):
+        calls = []
+        state = {'active': 'active', 'enabled': 'enabled-runtime'}
+        def run(args, **kwargs):
+            calls.append(args)
+            if args[:2] == ['systemctl', 'is-active']:
+                return SimpleNamespace(returncode=0, stdout=state['active'])
+            if args[:2] == ['systemctl', 'is-enabled']:
+                return SimpleNamespace(returncode=0, stdout=state['enabled'])
+            if args[:3] == ['systemctl', 'enable', '--runtime']:
+                state['enabled'] = 'enabled-runtime'
+                return SimpleNamespace(returncode=0)
+            if args[:2] == ['systemctl', 'start']:
+                state['active'] = 'active'
+                return SimpleNamespace(returncode=0)
+            return SimpleNamespace(returncode=0)
+        with patch.object(portal.subprocess, 'run', side_effect=run):
+            self.assertTrue(portal._restore_systemd_service_state(
+                'hy2-anytls', {'active': 'active', 'enabled': 'enabled-runtime'}))
+        self.assertIn(['systemctl', 'enable', '--runtime', 'hy2-anytls'], calls)
+        self.assertEqual(state, {'active': 'active', 'enabled': 'enabled-runtime'})
 
     def test_xray_transaction_restart_failure_restores_original_bytes(self):
         path = self.hdir / 'xray.json'

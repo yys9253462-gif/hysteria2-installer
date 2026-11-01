@@ -215,6 +215,51 @@ class RefreshPortalFailureTests(unittest.TestCase):
             self.assertNotIn('网页已更新', run.stdout)
 
 
+class AwgUninstallWrapperTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_controller_failure_is_propagated_and_controller_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            controller = root / 'hy2-awgctl'
+            controller.write_text('#!/bin/sh\nexit 9\n', encoding='utf-8')
+            controller.chmod(0o755)
+            script = '''
+AWG_CTL_BIN="$TEST_ROOT/hy2-awgctl"
+check_root() { :; }
+awg_ensure_ctl() { :; }
+log_warn() { :; }
+log_err() { :; }
+log_info() { :; }
+read() { printf -v "${@: -1}" y; }
+''' + extract_shell_function('uninstall_amneziawg') + '\nuninstall_amneziawg\n'
+            result = subprocess.run([shutil.which('bash'), '-c', script],
+                input='', capture_output=True, text=True, env=dict(os.environ, TEST_ROOT=str(root)))
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertTrue(controller.exists())
+
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_successful_controller_uninstall_removes_controller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            controller = root / 'hy2-awgctl'
+            controller.write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+            controller.chmod(0o755)
+            script = '''
+AWG_CTL_BIN="$TEST_ROOT/hy2-awgctl"
+check_root() { :; }
+awg_ensure_ctl() { :; }
+log_warn() { :; }
+log_err() { :; }
+log_info() { :; }
+read() { printf -v "${@: -1}" y; }
+rm() { command rm "$@"; }
+''' + extract_shell_function('uninstall_amneziawg') + '\nuninstall_amneziawg\n'
+            result = subprocess.run([shutil.which('bash'), '-c', script],
+                input='', capture_output=True, text=True, env=dict(os.environ, TEST_ROOT=str(root)))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(controller.exists())
+
+
 class MenuSourceTest(unittest.TestCase):
     def test_reconfigure_defaults_to_current_mode_and_key(self):
         # 商城版固定启用 Agent；重装 / 改配置时必须沿用旧 Key，否则控制台凭据失效。

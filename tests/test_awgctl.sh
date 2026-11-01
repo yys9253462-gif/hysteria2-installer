@@ -322,6 +322,45 @@ render_server_config
 check_eq "服务端配置含 3 个 Peer 段" "$(grep -c '^\[Peer\]' "$AWG_CONFIG")" "3"
 check_eq "服务端配置含全部 3 个客户端注释" "$(grep -cE '^# (one|three|four)$' "$AWG_CONFIG")" "3"
 
+# 渲染失败时 peer-add / peer-del 必须恢复 peers 和 server config，且不触碰运行态。
+cp -p "$AWG_PEERS_FILE" "${WORK}/peers.before"
+cp -p "$AWG_CONFIG" "${WORK}/config.before"
+: > "${WORK}/live-calls"
+peer_apply_live_add() { echo add >> "${WORK}/live-calls"; }
+peer_apply_live_del() { echo del >> "${WORK}/live-calls"; }
+detect_wan_iface() { return 1; }
+if (cmd_peer_add renderfail --endpoint vpn.example.com >/dev/null 2>&1); then
+    bad "render_server_config 失败时 peer-add 应失败退出"
+else
+    ok
+fi
+if cmp -s "$AWG_PEERS_FILE" "${WORK}/peers.before" && cmp -s "$AWG_CONFIG" "${WORK}/config.before"; then
+    ok
+else
+    bad "peer-add 渲染失败后应恢复 peers 与服务端配置"
+fi
+if [[ ! -s "${WORK}/live-calls" ]]; then ok; else bad "peer-add 渲染失败后不应应用 live peer"; fi
+
+# 用一个有内容的列表验证删除失败也会完整回滚。
+jq '.peers += [{name:"deletefail",address:"10.66.66.9",private_key:"p",public_key:"pub-deletefail",preshared_key:"k",endpoint:"vpn.example.com",created_at:"t",enabled:true}]' \
+    "$AWG_PEERS_FILE" > "${AWG_PEERS_FILE}.tmp" && mv "${AWG_PEERS_FILE}.tmp" "$AWG_PEERS_FILE"
+render_server_config
+cp -p "$AWG_PEERS_FILE" "${WORK}/peers.before"
+cp -p "$AWG_CONFIG" "${WORK}/config.before"
+: > "${WORK}/live-calls"
+if (cmd_peer_del deletefail >/dev/null 2>&1); then
+    bad "render_server_config 失败时 peer-del 应失败退出"
+else
+    ok
+fi
+if cmp -s "$AWG_PEERS_FILE" "${WORK}/peers.before" && cmp -s "$AWG_CONFIG" "${WORK}/config.before"; then
+    ok
+else
+    bad "peer-del 渲染失败后应恢复 peers 与服务端配置"
+fi
+if [[ ! -s "${WORK}/live-calls" ]]; then ok; else bad "peer-del 渲染失败后不应移除 live peer"; fi
+detect_wan_iface() { echo eth0; }
+
 # ==============================================================================
 section "5. meta 读写"
 # ==============================================================================

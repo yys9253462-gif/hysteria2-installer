@@ -4893,7 +4893,10 @@ uninstall_amneziawg() {
         return 0
     fi
 
-    "$AWG_CTL_BIN" uninstall || true
+    if ! "$AWG_CTL_BIN" uninstall; then
+        log_err "AmneziaWG 卸载失败，已保留控制工具；请修复服务问题后重试。"
+        return 1
+    fi
     rm -f "$AWG_CTL_BIN"
     log_info "AmneziaWG 已卸载，控制工具也已移除。"
     return 0
