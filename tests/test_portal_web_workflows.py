@@ -985,6 +985,14 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 503, body)
         self.assertEqual(self.data['users']['qa-user']['status'], 'disabled')
 
+    def test_api_set_status_rejects_string_false_without_mutation(self):
+        original = {'password': 'qa-pass', 'status': 'active', 'expires_at': 2200000000}
+        self.data['users']['qa-user'] = copy.deepcopy(original)
+        status, body = self.invoke_api({'user_id': 'qa-user', 'active': 'false'}, 'users/set_status')
+        self.assertEqual(status, 400, body)
+        self.assertEqual(self.data['users']['qa-user'], original)
+        self.sync.assert_not_called()
+
     def test_api_reconciles_absolute_usage_against_measured_ledger(self):
         self.data['users']['qa-user'] = {'password': 'original', 'used_bytes': 50,
                                           'legacy_auth_value': 7, 'expires_at': 2200000000}
@@ -1196,18 +1204,6 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertNotIn('warp_socks(suffix:openai.com)', text)
 
     def test_account_sync_includes_anytls_and_tuic_revocation(self):
-        self.data.clear()
-        self.data.update({'users': {'u1': {'status': 'disabled'}}})
-        self.ns['pending_revocations'] = lambda data: set()
-        self.ns['blocked_user_ids'] = lambda: set()
-        self.ns['copy'] = copy
-        self.ns['data_lock'] = threading.RLock()
-        self.ns['acquire_core_operation_lock'] = lambda: 19
-        self.ns['os'] = SimpleNamespace(close=lambda fd: None)
-        self.ns['save_data'] = Mock()
-        self.ns['portal_path'] = self.hdir / 'portal.json'
-        self.ns['access_apply_lock'] = threading.RLock()
-        self.ns['last_enforced_blocked'] = None
         source = Path(portal.__file__).read_text(encoding='utf-8')
         apply_access_body = source.split('def apply_access(force_ids=(), core_lock_fd=None):', 1)[1]
         apply_access_body = apply_access_body.split('def expiry_access_worker():', 1)[0]

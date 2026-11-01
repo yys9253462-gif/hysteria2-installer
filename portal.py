@@ -9664,7 +9664,9 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                     if 'active' not in params:
                         return self.reply_json(400, {'ok': False, 'error': 'Missing required field: active'})
-                    want = 'active' if params.get('active') else 'disabled'
+                    if not isinstance(params['active'], bool):
+                        return self.reply_json(400, {'ok': False, 'error': 'active must be a JSON boolean'})
+                    want = 'active' if params['active'] else 'disabled'
                     # 与 users/delete 同一条保护：机主账号不允许停用，
                     # 否则会出现"把面板自己锁在门外"的后果。
                     if user_id == MASTER_USER_ID and want != 'active':
