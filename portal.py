@@ -4362,7 +4362,23 @@ def drop_meter_totals(data, user_id):
     if not isinstance(totals, dict):
         return False
     totals.pop(user_id, None)
+    retired = meter.get('retired_users')
+    if not isinstance(retired, list):
+        retired = []
+        meter['retired_users'] = retired
+    if user_id not in retired:
+        retired.append(user_id)
     return True
+
+
+def restore_meter_user(data, user_id):
+    """Allow a newly created account to start a fresh accounting lifecycle."""
+    meter = data.get('usage_meter')
+    if not isinstance(meter, dict):
+        return
+    retired = meter.get('retired_users')
+    if isinstance(retired, list):
+        meter['retired_users'] = [uid for uid in retired if uid != user_id]
 
 
 def reconcile_meter_usage(data, user_id, requested):
@@ -7103,7 +7119,9 @@ def ensure_portal_access(root, meta, data):
     path = root / 'portal-access.json'
     if path.exists():
         try:
-            return json.loads(path.read_text(encoding='utf-8')), False
+            access = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(access, dict):
+                return access, False
         except (OSError, ValueError):
             pass
     username = secrets.token_hex(8)
@@ -7448,7 +7466,7 @@ def serve(path):
                     core_lock_fd = acquire_core_operation_lock()
                     acquired_core_lock = True
                 enforce_node_access(portal_path.parent,snapshot,pending,reality_apply_lock,
-                                    skip_anytls=True, skip_tuic=True)
+                                    skip_anytls=False, skip_tuic=False)
             except Exception as exc:
                 with data_lock:
                     data['_pending_revocations']=sorted(pending_revocations(data) | pending)
@@ -7703,6 +7721,7 @@ def serve(path):
         usage_meter = _usage_runtime.from_file(data, data_lock, save_meter_data,
                                               portal_path.parent / 'usage-meter-config.json',
                                               on_speed=_meter_speed_sample)
+        usage_meter.user_allowed = user_access_allowed
     except Exception as _usage_exc:
         print('[portal] 真实计量未初始化: ' + type(_usage_exc).__name__, file=sys.stderr)
 
@@ -9290,6 +9309,7 @@ if __name__ == '__main__':
                                                   if 'usage_meter' in data else missing)
                                 try:
                                     reconcile_meter_usage(data, user_id, initial_used)
+                                    restore_meter_user(data, user_id)
                                     data.setdefault('users', {})[user_id] = record
                                     save_data()
                                 except ValueError:
@@ -9309,6 +9329,7 @@ if __name__ == '__main__':
                                     conflict = (503, 'Reconciliation save failed; disk state may require verification')
                             elif conflict is None:
                                 previous_record = copy.deepcopy(existing)
+                                restore_meter_user(data, user_id)
                                 data.setdefault('users', {})[user_id] = record
                                 try:
                                     save_data()

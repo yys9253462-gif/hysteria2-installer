@@ -139,10 +139,6 @@ command() {
     if [[ "$1" == -v && "$2" == flock ]]; then return 1; fi
     builtin command "$@"
 }
-builtin() {
-    if [[ "$1" == command && "$2" == -v && "$3" == flock ]]; then return 1; fi
-    command "$@"
-}
 if acquire_lock; then exit 1; fi
 ''')
         self.assertNotEqual(result.returncode, 0)

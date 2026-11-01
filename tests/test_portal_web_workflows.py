@@ -1195,6 +1195,24 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertIn('qa_proxy(all)', text)
         self.assertNotIn('warp_socks(suffix:openai.com)', text)
 
+    def test_account_sync_includes_anytls_and_tuic_revocation(self):
+        self.data.clear()
+        self.data.update({'users': {'u1': {'status': 'disabled'}}})
+        self.ns['pending_revocations'] = lambda data: set()
+        self.ns['blocked_user_ids'] = lambda: set()
+        self.ns['copy'] = copy
+        self.ns['data_lock'] = threading.RLock()
+        self.ns['acquire_core_operation_lock'] = lambda: 19
+        self.ns['os'] = SimpleNamespace(close=lambda fd: None)
+        self.ns['save_data'] = Mock()
+        self.ns['portal_path'] = self.hdir / 'portal.json'
+        self.ns['access_apply_lock'] = threading.RLock()
+        self.ns['last_enforced_blocked'] = None
+        source = Path(portal.__file__).read_text(encoding='utf-8')
+        apply_access_body = source.split('def apply_access(force_ids=(), core_lock_fd=None):', 1)[1]
+        apply_access_body = apply_access_body.split('def expiry_access_worker():', 1)[0]
+        self.assertIn('skip_anytls=False, skip_tuic=False', apply_access_body)
+
     def test_stopped_reality_stays_off_during_account_sync(self):
         config = {'inbounds': [{'protocol': 'vless', 'streamSettings': {'security': 'reality'},
                                'settings': {'clients': []}}]}

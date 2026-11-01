@@ -158,6 +158,29 @@ class AdoptWithoutAccessFileTests(unittest.TestCase):
             self.assertEqual(access['api_key'], 'k' * 32)
             self.assertTrue(access['url'].startswith('https://node.example.com:8443/'))
 
+    def test_rebuilds_valid_json_with_wrong_top_level_shape(self):
+        import json, tempfile
+        from unittest import mock
+        for malformed in ('[]', 'null', '"text"', '42'):
+            with self.subTest(malformed=malformed), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                meta = root / 'client_meta.json'
+                meta.write_text(json.dumps({'server_name': 'node.example.com',
+                                            'public_ip': '192.0.2.1',
+                                            'subscription_port': 8443}), encoding='utf-8')
+                (root / 'portal.json').write_text(json.dumps({
+                    'port': 1111, 'token': 'tok', 'api_key': 'k' * 32,
+                    'auth_hash': 'a' * 64, 'session_secret': 's' * 32,
+                    'users': {'buyer': {'password': 'p2'}},
+                    'page': '', 'clash': '', 'sing': '', 'qr': '', 'proxy_services': [],
+                }), encoding='utf-8')
+                (root / 'portal-access.json').write_text(malformed, encoding='utf-8')
+                with mock.patch.object(portal, 'refresh', lambda *a, **k: None):
+                    portal.adopt(meta, 2222)
+                access = json.loads((root / 'portal-access.json').read_text(encoding='utf-8'))
+                self.assertIsInstance(access, dict)
+                self.assertEqual(access['api_key'], 'k' * 32)
+
 
 class MetaFileTests(unittest.TestCase):
     def test_non_object_json_returns_empty_mapping(self):

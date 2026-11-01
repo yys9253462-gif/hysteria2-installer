@@ -7,7 +7,7 @@ import copy
 ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"
 
 
-def apply_sample(state, source, epoch, counters, sampled_at):
+def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     if source not in ('hysteria', 'reality'):
         raise ValueError('unknown source')
     if not isinstance(epoch, str) or not epoch:
@@ -60,6 +60,24 @@ def apply_sample(state, source, epoch, counters, sampled_at):
     # 加上增量前校验原值，负数/布尔值不能被一次采样洗成正常整数。
     for uid in clean:
         total_bytes(new, uid)
+    retired_value = new.get('retired_users', [])
+    retired = {uid for uid in retired_value if isinstance(uid, str)} if isinstance(retired_value, list) else set()
+    if active_users is not None:
+        retired.difference_update(active_users)
+        new['retired_users'] = sorted(retired)
+    inactive = set()
+    if active_users is not None:
+        inactive = {uid for uid in clean if uid not in active_users}
+    ignored = retired | inactive
+    ignored_counters = {uid: clean.pop(uid) for uid in ignored if uid in clean}
+    for uid in retired:
+        totals.pop(uid, None)
+    adjustments = new.get('adjustments')
+    if isinstance(adjustments, dict):
+        for adjustment in adjustments.values():
+            if isinstance(adjustment, dict) and isinstance(adjustment.get('users'), dict):
+                for uid in ignored:
+                    adjustment['users'].pop(uid, None)
     reset_users = []
     corrupt_users = []
     first_sample = previous is None
@@ -67,6 +85,11 @@ def apply_sample(state, source, epoch, counters, sampled_at):
     cursors = {} if previous is None else dict(previous['counters'])
     if new_epoch:
         cursors = {}
+    for uid in ignored:
+        # Track a removed or inactive user's latest counter without charging it so
+        # same-ID recreation starts at this lifecycle boundary.
+        if uid in ignored_counters:
+            cursors[uid] = ignored_counters[uid]
     deltas = {}
     # 游标为防止重复累计而保留；速率只能使用相邻两轮都出现的计数。
     sampled_users = set()

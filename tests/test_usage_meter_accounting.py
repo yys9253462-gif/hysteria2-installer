@@ -157,6 +157,42 @@ class MeterAccountingTest(unittest.TestCase):
         self.assertNotIn('reality', summary['measurement_sources'])
         self.assertEqual(self.data['users']['admin_master']['password'], 'unchanged')
 
+    def test_deleted_user_counter_is_not_recreated_or_charged_on_recreation(self):
+        self.meter.poll()
+        self.counters['hysteria']['admin_master'] = {'tx': 100, 'rx': 0}
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 100)
+        del self.data['users']['admin_master']
+        portal_module = __import__('portal')
+        portal_module.drop_meter_totals(self.data, 'admin_master')
+        self.data['usage_meter'].setdefault('sources', {}).setdefault('hysteria', {})
+        self.data['usage_meter']['sources']['hysteria']['counters'] = {'admin_master': {'tx': 100, 'rx': 0}}
+        self.counters['hysteria']['admin_master'] = {'tx': 120, 'rx': 0}
+        self.meter.poll()
+        self.assertNotIn('admin_master', self.data['usage_meter']['totals'])
+        portal_module.restore_meter_user(self.data, 'admin_master')
+        self.data['users']['admin_master'] = {'used_bytes': 0, 'limit_bytes': 1000,
+                                              'status': 'active', 'expires_at': 9999999999}
+        self.counters['hysteria']['admin_master'] = {'tx': 150, 'rx': 0}
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 30)
+        self.assertEqual(self.data['usage_meter']['totals']['admin_master']['hysteria'], 30)
+
+    def test_disabled_users_are_not_charged_while_retaining_counter_cursor(self):
+        self.meter.poll()
+        self.counters['hysteria']['admin_master'] = {'tx': 100, 'rx': 0}
+        self.meter.poll()
+        self.data['users']['admin_master']['status'] = 'disabled'
+        self.meter.user_allowed = lambda user: user.get('status') == 'active'
+        self.counters['hysteria']['admin_master'] = {'tx': 140, 'rx': 0}
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 100)
+        self.assertEqual(self.data['usage_meter']['sources']['hysteria']['counters']['admin_master']['tx'], 140)
+        self.data['users']['admin_master']['status'] = 'active'
+        self.counters['hysteria']['admin_master'] = {'tx': 150, 'rx': 0}
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 110)
+
     def test_core_and_runtime_revision_match(self):
         self.assertEqual(runtime.core.ACCOUNTING_REVISION, runtime.ACCOUNTING_REVISION)
 

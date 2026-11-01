@@ -139,6 +139,7 @@ class PortalMeter:
     def __init__(self, data, lock, save, config, read=None, epoch=None, on_speed=None):
         self.data, self.lock, self.save, self.config=data,lock,save,config
         self.read=read or self._read
+        self.user_allowed = None
         self.epoch=epoch or readers.service_epoch
         self.stop=threading.Event()
         # 速率采样回调（2026-10-08）：on_speed(uid, tx, rx, elapsed, source)
@@ -210,7 +211,11 @@ class PortalMeter:
                     meter.setdefault('registered_users', list(users_view))
                     # 已存在客户在后续才第一次出现在计数器中时，core 从零累加是有效的：
                     # 当前服务为所有用户保持单调累计，且初始窗口无计数表示0。
-                    outcome = core.apply_sample(meter,source,before,counters,now)
+                    active_users = ({uid for uid, user in users_view.items()
+                                     if isinstance(user, dict) and self.user_allowed(user)}
+                                    if self.user_allowed is not None else None)
+                    outcome = core.apply_sample(meter,source,before,counters,now,
+                                                active_users=active_users)
                     if not isinstance(meter.get('health'), dict):
                         meter['health']={}
                     meter['health'][source]={'ok':True,'sampled_at':now,'error':''}

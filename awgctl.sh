@@ -1505,7 +1505,6 @@ main() {
             ;;
         peer-add)
             parse_name_endpoint "$@"
-            set -- "$PARSED_NAME" "$PARSED_ENDPOINT"
             ;;
         peer-del)
             [[ -n "${1:-}" ]] || die "用法: hy2-awgctl peer-del <名称>"

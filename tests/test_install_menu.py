@@ -218,16 +218,33 @@ class RefreshPortalFailureTests(unittest.TestCase):
 class NftablesProtocolMatchTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
     def test_tcp_rule_does_not_suppress_required_udp_rule(self):
-        helper = r'''
-_nft_has() { grep -qE "(^|[[:space:]])$1[[:space:]]+dport[[:space:]]+$2([[:space:]]|$)" <<<"$3"; }
-'''
-        namespace = {'grep': shutil.which('grep')}
+        install = (ROOT / 'install.sh').read_text(encoding='utf-8')
+        helper = install[install.index('            _nft_has()'):install.index('            _nft_ensure()')]
         rules = 'tcp dport 50000 accept # handle 1\n'
         result = subprocess.run([shutil.which('bash'), '-c', helper + '''
-_nft_has udp 50000 "$RULES" && exit 9
+if _nft_has udp 50000 "$RULES"; then exit 9; fi
 _nft_has tcp 50000 "$RULES"
 '''], capture_output=True, text=True,
             env=dict(os.environ, RULES=rules))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_add_rule_failure_does_not_claim_firewall_success(self):
+        install = (ROOT / 'install.sh').read_text(encoding='utf-8')
+        source = install[install.index('            _nft_has()'):install.index('            unset -f _nft_has _nft_ensure')]
+        script = source + r'''
+FAMILY=inet; TABLE=filter; CHAIN=input; RULES='tcp dport 50000 accept'; changed=0
+nft() { return 1; }
+_ensure() {
+    _nft_has "$1" "$2" "$RULES" && return 0
+    nft add rule "$FAMILY" "$TABLE" "$CHAIN" "$1" dport "$2" accept >/dev/null 2>&1 || true
+    changed=1
+}
+_ensure udp 50000
+[[ "$changed" == 1 ]]
+'''
+        result = subprocess.run([shutil.which('bash'), '-c', script],
+                                capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
