@@ -854,6 +854,27 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(self.data['users']['qa-user'], old)
         self.assertNotIn('adjustments', self.data['usage_meter'])
 
+    def test_api_create_save_failure_restores_memory_and_skips_protocol_sync(self):
+        portal.reality_registry(self.data)
+        before = copy.deepcopy(self.data)
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, body = self.invoke_api({'user_id': 'new-user'}, 'users/create')
+        self.assertEqual(status, 503, body)
+        self.assertEqual(self.data, before)
+        self.sync.assert_not_called()
+
+    def test_api_update_save_failure_restores_existing_record(self):
+        original = {'password': 'old', 'status': 'active', 'expires_at': 2200000000,
+                    'limit_bytes': 10, 'used_bytes': 5, 'ip_limit': 0}
+        self.data['users']['qa-user'] = copy.deepcopy(original)
+        portal.reality_registry(self.data)
+        before = copy.deepcopy(self.data)
+        self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        status, body = self.invoke_api({'user_id': 'qa-user', 'password': 'new'}, 'users/create')
+        self.assertEqual(status, 503, body)
+        self.assertEqual(self.data, before)
+        self.sync.assert_not_called()
+
     def test_api_duplicate_create_preserves_existing_usage_and_password(self):
         old = {'password': 'original-test-only', 'used_bytes': 123456, 'expires_at': 2200000000}
         self.data['users']['qa-user'] = dict(old)
@@ -1150,6 +1171,37 @@ class WebWorkflowTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 portal.apply_xray_config_transaction({'inbounds': []}, str(path), 'fixture-xray')
         self.assertEqual(path.read_bytes(), old)
+
+    def test_xray_transaction_preserves_disabled_state_on_enable_failure_rollback(self):
+        path = self.hdir / 'xray.json'
+        old = b'{"inbounds":[]}'
+        path.write_bytes(old)
+        commands = []
+        state = {'active': False}
+        def run(args, **kwargs):
+            commands.append(args)
+            if args == ['xray-fixture', 'run', '-test', '-c', str(path.with_name('xray.json.portal-candidate.json'))]:
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            if args[:3] == ['systemctl', 'is-active', 'xray']:
+                return SimpleNamespace(returncode=0, stdout='active' if state['active'] else 'inactive')
+            if args[:3] == ['systemctl', 'is-enabled', 'xray']:
+                return SimpleNamespace(returncode=0, stdout='disabled')
+            if args[:2] == ['systemctl', 'restart']:
+                state['active'] = True
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            if args[:2] == ['systemctl', 'enable']:
+                return SimpleNamespace(returncode=1, stdout='', stderr='enable failed')
+            if args[:2] == ['systemctl', 'stop']:
+                state['active'] = False
+            return SimpleNamespace(returncode=0, stdout='inactive', stderr='')
+        with patch.object(portal.subprocess, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, '自启动设置失败'):
+                portal.apply_xray_config_transaction({'inbounds': [{'tag': 'vmess-ws-in'}]},
+                    str(path), 'xray-fixture', restart=True)
+        self.assertEqual(path.read_bytes(), old)
+        self.assertIn(['systemctl', 'disable', 'xray'], commands)
+        self.assertIn(['systemctl', 'stop', 'xray'], commands)
+        self.assertEqual(commands.count(['systemctl', 'restart', 'xray']), 1)
 
     def test_xray_transaction_restart_failure_restores_original_bytes(self):
         path = self.hdir / 'xray.json'

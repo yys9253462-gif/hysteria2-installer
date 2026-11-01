@@ -1823,6 +1823,8 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
     candidate = path.with_name(path.name + '.portal-candidate.json')
     was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
                                 text=True, timeout=5).stdout.strip() == 'active'
+    was_enabled = subprocess.run(['systemctl', 'is-enabled', 'xray'], capture_output=True,
+                                 text=True, timeout=5).stdout.strip() == 'enabled'
     replaced = False
     try:
         candidate.write_text(json.dumps(config, indent=2), encoding='utf-8')
@@ -1867,9 +1869,16 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                 candidate.write_bytes(original)
                 candidate.chmod(mode)
                 os.replace(candidate, path)
-            if was_active and original is not None:
-                subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
-                subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
+            if was_enabled:
+                subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
+            else:
+                subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
+            if original is not None:
+                if was_active:
+                    subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+                    subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
+                else:
+                    subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -9231,7 +9240,19 @@ if __name__ == '__main__':
                                         data['usage_meter'] = previous_meter
                                     conflict = (503, 'Reconciliation save failed; disk state may require verification')
                             elif conflict is None:
+                                previous_record = copy.deepcopy(existing)
                                 data.setdefault('users', {})[user_id] = record
+                                try:
+                                    save_data()
+                                except AtomicWriteDurabilityError:
+                                    durability_uncertain = True
+                                except OSError:
+                                    if previous_record is None:
+                                        data.get('users', {}).pop(user_id, None)
+                                    else:
+                                        data.setdefault('users', {})[user_id] = previous_record
+                                    reality_registry(data)
+                                    conflict = (503, 'User save failed; disk state may require verification')
                             if conflict is None:
                                 pwd, expires = record['password'], record['expires_at']
                                 ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
@@ -11320,16 +11341,22 @@ if __name__ == '__main__':
                             if not _service_stop_confirmed(stop_result, state):
                                 # Restore every unit's original active and enabled
                                 # state, including units already stopped in this pass.
+                                restore_failed = []
                                 for restore_unit, (was_active, was_enabled) in unit_states.items():
-                                    if was_enabled:
-                                        subprocess.run(['systemctl', 'enable', restore_unit],
-                                                       capture_output=True, timeout=30)
-                                    else:
-                                        subprocess.run(['systemctl', 'disable', restore_unit],
-                                                       capture_output=True, timeout=30)
-                                    action = 'start' if was_active else 'stop'
-                                    subprocess.run(['systemctl', action, restore_unit],
-                                                   capture_output=True, timeout=30)
+                                    enable_result = subprocess.run(
+                                        ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
+                                        capture_output=True, timeout=30)
+                                    action_result = subprocess.run(
+                                        ['systemctl', 'start' if was_active else 'stop', restore_unit],
+                                        capture_output=True, timeout=30)
+                                    restored_state = _systemd_state(restore_unit)
+                                    active_ok = restored_state == ('active' if was_active else 'inactive')
+                                    if enable_result.returncode != 0 or action_result.returncode != 0 or not active_ok:
+                                        restore_failed.append(restore_unit)
+                                if restore_failed:
+                                    return self.reply_json(500, {'ok': False, 'error':
+                                        '核心服务 %s 未能停止；保留了所有文件，但服务状态恢复未确认：%s'
+                                        % (unit, ', '.join(restore_failed))})
                                 return self.reply_json(500, {'ok': False, 'error':
                                     '核心服务 %s 未能确认停止；已恢复原服务状态并保留所有文件' % unit})
                         for unit in unit_names:
