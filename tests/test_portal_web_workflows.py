@@ -1097,7 +1097,12 @@ class WebWorkflowTests(unittest.TestCase):
 
     def test_api_invalid_json_shape_and_numeric_parameters_return_400(self):
         for payload in ([], {'user_id': 42}, {'user_id': 'qa-user', 'traffic_gb': 'nan'},
-                        {'user_id': 'qa-user', 'duration_days': '-1'}):
+                        {'user_id': 'qa-user', 'duration_days': '-1'},
+                        {'user_id': 'fractional-days', 'duration_days': 1.9},
+                        {'user_id': 'fractional-ip-limit', 'ip_limit': 1.5},
+                        {'user_id': 'fractional-expiry', 'expires_at': 2200000000.5},
+                        {'user_id': 'fractional-limit', 'limit_bytes': 10.25},
+                        {'user_id': 'fractional-used', 'used_bytes': 4.5}):
             self.assertEqual(self.invoke_api(payload)[0], 400)
         self.assertNotIn('qa-user', self.data['users'])
 

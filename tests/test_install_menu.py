@@ -229,23 +229,18 @@ _nft_has tcp 50000 "$RULES"
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
-    def test_add_rule_failure_does_not_claim_firewall_success(self):
+    def test_add_rule_failure_is_reported(self):
         install = (ROOT / 'install.sh').read_text(encoding='utf-8')
-        source = install[install.index('            _nft_has()'):install.index('            unset -f _nft_has _nft_ensure')]
-        script = source + r'''
-FAMILY=inet; TABLE=filter; CHAIN=input; RULES='tcp dport 50000 accept'; changed=0
+        start = install.index('            _nft_has()')
+        end = install.index('            if ! _nft_ensure udp')
+        source = install[start:end]
+        result = subprocess.run([shutil.which('bash'), '-c', source + r'''
+log_err(){ printf '%s\\n' "$*" >&2; }
+FAMILY=inet; TABLE=filter; CHAIN=input
 nft() { return 1; }
-_ensure() {
-    _nft_has "$1" "$2" "$RULES" && return 0
-    nft add rule "$FAMILY" "$TABLE" "$CHAIN" "$1" dport "$2" accept >/dev/null 2>&1 || true
-    changed=1
-}
-_ensure udp 50000
-[[ "$changed" == 1 ]]
-'''
-        result = subprocess.run([shutil.which('bash'), '-c', script],
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+if _nft_ensure udp 50000 ''; then exit 10; else exit 0; fi
+'''], capture_output=True, text=True, encoding='utf-8', errors='replace')
+        self.assertEqual(result.returncode, 0, (result.stdout or '') + (result.stderr or ''))
 
 
 class AwgUninstallWrapperTests(unittest.TestCase):

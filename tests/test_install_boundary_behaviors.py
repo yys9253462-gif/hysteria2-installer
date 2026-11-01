@@ -304,5 +304,71 @@ jq(){
         self.assertNotIn("UDP 20000-40000", self.probe_hint(None))
 
 
+@unittest.skipUnless(BASH, "requires Bash")
+class TestGostInstallRollback(unittest.TestCase):
+    def test_selfcheck_write_failure_restores_existing_gost_deployment(self):
+        function = extract_function('install_gost')
+        with tempfile.TemporaryDirectory(prefix='hy2-gost-rollback-') as tmp:
+            root = Path(tmp)
+            hy2 = root / 'etc/hysteria'
+            units = root / 'etc/systemd/system'
+            lib = root / 'usr/local/lib'
+            bin_dir = root / 'usr/local/bin'
+            for directory in (hy2, units, lib, bin_dir):
+                directory.mkdir(parents=True, exist_ok=True)
+            paths = {
+                'gost': bin_dir / 'gost',
+                'config': hy2 / 'gost.yml',
+                'unit': units / 'gost.service',
+                'check': lib / 'hy2-gost-selfcheck',
+                'owner': hy2 / '.hy2-gost-owned',
+                'cert': hy2 / 'gost-cert/cert.pem',
+                'key': hy2 / 'gost-cert/key.pem',
+            }
+            for name, path in paths.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('old:' + name, encoding='utf-8')
+            script = '''
+HY2_DIR="$TEST_ROOT/etc/hysteria"
+HY2_ARCH=amd64
+GOST_BIN="$TEST_ROOT/usr/local/bin/gost"
+GOST_CONFIG="$HY2_DIR/gost.yml"
+GOST_UNIT="$TEST_ROOT/etc/systemd/system/gost.service"
+GOST_LATEST=v3.3.0
+GOST_VER=3.3.0
+GOST_ASSET=linux_amd64
+systemctl(){ :; }
+hy2_expected_sha256(){ printf digest; }
+curl(){ :; }
+hy2_verify_sha256(){ return 0; }
+hy2_tar_listing_safe(){ return 0; }
+hy2_tar_find_member(){ printf gost; }
+tar(){ printf new-gost > "$TMP_DIR/gost"; }
+install(){
+    if [[ "$1" == -m && "$3" == */gost.new ]]; then
+        command install "$@"
+    else
+        return 1
+    fi
+}
+mkdir(){ command mkdir "$@"; }
+cat(){
+    if [[ "$*" == *hy2-gost-selfcheck* ]]; then
+        return 1
+    fi
+    command cat "$@"
+}
+''' + function + '''
+install_gost
+'''
+            result = run_shell(
+                'TEST_ROOT="' + root.as_posix() + '"\n' + script)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(paths['gost'].read_text(encoding='utf-8'), 'old:gost')
+            self.assertEqual(paths['config'].read_text(encoding='utf-8'), 'old:config')
+            self.assertEqual(paths['unit'].read_text(encoding='utf-8'), 'old:unit')
+            self.assertEqual(paths['check'].read_text(encoding='utf-8'), 'old:check')
+
+
 if __name__ == "__main__":
     unittest.main()

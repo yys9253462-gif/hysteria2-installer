@@ -2052,16 +2052,21 @@ setup_system_firewall() {
             _nft_has() { grep -qE "(^|[[:space:]])$1[[:space:]]+dport[[:space:]]+$2([[:space:]]|$)" <<<"$3"; }
             _nft_ensure() {   # $1=proto $2=dport 表达式 $3=规则列表
                 _nft_has "$1" "$2" "$3" && return 0
-                nft add rule "$nft_fam" "$nft_tbl" "$nft_chain" "$1" dport "$2" accept >/dev/null 2>&1 || true
+                # Insert before existing terminal drops; appending an accept after
+                # a drop policy/rule leaves the listener unreachable.
+                if ! nft insert rule "$nft_fam" "$nft_tbl" "$nft_chain" "$1" dport "$2" accept >/dev/null 2>&1; then
+                    log_err "无法在 nftables 链 ${nft_fam} ${nft_tbl}/${nft_chain} 插入 $1 dport $2；端口未确认放行。"
+                    return 1
+                fi
                 _changed=1
             }
-            _nft_ensure udp "${port}" "$_nft_rules"
+            if ! _nft_ensure udp "${port}" "$_nft_rules"; then unset -f _nft_has _nft_ensure; return 1; fi
             if [[ -n "$s_port" && -n "$e_port" ]]; then
-                _nft_ensure udp "${s_port}-${e_port}" "$_nft_rules"
+                if ! _nft_ensure udp "${s_port}-${e_port}" "$_nft_rules"; then unset -f _nft_has _nft_ensure; return 1; fi
             fi
-            _nft_ensure tcp "${HY2_SUB_PORT}" "$_nft_rules"
+            if ! _nft_ensure tcp "${HY2_SUB_PORT}" "$_nft_rules"; then unset -f _nft_has _nft_ensure; return 1; fi
             if [[ "$CERT_TYPE" == "acme" ]]; then
-                _nft_ensure tcp 80 "$_nft_rules"
+                if ! _nft_ensure tcp 80 "$_nft_rules"; then unset -f _nft_has _nft_ensure; return 1; fi
             fi
             if [[ "$_changed" == "1" ]]; then
                 log_info "nftables ($nft_fam $nft_tbl/$nft_chain) 已放行 tcp ${HY2_SUB_PORT} + udp ${port}$([[ -n "$s_port" ]] && echo " + udp ${s_port}-${e_port}")。"
@@ -4314,17 +4319,22 @@ install_gost() {
 
     # 生成初始配置（services 由 Web 控制台动态管理）
     if [[ ! -f "$GOST_CONFIG" ]]; then
-        cat > "$GOST_CONFIG" <<'EOF'
+        if ! cat > "$GOST_CONFIG" <<'EOF'
 # gost 入站代理配置（由 Web 控制台动态管理，勿手动编辑）
 services: []
 EOF
+        then
+            _restore_gost_install
+            log_err "GOST 初始配置写入失败，已恢复原部署。"
+            return 1
+        fi
     fi
 
     # 落盘启动自检脚本 (unit 的 ExecStartPost 会调用它)
     # ⚠️ 内容必须与 portal.py 的 GOST_SELFCHECK_SCRIPT 常量一致
     # (tests/test_portal_gost_reload.py 有断言钉死).
     mkdir -p /usr/local/lib || { _restore_gost_install; return 1; }
-    cat > /usr/local/lib/hy2-gost-selfcheck <<'PYSELFCHECK'
+    if ! cat > /usr/local/lib/hy2-gost-selfcheck <<'PYSELFCHECK'
 #!/usr/bin/env python3
 """确认 /etc/hysteria/gost.yml 里声明监听的服务端口都真的在监听.
 
@@ -4385,6 +4395,11 @@ def main():
 if __name__ == '__main__':
     sys.exit(main())
 PYSELFCHECK
+    then
+        _restore_gost_install
+        log_err "GOST 自检脚本写入失败，已恢复原部署。"
+        return 1
+    fi
     chmod 755 /usr/local/lib/hy2-gost-selfcheck || { _restore_gost_install; return 1; }
 
     # 创建 systemd 守护服务
@@ -4398,7 +4413,7 @@ PYSELFCHECK
     #   -R 30s      —— gost 官方周期自动重载，作为兜底（实测 v3.3.0 有效）
     #   ExecStartPost —— 跑自检脚本确认端口真的监听了，把"active 但无监听"
     #                    的静默故障变成启动失败，交给 systemd 重试
-    cat > /etc/systemd/system/gost.service <<EOF
+    if ! cat > /etc/systemd/system/gost.service <<EOF
 [Unit]
 Description=GOST Proxy Service (SOCKS5/HTTP/HTTPS inbound)
 After=network-online.target
@@ -4418,6 +4433,11 @@ ExecStartPost=/usr/local/lib/hy2-gost-selfcheck
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        _restore_gost_install
+        log_err "GOST systemd unit 写入失败，已恢复原部署。"
+        return 1
+    fi
     if ! : > "$HY2_DIR/.hy2-gost-owned" || ! chmod 600 "$HY2_DIR/.hy2-gost-owned"; then
         _restore_gost_install
         log_err "GOST 所有权标记写入失败，已恢复原部署。"
