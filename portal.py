@@ -6646,7 +6646,12 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
         3. 全都不空闲 → 返回 0（**绝不硬塞**，宁可不生成也不配一个撞车的）
     """
     listening = _listening_ports()
-    blocked = set(_REALITY_RESERVED_PORTS)
+    # 内置黑名单（22 / 80 / 8443 …）只用来挡**新挑**的端口；extra_blocked 是调用方
+    # 明确知道「这端口别人在用」，对谁都生效（2026-11-03 修）。旧实现把两者混在一起
+    # 并先于「沿用原端口」判断：Reality 正在 8443 服务时，一次重置密钥 / 重启开关
+    # 就被挪到 443 或 2053，已下发的链接全部失效 —— 正是下面 free() 注释里的事故。
+    reserved = set(_REALITY_RESERVED_PORTS)
+    blocked = set()
     if extra_blocked:
         for p in extra_blocked:
             try:
@@ -6705,8 +6710,13 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
         # 黑名单代表「调用方明确知道这端口不能给」，优先级必须高于偏好值。
         if p in blocked:
             return False
+        # 22 / 80 无论如何都不给（SSH 与 ACME 验证），沿用原端口也不行。
+        if p in (22, 80):
+            return False
         if p == pref:
             return True
+        if p in reserved:
+            return False
         # 以**实际监听表**为准。黑名单只是补充 ——
         # 因为「8443 归谁」在不同节点上完全不同，写死数字必然出错。
         return p not in listening

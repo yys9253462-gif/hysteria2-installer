@@ -8,6 +8,7 @@
 import base64
 import json
 import unittest
+from unittest.mock import patch
 
 import sys  # noqa: E402
 # 🔴 2026-10-31：CI 用的是 `python3 -m unittest discover -s tests -p 'test_*.py'`，
@@ -364,6 +365,20 @@ class PortSelectionSafetyTests(unittest.TestCase):
 
     def test_reserved_port_is_not_chosen(self):
         self.assertNotEqual(portal._pick_reality_port(preferred=22)[0], 22)
+
+    def test_serving_protocol_keeps_its_reserved_list_port(self):
+        """内置黑名单里的 8443 只挡新挑的端口（2026-11-03）。
+
+        Reality 正在 8443 上服务时，重置密钥 / 重启开关会带 preferred=8443 进来；
+        旧实现先查黑名单，把它挪到 443 或 2053，已下发的链接全部失效。
+        """
+        with patch.object(portal, '_listening_ports', return_value={8443}):
+            self.assertEqual(portal._pick_reality_port(preferred=8443)[0], 8443)
+            # 调用方明确拉黑（另一个协议在用）时仍然不给。
+            self.assertNotEqual(portal._pick_reality_port(preferred=8443, extra_blocked={8443})[0], 8443)
+        # 新挑端口时 8443 依然被跳过。
+        with patch.object(portal, '_listening_ports', return_value={443}):
+            self.assertNotEqual(portal._pick_reality_port()[0], 8443)
 
     def test_free_preferred_port_is_kept(self):
         """没冲突时仍沿用原端口，不给已有节点无谓换端口。"""
