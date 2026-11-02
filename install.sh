@@ -2641,6 +2641,10 @@ EOTW
     # 写入 do_upgrade.sh 供 Web 控制台在线升级官方核心或面板
     cat > "$HY2_DIR/do_upgrade.sh" <<'EOUG'
 #!/usr/bin/env bash
+# 与 install.sh 相同的 umask（2026-11-03 修）：本脚本由门户服务或手工 shell 调用，
+# 继承的 umask 通常是 022，自愈重写 client_meta.json（含 auth_password /
+# obfs_password）时新文件会变成 0644，任何本地用户都能读到主密码。
+umask 077
 TARGET="${1:-}" # 'core' or 'portal'
 HY2_DIR="/etc/hysteria"
 HY2_BIN="/usr/local/bin/hysteria"
@@ -2914,6 +2918,7 @@ METEREOF2
                         if jq --arg t "$_nt" --argjson i "$_ni" --arg s "$_nsn" --arg p "$_np" \
                               '.cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p' \
                               "$HY2_DIR/client_meta.json" > "$_tmp_meta" 2>/dev/null && [[ -s "$_tmp_meta" ]]; then
+                            chmod 600 "$_tmp_meta"
                             mv -f "$_tmp_meta" "$HY2_DIR/client_meta.json"
                             echo "证书信任模型已自愈: cert_type=${_ct:-<空>} -> ${_nt}, server_name=${_cs:-<空>} -> ${_nsn}"
                         else
