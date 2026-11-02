@@ -332,6 +332,39 @@ class PageStatusConsistencyTest(unittest.TestCase):
         self.assertIn('data-state="inactive"', row)
         self.assertIn('已到期', row)
 
+    def test_records_rejected_by_auth_never_show_normal(self):
+        """/auth 以 'Invalid user record' 拒绝的记录，两个页面都不能显示「正常」。"""
+        base = {'password': 'pw-bad-rec', 'status': 'active', 'expires_at': 2085974400,
+                'limit_bytes': 0, 'used_bytes': 0}
+        for extra in ({'expires_at': 'abc'}, {'limit_bytes': True}, {'used_bytes': -5},
+                      {'limit_bytes': -1}, {'expires_at': float('inf')}):
+            with self.subTest(extra=extra):
+                info = dict(base, **extra)
+                self.assertEqual(portal.user_access_denial(info), 'Invalid user record')
+                page = self.render({'bad_rec': info})
+                row = re.search(r'<tr data-user-row[^>]*>.*?</tr>', page, re.S).group(0)
+                self.assertIn('data-state="inactive"', row)
+                self.assertNotIn('>正常<', row)
+                self.assertIn('资料异常', row)
+                user_page = portal.user_page_html(
+                    'h.example.com', 'h.example.com', 443, '', 'bad_rec', info,
+                    'hysteria2://x@h:1/', 'c', 's', '', 't', 'k', sub_port=8443)
+                self.assertNotIn('运行正常', user_page)
+                self.assertIn('账号资料异常', user_page)
+
+    def test_customer_page_states_follow_access_rule(self):
+        now = int(time.time())
+        cases = (({'status': 'active', 'expires_at': None}, '运行正常'),
+                 ({'status': 'active', 'expires_at': now - 1}, '服务已到期'),
+                 ({'status': 'disabled', 'expires_at': None}, '账号已停用'),
+                 ({'status': 'active', 'limit_bytes': 10, 'used_bytes': 10}, '流量已超额'))
+        for info, text in cases:
+            with self.subTest(info=info):
+                page = portal.user_page_html(
+                    'h.example.com', 'h.example.com', 443, '', 'u1', dict(info, password='pw-u1'),
+                    'hysteria2://x@h:1/', 'c', 's', '', 't', 'k', sub_port=8443)
+                self.assertIn('>%s<' % text, page)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

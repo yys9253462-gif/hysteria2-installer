@@ -2012,6 +2012,29 @@ def user_note_text(value):
     return value if isinstance(value, str) and value else '-'
 
 
+# user_access_denial 的拒绝原因 → 管理页 / 客户页的状态徽标文字。
+_STATUS_PILL_TEXT = {
+    'Traffic quota exceeded': ('流量超额', '流量已超额'),
+    'User account expired': ('已到期', '服务已到期'),
+    'User account inactive': ('已停用', '账号已停用'),
+    'Invalid user record': ('资料异常', '账号资料异常'),
+}
+
+
+def user_status_pill(info, now=None, customer=False):
+    """状态徽标直接取自准入判据 user_access_denial（2026-11-03 修）。
+
+    旧实现在两个页面里各算一遍：到期时间写坏时 `float()` 失败就当作「没到期」，
+    `limit_bytes: true` / 负数用量也照常判成正常。/auth 对这类记录回
+    'Invalid user record' 拒绝连接，页面却显示「正常」，管理员无从发现。
+    """
+    denial = user_access_denial(info, now)
+    if denial is None:
+        return '<span class="status-pill active">%s</span>' % ('运行正常' if customer else '正常')
+    admin_text, customer_text = _STATUS_PILL_TEXT.get(denial, ('不可用', '当前不可用'))
+    return '<span class="status-pill expired">%s</span>' % (customer_text if customer else admin_text)
+
+
 def password_hint(value):
     """总览页里密码的打码展示（头尾各 4 位）。
 
@@ -2206,26 +2229,13 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         limit_bytes = _safe_int(u.get("limit_bytes") or 0)
         total_used_bytes += used_bytes
 
-        # 展示用的分支判断必须与准入判据 user_access_allowed 同源：
-        # 缺 status 视为 active，expires_at 到点即过期。
-        is_traffic_ok = limit_bytes <= 0 or used_bytes < limit_bytes
-        try:
-            is_time_ok = u.get("expires_at") is None or float(u.get("expires_at")) > now_ts
-        except (TypeError, ValueError):
-            is_time_ok = True
+        # 展示必须与准入判据同源：徽标与行状态都取自 user_access_denial。
         is_active = user_access_allowed(u, now_ts)
 
         if is_active:
             active_count += 1
 
-        if not is_traffic_ok:
-            status_html = '<span class="status-pill expired">流量超额</span>'
-        elif not is_time_ok:
-            status_html = '<span class="status-pill expired">已到期</span>'
-        elif u.get("status", "active") != "active":
-            status_html = '<span class="status-pill expired">已停用</span>'
-        else:
-            status_html = '<span class="status-pill active">正常</span>'
+        status_html = user_status_pill(u, now_ts)
 
         expires_str = _expiry_text(u.get("expires_at"))
         # 设备上限与在线数可能是 `"5"`、None 或旧格式（在线 IP 存成数字）。
@@ -3559,23 +3569,8 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # 这几个值直接来自 portal.json（2026-10-30 修）。
     used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
     limit_bytes = _safe_int(uinfo.get("limit_bytes") or 0)
-    now_ts = int(time.time())
-    # 与 user_access_allowed 同源：到点即过期、缺 status 视为 active。
-    is_traffic_ok = limit_bytes <= 0 or used_bytes < limit_bytes
-    _exp = uinfo.get("expires_at")
-    try:
-        is_time_ok = _exp is None or float(_exp) > now_ts
-    except (TypeError, ValueError):
-        is_time_ok = True
-
-    if not is_traffic_ok:
-        status_html = '<span class="status-pill expired">流量已超额</span>'
-    elif not is_time_ok:
-        status_html = '<span class="status-pill expired">服务已到期</span>'
-    elif uinfo.get("status", "active") != "active":
-        status_html = '<span class="status-pill expired">账号已停用</span>'
-    else:
-        status_html = '<span class="status-pill active">运行正常</span>'
+    # 与 user_access_allowed 同源：徽标直接取自 user_access_denial。
+    status_html = user_status_pill(uinfo, customer=True)
 
     expires_str = _expiry_text(uinfo.get("expires_at"))
     # 与总览页同一处理：设备上限可能是 "5" / None（手工编辑或旧格式）。
