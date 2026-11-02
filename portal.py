@@ -7318,6 +7318,10 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
                     latest[key] = data[key]
             if _rebuilt:
                 latest['auth_hash'] = data['auth_hash']
+                # 凭据换了，旧密码登录的会话一并作废（同 adopt）。
+                epoch = latest.get('session_epoch', 0)
+                epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
+                latest['session_epoch'] = epoch + 1
             latest.pop('page', None)
             data = latest
     except (OSError, ValueError):
@@ -7428,9 +7432,16 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     # 两者如果漂移，用 master 密码算出来的 hash 会让真正的登录密码失效。
     _new_hash = hashlib.sha256(base64.b64encode(
         f"{access.get('username','')}:{access.get('password','')}".encode())).hexdigest()
-    if data.get('auth_hash') != _new_hash:
+    # ensure_portal_access 重建凭据时已把新 auth_hash 写进 data，下面的比较看不出
+    # 变化：旧实现下凭据重建后，用旧密码登录的会话在 30 天内照样有效（2026-11-03 修）。
+    # 改为推进会话纪元而不是换 session_secret —— 后者同时是分享链接 k 的密钥。
+    if data.get('auth_hash') != _new_hash or _rebuilt:
         data['auth_hash'] = _new_hash
-        data['session_secret'] = secrets.token_hex(32)
+        if not isinstance(data.get('session_secret'), str) or not data['session_secret']:
+            data['session_secret'] = secrets.token_hex(32)
+        epoch = data.get('session_epoch', 0)
+        epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
+        data['session_epoch'] = epoch + 1
     if node_api_key:
         data['api_key'] = node_api_key
         access['api_key'] = node_api_key
