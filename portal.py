@@ -4967,12 +4967,20 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None):
     if not isinstance(snapshot, dict):
         return False
     section = snapshot.get('anytls_config')
-    if not path.exists() or not (isinstance(section, dict) and section.get('enabled')):
+    if not (isinstance(section, dict) and section.get('enabled')):
         return False
     apply = apply or apply_anytls_config
     if service_active is None:
         service_active = lambda: _systemd_state(ANYTLS_SERVICE) == 'active'  # noqa: E731
     with anytls_apply_lock:
+        # 配置文件不在、服务却在跑（2026-11-03 修，与 TUIC 对齐）：sing-box 内存里
+        # 还是旧名单，被停用/到期/删除的用户照样能连。旧实现在这里返回 False，
+        # enforce_node_access 把它当成「已同步」，待撤销记录随之清掉。
+        if not path.exists():
+            if service_active():
+                raise RuntimeError('AnyTLS configuration missing while service is active; '
+                                   'cannot confirm user sync')
+            return False
         # ⚠️ 2026-10-29 修：这里原来是裸 json.loads，anytls.json 被截断或手工
         # 改坏时抛 JSONDecodeError，而本函数在 enforce_node_access 顶部调用 ——
         # 一个坏文件就让开户/续费/停用/删除全部返回 503，报错还写成

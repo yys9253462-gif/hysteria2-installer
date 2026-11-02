@@ -145,8 +145,25 @@ class AnytlsSyncTest(unittest.TestCase):
         snap['anytls_config']['enabled'] = False
         self.assertFalse(self.sync(snap))
 
-    def test_missing_config_is_ignored(self):
-        self.assertFalse(self.sync(snapshot({'alice': {}})))
+    def test_missing_config_while_stopped_needs_no_sync(self):
+        self.assertFalse(self.sync(snapshot({'alice': {}}), active=False))
+        self.assertEqual(self.applied, [])
+
+    def test_missing_config_while_active_cannot_confirm_sync(self):
+        """配置被删但 sing-box 仍在跑：内存里还是旧名单，不能当作已收回。"""
+        with self.assertRaisesRegex(RuntimeError, 'missing while service is active'):
+            self.sync(snapshot({'alice': {}}), active=True)
+        self.assertEqual(self.applied, [])
+
+    def test_missing_config_uses_service_state_to_detect_live_instance(self):
+        with mock.patch.object(portal, '_systemd_state', return_value='active'):
+            with self.assertRaisesRegex(RuntimeError, 'missing while service is active'):
+                portal.sync_anytls_users(self.root, snapshot({'alice': {}}))
+
+    def test_missing_config_disabled_snapshot_is_ignored(self):
+        snap = snapshot({'alice': {}})
+        snap['anytls_config']['enabled'] = False
+        self.assertFalse(self.sync(snap, active=True))
 
 
 class AnytlsStopConfirmationTests(unittest.TestCase):
