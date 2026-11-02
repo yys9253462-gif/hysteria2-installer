@@ -66,6 +66,34 @@ class DoUpgradeMetaModeTests(unittest.TestCase):
             mode = stat.S_IMODE(meta.stat().st_mode)
             self.assertEqual(mode, 0o600, '自愈后 client_meta.json 权限是 %o，主密码对本地用户可读' % mode)
 
+    def heal_with_sans(self, sans, cn, current):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'cert').mkdir()
+            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt',
+                            'ec_paramgen_curve:prime256v1', '-nodes', '-subj', '/CN=' + cn,
+                            '-addext', 'subjectAltName=' + ','.join('DNS:' + s for s in sans),
+                            '-days', '2', '-keyout', str(root / 'cert/server.key'),
+                            '-out', str(root / 'cert/server.crt')],
+                           check=True, capture_output=True, timeout=30)
+            (root / 'config.yaml').write_text('listen: :443\ntls:\n  cert: cert/server.crt\n  key: cert/server.key\n',
+                                              encoding='utf-8')
+            meta = root / 'client_meta.json'
+            meta.write_text(json.dumps({'cert_type': 'acme', 'server_name': current,
+                                        'is_insecure': False, 'pin_sha256': ''}), encoding='utf-8')
+            script = 'set -u\nHY2_DIR=%s\n%s' % (root, trust_heal_block())
+            subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=60)
+            return json.loads(meta.read_text(encoding='utf-8'))['server_name']
+
+    def test_multi_san_certificate_keeps_the_current_server_name(self):
+        """与 portal.sync_cert_trust 一致：当前 SNI 仍在证书里就不换（2026-11-03）。"""
+        self.assertEqual(self.heal_with_sans(['a.example.com', 'b.example.com'], 'a.example.com',
+                                             'b.example.com'), 'b.example.com')
+
+    def test_wildcard_first_san_still_heals_to_a_concrete_name(self):
+        self.assertEqual(self.heal_with_sans(['*.example.com', 'node.example.com'], '*.example.com',
+                                             'gone.example.org'), 'node.example.com')
+
 
 if __name__ == '__main__':
     unittest.main()

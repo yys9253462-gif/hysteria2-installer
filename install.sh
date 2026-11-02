@@ -2895,11 +2895,21 @@ METEREOF2
                 _subj="$(openssl x509 -in "$_cert" -noout -subject 2>/dev/null | sed 's/^subject=//' | sed 's/ *$//')"
                 _iss="$(openssl x509 -in "$_cert" -noout -issuer 2>/dev/null | sed 's/^issuer=//' | sed 's/ *$//')"
                 _cn="$(openssl x509 -in "$_cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -1 | sed 's/ *$//')"
-                _san="$(openssl x509 -in "$_cert" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | head -1)"
+                # 与 sync_cert_meta / portal.sync_cert_trust 同一取法（2026-11-03 修）：收集全部 SAN，
+                # 当前 server_name 仍在证书里就保留，否则取第一个非通配 SAN，最后才退回 CN。
+                # 旧写法只看第一个 SAN：多域名证书会把 SNI 悄悄换成另一个域名（订阅全部失效），
+                # 第一个 SAN 是通配符时又直接跳过自愈。
+                _sans="$(openssl x509 -in "$_cert" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | tr '\n' ' ')"
                 _self="false"; [[ -n "$_subj" && "$_subj" == "$_iss" ]] && _self="true"
                 _acme="false"; grep -q '^acme:' "$HY2_DIR/config.yaml" 2>/dev/null && _acme="true"
+                _cs="$(jq -r '.server_name // empty' "$HY2_DIR/client_meta.json" 2>/dev/null || true)"
                 _nsn=""
-                if [[ -n "$_san" && "$_san" != \** ]]; then _nsn="$_san"; elif [[ -n "$_cn" && "$_cn" != \** ]]; then _nsn="$_cn"; fi
+                for _san in $_sans; do
+                    [[ -z "$_san" || "$_san" == \** ]] && continue
+                    if [[ -n "$_cs" && "$_san" == "$_cs" ]]; then _nsn="$_san"; break; fi
+                    [[ -z "$_nsn" ]] && _nsn="$_san"
+                done
+                if [[ -z "$_nsn" && -n "$_cn" && "$_cn" != \** ]]; then _nsn="$_cn"; fi
                 if [[ -n "$_nsn" ]]; then
                     if [[ "$_self" == "true" ]]; then
                         _nt="self_signed"; _ni="true"
