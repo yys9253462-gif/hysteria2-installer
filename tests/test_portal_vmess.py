@@ -495,6 +495,23 @@ class XrayPrivateNetworkGuardTests(unittest.TestCase):
         self.assertEqual(len(twice['routing']['rules']), 1)
         self.assertEqual(len([o for o in twice['outbounds'] if o['tag'] == 'block-private']), 1)
 
+    def test_guard_resolves_domains_before_matching_ips(self):
+        """按 IP 的拦截也要覆盖域名目标（2026-11-03，SE 节点上用真 Xray 实测）。
+
+        默认 AsIs 不解析域名：通过 SOCKS 访问 localhost.localdomain / localtest.me
+        都打到了 127.0.0.1 上的服务。IPIfNonMatch 时三者都被拦，example.com 照常可用。
+        """
+        for strategy in (None, '', 'AsIs'):
+            with self.subTest(strategy=strategy):
+                config = {'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}
+                if strategy is not None:
+                    config['routing'] = {'domainStrategy': strategy}
+                out = portal.add_private_network_guard(config)
+                self.assertEqual(out['routing']['domainStrategy'], 'IPIfNonMatch')
+        stricter = {'routing': {'domainStrategy': 'IPOnDemand'}}
+        self.assertEqual(portal.add_private_network_guard(stricter)['routing']['domainStrategy'],
+                         'IPOnDemand', '不能覆盖运维选的更严格策略')
+
 
 class ReservedUserNameTests(unittest.TestCase):
     def test_placeholder_is_reserved(self):

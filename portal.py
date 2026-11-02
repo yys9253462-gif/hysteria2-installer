@@ -638,6 +638,13 @@ def add_private_network_guard(config):
     routing = config.setdefault('routing', {})
     if not isinstance(routing, dict):
         routing = config['routing'] = {}
+    # 按 IP 拦截只对 IP 目标生效（2026-11-03 修，SE 节点实测）：默认 AsIs 不解析域名，
+    # 客户端用 localhost.localdomain / localtest.me 之类解析到回环的域名照样能打到
+    # 127.0.0.1 上的门户与计量端口、169.254.169.254 云元数据。IPIfNonMatch 在没有
+    # 域名规则命中时先解析再按 IP 匹配，拦截就覆盖了域名目标。只在未设置时补上，
+    # 不覆盖运维手工选的更严格策略（IPOnDemand）。
+    if routing.get('domainStrategy') in (None, '', 'AsIs'):
+        routing['domainStrategy'] = 'IPIfNonMatch'
     rules = routing.setdefault('rules', [])
     if not isinstance(rules, list):
         rules = routing['rules'] = []
