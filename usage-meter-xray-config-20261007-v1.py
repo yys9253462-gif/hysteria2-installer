@@ -158,7 +158,9 @@ def enable_reality_online(config_path, binary, address):
     changed=any(not levels.get(level,{}).get('statsUserOnline',False) for level in used)
     for level in used:levels.setdefault(level,{})['statsUserOnline']=True
     candidate=path.with_name(path.name+'.online-candidate.json')
-    backup=path.with_name(path.name+'.before-reality-online-'+str(time.time_ns()))
+    # 固定备份名，与 before-iplimit 同理（2026-11-03 修）：时间戳文件名每次改动
+    # 新建一份，/etc/hysteria 下无界累积。
+    backup=path.with_name(path.name+'.before-reality-online')
     if not address.startswith('127.0.0.1:'):raise ValueError('stats endpoint must be loopback')
     if changed:
         candidate.write_text(json.dumps(config,indent=2),encoding='utf-8')
@@ -176,7 +178,8 @@ def enable_reality_online(config_path, binary, address):
             if replaced:
                 candidate.write_bytes(original)
                 os.replace(candidate,path)
-                subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15,check=True)
+                # 回滚后的重启不带 check：它失败时抛出的异常会顶掉真正的失败原因。
+                subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15)
             raise
         finally:
             candidate.unlink(missing_ok=True)
