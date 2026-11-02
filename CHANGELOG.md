@@ -19,7 +19,7 @@
 
 - `/auth` 的失败桶与速率桶改为按 Hysteria 鉴权体里的 `addr` 分桶（IPv4 单地址、IPv6 按 /64），旧实现是进程全局桶：任何人 60 秒内用错误密码连 30 次，全节点合法用户都被回 `Auth service busy`。全局只保留每秒 500 次的兜底，桶数上限 4096、淘汰最久未活动者。返回格式不变。
 - 门户监听 backlog 从默认 5 调到 128（实测开机以来溢出 208 次）。
-- Hysteria 服务端日志级别默认 `error`，写在 `hysteria-server.service.d/loglevel.conf`（`HYSTERIA_LOG_LEVEL`）；安装前 `export HY2_LOG_LEVEL=info` 可覆盖，重装时保留已有 drop-in。
+- Hysteria 服务端日志级别默认 `error`，写在 `hysteria-server.service.d/loglevel.conf`（`HYSTERIA_LOG_LEVEL`）；安装前 `export HY2_LOG_LEVEL=info` 可覆盖，重装时保留已有 drop-in。（2026-11-03 已改回默认 `info`，见上方条目。）
 - 新增按来源限流、IPv6 归并、全局兜底、桶上限、backlog 与日志 drop-in 回归测试。
 
 ## 2026-10-12 — 可核验批量更新与 Hy2 在线实例统计
