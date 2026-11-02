@@ -2154,6 +2154,26 @@ def read_meta_file(meta_path):
         print('[portal] client_meta.json unreadable: ' + type(exc).__name__, file=sys.stderr)
         return {}
 
+
+def read_access_file(access_path):
+    """读取 portal-access.json（门户账号 / 密码）；缺失或损坏时返回空 dict。
+
+    🔴 2026-11-03 修：regenerate_page 与首页渲染直接 json.loads，文件被截断（磁盘满）
+    或写成 [] 时抛 ValueError / AttributeError，于是每次打开管理页都失败，只能手修文件。
+    refresh 路径早就会经 ensure_portal_access 重建它，这两处读取也必须容错。
+    """
+    path = Path(access_path)
+    if not path.exists():
+        return {}
+    try:
+        access = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(access, dict):
+            raise ValueError('portal access must be a JSON object')
+        return access
+    except (OSError, ValueError) as exc:
+        print('[portal] portal-access.json unreadable: ' + type(exc).__name__, file=sys.stderr)
+        return {}
+
 def resolve_subscription_port(m, config_path='/etc/hysteria/config.yaml'):
     """解析订阅链接该用的端口。按优先级取值，**绝不返回伪造的 8443**。
 
@@ -2327,7 +2347,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     #
     # 反过来，绝不能把这份负载挂到 /api/v1/ 的 Bearer 链路上去：api_key 的权限
     # 明确低于 Basic（前者够不着门户网页端），用低权限凭据换高权限凭据就是提权。
-    access_url = f"https://{host}:{sub_port}/{token}/"
+    access_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
     access_json = json.dumps(
         portal_access_payload(access_url, username, password, api_key or ""),
         ensure_ascii=False)
@@ -7102,8 +7122,8 @@ def prepare(meta_path, port, node_api_key=None):
         m['subscription_port'] = sub_port
         Path(meta_path).write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding='utf-8')
         print(f'[portal] 订阅端口已自愈为 {sub_port}（来源: {sub_port_src}）', file=sys.stderr)
-    base = f"https://{host}:{sub_port}/{token}/"
-    subscription = f"https://{user}:{password}@{host}:{sub_port}/{token}/clash.yaml"
+    base = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
+    subscription = f"https://{user}:{password}@{_host_for_url(host)}:{sub_port}/{token}/clash.yaml"
     session_secret = secrets.token_hex(32)
     api_key = node_api_key or secrets.token_hex(24)
 
@@ -7238,7 +7258,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
     sync_download_artifacts(data, uri, clash, sing)
     
     # 域名 / 订阅端口改过之后，交给控制台的门户地址也要跟上（token 与凭据不变）。
-    access_url = f"https://{host}:{resolve_subscription_port(m)[0]}/{data['token']}/"
+    access_url = f"https://{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/"
     # Start from the latest persisted state and overlay the credentials/auth fields
     # that ensure_portal_access may have repaired in this refresh snapshot.
     # This preserves user, usage and service writes from the portal process.
@@ -8663,9 +8683,9 @@ if __name__ == '__main__':
         uri, clash, sing = artifacts(m)
         root = portal_path.parent
         access_file = root / 'portal-access.json'
-        access = json.loads(access_file.read_text(encoding='utf-8')) if access_file.exists() else {}
+        access = read_access_file(access_file)
         host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
-        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{host}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
+        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
         
         now_ts = int(time.time())
         display_users = {}
@@ -13458,8 +13478,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 uri, clash, sing = artifacts(m)
                 root = portal_path.parent
                 access_file = root / 'portal-access.json'
-                access = (json.loads(access_file.read_text(encoding='utf-8'))
-                          if access_file.exists() else {})
+                access = read_access_file(access_file)
                 host = (m.get('public_ip', '127.0.0.1') if m.get('is_insecure')
                         else m.get('server_name', 'localhost'))
                 with data_lock:
@@ -13470,7 +13489,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 subscription = (
                     "https://%s:%s@%s:%d/%s/clash.yaml"
                     % (access.get('username', ''), access.get('password', ''),
-                       host, resolve_subscription_port(m)[0], _token))
+                       _host_for_url(host), resolve_subscription_port(m)[0], _token))
                 return page_html(m, uri, subscription, clash, sing, users=users,
                                  api_key=_api_key, token=_token,
                                  session_secret=session_secret,
