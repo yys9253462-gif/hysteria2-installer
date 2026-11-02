@@ -259,6 +259,9 @@ for line in 2 3; do
     check_eq "  服务端含 Peer 段" "$(printf '%s' "$SERVER_TEXT" | grep -c '^\[Peer\]')" "1"
     check_eq "  服务端含 AllowedIPs" "$(printf '%s' "$SERVER_TEXT" | grep -c 'AllowedIPs = 10.66.66.2/32')" "1"
     check_eq "  服务端含 NAT 转发(PostUp)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostUp = .*MASQUERADE')" "1"
+    check_eq "  隧道拒绝转发到云元数据(PostUp)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostUp = .*-d 169.254.0.0/16 -j DROP')" "1"
+    check_eq "  隧道拒绝转发到内网(PostUp)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostUp = .*-d 10.0.0.0/8 -j DROP')" "1"
+    check_eq "  拒绝规则停服时清理(PostDown)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostDown = .*-D FORWARD -i awg0 ! -o awg0 -d 169.254.0.0/16 -j DROP')" "1"
     check_eq "  服务端含 NAT 清理(PostDown)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostDown = .*MASQUERADE')" "1"
 
     # 客户端必备项
