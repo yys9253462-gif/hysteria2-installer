@@ -90,7 +90,16 @@ def read_hysteria_online(url, secret):
 import re,ipaddress,time,pathlib,urllib.error
 
 def parse_events(rows):
+    """按「用户 + 客户端 IP」重放连接事件，返回 {(uid, ip): 仍在线的连接数}。
+
+    🔴 2026-11-02 修：旧实现按 (uid, addr) 配对，addr 带源端口。客户端开了端口跳跃
+    或 QUIC 迁移后，断开事件记的源端口和连上时不同（实测 153.37.136.218 连 :7206、
+    断 :7215），旧连接永远配不上 ⇒ 日志连接数 > 核心计数 ⇒ 整台节点判「暂不一致」，
+    控制台在线 IP 覆盖缺一块，跨节点设备上限整条订阅跳过。
+    同一 IP 上哪条连接先断不影响「有哪些 IP 在线」；总数仍要和核心计数对上才采信。
+    """
     active={}
+    unmatched=set()
     rows=sorted(rows,key=lambda row:int(row.get('__MONOTONIC_TIMESTAMP',row.get('__REALTIME_TIMESTAMP',0))))
     for row in rows:
         message=row.get('MESSAGE','')
@@ -113,16 +122,26 @@ def parse_events(rows):
         if not isinstance(uid,str) or not isinstance(addr,str):raise ValueError('missing_connection_identity')
         ip=addr.rsplit(':',1)[0].strip('[]')
         ip=str(ipaddress.ip_address(ip))
-        key=(uid,addr)
-        if event=='client connected':active[key]=ip
-        else:active.pop(key,None)
+        key=(uid,ip)
+        if event=='client connected':
+            active[key]=active.get(key,0)+1
+        elif active.get(key,0)>0:
+            active[key]-=1
+            if not active[key]:del active[key]
+        else:
+            # 断开了一条日志里没见过的连接（连上那条已被轮转/丢失）：该用户剩余连接
+            # 无法按 IP 对账，交给 confirmed_ips 判为未知，不猜。
+            unmatched.add(uid)
+    for uid in unmatched:
+        active.setdefault((uid,None),0)
     return active
 
 def confirmed_ips(connections,uid,count):
     if count==0:return []
-    known=[ip for (user,addr),ip in connections.items() if user==uid]
-    if len(known)!=count:return None
-    return sorted(set(known))
+    if (uid,None) in connections:return None
+    known={ip:n for (user,ip),n in connections.items() if user==uid and ip is not None}
+    if sum(known.values())!=count:return None
+    return sorted(known)
 
 def cmd(args):
     return subprocess.run(args,capture_output=True,text=True,timeout=8,check=True).stdout
