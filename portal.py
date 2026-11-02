@@ -4807,6 +4807,19 @@ core_operation_lock = threading.Lock()
 awg_operation_lock = threading.Lock()
 
 
+def _revocation_needed(snapshot, force_ids=()):
+    """本轮是否确有用户要收回：有被拒用户、待撤销记录或调用方强制撤销的 id。
+
+    sing-box 协议的配置文件缺失、服务却在跑时，只有这种情况才算
+    「无法确认收回」；只是开户 / 续费时不能因此回 503。
+    """
+    if force_ids or pending_revocations(snapshot):
+        return True
+    users = snapshot.get('users') if isinstance(snapshot, dict) else None
+    users = users if isinstance(users, dict) else {}
+    return any(not user_access_allowed(info) for info in users.values())
+
+
 def anytls_password_for_user(secret, user_id):
     """由节点 secret 派生某用户**稳定且不可猜**的 AnyTLS 密码。"""
     return hmac.new(str(secret).encode('utf-8'),
@@ -4968,7 +4981,7 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
         candidate.unlink(missing_ok=True)
 
 
-def sync_anytls_users(root, snapshot, apply=None, service_active=None):
+def sync_anytls_users(root, snapshot, apply=None, service_active=None, force_ids=()):
     """把 anytls.json 的 users 对齐到当前准入名单（停用/到期/超额/删除即收回）。
 
     名单没变就什么也不做；变了就重写并重启 —— sing-box 只有重启才会
@@ -4990,8 +5003,10 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None):
         # 配置文件不在、服务却在跑（2026-11-03 修，与 TUIC 对齐）：sing-box 内存里
         # 还是旧名单，被停用/到期/删除的用户照样能连。旧实现在这里返回 False，
         # enforce_node_access 把它当成「已同步」，待撤销记录随之清掉。
+        # 只在**确有人要收回**时才报错（与 Xray 的 xray.json 缺失判断一致）：
+        # 无条件报错会让开户/续费等所有账号操作都回 503。
         if not path.exists():
-            if service_active():
+            if _revocation_needed(snapshot, force_ids) and service_active():
                 raise RuntimeError('AnyTLS configuration missing while service is active; '
                                    'cannot confirm user sync')
             return False
@@ -5150,7 +5165,7 @@ def pick_tuic_port(preferred, blocked, listening=None, own_port_active=False):
     return 0
 
 
-def sync_tuic_users(root, snapshot, apply=None, service_active=None):
+def sync_tuic_users(root, snapshot, apply=None, service_active=None, force_ids=()):
     """把 tuic.json 的 users 对齐到当前准入名单；规则同 sync_anytls_users。"""
     path = Path(root) / TUIC_CONFIG_NAME
     if not isinstance(snapshot, dict):
@@ -5168,7 +5183,8 @@ def sync_tuic_users(root, snapshot, apply=None, service_active=None):
         if not enabled:
             return False
         if not path.exists():
-            if service_active():
+            # 同 AnyTLS：只有确有人要收回时，才算「无法确认」。
+            if _revocation_needed(snapshot, force_ids) and service_active():
                 raise RuntimeError('TUIC configuration missing while service is active; cannot confirm user sync')
             return False
         try:
@@ -6137,12 +6153,12 @@ def enforce_node_access(root, snapshot, force_ids=(), apply_lock=None,
     anytls_error = tuic_error = None
     if not skip_anytls:
         try:
-            sync_anytls_users(root, snapshot)
+            sync_anytls_users(root, snapshot, force_ids=force_ids)
         except Exception as exc:
             anytls_error = exc
     if not skip_tuic:
         try:
-            sync_tuic_users(root, snapshot)
+            sync_tuic_users(root, snapshot, force_ids=force_ids)
         except Exception as exc:
             tuic_error = exc
     result = _enforce_node_access_xray_hy2(root, snapshot, force_ids, apply_lock)
@@ -11690,6 +11706,13 @@ if __name__ == '__main__':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                if action == 'disable' and not enabled:
+                    # anytls.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
+                    # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉，
+                    # 而撤销同步正卡在「配置缺失、服务在跑」上。
+                    with data_lock:
+                        flagged = config_section(data, 'anytls_config').get('enabled') is True
+                    enabled = flagged or _systemd_state(ANYTLS_SERVICE) == 'active'
                 if action == 'enable':
                     with data_lock:
                         suspended = suspend_state(data).get('suspended') is True
@@ -11876,6 +11899,12 @@ if __name__ == '__main__':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                if action == 'disable' and not enabled:
+                    # tuic.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
+                    # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉。
+                    with data_lock:
+                        flagged = config_section(data, 'tuic_config').get('enabled') is True
+                    enabled = flagged or _systemd_state(TUIC_SERVICE) == 'active'
                 if action == 'enable':
                     with data_lock:
                         suspended = suspend_state(data).get('suspended') is True

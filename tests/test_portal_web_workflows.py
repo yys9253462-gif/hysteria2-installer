@@ -1589,6 +1589,43 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertTrue(replaced)
         self.assertIn(['systemctl', 'start'], commands)
 
+    def test_singbox_disable_works_when_config_file_is_missing(self):
+        """配置文件丢了、data 仍是 enabled、服务还在跑：停用必须真的停服务并清掉 enabled，
+        否则撤销同步会一直卡在「配置缺失、服务在跑」上。"""
+        for name, key, service in (('_h_post_manage_anytls', 'anytls_config', 'hy2-anytls'),
+                                   ('_h_post_manage_tuic', 'tuic_config', 'hy2-tuic')):
+            with self.subTest(handler=name):
+                self.data[key] = {'enabled': True, 'port': 45000, 'secret': 's' * 64,
+                                  'domain': 'node.example.com'}
+                state = {'value': 'active'}
+                commands = []
+
+                def fake_run(args, **kwargs):
+                    commands.append(list(args))
+                    if args[:2] == ['systemctl', 'disable']:
+                        state['value'] = 'inactive'
+                    return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+                self.ns.update(
+                    subprocess=SimpleNamespace(run=fake_run, TimeoutExpired=subprocess.TimeoutExpired),
+                    portal_path=self.hdir / 'portal.json',
+                    ANYTLS_CONFIG_NAME=portal.ANYTLS_CONFIG_NAME, ANYTLS_SERVICE='hy2-anytls',
+                    TUIC_CONFIG_NAME=portal.TUIC_CONFIG_NAME, TUIC_SERVICE='hy2-tuic',
+                    _active_anytls_config=lambda: None, _active_tuic_config=lambda: None,
+                    config_section=portal.config_section,
+                    _systemd_state=lambda unit: state['value'],
+                    _service_stop_confirmed=portal._service_stop_confirmed,
+                    _systemd_service_snapshot=lambda unit: {'active': 'active', 'enabled': 'enabled'},
+                    _restore_systemd_service_state=lambda unit, snap: True,
+                    close_protocol_port=lambda *a: True,
+                    anytls_apply_lock=threading.RLock(), tuic_apply_lock=threading.RLock())
+                status, payload = self.invoke(name, {'action': 'disable'})
+                self.assertEqual(status, 200, payload)
+                self.assertNotIn('message', payload, '仍被当成「本来就没有启用」')
+                self.assertIn(['systemctl', 'disable', '--now', service], commands)
+                self.assertIs(self.data[key]['enabled'], False)
+                self.assertEqual(self.data[key]['secret'], 's' * 64)
+
     def test_explicit_immutable_ref_does_not_make_a_branch_lookup(self):
         with patch.object(portal.urllib.request, 'urlopen') as open_:
             self.assertEqual(portal.resolve_update_ref('a' * 40), 'a' * 40)
