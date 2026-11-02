@@ -1076,7 +1076,7 @@ setup_certificates() {
         else
             # 证书链自检：文件里只有 1 张证书 = 叶证书，缺中间证书会让 Go 系客户端连不上。
             local chain_ok=1 sibling
-            if [[ "$(grep -c 'BEGIN CERTIFICATE' "$input_cert" 2>/dev/null || echo 0)" -lt 2 ]]; then
+            if [[ "$(pem_cert_count "$input_cert")" -lt 2 ]]; then
                 sibling="$(dirname "$input_cert")/fullchain.cer"
                 [[ -f "$sibling" ]] || sibling="$(dirname "$input_cert")/fullchain.pem"
                 if [[ -f "$sibling" ]]; then
@@ -1262,6 +1262,16 @@ find_cert_in_webserver() {
     return 1
 }
 
+# 证书文件里 PEM 证书的张数，总是只输出一个数字（2026-11-03 修）。
+# 旧写法 `$(grep -c … || echo 0)`：没有匹配时 grep 先打印 0 再返回 1，
+# 结果是两行 0，`[[ … -lt 2 ]]` 算术报错判假 —— 不含证书的文件被当作完整链接受。
+pem_cert_count() {
+    local n
+    n="$(grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null)" || true
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    echo "$n"
+}
+
 # 判断证书文件与其私钥是否构成一对可用组合
 # 传入证书路径；私钥路径由调用方给出（不同布局命名不同：.key / privkey.pem）
 _accept_cert_pair() {
@@ -1272,7 +1282,7 @@ _accept_cert_pair() {
     # 正式证书必须含完整链（>1 张）；只有 1 张说明是叶证书，
     # Go 系客户端（v2rayNG/Xray/hysteria）不会通过 AIA 补齐中间证书，
     # 会直接报 x509: certificate signed by unknown authority
-    [[ "$(grep -c 'BEGIN CERTIFICATE' "$c" 2>/dev/null || echo 0)" -ge 2 ]] || return 1
+    [[ "$(pem_cert_count "$c")" -ge 2 ]] || return 1
     # 🔴 公私钥必须配对：不配对的证书装上去，握手 100% 失败。
     # 与其等到用户连不上才发现，不如在这里就拒掉。
     local pub prv
