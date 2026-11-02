@@ -1676,6 +1676,13 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         before = _hy2_runtime_identity()
         os.replace(candidate, binary)
         replaced = True
+        if _unit_suspended('hysteria-server'):
+            # 整机流量超额停用中（2026-11-03 修，与 install.sh 的核心更新一致）：
+            # 服务不能启动，_restart_hy2 直接返回，于是下面的「新进程已加载」
+            # 核验必然失败、把新核心回滚掉，面板报「新核心未成功加载」。
+            # 已验过 SHA256 / ELF / version 的新二进制保留，控制台恢复节点时带它启动。
+            return {'changed': True, 'version': newer, 'backup': str(backup),
+                    'message': '节点流量超额停用中：新核心已就位，控制台恢复节点时生效'}
         _restart_hy2()
         time.sleep(1)
         after = _hy2_runtime_identity()

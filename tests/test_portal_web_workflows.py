@@ -1539,6 +1539,56 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(portal.core_version_key('2.12.3+custom'), portal.core_version_key('v2.12.3'))
         self.assertGreater(portal.core_version_key('v2.13.0'), portal.core_version_key('2.12.3'))
 
+    def run_verified_core_upgrade(self, suspended):
+        """下载、摘要、systemctl 都是桩；只有二进制文件是真的（在临时目录里）。"""
+        binary = self.root / 'hysteria'
+        old, new = b'\x7fELF old-test-binary', b'\x7fELF new-test-binary'
+        binary.write_bytes(old)
+        binary.chmod(0o755)
+        commands = []
+        identity = {'pid': '100'}
+
+        def fake_run(args, **kwargs):
+            args = [str(a) for a in args]
+            if args[0] == str(binary) or args[0].startswith(str(self.root / '.hysteria-update-')):
+                current = Path(args[0]).read_bytes()
+                return SimpleNamespace(returncode=0, stderr='',
+                                       stdout='Version: %s\n' % ('v2.6.0' if current == old else 'v2.7.0'))
+            commands.append(args[:2])
+            if args[:2] == ['systemctl', 'start']:
+                identity['pid'] = '200'
+            if args[:2] == ['systemctl', 'show']:
+                state = 'inactive' if suspended else 'active'
+                return SimpleNamespace(returncode=0, stderr='', stdout=(
+                    'ActiveState=%s\nMainPID=%s\nExecMainStartTimestamp=t%s\n'
+                    % (state, identity['pid'], identity['pid'])))
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+        with patch.object(portal.subprocess, 'run', side_effect=fake_run), \
+             patch.object(portal, 'fetch_text', return_value='{"tag_name": "app/v2.7.0"}'), \
+             patch.object(portal, 'fetch_expected_sha256', return_value='0' * 64), \
+             patch.object(portal, 'verify_sha256', return_value=True), \
+             patch.object(portal.urllib.request, 'urlopen', side_effect=lambda *a, **k: io.BytesIO(new)), \
+             patch.object(portal, '_unit_suspended', side_effect=lambda unit: suspended), \
+             patch.object(portal.time, 'sleep'):
+            result = portal.upgrade_core_binary(str(binary), str(self.root / 'backups'))
+        return result, binary.read_bytes() == new, commands
+
+    def test_core_upgrade_while_node_suspended_keeps_new_binary_without_starting(self):
+        """与 install.sh 的核心更新一致：停用期间只换二进制，不启动、不回滚。"""
+        result, replaced, commands = self.run_verified_core_upgrade(suspended=True)
+        self.assertTrue(result['changed'], result)
+        self.assertEqual(result['version'], 'v2.7.0')
+        self.assertTrue(replaced, '停用期间已校验的新核心被回滚掉了')
+        self.assertNotIn(['systemctl', 'start'], commands)
+        self.assertNotIn(['systemctl', 'restart'], commands)
+
+    def test_core_upgrade_restarts_and_verifies_when_not_suspended(self):
+        result, replaced, commands = self.run_verified_core_upgrade(suspended=False)
+        self.assertTrue(result['changed'], result)
+        self.assertTrue(replaced)
+        self.assertIn(['systemctl', 'start'], commands)
+
     def test_explicit_immutable_ref_does_not_make_a_branch_lookup(self):
         with patch.object(portal.urllib.request, 'urlopen') as open_:
             self.assertEqual(portal.resolve_update_ref('a' * 40), 'a' * 40)
