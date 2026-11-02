@@ -24,11 +24,14 @@ HY2_SERVICE="/etc/systemd/system/hysteria-server.service"
 HY2_CERT_DIR="${HY2_DIR}/cert"
 HY2_META_FILE="${HY2_DIR}/client_meta.json"
 HY2_SUB_PORT=""   # 由 select_subscription_port() 动态分配；空值表示"尚未确定"
-# Hysteria 服务端日志级别（debug|info|warn|error）。默认 error：info/warn 级几乎全是
-# 客户端超时/被拒的噪声（东京 3 天约 1.5 万条）。安装前 export HY2_LOG_LEVEL=info 可覆盖。
+# Hysteria 服务端日志级别（debug|info|warn|error）。默认 info（2026-11-03 由 error 改回）：
+# 官方核心没有 /online/ips，计量模块要从 journal 里的 INFO 级 `client connected /
+# client disconnected` 重建在线 IP；error 级下这些行全没了，在线 IP 一律「未知」，
+# 设备上限退回 /auth 的 180 秒窗口（第二台设备 3 分钟后就能连）。SE 节点实测确认。
+# 嫌日志多可 export HY2_LOG_LEVEL=warn/error，但那样只适合带 /online/ips 的定制核心。
 # 写成 systemd drop-in（环境变量 HYSTERIA_LOG_LEVEL，hysteria 官方支持），不改主单元。
 HY2_LOG_LEVEL_EXPLICIT="${HY2_LOG_LEVEL:+1}"
-HY2_LOG_LEVEL="${HY2_LOG_LEVEL:-error}"
+HY2_LOG_LEVEL="${HY2_LOG_LEVEL:-info}"
 HY2_LOG_DROPIN="/etc/systemd/system/hysteria-server.service.d/loglevel.conf"
 
 # ---- AmneziaWG (AWG) ----
@@ -598,6 +601,24 @@ is_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
 }
 
+# 主机名：标签 1-63 位字母数字与连字符、不以连字符开头结尾，至少两段，总长 ≤ 253。
+# 调用方先转小写。只放行这些字符，值才能安全进 YAML / nginx / Caddyfile / 正则。
+is_valid_domain() {
+    local d="$1"
+    (( ${#d} >= 1 && ${#d} <= 253 )) || return 1
+    # 末段全是数字就是 IP（1.2.3.4），ACME 不给 IP 签发，提前拒绝。
+    [[ "${d##*.}" =~ ^[0-9]+$ ]] && return 1
+    [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+# ACME 通知邮箱：本地部分只放行常见安全字符，域名部分同 is_valid_domain（不区分大小写）。
+is_valid_email() {
+    local e="$1" local_part domain
+    [[ "$e" == *@* && "$e" != *@*@* ]] || return 1
+    local_part="${e%@*}"; domain="$(printf '%s' "${e#*@}" | tr 'A-Z' 'a-z')"
+    [[ "$local_part" =~ ^[A-Za-z0-9._%+-]{1,64}$ ]] && is_valid_domain "$domain"
+}
+
 # ==============================================================================
 # 交互环境自愈（必须在所有交互之前）
 # ------------------------------------------------------------------------------
@@ -652,6 +673,15 @@ if [[ -n "${HY2_NODE_MODE:-}" ]] && [[ "${HY2_NODE_MODE}" != "2" ]]; then
 fi
 if [[ "${HY2_CERT_TYPE:-}" == "3" && -z "${HY2_DOMAIN:-}" ]]; then
     log_err "HY2_CERT_TYPE=3 需要同时提供 HY2_DOMAIN=<你的域名>。"
+    exit 1
+fi
+# 免交互的域名 / 邮箱在动工前就校验，不能装到一半才在证书那步报错。
+if [[ -n "${HY2_DOMAIN:-}" ]] && ! is_valid_domain "$(printf '%s' "$HY2_DOMAIN" | tr 'A-Z' 'a-z')"; then
+    log_err "环境变量 HY2_DOMAIN='${HY2_DOMAIN}' 不是合法域名（例如 hy2.example.com）。"
+    exit 1
+fi
+if [[ -n "${HY2_EMAIL:-}" ]] && ! is_valid_email "$HY2_EMAIL"; then
+    log_err "环境变量 HY2_EMAIL='${HY2_EMAIL}' 不是合法邮箱。"
     exit 1
 fi
 
@@ -1657,8 +1687,12 @@ setup_acme_certificate() {
     else
         read -rp "请输入要绑定的域名 (例如 hy2.example.com): " SERVER_NAME || true
     fi
-    if [[ -z "$SERVER_NAME" || "$SERVER_NAME" == *"/"* || "$SERVER_NAME" == *":"* ]]; then
-        log_err "域名不能为空，且不能包含协议、路径或端口。"
+    # 域名 / 邮箱会原样进 config.yaml、nginx server_name、Caddyfile 与 grep 正则
+    # （2026-11-03 修）：旧校验只挡 / 和 :，引号、分号、花括号、空格、换行都能进去，
+    # 写坏或注入配置后 Hysteria / nginx / Caddy 反复重启。
+    SERVER_NAME="$(printf '%s' "$SERVER_NAME" | tr 'A-Z' 'a-z')"
+    if ! is_valid_domain "$SERVER_NAME"; then
+        log_err "域名格式不正确（只能是 hy2.example.com 这样的主机名，不能带协议、路径、端口或空格）。"
         return 1
     fi
     if [[ -n "${HY2_EMAIL:-}" ]]; then
@@ -1667,7 +1701,7 @@ setup_acme_certificate() {
     else
         read -rp "请输入 ACME 通知邮箱: " ACME_EMAIL || true
     fi
-    if [[ -z "$ACME_EMAIL" || "$ACME_EMAIL" != *"@"* ]]; then
+    if ! is_valid_email "$ACME_EMAIL"; then
         log_err "请输入有效的通知邮箱。"
         return 1
     fi
@@ -2412,6 +2446,19 @@ generate_server_config() {
     fi
     select_subscription_port || { log_err "订阅端口分配失败，安装中止。"; return 1; }
 
+    # 先把门户整包取下来、校验通过、落地，再写 config.yaml（2026-11-03 修）。
+    # 旧顺序是先重写 config.yaml（auth 指向新选的 PORTAL_LOCAL_PORT），最后才在
+    # setup_portal 里取门户：三源都失败时安装中止，旧门户还在旧端口跑，config.yaml
+    # 却已指向没人监听的新端口 —— 下次 Hysteria 重启（开机 / 自愈 / 门户操作）
+    # 所有用户都连不上。portal_ensure_py 的计量配置那一步要读 config.yaml 的
+    # trafficStats.secret，所以这里只取包（PORTAL_BUNDLE_ONLY=1），计量配置留到
+    # setup_portal 里写完 config.yaml 之后再做。
+    PORTAL_BUNDLE_ONLY=1 portal_ensure_py || {
+        log_err "门户程序取不到，未改动 ${HY2_CONFIG}，现有服务保持原样。"
+        return 1
+    }
+    PORTAL_BUNDLE_PLACED=1
+
     # 真实计量的 secret：hysteria trafficStats 与 usage-meter-config.json 必须一致。
     # 缺失则计量模块启动即 FileNotFoundError，用量永远「未开始计量」（静默降级）。
     if [[ -z "${METER_SECRET:-}" ]]; then
@@ -3061,7 +3108,11 @@ EOF
         --argjson listen_port "$LISTEN_PORT" --argjson is_insecure "$IS_INSECURE" \
         --argjson subscription_port "$HY2_SUB_PORT" \
         '$ARGS.named' > "$HY2_META_FILE"
-    setup_portal
+    # PORTAL_BUNDLE_PLACED 只给这一次 setup_portal 用；菜单循环里下一次操作要重新取包。
+    local _portal_rc=0
+    setup_portal || _portal_rc=$?
+    unset PORTAL_BUNDLE_PLACED
+    (( _portal_rc == 0 )) || return "$_portal_rc"
     log_info "配置文件写入完成。"
 }
 
@@ -3122,7 +3173,7 @@ EOF
     # 日志级别 drop-in：显式指定 HY2_LOG_LEVEL 时覆盖；未指定且已存在时保留用户的修改。
     case "$HY2_LOG_LEVEL" in
         debug|info|warn|error) ;;
-        *) log_warn "HY2_LOG_LEVEL=${HY2_LOG_LEVEL} 不受支持，改用 error"; HY2_LOG_LEVEL=error ;;
+        *) log_warn "HY2_LOG_LEVEL=${HY2_LOG_LEVEL} 不受支持，改用 info"; HY2_LOG_LEVEL=info ;;
     esac
     if [[ -n "$HY2_LOG_LEVEL_EXPLICIT" || ! -f "$HY2_LOG_DROPIN" ]]; then
         mkdir -p "${HY2_LOG_DROPIN%/*}"
@@ -3578,6 +3629,17 @@ PYINSTALLBUNDLE
     fi
     rm -rf "$stage"
     [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
+    # 安装流程先只取包（见 generate_server_config），计量配置等 config.yaml 写完再做。
+    if [[ "${PORTAL_BUNDLE_ONLY:-0}" == "1" ]]; then
+        log_info "门户程序已就位: ${dest_dir}/portal.py + portal_assets.py + 计量模块"
+        return 0
+    fi
+    portal_write_meter_config "$dest_dir"
+}
+
+# 计量配置 usage-meter-config.json：secret 取自本机 config.yaml 的 trafficStats。
+portal_write_meter_config() {
+    local dest_dir="${1:-$HY2_DIR}"
     # 计量配置：secret 取自本机 config.yaml 的 trafficStats，
     # 绝不写死进仓库 —— 仓库里只放 usage-meter-config.json.example。
     #
@@ -3754,7 +3816,13 @@ refresh_portal() {
 }
 
 setup_portal() {
-    portal_ensure_py
+    # generate_server_config 已在写 config.yaml 之前取好整包；这里只补计量配置
+    # （它要读刚写好的 trafficStats.secret），不再取第二次 —— 两次取包可能落到不同提交。
+    if [[ "${PORTAL_BUNDLE_PLACED:-0}" == "1" ]]; then
+        portal_write_meter_config "$HY2_DIR" || return 1
+    else
+        portal_ensure_py || return 1
+    fi
     # 只要求 portal.json：凭据文件缺失时 adopt 会重建一份（保留用户与
     # API Key），不能因为一个文件丢了就把整个用户表推倒重建（2026-10-30 修）。
     if [[ "${PRESERVE_PORTAL:-0}" == "1" && -f "$HY2_DIR/portal.json" ]]; then
@@ -5383,6 +5451,16 @@ flow_update_core() {
         log_err "无法创建核心升级锁。"; return 1; }
     if ! flock -n "$update_lock_fd"; then
         log_err "另一个核心升级正在运行，请稍后重试。"
+        return 1
+    fi
+    # 定制核心（版本号带 +，例如提供 /online/ips 的 …+teyir）不能被静默换成官方版
+    # （2026-11-03 修，与门户 upgrade_core_binary 的 allow_custom 一致）：换掉后
+    # 在线 IP 退回 journal 重建，设备上限随之变弱；而且官方版可能比它还旧，等于降级。
+    local _current_version
+    _current_version="$("$HY2_BIN" version 2>/dev/null | awk -F': *' '/^Version:/{print $2; exit}')" || _current_version=""
+    if [[ "$_current_version" == *+* && "${HY2_ALLOW_CUSTOM_CORE_REPLACE:-0}" != "1" ]]; then
+        log_err "当前核心是定制版本（${_current_version}），官方核心会覆盖它的补丁，已放弃更新。"
+        log_err "确需换成官方核心，请先 export HY2_ALLOW_CUSTOM_CORE_REPLACE=1 再执行。"
         return 1
     fi
     local rollback_file

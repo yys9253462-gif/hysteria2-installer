@@ -8,6 +8,7 @@
 import base64
 import json
 import unittest
+from unittest.mock import patch
 
 import sys  # noqa: E402
 # 🔴 2026-10-31：CI 用的是 `python3 -m unittest discover -s tests -p 'test_*.py'`，
@@ -364,6 +365,47 @@ class PortSelectionSafetyTests(unittest.TestCase):
 
     def test_reserved_port_is_not_chosen(self):
         self.assertNotEqual(portal._pick_reality_port(preferred=22)[0], 22)
+
+    def test_default_port_is_checked_against_listening_table(self):
+        """首次启用时的默认端口（VMess 2087 等）要查监听表（2026-11-03）。
+
+        旧调用写成 preferred=old.get('port') or 2087，默认值被当成「自己的端口」
+        跳过监听检查：2087 已被别的程序占用时照选不误，Xray bind 失败、整体回滚。
+        """
+        with patch.object(portal, '_listening_ports', return_value={2087}):
+            port, _ = portal._pick_reality_port(preferred=None, default=2087)
+            self.assertNotEqual(port, 2087)
+            self.assertTrue(port)
+        with patch.object(portal, '_listening_ports', return_value=set()):
+            self.assertEqual(portal._pick_reality_port(preferred=None, default=2087)[0], 2087)
+            # 已配置端口仍然优先于默认端口。
+            self.assertEqual(portal._pick_reality_port(preferred=31000, default=2087)[0], 31000)
+
+    def test_enable_paths_pass_default_not_preferred(self):
+        import ast
+        from pathlib import Path
+        tree = ast.parse(Path(portal.__file__).read_text(encoding='utf-8'))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                 and getattr(n.func, 'id', None) == '_pick_reality_port']
+        for call in calls:
+            for kw in call.keywords:
+                if kw.arg == 'preferred':
+                    self.assertFalse(isinstance(kw.value, ast.BoolOp),
+                                     'preferred 不能写成「旧端口 or 默认端口」：%s' % ast.unparse(kw.value))
+
+    def test_serving_protocol_keeps_its_reserved_list_port(self):
+        """内置黑名单里的 8443 只挡新挑的端口（2026-11-03）。
+
+        Reality 正在 8443 上服务时，重置密钥 / 重启开关会带 preferred=8443 进来；
+        旧实现先查黑名单，把它挪到 443 或 2053，已下发的链接全部失效。
+        """
+        with patch.object(portal, '_listening_ports', return_value={8443}):
+            self.assertEqual(portal._pick_reality_port(preferred=8443)[0], 8443)
+            # 调用方明确拉黑（另一个协议在用）时仍然不给。
+            self.assertNotEqual(portal._pick_reality_port(preferred=8443, extra_blocked={8443})[0], 8443)
+        # 新挑端口时 8443 依然被跳过。
+        with patch.object(portal, '_listening_ports', return_value={443}):
+            self.assertNotEqual(portal._pick_reality_port()[0], 8443)
 
     def test_free_preferred_port_is_kept(self):
         """没冲突时仍沿用原端口，不给已有节点无谓换端口。"""

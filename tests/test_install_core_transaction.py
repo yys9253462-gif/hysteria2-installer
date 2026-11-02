@@ -19,7 +19,7 @@ USER_BACKUP = b'user-owned historical backup\n'
 
 @unittest.skipUnless(BASH, 'requires bash')
 class CoreTransactionTests(unittest.TestCase):
-    def run_case(self, route, *, failure='', suspended=False, conditional=False):
+    def run_case(self, route, *, failure='', suspended=False, conditional=False, current=OLD, env=None):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             # 下载内容、可执行测试脚本、设备数据各自放入独立目录。
@@ -29,7 +29,7 @@ class CoreTransactionTests(unittest.TestCase):
             for directory in (downloads, scripts, data):
                 directory.mkdir()
             binary = data / 'hysteria'
-            binary.write_bytes(OLD)
+            binary.write_bytes(current)
             binary.chmod(0o755)
             backup = data / 'hysteria.bak'
             backup.write_bytes(USER_BACKUP)
@@ -142,7 +142,7 @@ mv() {{
                            if conditional else '\nflow_update_core\n')
             path = scripts / 'run.sh'
             path.write_text(script, encoding='utf-8', newline='\n')
-            result = subprocess.run([BASH, str(path)], cwd=scripts, env=dict(os.environ),
+            result = subprocess.run([BASH, str(path)], cwd=scripts, env=dict(os.environ, **(env or {})),
                                     capture_output=True, text=True, encoding='utf-8',
                                     errors='replace', timeout=30)
             files = {p.name: p.read_bytes() for p in data.iterdir() if p.is_file()}
@@ -199,6 +199,22 @@ mv() {{
                 self.assertIn('回滚', result.stdout + result.stderr)
                 self.assert_protected(files, protected)
                 self.assert_clean(files)
+
+    def test_custom_core_is_not_replaced_without_explicit_consent(self):
+        """菜单 2 不能把带 + 的定制核心静默换成官方版（2026-11-03，与门户 allow_custom 一致）。"""
+        custom = b'#!/bin/sh\nprintf "Version: v2.6.5+teyir\\n"\n'
+        result, files, protected = self.run_case('cli', current=custom)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(files['hysteria'], custom, '定制核心被覆盖了')
+        self.assertNotIn('restarts.log', files)
+        self.assertIn('定制版本', result.stdout + result.stderr)
+        self.assert_protected(files, protected)
+        self.assert_clean(files)
+        # 显式同意后照常更新。
+        result, files, protected = self.run_case('cli', current=custom,
+                                                 env={'HY2_ALLOW_CUSTOM_CORE_REPLACE': '1'})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(files['hysteria'], NEW)
 
     def test_success_preserves_user_backup_and_data(self):
         for route in ('generated', 'cli'):

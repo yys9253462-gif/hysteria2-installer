@@ -1286,6 +1286,49 @@ class WebWorkflowTests(unittest.TestCase):
                  SimpleNamespace(returncode=1, stdout='')]):
             self.assertFalse(portal.firewall_port(8443, 'tcp', open_=True))
 
+    def test_vmess_and_vlessenc_disable_keep_stable_identity(self):
+        """停用只标 enabled=False，保留 ws_path / 密钥对 / 端口（2026-11-03）。
+
+        旧实现整段删除：再启用时 VMess 换新 ws_path、VLESS-Enc 重新生成密钥对，
+        端口回到默认，已下发的订阅全部失效。坏端口值也不能让停用 500。
+        """
+        cases = (('_h_post_manage_vmess', 'vmess_config', portal.VMESS_INBOUND_TAG, 'vmess',
+                  {'port': 31000, 'ws_path': '/keep-this-path', 'uuid': 'u', 'domain': 'node.example.com'}),
+                 ('_h_post_manage_vlessenc', 'vlessenc_config', portal.VLESSENC_INBOUND_TAG, 'vless',
+                  {'port': 'abc', 'decryption': 'mlkem768x25519plus.native.600s.KEEP',
+                   'encryption': 'mlkem768x25519plus.native.0rtt.KEEP', 'domain': 'node.example.com'}))
+        for handler, key, tag, protocol, section in cases:
+            with self.subTest(handler=handler):
+                path = self.hdir / 'xray.json'
+                path.write_text(json.dumps({'inbounds': [{'tag': tag, 'protocol': protocol,
+                    'port': 31000, 'settings': {'clients': []}}]}), encoding='utf-8')
+                self.data[key] = dict(section)
+                self.ns.update(
+                    Path=lambda value, p=path: p if str(value) == '/etc/hysteria/xray.json' else Path(value),
+                    has_managed_inbound=lambda cfg, t: any(x.get('tag') == t for x in cfg.get('inbounds', [])),
+                    remove_managed_inbound=lambda cfg, t: cfg.update(
+                        inbounds=[x for x in cfg['inbounds'] if x.get('tag') != t]),
+                    apply_xray_config_transaction=Mock(), unit_suspended=lambda _: False,
+                    config_section=portal.config_section, _valid_port=portal._valid_port,
+                    save_data=Mock(), regenerate_page=Mock(), close_protocol_port=Mock(return_value=True))
+                status, body = self.invoke(handler, {'action': 'disable'})
+                self.assertEqual(status, 200, body)
+                kept = self.data[key]
+                self.assertIs(kept.get('enabled'), False)
+                for field, value in section.items():
+                    self.assertEqual(kept.get(field), value, '%s 停用后丢了 %s' % (key, field))
+
+    def test_disabled_section_does_not_reserve_its_port(self):
+        """停用后保留的配置段不能继续占着端口，否则别的协议永远选不到它。"""
+        data = {'vmess_config': {'enabled': False, 'port': 31000},
+                'vlessenc_config': {'enabled': True, 'port': 31001}}
+        reserved = portal.managed_reserved_ports({}, data)
+        self.assertNotIn(31000, reserved)
+        self.assertIn(31001, reserved)
+        with patch.object(portal, '_systemd_state', return_value='inactive'):
+            self.assertFalse(portal.protocol_port_in_use(31000, 'tcp', data))
+            self.assertTrue(portal.protocol_port_in_use(31001, 'tcp', data))
+
     def test_vmess_disable_reports_firewall_rule_removal_failure(self):
         xray = {'inbounds': [{'tag': portal.VMESS_INBOUND_TAG, 'protocol': 'vmess',
             'port': 2087, 'settings': {'clients': []}}]}

@@ -366,8 +366,11 @@ download_binaries() {
     log_info "来源: ${url}"
 
     tmpd="$(mktemp -d)"
-    if ! curl -fL --connect-timeout 20 --retry 2 --retry-delay 2 \
-            -o "${tmpd}/awg.tar.gz" "$url" 2>/dev/null; then
+    # --max-time 与 `9>&-`（2026-11-03 修）：门户 420 秒超时只杀 bash，不杀 curl；
+    # curl 又继承了持锁的 fd 9。下载卡住时孤儿 curl 一直占着锁，之后每个改 AWG
+    # 的命令都等 300 秒再失败，EXIT 回滚也不会执行。两次下载 + 校验必须在 420 秒内完。
+    if ! curl -fL --connect-timeout 20 --max-time 240 --retry 2 --retry-delay 2 \
+            -o "${tmpd}/awg.tar.gz" "$url" 2>/dev/null 9>&-; then
         rm -rf "$tmpd"
         log_err "下载失败。可能原因："
         log_err "  1) 仓库 Release 尚未构建 —— 请在 GitHub Actions 中手动运行"
@@ -383,7 +386,7 @@ download_binaries() {
     #    缺摘要就拒绝安装，不存在绕过路径。
     local sums_url want got
     sums_url="https://github.com/${AWG_REPO}/releases/download/${AWG_RELEASE_TAG}/SHA256SUMS"
-    if ! curl -fsSL --connect-timeout 20 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null; then
+    if ! curl -fsSL --connect-timeout 20 --max-time 60 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null 9>&-; then
         # curl -o 会先建文件：失败时可能留下空/半截的 SHA256SUMS，
         # 一并清掉，避免被当成"清单存在但没有该资产"。
         rm -rf "$tmpd"
@@ -1473,7 +1476,10 @@ EOF
 acquire_lock() {
     builtin command -v flock >/dev/null 2>&1 || die "缺少 flock，无法安全串行化 AWG 修改；请安装 util-linux 后重试"
     local lock_file="${AWG_LOCK_FILE:-/run/hy2-awgctl.lock}"
-    exec 9>"$lock_file" 2>/dev/null || die "无法打开 AWG 操作锁 ${lock_file}，拒绝并发修改"
+    # 2>/dev/null 必须只作用于打开锁文件这一步（2026-11-03 修）：只有重定向的
+    # `exec 9>f 2>/dev/null` 会把 fd 2 也永久改掉，之后所有 log_err / die 与
+    # journalctl 诊断都被吞掉，门户只看到「退出码 1」。
+    { exec 9>"$lock_file"; } 2>/dev/null || die "无法打开 AWG 操作锁 ${lock_file}，拒绝并发修改"
     flock -w 300 9 || die "另一个 hy2-awgctl 操作仍在进行，请稍后重试"
 }
 

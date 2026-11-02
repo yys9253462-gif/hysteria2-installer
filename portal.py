@@ -141,7 +141,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.11'
+PORTAL_VERSION = '2.12'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -6039,6 +6039,9 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
         if key == exclude_key:
             continue
         section = data.get(key)
+        # 停用后保留的配置段（enabled=False）只是记着端口 / 密钥，端口已经空出来了。
+        if isinstance(section, dict) and section.get('enabled') is False:
+            continue
         if isinstance(section, dict) and (key not in ('anytls_config', 'tuic_config') or section.get('enabled')):
             try:
                 if int(section.get('port') or 0) == port:
@@ -6294,6 +6297,16 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
                                        force_ids, wanted_by_tag):
     original=xj.read_bytes()
     xcfg=json.loads(original)
+    # wanted_by_tag 是锁外读 xray.json 时算的；拿到锁之前可能有协议被停用、
+    # 入站被删（2026-11-03 修）。旧实现照旧 tag 集合取下标：找不到时下标是 -1，
+    # clients 被写进**最后一个入站**（通常是计量的 usage-meter-api-in），
+    # 之后 add_stats 一律报 api inbound conflict。读-改-写必须以锁内这次读取为准。
+    if not isinstance(xcfg, dict) or not isinstance(xcfg.get('inbounds', []), list):
+        raise ValueError('invalid Xray configuration; cannot confirm revocation')
+    wanted_by_tag={tag:wanted for tag,wanted in wanted_by_tag.items()
+                   if managed_inbound_index(xcfg,tag)[0]>=0}
+    if not wanted_by_tag:
+        return True
     signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
     epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
     current={tag:xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings',{}).get('clients')
@@ -6359,8 +6372,11 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None):
             pass
     for key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
         # AnyTLS 停用后保留 secret 与端口记录（再启用要沿用），但那个端口已经空出来了。
+        # VMess / VLESS Encryption 停用后同样保留配置段并标 enabled=False（2026-11-03）。
         section = data.get(key)
         if key == 'anytls_config' and not (isinstance(section, dict) and section.get('enabled')):
+            continue
+        if isinstance(section, dict) and section.get('enabled') is False:
             continue
         if key == exclude_key:
             # 协议**自己**的端口不是冲突：重新启用时应当沿用它。
@@ -6613,12 +6629,15 @@ _REALITY_RESERVED_PORTS = {
 _REALITY_PORT_CANDIDATES = [443, 8443, 2053, 2083, 2087, 2096, 9443, 5443, 8444]
 
 
-def _pick_reality_port(preferred=None, extra_blocked=None):
+def _pick_reality_port(preferred=None, extra_blocked=None, default=None):
     """挑一个**确实没被占用**的端口给 Reality 用。
 
     参数：
         preferred    —— 期望端口（来自已有配置或调用方指定）。可用就直接用它。
         extra_blocked—— 额外要避开的端口（如本机 hy2 的 listen_port）。
+        default      —— 协议的默认端口（VMess 2087 等）。排在候选表最前，但和
+                        其它候选一样要查监听表；不能当作 preferred 传进来 ——
+                        preferred 视为「自己的」端口，会跳过监听检查（2026-11-03）。
 
     返回 (port, reason)：
         port 为 0 表示**没找到可用端口**，调用方应当报错而不是硬塞一个。
@@ -6630,7 +6649,12 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
         3. 全都不空闲 → 返回 0（**绝不硬塞**，宁可不生成也不配一个撞车的）
     """
     listening = _listening_ports()
-    blocked = set(_REALITY_RESERVED_PORTS)
+    # 内置黑名单（22 / 80 / 8443 …）只用来挡**新挑**的端口；extra_blocked 是调用方
+    # 明确知道「这端口别人在用」，对谁都生效（2026-11-03 修）。旧实现把两者混在一起
+    # 并先于「沿用原端口」判断：Reality 正在 8443 服务时，一次重置密钥 / 重启开关
+    # 就被挪到 443 或 2053，已下发的链接全部失效 —— 正是下面 free() 注释里的事故。
+    reserved = set(_REALITY_RESERVED_PORTS)
+    blocked = set()
     if extra_blocked:
         for p in extra_blocked:
             try:
@@ -6689,8 +6713,13 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
         # 黑名单代表「调用方明确知道这端口不能给」，优先级必须高于偏好值。
         if p in blocked:
             return False
+        # 22 / 80 无论如何都不给（SSH 与 ACME 验证），沿用原端口也不行。
+        if p in (22, 80):
+            return False
         if p == pref:
             return True
+        if p in reserved:
+            return False
         # 以**实际监听表**为准。黑名单只是补充 ——
         # 因为「8443 归谁」在不同节点上完全不同，写死数字必然出错。
         return p not in listening
@@ -6699,8 +6728,10 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
     if pref and free(pref):
         return pref, '沿用已配置端口 %d（空闲）' % pref
 
-    # 2) 按候选顺序找第一个空闲的
-    for cand in _REALITY_PORT_CANDIDATES:
+    # 2) 按候选顺序找第一个空闲的（协议默认端口排最前）
+    first = _as_port(default)
+    candidates = ([first] if first else []) + [c for c in _REALITY_PORT_CANDIDATES if c != first]
+    for cand in candidates:
         if free(cand):
             if pref:
                 return cand, ('原端口 %d 已被占用，自动改用 %d' % (pref, cand))
@@ -11151,7 +11182,7 @@ if __name__ == '__main__':
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config')
             blocked.add(reality_port)
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port') or 2087,
+                preferred=old.get('port'), default=2087,
                 extra_blocked=blocked)
             if not listen_port:
                 raise RuntimeError(reason)
@@ -11193,7 +11224,7 @@ if __name__ == '__main__':
                 apply_xray_config_with_meter(
                     config, xray_path, portal_path.parent / 'usage-meter-config.json',
                     Path(__file__).parent)
-            new_cfg = {'port': listen_port, 'domain': domain, 'sni': sni,
+            new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
                        'ws_path': ws_path, 'uuid': vmess_uuid_for_user(MASTER_USER_ID)}
             new_cfg['uri'] = vmess_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
                                                 label='VMess-WS-' + domain)
@@ -11257,7 +11288,7 @@ if __name__ == '__main__':
                 _data_now = dict(data)
             blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config')
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port') or 2088, extra_blocked=blocked_ports)
+                preferred=old.get('port'), default=2088, extra_blocked=blocked_ports)
             if not listen_port:
                 raise RuntimeError(reason)
             decryption = old.get('decryption', '')
@@ -11300,7 +11331,7 @@ if __name__ == '__main__':
                 apply_xray_config_with_meter(
                     config, xray_path, portal_path.parent / 'usage-meter-config.json',
                     Path(__file__).parent)
-            new_cfg = {'port': listen_port, 'domain': domain, 'sni': sni,
+            new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
                        'decryption': decryption, 'encryption': encryption}
             new_cfg['uri'] = vlessenc_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
                                                    label='VLESS-Enc-' + domain)
@@ -11372,7 +11403,7 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'VMess 本来就没有启用'})
                 with data_lock:
-                    closed_port = int((data.get('vmess_config') or {}).get('port') or 0)
+                    closed_port = _valid_port(config_section(data, 'vmess_config').get('port')) or 0
                 # 在统一锁序内重读并删，防止并发启用丢配置或核心卸载竞态。
                 with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                     try:
@@ -11388,7 +11419,11 @@ if __name__ == '__main__':
                         binary='/usr/local/bin/xray',
                         restart=not unit_suspended('xray'))
                 with data_lock:
-                    data.pop('vmess_config', None)
+                    # 保留 ws_path / 端口，只标停用（2026-11-03 修）：旧实现整段删除，
+                    # 再启用时换新的 ws_path、端口回到默认，已下发的订阅全部失效。
+                    _kept = dict(config_section(data, 'vmess_config'))
+                    _kept['enabled'] = False
+                    data['vmess_config'] = _kept
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
@@ -11664,7 +11699,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config')
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port') or 2096, extra_blocked=blocked)
+                preferred=old.get('port'), default=2096, extra_blocked=blocked)
             if not listen_port:
                 raise RuntimeError(reason)
             new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
@@ -12062,7 +12097,7 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'VLESS Encryption 本来就没有启用'})
                 with data_lock:
-                    closed_port = int((data.get('vlessenc_config') or {}).get('port') or 0)
+                    closed_port = _valid_port(config_section(data, 'vlessenc_config').get('port')) or 0
                 # 在统一锁序内重读并删，防止并发启用丢配置或核心卸载竞态。
                 with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                     try:
@@ -12078,7 +12113,11 @@ if __name__ == '__main__':
                         binary='/usr/local/bin/xray',
                         restart=not unit_suspended('xray'))
                 with data_lock:
-                    data.pop('vlessenc_config', None)
+                    # 保留密钥对与端口，只标停用（2026-11-03 修）：旧实现整段删除，
+                    # 再启用时重新生成 decryption / encryption，已下发的订阅全部失效。
+                    _kept = dict(config_section(data, 'vlessenc_config'))
+                    _kept['enabled'] = False
+                    data['vlessenc_config'] = _kept
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
