@@ -2911,7 +2911,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             <textarea class="link" id="reality-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px;display:flex;justify-content:space-between;align-items:center">
               <button class="button primary" id="btn-copy-reality-uri" type="button">复制 Reality 直链</button>
-              <button class="button" id="btn-reset-reality-keys" type="button" style="font-size:11px;color:var(--muted)" title="重置将重新生成 UUID 与密钥对">🔄 重新生成密钥对</button>
+              <button class="button" id="btn-reset-reality-keys" type="button" style="font-size:11px;color:var(--muted)" title="重置将重新生成密钥对（用户 UUID 不变）">🔄 重新生成密钥对</button>
             </div>
           </section>
 
@@ -11094,6 +11094,11 @@ if __name__ == '__main__':
                     # 用户的 UUID 是 uuid5 派生的，不受密钥轮换影响。
                     with core_operation_lock, core_operation_file_lock():
                         self._generate_and_apply_reality(True, force=True)
+                    # 整机超额停用时 _generate_and_apply_reality 只写配置不重启（2026-11-03 修）：
+                    # 旧回复一律写「已重启生效」，而节点仍在用旧密钥、订阅里已经是新 pbk。
+                    if unit_suspended('xray'):
+                        return self.reply_json(200, {'ok': True, 'message':
+                            '已重置密钥；节点因流量超额停用中，新密钥将在控制台恢复节点时生效'})
                     return self.reply_json(200, {'ok': True, 'message': '已重置密钥并重启生效'})
 
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})

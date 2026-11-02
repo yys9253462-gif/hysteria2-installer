@@ -1715,6 +1715,19 @@ class WebWorkflowTests(unittest.TestCase):
                 self.assertEqual(result['r'][0], 200, result.get('r'))
                 self.assertFalse(core_lock.locked(), '核心锁在请求结束后仍被占用')
 
+    def test_reality_reset_reply_matches_whether_xray_restarted(self):
+        """整机停用时重置密钥只写配置不重启，回复不能说「已重启生效」（2026-11-03）。"""
+        for suspended, expected in ((False, '已重置密钥并重启生效'), (True, '恢复节点时生效')):
+            with self.subTest(suspended=suspended):
+                self.ns['unit_suspended'] = lambda unit, s=suspended: s and unit == 'xray'
+                self.ns['core_operation_lock'] = threading.Lock()
+                self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
+                self.handler._generate_and_apply_reality = Mock()
+                status, payload = self.invoke('_h_post_manage_reality', {'action': 'reset'})
+                self.assertEqual(status, 200, payload)
+                self.assertIn(expected, payload['message'])
+                self.handler._generate_and_apply_reality.assert_called_once_with(True, force=True)
+
     def test_explicit_immutable_ref_does_not_make_a_branch_lookup(self):
         with patch.object(portal.urllib.request, 'urlopen') as open_:
             self.assertEqual(portal.resolve_update_ref('a' * 40), 'a' * 40)
