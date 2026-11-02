@@ -2003,6 +2003,24 @@ def _expiry_text(value):
     except (OverflowError, OSError, ValueError):
         return '永久有效'
 
+def _utf8_encodable(value):
+    """JSON 解析结果里的每个字符串（含键）都能编码成 UTF-8。
+
+    json.loads 接受孤立代理项（"\\ud800"），这种 str 一写盘就抛 UnicodeEncodeError。
+    """
+    if isinstance(value, str):
+        try:
+            value.encode('utf-8')
+        except UnicodeEncodeError:
+            return False
+        return True
+    if isinstance(value, dict):
+        return all(_utf8_encodable(k) and _utf8_encodable(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(_utf8_encodable(v) for v in value)
+    return True
+
+
 def user_note_text(value):
     """账户备注的展示文本；非字符串（手工编辑/旧格式）一律显示占位符。
 
@@ -9304,6 +9322,12 @@ if __name__ == '__main__':
 
                 if not isinstance(params, dict):
                     return self.reply_json(400, {'ok': False, 'error': 'JSON body must be an object'})
+                # JSON 允许 "\ud800" 这种孤立代理项，json.loads 照收、isinstance(str) 也过；
+                # 但 save_data 编码 UTF-8 时抛 UnicodeEncodeError（不是 OSError，回滚分支
+                # 接不住）。坏值留在内存里，此后每一次落盘都失败，直到门户重启
+                # （2026-11-03 修）。在入口处整包拒绝。
+                if not _utf8_encodable(params):
+                    return self.reply_json(400, {'ok': False, 'error': 'JSON body contains invalid Unicode'})
                 sub = self.path[len('/api/v1/'):].split('?', 1)[0]
                 if sub.startswith('users/'):
                     try:
