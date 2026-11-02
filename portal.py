@@ -1278,12 +1278,18 @@ def _prune_portal_backups(directory, keep=3, protected=()):
     keep=3 会把本轮刚建的三份直接删掉 —— 而那正是回滚要用的。所以：
       * `protected` 传本轮生成的备份路径，永远不删；
       * keep 按**轮次戳**（文件名里的 `<stamp>`）计，不是按文件数。
+
+    ⚠️ 只认门户整包六个文件的备份（2026-11-03 修）：/etc/hysteria 里还有
+    install.sh 改配置前留的 portal.json / client_meta.json / config.yaml /
+    证书快照，同样是 `<file>.bak-<stamp>`。旧实现按 '.bak-' 一视同仁，
+    自更新三轮之后就把这些用户数据快照删光了，它们的保留由 install.sh 自己管。
     """
     directory = Path(directory)
     protected = {Path(p).name for p in (protected or ())}
+    owned = tuple(name + '.bak-' for name in PORTAL_BUNDLE_FILES)
     try:
         items = [p for p in directory.iterdir()
-                 if p.is_file() and '.bak-' in p.name]
+                 if p.is_file() and p.name.startswith(owned)]
     except OSError:
         return
     # 从文件名取轮次戳：<name>.bak-<YYYYmmdd-HHMMSS>-<pid>
