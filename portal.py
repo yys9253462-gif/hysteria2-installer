@@ -4187,13 +4187,24 @@ def sync_cert_runtime(root, cert_file, state_path=None):
 
 
 def record_cert_heal(root, state, before, after):
-    """把一次自愈写成痕迹文件，供界面显示「上次自动对齐时间」。"""
+    """把一次自愈写成痕迹文件，供界面显示「上次自动对齐时间」。
+
+    🔴 2026-11-02 修：同一个文件里还有 sync_cert_runtime 写的 loaded_cert_sha256。
+    旧实现整份覆盖，刚记下的运行态指纹被抹掉；下一轮 selfheal 看不到指纹，
+    就当成「首次观测」再 try-restart 一遍 hysteria-server / xray —— 每 30 分钟
+    重启一次所有监听，计量每次都记一条 service_restart_unsampled_tail_unknown，
+    控制台于是整排显示「计量有缺口或采集异常」。这里只更新痕迹字段，其余原样保留。
+    """
     try:
         state_path = Path(root) / 'cert-selfheal.json'
         prev_count = 0
+        previous = {}
         if state_path.exists():
             try:
-                prev_count = int(json.loads(state_path.read_text(encoding='utf-8')).get('heal_count') or 0)
+                loaded = json.loads(state_path.read_text(encoding='utf-8'))
+                if isinstance(loaded, dict):
+                    previous = loaded
+                prev_count = int(previous.get('heal_count') or 0)
             except Exception:
                 prev_count = 0
         # before/after 是 meta 快照；被改成数字/列表时 `.get` 抛 AttributeError，
@@ -4202,13 +4213,14 @@ def record_cert_heal(root, state, before, after):
         before = before if isinstance(before, dict) else {}
         after = after if isinstance(after, dict) else {}
         last_pin = after.get('pin_sha256')
-        payload = {
+        payload = dict(previous)
+        payload.update({
             'healed_at': int(time.time()),
             'heal_count': prev_count + 1,
             'last_pin': last_pin if isinstance(last_pin, str) else '',
             'fields': [k for k in ('cert_type', 'server_name', 'is_insecure', 'pin_sha256')
                        if before.get(k) != after.get(k)],
-        }
+        })
         tmp = state_path.with_suffix('.tmp')
         tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
         tmp.chmod(0o600)

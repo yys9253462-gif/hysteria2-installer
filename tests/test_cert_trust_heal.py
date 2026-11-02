@@ -479,6 +479,50 @@ class TestCertRuntimeReload(unittest.TestCase):
             self.assertEqual(calls, [['systemctl', 'try-restart', 'xray']])
             self.assertTrue(state.exists())
 
+    def test_repeated_selfheal_does_not_restart_again_after_first_reload(self):
+        # 2026-11-02 生产实测：record_cert_heal 整份覆盖 cert-selfheal.json，
+        # 把 sync_cert_runtime 刚写的 loaded_cert_sha256 抹掉，于是每 30 分钟的
+        # timer 都当成「首次观测」再重启一次 hysteria-server / xray，
+        # 计量每轮记一条 service_restart_unsampled_tail_unknown 缺口。
+        # 这里不桩 record_cert_heal：它正是出问题的那一环。
+        import portal
+        from types import SimpleNamespace
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert = root / 'fullchain.pem'
+            cert.write_bytes(b'certificate that never changes')
+            meta_path = root / 'client_meta.json'
+            meta_path.write_text('{}', encoding='utf-8')
+            state = root / 'cert-selfheal.json'
+            calls = []
+            with mock.patch.object(portal, '_resolve_live_cert', return_value=(cert, '', [], False)), \
+                 mock.patch.object(portal, 'sync_cert_trust', return_value=False), \
+                 mock.patch.object(portal, 'sync_pin', side_effect=lambda *_: None), \
+                 mock.patch.object(portal, '_systemd_state',
+                                   side_effect=lambda service: 'active' if service == 'hysteria-server' else 'inactive'), \
+                 mock.patch.object(portal.subprocess, 'run', side_effect=lambda args, **kwargs:
+                     (calls.append(args) or SimpleNamespace(returncode=0))):
+                for _ in range(3):
+                    portal.selfheal(str(meta_path), config_path=str(root / 'config.yaml'))
+            self.assertEqual(calls, [['systemctl', 'try-restart', 'hysteria-server']])
+            saved = json.loads(state.read_text(encoding='utf-8'))
+            self.assertEqual(saved['loaded_cert_sha256'],
+                             __import__('hashlib').sha256(cert.read_bytes()).hexdigest())
+            self.assertEqual(saved['heal_count'], 1)
+
+    def test_record_cert_heal_keeps_runtime_fingerprint(self):
+        import portal
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = root / 'cert-selfheal.json'
+            state.write_text(json.dumps({'loaded_cert_sha256': 'ab' * 32, 'heal_count': 4}), encoding='utf-8')
+            portal.record_cert_heal(root, None, {'pin_sha256': 'old'}, {'pin_sha256': 'new'})
+            saved = json.loads(state.read_text(encoding='utf-8'))
+            self.assertEqual(saved['loaded_cert_sha256'], 'ab' * 32)
+            self.assertEqual(saved['heal_count'], 5)
+            self.assertEqual(saved['fields'], ['pin_sha256'])
+
     def test_changed_certificate_restarts_only_active_services_and_retries_failures(self):
         import portal
         from types import SimpleNamespace
