@@ -8809,10 +8809,20 @@ if __name__ == '__main__':
     # 每次登录得到同一个值、永不过期（Max-Age 只约束浏览器），泄露即永久可用。
     SESSION_MAX_AGE = 30 * 86400
 
+    # 退出登录要让服务端也作废会话（2026-11-03 修）：此前只清浏览器 Cookie，
+    # 被复制走的 Cookie 在 30 天内照样能用。session_secret 同时是分享链接 k 的
+    # 密钥，不能为登出轮换它；改为把纪元号签进会话，登出时纪元 +1。
+    def session_epoch():
+        value = data.get('session_epoch', 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    def _session_sig(token, issued_at, epoch):
+        msg = f'sess:{token}:{issued_at}' if epoch == 0 else f'sess:{token}:{issued_at}:{epoch}'
+        return hmac.new(session_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
     def sign_session(token, issued_at=None):
         issued_at = int(time.time()) if issued_at is None else int(issued_at)
-        sig = hmac.new(session_secret.encode(), f'sess:{token}:{issued_at}'.encode(), hashlib.sha256).hexdigest()
-        return f'{token}.{issued_at}.{sig}'
+        return f'{token}.{issued_at}.{_session_sig(token, issued_at, session_epoch())}'
 
     def verify_session(cookie_header):
         if not cookie_header:
@@ -8830,7 +8840,7 @@ if __name__ == '__main__':
         t, issued_at, sig = parts
         if not 0 <= time.time() - int(issued_at) <= SESSION_MAX_AGE:
             return False
-        expected = hmac.new(session_secret.encode(), f'sess:{t}:{issued_at}'.encode(), hashlib.sha256).hexdigest()
+        expected = _session_sig(t, issued_at, session_epoch())
         return hmac.compare_digest(t, data['token']) and hmac.compare_digest(sig, expected)
 
     # SPEEDTEST_TARGETS 是 /api/v1/speedtest 的**唯一**靶点来源。
@@ -10147,6 +10157,15 @@ if __name__ == '__main__':
             # 退出登录（2026-10-29 加）：此前没有任何登出入口，勾了「记住我」
             # 的用户只能去浏览器里手删 Cookie，共用电脑时不安全。
             if self.path == prefix + 'logout':
+                # 只有带着有效会话的登出才作废服务端会话：不鉴权的登出若也能
+                # 推进纪元，任何人反复 POST 就能把机主一直踢下线。
+                if verify_session(self.headers.get('Cookie')):
+                    with data_lock:
+                        data['session_epoch'] = session_epoch() + 1
+                    try:
+                        save_data()
+                    except OSError as exc:
+                        _log_ignored('logout_epoch_save', exc)
                 self.send_response(302)
                 self._responded = True
                 self.send_header('Location', prefix)
