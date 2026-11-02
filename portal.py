@@ -5586,6 +5586,20 @@ REALITY_IPLIMIT_RELEASE_SECONDS = 180
 REALITY_IPLIMIT_TAG_PREFIX = 'iplimit-'
 
 
+def user_ip_limit(info):
+    """账户的设备上限，Hy2 鉴权与 Reality 设备限制共用这一份（2026-11-03 修）。
+
+    bool 是 int 的子类：True 会被静默算成「1 个设备」，把一个本应不限设备的
+    账号限成单设备（JSON 里写成 true 就会触发）。旧实现只有 Reality 一侧跳过
+    bool，同一条记录在 Hy2 上限 1 台、在 Reality 上不限。
+    无法解析时抛 ValueError / TypeError，由调用方决定拒绝还是跳过。
+    """
+    raw = info.get('ip_limit', 0)
+    if isinstance(raw, bool):
+        return 0
+    return int(raw)
+
+
 def active_ip_limits(users):
     """逐账户读取设备上限，损坏记录不能撤销其他账户的拦截。"""
     # 调用方传的是 user_table(data)，但 ip_limit worker 也会直接传快照；
@@ -5596,13 +5610,8 @@ def active_ip_limits(users):
     for uid, info in users.items():
         if not user_access_allowed(info):
             continue
-        raw = info.get('ip_limit', 0)
-        # bool 是 int 的子类：True 会被静默算成「1 个设备」，把一个本应
-        # 不限设备的账号限成单设备（JSON 里写成 true 就会触发）。
-        if isinstance(raw, bool):
-            continue
         try:
-            limit = int(raw)
+            limit = user_ip_limit(info)
         except (ValueError, TypeError, OverflowError):
             continue
         if limit > 0:
@@ -9355,7 +9364,7 @@ if __name__ == '__main__':
                         if deny is None and client_ip and client_ip in active_ip_deny(global_ip_deny, matched_uid, now_ts):
                             deny = 'Device limit exceeded across nodes'
                         try:
-                            ip_limit = int(matched_user.get('ip_limit', 0))
+                            ip_limit = user_ip_limit(matched_user)
                         except (ValueError, TypeError, OverflowError):
                             deny = deny or 'Invalid user record'
                         if deny is None:
