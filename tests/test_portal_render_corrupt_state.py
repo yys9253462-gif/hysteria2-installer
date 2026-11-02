@@ -55,6 +55,22 @@ class RenderCorruptStateTests(unittest.TestCase):
                     'hysteria2://x@h:1/', 'clash', 'sing', '', 'tok', 'k', sub_port=8443)
                 self.assertIn('<!doctype html', page.lower())
 
+    def test_page_html_tolerates_non_string_password(self):
+        """旧版本会把数字密码原样落盘；单条坏密码不能让整个总览页渲染失败。"""
+        meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com',
+                'subscription_port': 8443, 'listen_port': 1, 'hop_port_range': '',
+                'auth_password': 'p', 'obfs_password': '', 'cert_type': 'acme',
+                'is_insecure': False, 'pin_sha256': ''}
+        base = {'expires_at': 2085974400, 'limit_bytes': 0, 'used_bytes': 0, 'status': 'active'}
+        for bad in (123456789, None, ['a', 'b'], {'x': 1}, ''):
+            with self.subTest(password=bad):
+                page = portal.page_html(meta, 'hysteria2://x@h:1/', '#s', 'c', '{}',
+                                        users={'good': dict(base, password='abcd-secret-wxyz'),
+                                               'bad': dict(base, password=bad)},
+                                        token='t', session_secret='s')
+                self.assertIn('abcd****wxyz', page)
+                self.assertIn('（密码无效）', page)
+
     def test_page_html_tolerates_non_dict_user_table(self):
         meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com',
                 'subscription_port': 8443, 'listen_port': 1, 'hop_port_range': '',

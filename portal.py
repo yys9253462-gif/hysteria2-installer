@@ -2005,6 +2005,18 @@ def user_note_text(value):
     return value if isinstance(value, str) and value else '-'
 
 
+def password_hint(value):
+    """总览页里密码的打码展示（头尾各 4 位）。
+
+    旧版本会把数字密码原样落盘（见 users/create 的说明），手工编辑也可能写成
+    null / 列表。旧写法直接切片，单条坏记录就让 page_html 抛 TypeError，
+    regenerate_page 随之失败、整个控制台打不开（2026-11-03 修）。
+    """
+    if not isinstance(value, str) or not value:
+        return '（密码无效）'
+    return value[:4] + '****' + value[-4:]
+
+
 def format_bytes(b):
     """把字节数渲染成人可读文本；任何非数值输入都按 0 处理。
 
@@ -2240,7 +2252,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             <div style="margin-top:4px"><span class="speed-badge" data-user-speed="{html.escape(uid)}">↓ 0 B/s · ↑ 0 B/s</span></div>
           </td>
           <td>{expires_str}</td>
-          <td><code style="font-size:11px">{html.escape(u.get("password","")[:4] + "****" + u.get("password","")[-4:])}</code></td>
+          <td><code style="font-size:11px">{html.escape(password_hint(u.get("password")))}</code></td>
           <td>
             {'' if uid == MASTER_USER_ID else f'''<button class="button primary btn-user-connect" style="padding:4px 10px;font-size:11px;margin-right:6px" type="button" data-uid="{html.escape(uid)}" data-token="{token}" data-key="{user_key}">专属连接</button>'''}
             {'' if uid == MASTER_USER_ID else f'''<form method="POST" action="/{token}/manage-user" style="display:inline" class="js-confirm-delete" data-confirm="确定注销此用户？此操作不可撤销。">
@@ -12215,7 +12227,8 @@ if __name__ == '__main__':
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
                         if existing is not None:
-                            tail = (existing.get('password') or '')[-4:]
+                            _pw = existing.get('password')
+                            tail = _pw[-4:] if isinstance(_pw, str) else ''
                             # 数据被改坏时 int('x') 会抛 ValueError，这里只影响
                             # 一条提示文案，不值得让整个 409 变成 500（2026-10-30 修）。
                             try:
