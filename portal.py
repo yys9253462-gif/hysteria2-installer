@@ -11988,7 +11988,7 @@ if __name__ == '__main__':
                 with data_lock:
                     acfg = dict(config_section(data, 'anytls_config'))
                     old_acfg = copy.deepcopy(acfg)
-                    closed_port = int(acfg.get('port') or 0)
+                    closed_port = _valid_port(acfg.get('port')) or 0
                     # secret 与端口保留：再次启用时沿用，已下发的订阅不失效。
                     acfg['enabled'] = False
                     data['anytls_config'] = acfg
