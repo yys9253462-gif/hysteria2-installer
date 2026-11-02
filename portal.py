@@ -12518,6 +12518,26 @@ for t in curl jq; do
 done
 command -v curl >/dev/null 2>&1 || { echo "缺少 curl，无法继续" >&2; exit 1; }
 
+# 归属检查，与 install.sh 的 install_warp_local_proxy 同一规则（2026-11-03 修）。
+# 旧版网页安装不查也不写归属标记：机器上已有别人的 wireproxy 时直接覆盖它的
+# unit 与 wp.conf；而 install.sh 卸载只认 .hy2-warp-owned，网页装的 WARP 卸载后
+# 还在跑、开机自启、watchdog 每 3 分钟拉起一次，wp.conf 里的私钥也留在盘上。
+WARP_OWNED_MARKER="/etc/hysteria/.hy2-warp-owned"
+if [ ! -f "$WARP_OWNED_MARKER" ]; then
+    if [ -f /etc/systemd/system/wireproxy.service ] && [ -f "$WP_CFG" ] \
+            && grep -qF '# wireproxy config (managed by hysteria2-installer, do not edit)' "$WP_CFG" \
+            && grep -qF 'ExecStart=/usr/local/bin/wireproxy -c /etc/wireguard/wp.conf' \
+                /etc/systemd/system/wireproxy.service; then
+        :  # 旧版本装的，按我们的认领
+    elif [ -e "$WP_BIN" ] || [ -e /etc/systemd/system/wireproxy.service ] || [ -e "$WP_CFG" ]; then
+        echo "wireproxy 资产已存在但归属无法确认；为避免覆盖宿主服务，已停止 WARP 安装。" >&2
+        exit 1
+    fi
+fi
+# 从这里开始写的文件都归本项目：先落标记，后面任何一步失败，卸载也能清干净。
+: > "$WARP_OWNED_MARKER"
+chmod 600 "$WARP_OWNED_MARKER"
+
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64|amd64)   WG_A="amd64"; WP_A="amd64" ;;
