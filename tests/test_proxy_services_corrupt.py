@@ -23,6 +23,10 @@ def load_writer():
                   and n.name == 'proxy_services')
     root = Path(__file__).resolve().parents[1] / 'tests' / '_gost_fixture'
     env = {}
+    for n in TREE.body:
+        if isinstance(n, ast.Assign) and any(getattr(t, 'id', '') in (
+                'PRIVATE_REJECT_RULES', 'GOST_PRIVATE_BYPASS') for t in n.targets):
+            exec(compile(ast.Module(body=[copy.deepcopy(n)], type_ignores=[]), '<const>', 'exec'), env)
     exec(compile(ast.Module(body=[copy.deepcopy(helper), copy.deepcopy(fn)], type_ignores=[]),
                  '<gost>', 'exec'), env)
     return env
@@ -68,6 +72,32 @@ class GostConfigCorruptStateTests(unittest.TestCase):
         self.assertEqual([s['addr'] for s in cfg['services']], [':25001', ':25002'])
         self.assertEqual(cfg['services'][0]['handler']['type'], 'socks5')
         self.assertEqual(cfg['services'][1]['handler']['type'], 'http')
+
+    def test_every_service_refuses_private_destinations(self):
+        """代理不能当跳板访问内网、云元数据和本机端口（2026-11-03 修）。
+
+        生成的配置在 SE 上喂给真 gost 3.2.6 验证过：带 bypass 时
+        127.0.0.1 / localhost 被拒，example.com 照常 200。
+        """
+        import ipaddress
+        import tempfile
+        written = {}
+        env = load_writer()
+        env.update({'data': {'proxy_services': [
+            {'type': 'socks5', 'port': 25001}, {'type': 'http', 'port': 25002}]},
+            'data_lock': threading.RLock(), 'portal_path': Path(tempfile.mkdtemp()) / 'portal.json',
+            'json': json, 'atomic_write_private': lambda p, b: written.update(payload=b)})
+        env['write_gost_config']()
+        cfg = json.loads(written['payload'])
+        bypasses = {b['name']: b['matchers'] for b in cfg.get('bypasses', [])}
+        for svc in cfg['services']:
+            with self.subTest(addr=svc['addr']):
+                matchers = bypasses.get(svc.get('bypass'), [])
+                nets = [ipaddress.ip_network(m) for m in matchers if '/' in m]
+                for target in ('127.0.0.1', '169.254.169.254', '10.1.2.3', '192.168.1.1', '::1'):
+                    addr = ipaddress.ip_address(target)
+                    self.assertTrue(any(addr in n for n in nets if n.version == addr.version), target)
+                self.assertIn('localhost', matchers)
 
 
 if __name__ == '__main__':

@@ -616,6 +616,10 @@ PRIVATE_REJECT_RULES = ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0
 # 规则用 routing.rules 的 ip 匹配（不是 domain）：即使客户端不做 DNS 解析、
 # 直接连 IP 也能挡住。block 出站排在 freedom 之前，且是 blackhole。
 XRAY_PRIVATE_REJECT_IPS = [c for c in PRIVATE_REJECT_RULES]
+# GOST 代理同样不能当跳板进内网 / 云元数据 / 本机门户与计量端口（2026-11-03 修）。
+# GOST 的 bypass 匹配的是请求里的目标地址，不做解析后检查：解析到内网的域名
+# 仍能穿过，这一点弱于 Xray 的 IPIfNonMatch，SE 实测确认。
+GOST_PRIVATE_BYPASS = 'hy2-private-guard'
 XRAY_BLOCK_OUTBOUND_TAG = 'block-private'
 
 
@@ -8141,6 +8145,7 @@ def serve(path):
                         },
                     },
                     'listener': {'type': 'tcp'},
+                    'bypass': GOST_PRIVATE_BYPASS,
                 }
                 if ptype == 'https':
                     cert_file, key_file = gost_tls_paths(portal_path.parent)
@@ -8148,7 +8153,9 @@ def serve(path):
                         'certFile': cert_file, 'keyFile': key_file}}
                 services.append(entry)
 
-        cfg = {'services': services}
+        cfg = {'services': services,
+               'bypasses': [{'name': GOST_PRIVATE_BYPASS,
+                             'matchers': list(PRIVATE_REJECT_RULES) + ['localhost', '*.localhost']}]}
         # gost.yml 里有代理账号密码，与 portal.json 同样必须一创建就是 0600。
         atomic_write_private(gost_cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8'))
 
