@@ -8475,6 +8475,17 @@ if __name__ == '__main__':
         text = (err or '').strip() or (out or '').strip()
         return text[-limit:] if text else '退出码 ' + str(rc)
 
+    def awg_peers():
+        """peers.json 里的客户端列表；容器或条目被改坏时跳过，不抛异常。
+
+        awg_state 与下载 .conf / 二维码的路由共用这一份清洗规则：旧的下载路由
+        直接 `p.get(...)`，peers 里只要有一条 null / 字符串，所有客户端的配置
+        都下载不了（do_GET 没有兜底，连接被掐断）。
+        """
+        peers_doc = awg_read_json(AWG_PEERS_PATH, {})
+        peers_raw = peers_doc.get('peers') if isinstance(peers_doc, dict) else None
+        return [p for p in peers_raw if isinstance(p, dict)] if isinstance(peers_raw, list) else []
+
     def awg_state():
         meta = awg_read_json(AWG_META_PATH, {})
         if not isinstance(meta, dict):
@@ -8482,9 +8493,7 @@ if __name__ == '__main__':
         # peers 文件是 awgctl.sh 写的 JSON：被截断/手工改坏时 `peers` 可能是
         # 字符串或含非 dict 条目。旧写法 len() / p.get() 直接抛异常，
         # 整个 /awg-state 端点 500，面板的 AWG 卡片整块空白。
-        peers_doc = awg_read_json(AWG_PEERS_PATH, {})
-        peers_raw = peers_doc.get('peers') if isinstance(peers_doc, dict) else None
-        peers_raw = [p for p in peers_raw if isinstance(p, dict)] if isinstance(peers_raw, list) else []
+        peers_raw = awg_peers()
         line = str(meta.get('line', '3') or '3')
         if line not in ('2', '3'):
             line = '3'
@@ -13187,7 +13196,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 # 客户端不存在时给 404，而不是让底层命令失败后统一报 500 ——
                 # 前端需要能区分「查无此人」与「服务端出错」。
-                peers_now = awg_read_json(AWG_PEERS_PATH, {}).get('peers', []) or []
+                peers_now = awg_peers()
                 if not any(p.get('name') == name for p in peers_now):
                     return self.reply(404, b'Client not found')
 
