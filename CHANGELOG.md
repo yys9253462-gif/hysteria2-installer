@@ -1,3 +1,16 @@
+## 2026-11-03 — 第二批十项修复，门户 2.12
+
+- 撤销用户时若某个协议刚被停用，clients 不再被写进计量 API 入站（之后启用任何协议都会失败）。
+- 停用 VMess / VLESS Encryption 保留 ws_path、密钥对与端口（只标 `enabled: false`）；再启用不再换参数，已发订阅继续有效。
+- 已在 8443 等内置黑名单端口上服务的协议，重置密钥 / 重启开关时不再被挪到别的端口。
+- 首次启用 VMess / VLESS Encryption / AnyTLS 时，默认端口（2087 / 2088 / 2096）也要查监听表，被占用就换一个，不再撞车回滚。
+- `hy2-awgctl` 拿到操作锁后不再吞掉 stderr；AWG 出错时门户能看到真实原因。
+- `hy2-awgctl` 下载有总时长上限，且 curl 不再继承锁；下载卡住不会永久占锁。
+- Hysteria 服务端日志级别默认改回 `info`：官方核心没有 `/online/ips`，在线 IP 要靠 journal 的 INFO 行重建，`error` 级下设备上限会退化（SE 节点实测）。
+- 安装 / 重装时先取门户整包再写 config.yaml；取不到时现有配置保持原样，不会让鉴权指向没人监听的端口。
+- 菜单 2 更新核心时不再静默覆盖带 `+` 的定制核心；确需替换请 `export HY2_ALLOW_CUSTOM_CORE_REPLACE=1`。
+- ACME 域名与通知邮箱按主机名 / 邮箱格式校验（含 `HY2_DOMAIN` / `HY2_EMAIL`），不再能把引号、分号、换行写进 config.yaml / nginx / Caddy 配置。
+
 ## 2026-11-03 — 十项修复，门户 2.11
 
 - 网页自更新清理旧备份时只认门户六个文件的 `.bak-*`；此前第 4 次自更新会删掉 install.sh 改配置前留的 portal.json / client_meta.json / config.yaml / 证书快照。
