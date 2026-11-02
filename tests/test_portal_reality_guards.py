@@ -98,6 +98,30 @@ class TestRealityClientSyncGuards(unittest.TestCase):
                 portal.enforce_node_access(root,{'users':{}})
             self.assertEqual((root/'xray.json').read_text(encoding='utf-8'),'invalid')
 
+    def test_inbound_removed_before_lock_never_receives_clients_on_another_inbound(self):
+        """锁外算 wanted_by_tag 时 VMess 还在，拿到锁时它已被停用删除（2026-11-03）。
+
+        旧实现照旧 tag 取下标，-1 指向最后一个入站，VMess 的 clients 被写进计量 API 入站。
+        """
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        api_inbound = {'tag': 'usage-meter-api-in', 'protocol': 'dokodemo-door',
+                       'listen': '127.0.0.1', 'port': 10085, 'settings': {'address': '127.0.0.1'}}
+        reality = {'tag': portal.REALITY_INBOUND_TAG, 'protocol': 'vless', 'port': 443,
+                   'settings': {'clients': [{'id': 'old', 'email': 'old'}]}}
+        with tempfile.TemporaryDirectory() as d:
+            xj = Path(d) / 'xray.json'
+            xj.write_text(json.dumps({'inbounds': [reality, api_inbound]}), encoding='utf-8')
+            wanted = {portal.REALITY_INBOUND_TAG: [{'id': 'new', 'email': 'alice', 'flow': 'xtls-rprx-vision'}],
+                      portal.VMESS_INBOUND_TAG: [{'id': 'vm', 'email': 'alice'}]}
+            run = lambda args, **kw: SimpleNamespace(returncode=0, stdout='inactive\n' if 'is-active' in args else 'epoch\n', stderr='')
+            with patch.object(portal.subprocess, 'run', side_effect=run):
+                self.assertTrue(portal._apply_xray_access_snapshot_locked(
+                    Path(d), xj, {'users': {}}, ['bob'], Path(d) / 'meter.json', {}, (), wanted))
+            saved = json.loads(xj.read_text(encoding='utf-8'))['inbounds']
+            self.assertEqual(saved[1], api_inbound, '计量 API 入站被写进了 clients')
+            self.assertEqual(saved[0]['settings']['clients'], wanted[portal.REALITY_INBOUND_TAG])
+
 
 class TestEncodingHardening(unittest.TestCase):
     """所有 write_text 必须显式 encoding='utf-8'。

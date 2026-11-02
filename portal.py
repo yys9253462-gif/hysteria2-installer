@@ -6294,6 +6294,16 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
                                        force_ids, wanted_by_tag):
     original=xj.read_bytes()
     xcfg=json.loads(original)
+    # wanted_by_tag 是锁外读 xray.json 时算的；拿到锁之前可能有协议被停用、
+    # 入站被删（2026-11-03 修）。旧实现照旧 tag 集合取下标：找不到时下标是 -1，
+    # clients 被写进**最后一个入站**（通常是计量的 usage-meter-api-in），
+    # 之后 add_stats 一律报 api inbound conflict。读-改-写必须以锁内这次读取为准。
+    if not isinstance(xcfg, dict) or not isinstance(xcfg.get('inbounds', []), list):
+        raise ValueError('invalid Xray configuration; cannot confirm revocation')
+    wanted_by_tag={tag:wanted for tag,wanted in wanted_by_tag.items()
+                   if managed_inbound_index(xcfg,tag)[0]>=0}
+    if not wanted_by_tag:
+        return True
     signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
     epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
     current={tag:xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings',{}).get('clients')
