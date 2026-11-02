@@ -1569,6 +1569,13 @@ EOF
     if ! "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
             --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null; then
+        # 与签发失败同样撤掉本次新增的验证配置（2026-11-03 修）：旧实现直接 return，
+        # 留下一个没有归属标记的 server 块 —— Nginx 继续为该域名回 404，下次运行
+        # 撞上「无法确认归属」永久走不通，卸载也认不出它。
+        if [[ "$created_owned_conf" == 1 && -n "$conf" ]]; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+        fi
         log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败。"
         return 1
     fi
