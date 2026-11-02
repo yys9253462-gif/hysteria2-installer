@@ -13134,7 +13134,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'clash': clash_yaml,
                     'sing_box': sing_json,
                     'qr_svg': qr_svg,
-                    'expires_at': u_copy.get('expires_at', 0),
+                    # 缺失 = 永久，必须原样回 None（2026-11-03 修）：旧实现兜底成 0，
+                    # 前端弹窗按 `=== null` 判永久，于是永久用户显示成 1970-01-01 到期；
+                    # 而 0 在本项目里恰恰表示「已过期」。
+                    'expires_at': u_copy.get('expires_at'),
                     'traffic_used': u_copy.get('used_bytes', 0),
                     'traffic_limit': u_copy.get('limit_bytes', 0),
                     'ip_limit': u_copy.get('ip_limit', 0),
