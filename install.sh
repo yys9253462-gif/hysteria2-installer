@@ -5418,6 +5418,16 @@ flow_update_core() {
         log_err "另一个核心升级正在运行，请稍后重试。"
         return 1
     fi
+    # 定制核心（版本号带 +，例如提供 /online/ips 的 …+teyir）不能被静默换成官方版
+    # （2026-11-03 修，与门户 upgrade_core_binary 的 allow_custom 一致）：换掉后
+    # 在线 IP 退回 journal 重建，设备上限随之变弱；而且官方版可能比它还旧，等于降级。
+    local _current_version
+    _current_version="$("$HY2_BIN" version 2>/dev/null | awk -F': *' '/^Version:/{print $2; exit}')" || _current_version=""
+    if [[ "$_current_version" == *+* && "${HY2_ALLOW_CUSTOM_CORE_REPLACE:-0}" != "1" ]]; then
+        log_err "当前核心是定制版本（${_current_version}），官方核心会覆盖它的补丁，已放弃更新。"
+        log_err "确需换成官方核心，请先 export HY2_ALLOW_CUSTOM_CORE_REPLACE=1 再执行。"
+        return 1
+    fi
     local rollback_file
     rollback_file="$(mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
         log_err "创建核心备份失败，现有二进制未改动。"; return 1; }
