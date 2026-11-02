@@ -66,16 +66,34 @@ class LiveTests(unittest.TestCase):
   with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
    result=m.read_live_connections()['users']['active']
   self.assertTrue(result['reality_ok']);self.assertEqual(result['ips'][0]['protocol'],'Reality');self.assertEqual(result['ips'][0]['ip'],'203.0.113.12')
- def test_long_connection_does_not_expire(self):self.assertEqual(m.parse_events([row('client connected')]),{('user','203.0.113.8:1234'):'203.0.113.8'})
- def test_core_zero_removes_ghost(self):self.assertEqual(m.confirmed_ips({('user','203.0.113.8:1'):'203.0.113.8'},'user',0),[])
+ def test_long_connection_does_not_expire(self):self.assertEqual(m.parse_events([row('client connected')]),{('user','203.0.113.8'):1})
+ def test_core_zero_removes_ghost(self):self.assertEqual(m.confirmed_ips({('user','203.0.113.8'):1},'user',0),[])
  def test_count_mismatch_unknown(self):self.assertIsNone(m.confirmed_ips({},'user',1))
- def test_deduplicate_same_ip(self):self.assertEqual(m.confirmed_ips({('user','a'):'203.0.113.8',('user','b'):'203.0.113.8'},'user',2),['203.0.113.8'])
+ def test_deduplicate_same_ip(self):self.assertEqual(m.confirmed_ips({('user','203.0.113.8'):2},'user',2),['203.0.113.8'])
  def test_disconnect_removes(self):self.assertEqual(m.parse_events([row('client connected'),row('client disconnected',time=2)]),{})
  def test_reversed_binary_journal(self):self.assertEqual(m.parse_events([row('client disconnected',time=2,binary=True),row('client connected',binary=True)]),{})
- def test_same_ip_multiple_instances(self):self.assertEqual(len(m.parse_events([row('client connected'),row('client connected',addr='203.0.113.8:5678')])),2)
- def test_ipv6(self):self.assertEqual(list(m.parse_events([row('client connected',addr='[2001:db8::1]:1234')]).values()),['2001:db8::1'])
+ def test_same_ip_multiple_instances(self):self.assertEqual(m.parse_events([row('client connected'),row('client connected',addr='203.0.113.8:5678')]),{('user','203.0.113.8'):2})
+ def test_ipv6(self):self.assertEqual(list(m.parse_events([row('client connected',addr='[2001:db8::1]:1234')])),[('user','2001:db8::1')])
  def test_invalid_rejected(self):
   with self.assertRaises(ValueError):m.parse_events([row('client connected',addr='not-ip:1')])
  def test_users_isolated(self):self.assertEqual(len(m.parse_events([row('client connected'),row('client connected',uid='other')])),2)
  def test_structured_logs(self):self.assertEqual(len(m.parse_events([{'MESSAGE':json.dumps({'msg':'client connected','id':'u','addr':'203.0.113.7:1'})}])),1)
+ # 2026-11-02 生产实测（东京③）：端口跳跃 / QUIC 迁移后断开事件的源端口与连上时不同，
+ # 按 (uid, addr) 配对时旧连接永远不消失，日志连接数 > 核心计数，整台节点判「暂不一致」。
+ def test_port_hopping_disconnect_on_other_port_still_closes(self):
+  events=[row('client connected',addr='153.37.136.218:7206',time=1),row('client connected',addr='153.37.136.218:7457',time=2),
+          row('client disconnected',addr='153.37.136.218:7215',time=3)]
+  connections=m.parse_events(events)
+  self.assertEqual(m.confirmed_ips(connections,'user',1),['153.37.136.218'])
+ def test_disconnect_never_seen_makes_user_unknown(self):
+  connections=m.parse_events([row('client connected',addr='203.0.113.8:1',time=1),row('client disconnected',addr='198.51.100.9:2',time=2)])
+  self.assertIsNone(m.confirmed_ips(connections,'user',1))
+  self.assertEqual(m.confirmed_ips(connections,'user',0),[])
+ def test_more_logged_than_core_is_still_unknown(self):
+  connections=m.parse_events([row('client connected',addr='203.0.113.8:1',time=1),row('client connected',addr='198.51.100.9:2',time=2)])
+  self.assertIsNone(m.confirmed_ips(connections,'user',1))
+ def test_other_users_unknown_does_not_leak(self):
+  connections=m.parse_events([row('client disconnected',uid='other',addr='198.51.100.9:2',time=1),row('client connected',addr='203.0.113.8:1',time=2)])
+  self.assertEqual(m.confirmed_ips(connections,'user',1),['203.0.113.8'])
+  self.assertIsNone(m.confirmed_ips(connections,'other',1))
 if __name__=='__main__':unittest.main()
