@@ -4728,7 +4728,7 @@ def vmess_clients(data):
     users = user_table(data)
     clients = []
     for uid in sorted(users):
-        if not user_access_allowed(users.get(uid) or {}):
+        if not user_access_allowed(users.get(uid)):
             continue
         clients.append({'id': vmess_uuid_for_user(uid), 'email': uid})
     if not clients:
@@ -4851,7 +4851,7 @@ def anytls_users(data):
     if secret:
         all_users = user_table(data)
         for uid in sorted(all_users):
-            if user_access_allowed(all_users.get(uid) or {}):
+            if user_access_allowed(all_users.get(uid)):
                 users.append({'name': uid, 'password': anytls_password_for_user(secret, uid)})
     if not users:
         # 占位密码必须**稳定**：secret 缺失时旧实现每次用随机数，导致
@@ -5072,7 +5072,7 @@ def tuic_users(data):
     if secret:
         all_users = user_table(data)
         for uid in sorted(all_users):
-            if user_access_allowed(all_users.get(uid) or {}):
+            if user_access_allowed(all_users.get(uid)):
                 u, pwd = tuic_credentials_for_user(secret, uid)
                 users.append({'name': uid, 'uuid': u, 'password': pwd})
     if not users:
@@ -5454,7 +5454,7 @@ def vlessenc_clients(data):
     users = user_table(data)
     clients = []
     for uid in sorted(users):
-        if not user_access_allowed(users.get(uid) or {}):
+        if not user_access_allowed(users.get(uid)):
             continue
         clients.append({'id': reality_uuid_for_user(uid), 'email': uid})
     if not clients:
@@ -6438,7 +6438,10 @@ def reality_clients(data):
     users = user_table(data)
     clients = []
     for uid, uid_uuid in sorted(reg.items()):
-        info = users.get(uid) or {}
+        # 原样传给准入判据（2026-11-03 修）：旧写法 `or {}` 把 null / 0 / "" / []
+        # 记录变成 {}，而 user_access_allowed({}) 为 True —— /auth 拒绝的坏记录
+        # 在 Reality / VMess / VLESS-Enc / AnyTLS / TUIC 上却拿到可用身份。
+        info = users.get(uid)
         # 只有 active 的用户才进白名单。
         # 缺 status 视为 active —— 与 handle_auth 的判据保持同源
         # （那边也是 `info.get('status', 'active') == 'active'`），
