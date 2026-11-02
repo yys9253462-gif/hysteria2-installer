@@ -50,6 +50,7 @@ class InstallOrderTests(unittest.TestCase):
                 'setup_portal(){ echo "setup_portal PLACED=${PORTAL_BUNDLE_PLACED:-0}" >> %s; }' % calls,
                 function('generate_server_config'),
                 'generate_server_config',
+                'echo "after PLACED=${PORTAL_BUNDLE_PLACED:-unset}" >> %s' % calls,
             ])
             result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=60)
             return (result, config.read_text(encoding='utf-8'), meta.read_text(encoding='utf-8'),
@@ -69,7 +70,7 @@ class InstallOrderTests(unittest.TestCase):
         self.assertIn('url: http://127.0.0.1:22222/auth', config)
         import json
         self.assertEqual(json.loads(meta)['listen_port'], 443)
-        self.assertEqual(calls.splitlines(), ['ensure ONLY=1', 'setup_portal PLACED=1'])
+        self.assertEqual(calls.splitlines(), ['ensure ONLY=1', 'setup_portal PLACED=1', 'after PLACED=unset'])
 
 
 if __name__ == '__main__':

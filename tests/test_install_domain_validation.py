@@ -35,7 +35,7 @@ class DomainValidationTests(unittest.TestCase):
             self.assertTrue(self.check('is_valid_domain', good), good)
         for bad in ('', 'example', 'evil.com"; touch /tmp/x', 'a.com;', 'a.com }', 'a .com',
                     'a.com\nlisten: :1', '-a.com', 'a-.com', 'https://a.com', 'a.com:443',
-                    'a..com', 'a' * 64 + '.com'):
+                    'a..com', 'a' * 64 + '.com', '1.2.3.4', '203.0.113.10'):
             self.assertFalse(self.check('is_valid_domain', bad), repr(bad))
 
     def test_emails(self):

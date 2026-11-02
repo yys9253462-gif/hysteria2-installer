@@ -606,6 +606,8 @@ is_valid_port() {
 is_valid_domain() {
     local d="$1"
     (( ${#d} >= 1 && ${#d} <= 253 )) || return 1
+    # 末段全是数字就是 IP（1.2.3.4），ACME 不给 IP 签发，提前拒绝。
+    [[ "${d##*.}" =~ ^[0-9]+$ ]] && return 1
     [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
 }
 
@@ -3106,7 +3108,11 @@ EOF
         --argjson listen_port "$LISTEN_PORT" --argjson is_insecure "$IS_INSECURE" \
         --argjson subscription_port "$HY2_SUB_PORT" \
         '$ARGS.named' > "$HY2_META_FILE"
-    setup_portal
+    # PORTAL_BUNDLE_PLACED 只给这一次 setup_portal 用；菜单循环里下一次操作要重新取包。
+    local _portal_rc=0
+    setup_portal || _portal_rc=$?
+    unset PORTAL_BUNDLE_PLACED
+    (( _portal_rc == 0 )) || return "$_portal_rc"
     log_info "配置文件写入完成。"
 }
 
