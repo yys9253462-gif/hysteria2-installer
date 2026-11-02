@@ -8873,6 +8873,20 @@ if __name__ == '__main__':
     )
 
     class Handler(BaseHTTPRequestHandler):
+        def _kick_old_password_sessions(self, user_id):
+            """改密码后断开该用户的 Hy2 会话（2026-11-03 修）。
+
+            用户仍然允许接入，不在撤销名单里：旧实现下用泄露的旧密码连着的会话
+            一直保持到自然断开。只踢 Hy2 —— 走 apply_access(force_ids) 会重启
+            Xray，把所有人的 Reality / VMess 会话一起断掉。踢失败不影响改密结果，
+            断线重连时 /auth 已经只认新密码。
+            """
+            try:
+                return kick_hy2_users(portal_path.parent, [user_id])
+            except Exception as exc:
+                _log_ignored('password_change_kick', exc)
+                return False
+
         def _sync_reality_clients(self, core_lock_fd=None):
             # 名字保留（调用点很多），实际语义已扩展为「同步所有托管入站」：
             # Reality 与 VMess 的 clients 都由 enforce_node_access 一并收回。
@@ -9528,6 +9542,7 @@ if __name__ == '__main__':
                     # 时会阻塞到连接超时）等于把全节点的鉴权一起卡住。
                     conflict = None
                     durability_uncertain = False
+                    password_changed = False
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
                         # 只认明确的真值：字符串 "0"/"false" 不该被当成 true。
@@ -9576,6 +9591,8 @@ if __name__ == '__main__':
                                     record['expires_at'] = existing.get('expires_at', record['expires_at'])
                             if existing is not None:
                                 rotate_user_view_key_on_change(existing, record)
+                                password_changed = (isinstance(existing, dict)
+                                                    and existing.get('password') != record.get('password'))
                             if conflict is None and 'used_bytes' in params:
                                 # 同一共享锁覆盖对账、用户写入和落盘；失败时仅回滚
                                 # 本请求的两个字段。replace 后目录 fsync 失败属于未知
@@ -9641,6 +9658,8 @@ if __name__ == '__main__':
                     else:
                         if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if password_changed:
+                        self._kick_old_password_sessions(user_id)
                     if durability_uncertain:
                         return self.reply_json(503, {'ok': False,
                             'error': 'Reconciliation saved but durability uncertain; verify and retry'})
@@ -9730,6 +9749,7 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid attribute'})
                     conflict = None
                     durability_uncertain = False
+                    password_changed = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
                         if u is None:
@@ -9739,6 +9759,7 @@ if __name__ == '__main__':
                         else:
                             previous = copy.deepcopy(u)
                             u.update(changes)
+                            password_changed = previous.get('password') != u.get('password')
                             rotate_user_view_key_on_change(previous, u)
                             try:
                                 save_data()
@@ -9759,6 +9780,8 @@ if __name__ == '__main__':
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if password_changed:
+                        self._kick_old_password_sessions(user_id)
                     if durability_uncertain:
                         return self.reply_json(503, {'ok': False,
                             'error': 'User update saved but durability uncertain; verify and retry'})
