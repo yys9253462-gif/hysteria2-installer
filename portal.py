@@ -9244,8 +9244,13 @@ if __name__ == '__main__':
                     return True
                 else:
                     self.server.requests[:] = [t for t in self.server.requests if now - t < 1]
-                    self.server.failures[:] = [t for t in self.server.failures if now - t < 60]
-                    if len(self.server.requests) >= 50 or len(self.server.failures) >= 60:
+                    if len(self.server.requests) >= 50:
+                        return False
+                    # 失败按来源计（2026-11-03 修）：旧实现是进程全局桶，拿到分享链接
+                    # 的人每分钟发 60 次不带凭据的 clash.yaml，管理页与所有人的订阅
+                    # 更新就全部 429。来源取 masquerade 写入的 X-Forwarded-For。
+                    limiter = self.server.web_failure_limiter
+                    if limiter.limited(self._web_source_key(), now):
                         return False
                     self.server.requests.append(now)
                     return True
@@ -9297,10 +9302,21 @@ if __name__ == '__main__':
                 self.server.login_failures.clear()
                 self.server._login_lock_logged = False
 
+        def _web_source_key(self):
+            """Web 失败计数的来源键：masquerade 代理进来的取 X-Forwarded-For 最后一跳。
+
+            门户只监听 127.0.0.1，公网请求都经 Hysteria masquerade 转入。SE 上用
+            hysteria v2.13.0 实测：xForwarded 会用真实来源**整体替换**客户端带的
+            X-Forwarded-For；取最后一项，在追加式代理下同样不吃伪造的前置项。
+            """
+            forwarded = self.headers.get('X-Forwarded-For') or ''
+            hop = forwarded.split(',')[-1].strip() if forwarded else ''
+            return auth_rate_key(hop or self.client_address[0])
+
         def record_failure(self):
             now = time.monotonic()
             with data_lock:
-                self.server.failures.append(now)
+                self.server.web_failure_limiter.record_failure(self._web_source_key(), now)
 
         def auth_rate_limited(self):
             """/auth 专用限流 + 失败累计。
@@ -14428,6 +14444,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     server = ThreadingHTTPServer(('127.0.0.1', data['port']), Handler)
     server.requests, server.failures, server.api_requests = [], [], []
     server.api_anon_requests = []
+    # 每来源 60 秒 60 次失败；全局速率由 requests 桶管，这里不再设兜底。
+    server.web_failure_limiter = AuthLimiter(per_ip_rate=10**6, per_ip_failures=60,
+                                             failure_window=60, global_rate=10**6)
     # /auth 专用限流桶（2026-10-09）：见 auth_rate_limited() 的说明 ——
     # /auth 经 masquerade 对公网可达，必须有独立的速率+失败计数。
     # auth_requests 仍供 check_rate_limit('auth') 使用；/auth 本身走按来源分桶的 auth_limiter（H4）。
