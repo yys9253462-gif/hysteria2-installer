@@ -79,6 +79,7 @@ class PortalUpdateFixture(unittest.TestCase):
             'time': time, 'shlex': shlex,
             'parse_qs': parse_qs, 're': re, 'shutil': shutil,
             'PORTAL_SELF': self.base / 'portal.py',
+            'PORTAL_BUNDLE_FILES': BUNDLE,
             'portal_upgrade_lock': self.lock, 'data': {'port': 18080},
             'resolve_update_ref': lambda ref: 'a' * 40,
             '_remote_blob_sha': lambda *args, **kwargs: 'b' * 40,

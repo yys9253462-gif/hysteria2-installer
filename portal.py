@@ -141,7 +141,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.10'
+PORTAL_VERSION = '2.11'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1278,12 +1278,18 @@ def _prune_portal_backups(directory, keep=3, protected=()):
     keep=3 会把本轮刚建的三份直接删掉 —— 而那正是回滚要用的。所以：
       * `protected` 传本轮生成的备份路径，永远不删；
       * keep 按**轮次戳**（文件名里的 `<stamp>`）计，不是按文件数。
+
+    ⚠️ 只认门户整包六个文件的备份（2026-11-03 修）：/etc/hysteria 里还有
+    install.sh 改配置前留的 portal.json / client_meta.json / config.yaml /
+    证书快照，同样是 `<file>.bak-<stamp>`。旧实现按 '.bak-' 一视同仁，
+    自更新三轮之后就把这些用户数据快照删光了，它们的保留由 install.sh 自己管。
     """
     directory = Path(directory)
     protected = {Path(p).name for p in (protected or ())}
+    owned = tuple(name + '.bak-' for name in PORTAL_BUNDLE_FILES)
     try:
         items = [p for p in directory.iterdir()
-                 if p.is_file() and '.bak-' in p.name]
+                 if p.is_file() and p.name.startswith(owned)]
     except OSError:
         return
     # 从文件名取轮次戳：<name>.bak-<YYYYmmdd-HHMMSS>-<pid>
@@ -1670,6 +1676,13 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         before = _hy2_runtime_identity()
         os.replace(candidate, binary)
         replaced = True
+        if _unit_suspended('hysteria-server'):
+            # 整机流量超额停用中（2026-11-03 修，与 install.sh 的核心更新一致）：
+            # 服务不能启动，_restart_hy2 直接返回，于是下面的「新进程已加载」
+            # 核验必然失败、把新核心回滚掉，面板报「新核心未成功加载」。
+            # 已验过 SHA256 / ELF / version 的新二进制保留，控制台恢复节点时带它启动。
+            return {'changed': True, 'version': newer, 'backup': str(backup),
+                    'message': '节点流量超额停用中：新核心已就位，控制台恢复节点时生效'}
         _restart_hy2()
         time.sleep(1)
         after = _hy2_runtime_identity()
@@ -1990,6 +2003,24 @@ def _expiry_text(value):
     except (OverflowError, OSError, ValueError):
         return '永久有效'
 
+def _utf8_encodable(value):
+    """JSON 解析结果里的每个字符串（含键）都能编码成 UTF-8。
+
+    json.loads 接受孤立代理项（"\\ud800"），这种 str 一写盘就抛 UnicodeEncodeError。
+    """
+    if isinstance(value, str):
+        try:
+            value.encode('utf-8')
+        except UnicodeEncodeError:
+            return False
+        return True
+    if isinstance(value, dict):
+        return all(_utf8_encodable(k) and _utf8_encodable(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return all(_utf8_encodable(v) for v in value)
+    return True
+
+
 def user_note_text(value):
     """账户备注的展示文本；非字符串（手工编辑/旧格式）一律显示占位符。
 
@@ -1997,6 +2028,41 @@ def user_note_text(value):
     AttributeError —— 单条坏备注会让整个总览页/客户页 500。
     """
     return value if isinstance(value, str) and value else '-'
+
+
+# user_access_denial 的拒绝原因 → 管理页 / 客户页的状态徽标文字。
+_STATUS_PILL_TEXT = {
+    'Traffic quota exceeded': ('流量超额', '流量已超额'),
+    'User account expired': ('已到期', '服务已到期'),
+    'User account inactive': ('已停用', '账号已停用'),
+    'Invalid user record': ('资料异常', '账号资料异常'),
+}
+
+
+def user_status_pill(info, now=None, customer=False):
+    """状态徽标直接取自准入判据 user_access_denial（2026-11-03 修）。
+
+    旧实现在两个页面里各算一遍：到期时间写坏时 `float()` 失败就当作「没到期」，
+    `limit_bytes: true` / 负数用量也照常判成正常。/auth 对这类记录回
+    'Invalid user record' 拒绝连接，页面却显示「正常」，管理员无从发现。
+    """
+    denial = user_access_denial(info, now)
+    if denial is None:
+        return '<span class="status-pill active">%s</span>' % ('运行正常' if customer else '正常')
+    admin_text, customer_text = _STATUS_PILL_TEXT.get(denial, ('不可用', '当前不可用'))
+    return '<span class="status-pill expired">%s</span>' % (customer_text if customer else admin_text)
+
+
+def password_hint(value):
+    """总览页里密码的打码展示（头尾各 4 位）。
+
+    旧版本会把数字密码原样落盘（见 users/create 的说明），手工编辑也可能写成
+    null / 列表。旧写法直接切片，单条坏记录就让 page_html 抛 TypeError，
+    regenerate_page 随之失败、整个控制台打不开（2026-11-03 修）。
+    """
+    if not isinstance(value, str) or not value:
+        return '（密码无效）'
+    return value[:4] + '****' + value[-4:]
 
 
 def format_bytes(b):
@@ -2181,26 +2247,13 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         limit_bytes = _safe_int(u.get("limit_bytes") or 0)
         total_used_bytes += used_bytes
 
-        # 展示用的分支判断必须与准入判据 user_access_allowed 同源：
-        # 缺 status 视为 active，expires_at 到点即过期。
-        is_traffic_ok = limit_bytes <= 0 or used_bytes < limit_bytes
-        try:
-            is_time_ok = u.get("expires_at") is None or float(u.get("expires_at")) > now_ts
-        except (TypeError, ValueError):
-            is_time_ok = True
+        # 展示必须与准入判据同源：徽标与行状态都取自 user_access_denial。
         is_active = user_access_allowed(u, now_ts)
 
         if is_active:
             active_count += 1
 
-        if not is_traffic_ok:
-            status_html = '<span class="status-pill expired">流量超额</span>'
-        elif not is_time_ok:
-            status_html = '<span class="status-pill expired">已到期</span>'
-        elif u.get("status", "active") != "active":
-            status_html = '<span class="status-pill expired">已停用</span>'
-        else:
-            status_html = '<span class="status-pill active">正常</span>'
+        status_html = user_status_pill(u, now_ts)
 
         expires_str = _expiry_text(u.get("expires_at"))
         # 设备上限与在线数可能是 `"5"`、None 或旧格式（在线 IP 存成数字）。
@@ -2234,7 +2287,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             <div style="margin-top:4px"><span class="speed-badge" data-user-speed="{html.escape(uid)}">↓ 0 B/s · ↑ 0 B/s</span></div>
           </td>
           <td>{expires_str}</td>
-          <td><code style="font-size:11px">{html.escape(u.get("password","")[:4] + "****" + u.get("password","")[-4:])}</code></td>
+          <td><code style="font-size:11px">{html.escape(password_hint(u.get("password")))}</code></td>
           <td>
             {'' if uid == MASTER_USER_ID else f'''<button class="button primary btn-user-connect" style="padding:4px 10px;font-size:11px;margin-right:6px" type="button" data-uid="{html.escape(uid)}" data-token="{token}" data-key="{user_key}">专属连接</button>'''}
             {'' if uid == MASTER_USER_ID else f'''<form method="POST" action="/{token}/manage-user" style="display:inline" class="js-confirm-delete" data-confirm="确定注销此用户？此操作不可撤销。">
@@ -3534,23 +3587,8 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # 这几个值直接来自 portal.json（2026-10-30 修）。
     used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
     limit_bytes = _safe_int(uinfo.get("limit_bytes") or 0)
-    now_ts = int(time.time())
-    # 与 user_access_allowed 同源：到点即过期、缺 status 视为 active。
-    is_traffic_ok = limit_bytes <= 0 or used_bytes < limit_bytes
-    _exp = uinfo.get("expires_at")
-    try:
-        is_time_ok = _exp is None or float(_exp) > now_ts
-    except (TypeError, ValueError):
-        is_time_ok = True
-
-    if not is_traffic_ok:
-        status_html = '<span class="status-pill expired">流量已超额</span>'
-    elif not is_time_ok:
-        status_html = '<span class="status-pill expired">服务已到期</span>'
-    elif uinfo.get("status", "active") != "active":
-        status_html = '<span class="status-pill expired">账号已停用</span>'
-    else:
-        status_html = '<span class="status-pill active">运行正常</span>'
+    # 与 user_access_allowed 同源：徽标直接取自 user_access_denial。
+    status_html = user_status_pill(uinfo, customer=True)
 
     expires_str = _expiry_text(uinfo.get("expires_at"))
     # 与总览页同一处理：设备上限可能是 "5" / None（手工编辑或旧格式）。
@@ -4708,7 +4746,7 @@ def vmess_clients(data):
     users = user_table(data)
     clients = []
     for uid in sorted(users):
-        if not user_access_allowed(users.get(uid) or {}):
+        if not user_access_allowed(users.get(uid)):
             continue
         clients.append({'id': vmess_uuid_for_user(uid), 'email': uid})
     if not clients:
@@ -4787,6 +4825,19 @@ core_operation_lock = threading.Lock()
 awg_operation_lock = threading.Lock()
 
 
+def _revocation_needed(snapshot, force_ids=()):
+    """本轮是否确有用户要收回：有被拒用户、待撤销记录或调用方强制撤销的 id。
+
+    sing-box 协议的配置文件缺失、服务却在跑时，只有这种情况才算
+    「无法确认收回」；只是开户 / 续费时不能因此回 503。
+    """
+    if force_ids or pending_revocations(snapshot):
+        return True
+    users = snapshot.get('users') if isinstance(snapshot, dict) else None
+    users = users if isinstance(users, dict) else {}
+    return any(not user_access_allowed(info) for info in users.values())
+
+
 def anytls_password_for_user(secret, user_id):
     """由节点 secret 派生某用户**稳定且不可猜**的 AnyTLS 密码。"""
     return hmac.new(str(secret).encode('utf-8'),
@@ -4818,7 +4869,7 @@ def anytls_users(data):
     if secret:
         all_users = user_table(data)
         for uid in sorted(all_users):
-            if user_access_allowed(all_users.get(uid) or {}):
+            if user_access_allowed(all_users.get(uid)):
                 users.append({'name': uid, 'password': anytls_password_for_user(secret, uid)})
     if not users:
         # 占位密码必须**稳定**：secret 缺失时旧实现每次用随机数，导致
@@ -4948,7 +4999,7 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
         candidate.unlink(missing_ok=True)
 
 
-def sync_anytls_users(root, snapshot, apply=None, service_active=None):
+def sync_anytls_users(root, snapshot, apply=None, service_active=None, force_ids=()):
     """把 anytls.json 的 users 对齐到当前准入名单（停用/到期/超额/删除即收回）。
 
     名单没变就什么也不做；变了就重写并重启 —— sing-box 只有重启才会
@@ -4961,12 +5012,22 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None):
     if not isinstance(snapshot, dict):
         return False
     section = snapshot.get('anytls_config')
-    if not path.exists() or not (isinstance(section, dict) and section.get('enabled')):
+    if not (isinstance(section, dict) and section.get('enabled')):
         return False
     apply = apply or apply_anytls_config
     if service_active is None:
         service_active = lambda: _systemd_state(ANYTLS_SERVICE) == 'active'  # noqa: E731
     with anytls_apply_lock:
+        # 配置文件不在、服务却在跑（2026-11-03 修，与 TUIC 对齐）：sing-box 内存里
+        # 还是旧名单，被停用/到期/删除的用户照样能连。旧实现在这里返回 False，
+        # enforce_node_access 把它当成「已同步」，待撤销记录随之清掉。
+        # 只在**确有人要收回**时才报错（与 Xray 的 xray.json 缺失判断一致）：
+        # 无条件报错会让开户/续费等所有账号操作都回 503。
+        if not path.exists():
+            if _revocation_needed(snapshot, force_ids) and service_active():
+                raise RuntimeError('AnyTLS configuration missing while service is active; '
+                                   'cannot confirm user sync')
+            return False
         # ⚠️ 2026-10-29 修：这里原来是裸 json.loads，anytls.json 被截断或手工
         # 改坏时抛 JSONDecodeError，而本函数在 enforce_node_access 顶部调用 ——
         # 一个坏文件就让开户/续费/停用/删除全部返回 503，报错还写成
@@ -5029,7 +5090,7 @@ def tuic_users(data):
     if secret:
         all_users = user_table(data)
         for uid in sorted(all_users):
-            if user_access_allowed(all_users.get(uid) or {}):
+            if user_access_allowed(all_users.get(uid)):
                 u, pwd = tuic_credentials_for_user(secret, uid)
                 users.append({'name': uid, 'uuid': u, 'password': pwd})
     if not users:
@@ -5122,7 +5183,7 @@ def pick_tuic_port(preferred, blocked, listening=None, own_port_active=False):
     return 0
 
 
-def sync_tuic_users(root, snapshot, apply=None, service_active=None):
+def sync_tuic_users(root, snapshot, apply=None, service_active=None, force_ids=()):
     """把 tuic.json 的 users 对齐到当前准入名单；规则同 sync_anytls_users。"""
     path = Path(root) / TUIC_CONFIG_NAME
     if not isinstance(snapshot, dict):
@@ -5140,7 +5201,8 @@ def sync_tuic_users(root, snapshot, apply=None, service_active=None):
         if not enabled:
             return False
         if not path.exists():
-            if service_active():
+            # 同 AnyTLS：只有确有人要收回时，才算「无法确认」。
+            if _revocation_needed(snapshot, force_ids) and service_active():
                 raise RuntimeError('TUIC configuration missing while service is active; cannot confirm user sync')
             return False
         try:
@@ -5410,7 +5472,7 @@ def vlessenc_clients(data):
     users = user_table(data)
     clients = []
     for uid in sorted(users):
-        if not user_access_allowed(users.get(uid) or {}):
+        if not user_access_allowed(users.get(uid)):
             continue
         clients.append({'id': reality_uuid_for_user(uid), 'email': uid})
     if not clients:
@@ -6109,12 +6171,12 @@ def enforce_node_access(root, snapshot, force_ids=(), apply_lock=None,
     anytls_error = tuic_error = None
     if not skip_anytls:
         try:
-            sync_anytls_users(root, snapshot)
+            sync_anytls_users(root, snapshot, force_ids=force_ids)
         except Exception as exc:
             anytls_error = exc
     if not skip_tuic:
         try:
-            sync_tuic_users(root, snapshot)
+            sync_tuic_users(root, snapshot, force_ids=force_ids)
         except Exception as exc:
             tuic_error = exc
     result = _enforce_node_access_xray_hy2(root, snapshot, force_ids, apply_lock)
@@ -6394,7 +6456,10 @@ def reality_clients(data):
     users = user_table(data)
     clients = []
     for uid, uid_uuid in sorted(reg.items()):
-        info = users.get(uid) or {}
+        # 原样传给准入判据（2026-11-03 修）：旧写法 `or {}` 把 null / 0 / "" / []
+        # 记录变成 {}，而 user_access_allowed({}) 为 True —— /auth 拒绝的坏记录
+        # 在 Reality / VMess / VLESS-Enc / AnyTLS / TUIC 上却拿到可用身份。
+        info = users.get(uid)
         # 只有 active 的用户才进白名单。
         # 缺 status 视为 active —— 与 handle_auth 的判据保持同源
         # （那边也是 `info.get('status', 'active') == 'active'`），
@@ -8449,6 +8514,17 @@ if __name__ == '__main__':
         text = (err or '').strip() or (out or '').strip()
         return text[-limit:] if text else '退出码 ' + str(rc)
 
+    def awg_peers():
+        """peers.json 里的客户端列表；容器或条目被改坏时跳过，不抛异常。
+
+        awg_state 与下载 .conf / 二维码的路由共用这一份清洗规则：旧的下载路由
+        直接 `p.get(...)`，peers 里只要有一条 null / 字符串，所有客户端的配置
+        都下载不了（do_GET 没有兜底，连接被掐断）。
+        """
+        peers_doc = awg_read_json(AWG_PEERS_PATH, {})
+        peers_raw = peers_doc.get('peers') if isinstance(peers_doc, dict) else None
+        return [p for p in peers_raw if isinstance(p, dict)] if isinstance(peers_raw, list) else []
+
     def awg_state():
         meta = awg_read_json(AWG_META_PATH, {})
         if not isinstance(meta, dict):
@@ -8456,9 +8532,7 @@ if __name__ == '__main__':
         # peers 文件是 awgctl.sh 写的 JSON：被截断/手工改坏时 `peers` 可能是
         # 字符串或含非 dict 条目。旧写法 len() / p.get() 直接抛异常，
         # 整个 /awg-state 端点 500，面板的 AWG 卡片整块空白。
-        peers_doc = awg_read_json(AWG_PEERS_PATH, {})
-        peers_raw = peers_doc.get('peers') if isinstance(peers_doc, dict) else None
-        peers_raw = [p for p in peers_raw if isinstance(p, dict)] if isinstance(peers_raw, list) else []
+        peers_raw = awg_peers()
         line = str(meta.get('line', '3') or '3')
         if line not in ('2', '3'):
             line = '3'
@@ -9248,6 +9322,12 @@ if __name__ == '__main__':
 
                 if not isinstance(params, dict):
                     return self.reply_json(400, {'ok': False, 'error': 'JSON body must be an object'})
+                # JSON 允许 "\ud800" 这种孤立代理项，json.loads 照收、isinstance(str) 也过；
+                # 但 save_data 编码 UTF-8 时抛 UnicodeEncodeError（不是 OSError，回滚分支
+                # 接不住）。坏值留在内存里，此后每一次落盘都失败，直到门户重启
+                # （2026-11-03 修）。在入口处整包拒绝。
+                if not _utf8_encodable(params):
+                    return self.reply_json(400, {'ok': False, 'error': 'JSON body contains invalid Unicode'})
                 sub = self.path[len('/api/v1/'):].split('?', 1)[0]
                 if sub.startswith('users/'):
                     try:
@@ -10140,6 +10220,10 @@ if __name__ == '__main__':
                     if not awg_installed():
                         return self.reply_json(400, {'ok': False,
                                                      'error': 'AmneziaWG 尚未安装'})
+                    # awgctl update 结尾会重启服务：停用期间同样不能做（见 manage-amneziawg）。
+                    if unit_suspended(AWG_SVC_NAME):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
                     # 先刷新控制脚本自身，再更新二进制。不需要重启面板。
                     ensure_awgctl(force=True)
                     # awgctl update 要下载并核验二进制，超时 420 秒。
@@ -10634,6 +10718,12 @@ if __name__ == '__main__':
 
                 if not awg_installed():
                     return self.reply_json(400, {'ok': False, 'error': 'AmneziaWG 尚未安装'})
+                # 整机流量超额停用期间不能拉起 AWG（2026-11-03 修，与其它协议一致）：
+                # update / set_line 结尾会 systemctl restart，start / restart 更是直接启动，
+                # 停用就形同虚设。peer 增删只改文件、服务没跑时不碰接口，可以照常做。
+                if action in ('set_line', 'update', 'start', 'restart') and unit_suspended(AWG_SVC_NAME):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
                 if not ensure_awgctl():
                     return self.reply_json(500, {'ok': False, 'error': 'hy2-awgctl 不可用'})
 
@@ -11272,8 +11362,10 @@ if __name__ == '__main__':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，VMess 将在控制台恢复节点时一并恢复'})
-                    with core_operation_lock, core_operation_file_lock():
-                        cfg = self._apply_vmess_enable()
+                    # _apply_vmess_enable 自己按「核心锁 → 协议锁」取锁。这里再套一层
+                    # 会在同一线程里二次获取不可重入的 core_operation_lock：请求永远
+                    # 挂起，核心 flock 一直被占，之后每轮撤销都失败（2026-11-03 修）。
+                    cfg = self._apply_vmess_enable()
                     return self.reply_json(200, {'ok': True, 'active': True,
                                                  'port': cfg['port'], 'uri': cfg['uri']})
                 if not enabled:
@@ -11643,6 +11735,13 @@ if __name__ == '__main__':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                if action == 'disable' and not enabled:
+                    # anytls.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
+                    # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉，
+                    # 而撤销同步正卡在「配置缺失、服务在跑」上。
+                    with data_lock:
+                        flagged = config_section(data, 'anytls_config').get('enabled') is True
+                    enabled = flagged or _systemd_state(ANYTLS_SERVICE) == 'active'
                 if action == 'enable':
                     with data_lock:
                         suspended = suspend_state(data).get('suspended') is True
@@ -11829,6 +11928,12 @@ if __name__ == '__main__':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                if action == 'disable' and not enabled:
+                    # tuic.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
+                    # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉。
+                    with data_lock:
+                        flagged = config_section(data, 'tuic_config').get('enabled') is True
+                    enabled = flagged or _systemd_state(TUIC_SERVICE) == 'active'
                 if action == 'enable':
                     with data_lock:
                         suspended = suspend_state(data).get('suspended') is True
@@ -11949,8 +12054,8 @@ if __name__ == '__main__':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，VLESS Encryption 将在控制台恢复节点时一并恢复'})
-                    with core_operation_lock, core_operation_file_lock():
-                        cfg = self._apply_vlessenc_enable()
+                    # 锁由 _apply_vlessenc_enable 自己取，原因同 VMess（2026-11-03 修）。
+                    cfg = self._apply_vlessenc_enable()
                     return self.reply_json(200, {'ok': True, 'active': True,
                                                  'port': cfg['port'], 'uri': cfg['uri']})
                 if not enabled:
@@ -12191,7 +12296,8 @@ if __name__ == '__main__':
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
                         if existing is not None:
-                            tail = (existing.get('password') or '')[-4:]
+                            _pw = existing.get('password')
+                            tail = _pw[-4:] if isinstance(_pw, str) else ''
                             # 数据被改坏时 int('x') 会抛 ValueError，这里只影响
                             # 一条提示文案，不值得让整个 409 变成 500（2026-10-30 修）。
                             try:
@@ -13120,7 +13226,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'clash': clash_yaml,
                     'sing_box': sing_json,
                     'qr_svg': qr_svg,
-                    'expires_at': u_copy.get('expires_at', 0),
+                    # 缺失 = 永久，必须原样回 None（2026-11-03 修）：旧实现兜底成 0，
+                    # 前端弹窗按 `=== null` 判永久，于是永久用户显示成 1970-01-01 到期；
+                    # 而 0 在本项目里恰恰表示「已过期」。
+                    'expires_at': u_copy.get('expires_at'),
                     'traffic_used': u_copy.get('used_bytes', 0),
                     'traffic_limit': u_copy.get('limit_bytes', 0),
                     'ip_limit': u_copy.get('ip_limit', 0),
@@ -13147,7 +13256,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 # 客户端不存在时给 404，而不是让底层命令失败后统一报 500 ——
                 # 前端需要能区分「查无此人」与「服务端出错」。
-                peers_now = awg_read_json(AWG_PEERS_PATH, {}).get('peers', []) or []
+                peers_now = awg_peers()
                 if not any(p.get('name') == name for p in peers_now):
                     return self.reply(404, b'Client not found')
 

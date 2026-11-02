@@ -51,6 +51,25 @@ import urllib.error
 
 CONFIG = "/etc/hysteria/config.yaml"
 PORTAL = "/etc/hysteria/portal.json"
+META = "/etc/hysteria/client_meta.json"
+
+
+def meta_host(meta_text):
+    """与门户同一条规则取对外地址：自签用 public_ip，可信证书用 server_name。
+
+    只看 config.yaml 的 acme.domains 不够：证书来自 Caddy / 手工路径（tls 段）
+    或自签时根本没有这一段，旧逻辑拼出 `https://13427` 这种没有主机的地址
+    （2026-11-03 在瑞典节点实测）。
+    """
+    try:
+        meta = json.loads(meta_text or "")
+    except ValueError:
+        return ""
+    if not isinstance(meta, dict):
+        return ""
+    key = "public_ip" if meta.get("is_insecure") else "server_name"
+    host = meta.get(key)
+    return host.strip() if isinstance(host, str) else ""
 
 
 def read(path):
@@ -91,6 +110,7 @@ def main():
     ap = argparse.ArgumentParser(description="生成本节点接入 hy2-ops-console 所需的信息")
     ap.add_argument("--config", default=CONFIG)
     ap.add_argument("--portal", dest="portal_file", default=PORTAL)
+    ap.add_argument("--meta", dest="meta_file", default=META)
     ap.add_argument("--panel", help="面板地址，如 https://mb.teyir.com")
     # 也可用环境变量 PANEL_ADMIN_TOKEN 传：命令行参数会出现在 ps / shell 历史里。
     ap.add_argument("--admin-token", default=os.environ.get("PANEL_ADMIN_TOKEN"),
@@ -124,12 +144,13 @@ def main():
     cfg = parse_simple_yaml(cfg_text)
     masq = cfg.get("masquerade", {})
 
-    # 域名：优先 acme.domains 的第一项（列表在 YAML 里是 "- xxx" 行，简单解析拿不到，
+    # 域名：优先 client_meta.json（门户发订阅用的同一个地址），
+    # 再退回 acme.domains 的第一项（列表在 YAML 里是 "- xxx" 行，简单解析拿不到，
     # 所以退回到正则扫）
-    domain = ""
+    domain = meta_host(read(args.meta_file))
     m = re.search(r"^\s*-\s*([A-Za-z0-9._-]+)\s*$", cfg_text, re.M)
     acme_block = re.search(r"^acme:(.*?)(?=^[a-z])", cfg_text, re.M | re.S)
-    if acme_block:
+    if not domain and acme_block:
         dm = re.search(r"domains:\s*\n((?:\s*-\s*[^\n]+\n)+)", acme_block.group(1))
         if dm:
             first = re.search(r"-\s*([A-Za-z0-9._-]+)", dm.group(1))
@@ -156,7 +177,13 @@ def main():
         return 3
 
     listen = (cfg.get("listen", {}).get("__value__") or "").lstrip(":")
-    api_url = f"https://{domain}:{https_port}" if domain else f"https://{https_port}"
+    if not domain:
+        # 没有主机名就拼不出能用的地址；旧实现输出 `https://<端口>` 并返回 0。
+        print("取不到节点的对外地址：client_meta.json 没有 server_name / public_ip，"
+              "config.yaml 里也没有 acme.domains。", file=sys.stderr)
+        return 3
+    host = f"[{domain}]" if ":" in domain and not domain.startswith("[") else domain
+    api_url = f"https://{host}:{https_port}"
 
     result = {
         "api_url": api_url,

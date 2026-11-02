@@ -35,6 +35,28 @@ class UserTableConsumersTests(unittest.TestCase):
         self.assertEqual(portal.vmess_clients({'users': users})[0]['email'], 'good')
         self.assertEqual(portal.vlessenc_clients({'users': users})[0]['email'], 'good')
 
+    def test_falsy_corrupt_records_get_no_identity_on_any_protocol(self):
+        """null / 0 / "" / [] 记录被 /auth 拒绝，其它协议也不能给它可用身份（2026-11-03）。
+
+        旧写法 `users.get(uid) or {}` 把这些值变成 {}，而 user_access_allowed({}) 为 True；
+        Reality / VMess / VLESS-Enc 的 UUID 由公开的 user_id 派生，知道 id 就能连。
+        """
+        secret = 's' * 64
+        for bad in (None, 0, '', [], False):
+            with self.subTest(bad=bad):
+                data = {'users': {'good': {'status': 'active'}, 'ghost': bad},
+                        'anytls_config': {'secret': secret}, 'tuic_config': {'secret': secret}}
+                self.assertFalse(portal.user_access_allowed(bad))
+                names = {
+                    'reality': [c['email'] for c in portal.reality_clients(data)],
+                    'vmess': [c['email'] for c in portal.vmess_clients(data)],
+                    'vlessenc': [c['email'] for c in portal.vlessenc_clients(data)],
+                    'anytls': [u['name'] for u in portal.anytls_users(data)],
+                    'tuic': [u['name'] for u in portal.tuic_users(data)],
+                }
+                for protocol, emails in names.items():
+                    self.assertEqual(emails, ['good'], protocol)
+
 
 class ConfigSectionTests(unittest.TestCase):
     """协议配置读取统一走 config_section：非 dict 一律当空表。"""

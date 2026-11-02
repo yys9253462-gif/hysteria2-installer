@@ -355,8 +355,32 @@ class AwgctlArgumentTests(unittest.TestCase):
 # 12. _prune_portal_backups 不能删掉本轮备份（make-or-break：删了就没法回滚）
 # --------------------------------------------------------------------------
 class PrunePortalBackupsTests(unittest.TestCase):
+    BUNDLE = ('portal.py', 'portal_assets.py', 'usage-meter-core-20261007-v1.py',
+              'usage-meter-readers-20261007-v1.py', 'usage-meter-runtime-20261007-v1.py',
+              'usage-meter-xray-config-20261007-v1.py')
+
     def load(self):
-        return exec_function('_prune_portal_backups', {'Path': Path})
+        return exec_function('_prune_portal_backups',
+                             {'Path': Path, 'PORTAL_BUNDLE_FILES': self.BUNDLE})
+
+    def test_installer_reconfigure_snapshots_are_never_pruned(self):
+        """install.sh 改配置前的 portal.json / client_meta.json / config.yaml 快照
+        同样叫 `<file>.bak-<stamp>`；门户自更新只能清理自己六个文件的备份。"""
+        prune = self.load()
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, base, True)
+        snapshots = [base / ('%s.bak-20261101-120000-4242-17731' % name)
+                     for name in ('portal.json', 'client_meta.json', 'config.yaml',
+                                  'portal-access.json')]
+        for p in snapshots:
+            p.write_text('user data')
+        for stamp in ('20261102-090000-1', '20261102-100000-2', '20261102-110000-3',
+                      '20261102-120000-4'):
+            (base / ('portal.py.bak-' + stamp)).write_text('old portal')
+        prune(base, keep=3)
+        for p in snapshots:
+            self.assertTrue(p.exists(), '安装脚本的配置快照被门户更新删掉了: %s' % p.name)
+        self.assertFalse((base / 'portal.py.bak-20261102-090000-1').exists())
 
     def test_current_round_files_survive(self):
         """一次更新有 6 个文件；keep=3 若按文件数算会把本轮备份全删掉。"""

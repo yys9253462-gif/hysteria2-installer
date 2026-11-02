@@ -163,7 +163,12 @@ class TuicSyncTest(unittest.TestCase):
 
     def test_missing_config_while_active_cannot_confirm_sync(self):
         with self.assertRaisesRegex(RuntimeError, 'missing while service is active'):
-            self.sync(snapshot({'alice': {}}), active=True)
+            self.sync(snapshot({'alice': {}, 'bob': {'status': 'disabled'}}), active=True)
+        self.assertEqual(self.applied, [])
+
+    def test_missing_config_without_revocation_does_not_block_account_changes(self):
+        """与 AnyTLS 一致：没人要收回时不报错，否则开户 / 续费全部回 503。"""
+        self.assertFalse(self.sync(snapshot({'alice': {}, 'new_user': {}}), active=True))
         self.assertEqual(self.applied, [])
 
     def test_missing_config_while_stopped_needs_no_sync(self):
@@ -172,7 +177,7 @@ class TuicSyncTest(unittest.TestCase):
     def test_missing_config_uses_service_state_to_detect_live_instance(self):
         with mock.patch.object(portal, '_systemd_state', return_value='active'):
             with self.assertRaisesRegex(RuntimeError, 'missing while service is active'):
-                portal.sync_tuic_users(self.root, snapshot({'alice': {}}))
+                portal.sync_tuic_users(self.root, snapshot({'alice': {}}), force_ids=('gone',))
 
     def test_missing_config_disabled_snapshot_is_ignored(self):
         self.assertFalse(self.sync({'tuic_config': {'enabled': False}, 'users': {}}, active=True))

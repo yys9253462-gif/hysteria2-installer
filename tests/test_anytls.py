@@ -145,8 +145,37 @@ class AnytlsSyncTest(unittest.TestCase):
         snap['anytls_config']['enabled'] = False
         self.assertFalse(self.sync(snap))
 
-    def test_missing_config_is_ignored(self):
-        self.assertFalse(self.sync(snapshot({'alice': {}})))
+    def test_missing_config_while_stopped_needs_no_sync(self):
+        self.assertFalse(self.sync(snapshot({'alice': {}, 'bob': {'status': 'disabled'}}),
+                                   active=False))
+        self.assertEqual(self.applied, [])
+
+    def test_missing_config_while_active_cannot_confirm_revocation(self):
+        """配置被删但 sing-box 仍在跑：内存里还是旧名单，有人要收回时不能当作已收回。"""
+        for snap, force in ((snapshot({'alice': {}, 'bob': {'status': 'disabled'}}), ()),
+                            (dict(snapshot({'alice': {}}), _pending_revocations=['gone']), ()),
+                            (snapshot({'alice': {}}), ('gone',))):
+            with self.subTest(force=force, pending=snap.get('_pending_revocations')):
+                with self.assertRaisesRegex(RuntimeError, 'missing while service is active'):
+                    portal.sync_anytls_users(self.root, snap, force_ids=force,
+                                             apply=lambda *a, **k: self.applied.append(a),
+                                             service_active=lambda: True)
+        self.assertEqual(self.applied, [])
+
+    def test_missing_config_without_revocation_does_not_block_account_changes(self):
+        """只是开户 / 续费、没人要收回时，不能因此让所有账号操作回 503。"""
+        self.assertFalse(self.sync(snapshot({'alice': {}, 'new_user': {}}), active=True))
+        self.assertEqual(self.applied, [])
+
+    def test_missing_config_uses_service_state_to_detect_live_instance(self):
+        with mock.patch.object(portal, '_systemd_state', return_value='active'):
+            with self.assertRaisesRegex(RuntimeError, 'missing while service is active'):
+                portal.sync_anytls_users(self.root, snapshot({'bob': {'status': 'disabled'}}))
+
+    def test_missing_config_disabled_snapshot_is_ignored(self):
+        snap = snapshot({'alice': {}})
+        snap['anytls_config']['enabled'] = False
+        self.assertFalse(self.sync(snap, active=True))
 
 
 class AnytlsStopConfirmationTests(unittest.TestCase):

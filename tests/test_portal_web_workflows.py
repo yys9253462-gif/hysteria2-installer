@@ -801,19 +801,32 @@ class WebWorkflowTests(unittest.TestCase):
                 self.assertNotIn(config_key, self.data)
 
     def test_protocol_install_paths_share_cross_process_core_lock(self):
+        """启用路径必须持有跨进程核心锁 —— 在 handler 里拿，或在它调用的 _apply_*_enable 里拿。
+
+        VMess / VLESS Encryption 的锁在 _apply_*_enable 内部；handler 再套一层会自锁
+        （见 test_vmess_and_vlessenc_enable_do_not_deadlock_on_real_locks），
+        所以这里接受两处之一，但不接受两处都拿。
+        """
         source = Path(portal.__file__).read_text(encoding='utf-8')
-        for handler, action in (('_h_post_manage_vmess', "if action == 'enable':"),
-                                ('_h_post_manage_vlessenc', "if action == 'enable':"),
-                                ('_h_post_manage_anytls', "if action == 'enable':"),
-                                ('_h_post_manage_tuic', "if action == 'enable':")):
+
+        def method_body(name):
+            start = source.index('        def ' + name + '(')
+            end = source.find('\n        def ', start + 12)
+            return source[start:end if end >= 0 else len(source)]
+
+        for handler, inner in (('_h_post_manage_vmess', '_apply_vmess_enable'),
+                               ('_h_post_manage_vlessenc', '_apply_vlessenc_enable'),
+                               ('_h_post_manage_anytls', '_apply_anytls_enable'),
+                               ('_h_post_manage_tuic', '_apply_tuic_enable')):
             with self.subTest(handler=handler):
-                start = source.index('        def ' + handler + '(')
-                end = source.find('\n        def ', start + 12)
-                body = source[start:end if end >= 0 else len(source)]
-                action_start = body.index(action)
+                body = method_body(handler)
+                action_start = body.index("if action == 'enable':")
                 action_end = body.find("if not enabled:", action_start)
                 enable_body = body[action_start:action_end if action_end >= 0 else len(body)]
-                self.assertIn('core_operation_file_lock()', enable_body)
+                in_handler = 'core_operation_file_lock()' in enable_body
+                in_inner = 'core_operation_file_lock()' in method_body(inner)
+                self.assertTrue(in_handler or in_inner, '%s 的启用路径没有拿跨进程核心锁' % handler)
+                self.assertFalse(in_handler and in_inner, '%s 在两层都拿核心锁，会自锁' % handler)
 
     def test_core_install_releases_cross_process_lock_after_operation(self):
         acquire = Mock(return_value=17)
@@ -1539,10 +1552,171 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(portal.core_version_key('2.12.3+custom'), portal.core_version_key('v2.12.3'))
         self.assertGreater(portal.core_version_key('v2.13.0'), portal.core_version_key('2.12.3'))
 
+    def run_verified_core_upgrade(self, suspended):
+        """下载、摘要、systemctl 都是桩；只有二进制文件是真的（在临时目录里）。"""
+        binary = self.root / 'hysteria'
+        old, new = b'\x7fELF old-test-binary', b'\x7fELF new-test-binary'
+        binary.write_bytes(old)
+        binary.chmod(0o755)
+        commands = []
+        identity = {'pid': '100'}
+
+        def fake_run(args, **kwargs):
+            args = [str(a) for a in args]
+            if args[0] == str(binary) or args[0].startswith(str(self.root / '.hysteria-update-')):
+                current = Path(args[0]).read_bytes()
+                return SimpleNamespace(returncode=0, stderr='',
+                                       stdout='Version: %s\n' % ('v2.6.0' if current == old else 'v2.7.0'))
+            commands.append(args[:2])
+            if args[:2] == ['systemctl', 'start']:
+                identity['pid'] = '200'
+            if args[:2] == ['systemctl', 'show']:
+                state = 'inactive' if suspended else 'active'
+                return SimpleNamespace(returncode=0, stderr='', stdout=(
+                    'ActiveState=%s\nMainPID=%s\nExecMainStartTimestamp=t%s\n'
+                    % (state, identity['pid'], identity['pid'])))
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+        with patch.object(portal.subprocess, 'run', side_effect=fake_run), \
+             patch.object(portal, 'fetch_text', return_value='{"tag_name": "app/v2.7.0"}'), \
+             patch.object(portal, 'fetch_expected_sha256', return_value='0' * 64), \
+             patch.object(portal, 'verify_sha256', return_value=True), \
+             patch.object(portal.urllib.request, 'urlopen', side_effect=lambda *a, **k: io.BytesIO(new)), \
+             patch.object(portal, '_unit_suspended', side_effect=lambda unit: suspended), \
+             patch.object(portal.time, 'sleep'):
+            result = portal.upgrade_core_binary(str(binary), str(self.root / 'backups'))
+        return result, binary.read_bytes() == new, commands
+
+    def test_core_upgrade_while_node_suspended_keeps_new_binary_without_starting(self):
+        """与 install.sh 的核心更新一致：停用期间只换二进制，不启动、不回滚。"""
+        result, replaced, commands = self.run_verified_core_upgrade(suspended=True)
+        self.assertTrue(result['changed'], result)
+        self.assertEqual(result['version'], 'v2.7.0')
+        self.assertTrue(replaced, '停用期间已校验的新核心被回滚掉了')
+        self.assertNotIn(['systemctl', 'start'], commands)
+        self.assertNotIn(['systemctl', 'restart'], commands)
+
+    def test_core_upgrade_restarts_and_verifies_when_not_suspended(self):
+        result, replaced, commands = self.run_verified_core_upgrade(suspended=False)
+        self.assertTrue(result['changed'], result)
+        self.assertTrue(replaced)
+        self.assertIn(['systemctl', 'start'], commands)
+
+    def test_singbox_disable_works_when_config_file_is_missing(self):
+        """配置文件丢了、data 仍是 enabled、服务还在跑：停用必须真的停服务并清掉 enabled，
+        否则撤销同步会一直卡在「配置缺失、服务在跑」上。"""
+        for name, key, service in (('_h_post_manage_anytls', 'anytls_config', 'hy2-anytls'),
+                                   ('_h_post_manage_tuic', 'tuic_config', 'hy2-tuic')):
+            with self.subTest(handler=name):
+                self.data[key] = {'enabled': True, 'port': 45000, 'secret': 's' * 64,
+                                  'domain': 'node.example.com'}
+                state = {'value': 'active'}
+                commands = []
+
+                def fake_run(args, **kwargs):
+                    commands.append(list(args))
+                    if args[:2] == ['systemctl', 'disable']:
+                        state['value'] = 'inactive'
+                    return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+                self.ns.update(
+                    subprocess=SimpleNamespace(run=fake_run, TimeoutExpired=subprocess.TimeoutExpired),
+                    portal_path=self.hdir / 'portal.json',
+                    ANYTLS_CONFIG_NAME=portal.ANYTLS_CONFIG_NAME, ANYTLS_SERVICE='hy2-anytls',
+                    TUIC_CONFIG_NAME=portal.TUIC_CONFIG_NAME, TUIC_SERVICE='hy2-tuic',
+                    _active_anytls_config=lambda: None, _active_tuic_config=lambda: None,
+                    config_section=portal.config_section,
+                    _systemd_state=lambda unit: state['value'],
+                    _service_stop_confirmed=portal._service_stop_confirmed,
+                    _systemd_service_snapshot=lambda unit: {'active': 'active', 'enabled': 'enabled'},
+                    _restore_systemd_service_state=lambda unit, snap: True,
+                    close_protocol_port=lambda *a: True,
+                    anytls_apply_lock=threading.RLock(), tuic_apply_lock=threading.RLock())
+                status, payload = self.invoke(name, {'action': 'disable'})
+                self.assertEqual(status, 200, payload)
+                self.assertNotIn('message', payload, '仍被当成「本来就没有启用」')
+                self.assertIn(['systemctl', 'disable', '--now', service], commands)
+                self.assertIs(self.data[key]['enabled'], False)
+                self.assertEqual(self.data[key]['secret'], 's' * 64)
+
+    def test_vmess_and_vlessenc_enable_do_not_deadlock_on_real_locks(self):
+        """用真实的锁类型（不可重入的 threading.Lock + 真 flock）跑启用分支。
+
+        旧实现在 handler 里先拿 core_operation_lock，_apply_*_enable 里又拿一次：
+        请求永远挂起，核心锁一直被占，之后每轮撤销都报「another core operation」。
+        """
+        for handler_name, method in (('_h_post_manage_vmess', '_apply_vmess_enable'),
+                                     ('_h_post_manage_vlessenc', '_apply_vlessenc_enable')):
+            with self.subTest(handler=handler_name):
+                core_lock = threading.Lock()
+                lock_dir = self.root / ('locks-' + method)
+                lock_dir.mkdir()
+                self.ns.update(
+                    core_operation_lock=core_lock,
+                    core_operation_file_lock=lambda d=lock_dir: portal.core_operation_file_lock(str(d)),
+                    reality_apply_lock=threading.Lock(), unit_suspended=lambda unit: False,
+                    has_managed_inbound=lambda config, tag: False)
+
+                def inner(ns=self.ns):
+                    # 与真实 _apply_*_enable 相同的取锁顺序。
+                    with ns['core_operation_lock'], ns['core_operation_file_lock'](), ns['reality_apply_lock']:
+                        return {'port': 2087, 'uri': 'vmess://fixture'}
+
+                setattr(self.handler, method, inner)
+                result = {}
+                worker = threading.Thread(daemon=True, target=lambda: result.update(
+                    r=self.invoke(handler_name, {'action': 'enable'})))
+                worker.start()
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), '%s 启用时自锁挂起' % handler_name)
+                self.assertEqual(result['r'][0], 200, result.get('r'))
+                self.assertFalse(core_lock.locked(), '核心锁在请求结束后仍被占用')
+
     def test_explicit_immutable_ref_does_not_make_a_branch_lookup(self):
         with patch.object(portal.urllib.request, 'urlopen') as open_:
             self.assertEqual(portal.resolve_update_ref('a' * 40), 'a' * 40)
         open_.assert_not_called()
+
+    def awg_suspended_fixture(self, suspended):
+        """整机超额停用时 AWG 的启动类操作必须被拒；awgctl / systemctl 都是桩。"""
+        awg_calls = []
+        self.ns.update(
+            AWG_SVC_NAME='amneziawg-server',
+            VALID_AWG_NAME_RE=portal.re.compile(r'^[A-Za-z0-9_.\-]{1,32}$'),
+            awg_installed=lambda: True, ensure_awgctl=lambda force=False: True,
+            awg_state=lambda: {'line': '3'},
+            awg_run=lambda args, timeout=0: awg_calls.append(args) or (0, '', ''),
+            awg_err_tail=lambda *a, **kw: '',
+            awg_endpoint_error=lambda endpoint: '',
+            unit_suspended=lambda unit: suspended and unit == 'amneziawg-server')
+        return awg_calls
+
+    def test_awg_start_actions_are_refused_while_node_is_suspended(self):
+        for action, extra in (('start', {}), ('restart', {}), ('update', {}),
+                              ('set_line', {'line': '2'})):
+            with self.subTest(action=action):
+                awg_calls = self.awg_suspended_fixture(True)
+                self.run.reset_mock()
+                status, payload = self.invoke('_h_post_manage_amneziawg',
+                                              dict({'action': action}, **extra))
+                self.assertEqual(status, 409, payload)
+                self.assertEqual(awg_calls, [])
+                self.run.assert_not_called()
+
+    def test_awg_peer_changes_still_work_while_node_is_suspended(self):
+        """peer 增删只改文件，服务没跑时 awgctl 不碰接口，停用期间照常可做。"""
+        awg_calls = self.awg_suspended_fixture(True)
+        status, payload = self.invoke('_h_post_manage_amneziawg',
+                                      {'action': 'peer_del', 'name': 'phone'})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(awg_calls, [['peer-del', 'phone']])
+
+    def test_awg_start_runs_when_node_is_not_suspended(self):
+        self.awg_suspended_fixture(False)
+        status, payload = self.invoke('_h_post_manage_amneziawg', {'action': 'start'})
+        self.assertEqual(status, 200, payload)
+        self.run.assert_called_once()
+        self.assertEqual(self.run.call_args[0][0], ['systemctl', 'start', 'amneziawg-server'])
 
 
 if __name__ == '__main__':
