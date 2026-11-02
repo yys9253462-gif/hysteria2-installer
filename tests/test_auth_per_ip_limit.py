@@ -3,7 +3,6 @@ import ast
 import copy
 import io
 import json
-import re
 import sys
 import threading
 import time
@@ -135,11 +134,49 @@ class ListenBacklogTest(unittest.TestCase):
 
 
 class LogLevelDropinTest(unittest.TestCase):
-    def test_install_writes_error_level_dropin(self):
+    """跑 install.sh 里真实的日志级别逻辑（变量默认值 + 写 drop-in 的那段），写到临时目录。
+
+    2026-11-03：默认由 error 改回 info。官方核心没有 /online/ips，计量要从 journal 的
+    INFO 级 client connected / disconnected 行重建在线 IP；error 级下设备上限退化。
+    """
+
+    def render(self, env_level=None, existing=None):
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+        if shutil.which('bash') is None:
+            self.skipTest('needs bash')
         install = (ROOT / 'install.sh').read_text(encoding='utf-8')
-        self.assertIn('HY2_LOG_LEVEL="${HY2_LOG_LEVEL:-error}"', install)
-        self.assertIn('hysteria-server.service.d/loglevel.conf', install)
-        self.assertRegex(install, re.compile(r'Environment=HYSTERIA_LOG_LEVEL=\$\{HY2_LOG_LEVEL\}'))
+        defaults = '\n'.join(line for line in install.splitlines()
+                             if line.startswith(('HY2_LOG_LEVEL_EXPLICIT=', 'HY2_LOG_LEVEL=')))
+        start = install.index('    case "$HY2_LOG_LEVEL" in')
+        end = install.index('    fi\n', install.index('Environment=HYSTERIA_LOG_LEVEL', start)) + len('    fi\n')
+        with tempfile.TemporaryDirectory() as d:
+            dropin = Path(d) / 'hysteria-server.service.d' / 'loglevel.conf'
+            if existing is not None:
+                dropin.parent.mkdir(parents=True)
+                dropin.write_text(existing, encoding='utf-8')
+            script = 'log_warn(){ :; }\n%s\nHY2_LOG_DROPIN=%s\n%s' % (defaults, dropin, install[start:end])
+            env = {k: v for k, v in os.environ.items() if k != 'HY2_LOG_LEVEL'}
+            if env_level is not None:
+                env['HY2_LOG_LEVEL'] = env_level
+            result = subprocess.run(['bash', '-c', script], capture_output=True, text=True,
+                                    timeout=20, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return dropin.read_text(encoding='utf-8')
+
+    def test_default_keeps_connect_events_in_the_journal(self):
+        self.assertIn('Environment=HYSTERIA_LOG_LEVEL=info', self.render())
+
+    def test_explicit_level_and_invalid_value(self):
+        self.assertIn('Environment=HYSTERIA_LOG_LEVEL=error', self.render('error'))
+        self.assertIn('Environment=HYSTERIA_LOG_LEVEL=info', self.render('verbose\nExecStart=/bin/x'))
+
+    def test_existing_dropin_is_kept_unless_level_is_explicit(self):
+        mine = '[Service]\nEnvironment=HYSTERIA_LOG_LEVEL=warn\n'
+        self.assertEqual(self.render(existing=mine), mine)
+        self.assertIn('=debug', self.render('debug', existing=mine))
 
 
 if __name__ == '__main__':

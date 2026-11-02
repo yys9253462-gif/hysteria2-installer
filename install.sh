@@ -24,11 +24,14 @@ HY2_SERVICE="/etc/systemd/system/hysteria-server.service"
 HY2_CERT_DIR="${HY2_DIR}/cert"
 HY2_META_FILE="${HY2_DIR}/client_meta.json"
 HY2_SUB_PORT=""   # 由 select_subscription_port() 动态分配；空值表示"尚未确定"
-# Hysteria 服务端日志级别（debug|info|warn|error）。默认 error：info/warn 级几乎全是
-# 客户端超时/被拒的噪声（东京 3 天约 1.5 万条）。安装前 export HY2_LOG_LEVEL=info 可覆盖。
+# Hysteria 服务端日志级别（debug|info|warn|error）。默认 info（2026-11-03 由 error 改回）：
+# 官方核心没有 /online/ips，计量模块要从 journal 里的 INFO 级 `client connected /
+# client disconnected` 重建在线 IP；error 级下这些行全没了，在线 IP 一律「未知」，
+# 设备上限退回 /auth 的 180 秒窗口（第二台设备 3 分钟后就能连）。SE 节点实测确认。
+# 嫌日志多可 export HY2_LOG_LEVEL=warn/error，但那样只适合带 /online/ips 的定制核心。
 # 写成 systemd drop-in（环境变量 HYSTERIA_LOG_LEVEL，hysteria 官方支持），不改主单元。
 HY2_LOG_LEVEL_EXPLICIT="${HY2_LOG_LEVEL:+1}"
-HY2_LOG_LEVEL="${HY2_LOG_LEVEL:-error}"
+HY2_LOG_LEVEL="${HY2_LOG_LEVEL:-info}"
 HY2_LOG_DROPIN="/etc/systemd/system/hysteria-server.service.d/loglevel.conf"
 
 # ---- AmneziaWG (AWG) ----
@@ -3122,7 +3125,7 @@ EOF
     # 日志级别 drop-in：显式指定 HY2_LOG_LEVEL 时覆盖；未指定且已存在时保留用户的修改。
     case "$HY2_LOG_LEVEL" in
         debug|info|warn|error) ;;
-        *) log_warn "HY2_LOG_LEVEL=${HY2_LOG_LEVEL} 不受支持，改用 error"; HY2_LOG_LEVEL=error ;;
+        *) log_warn "HY2_LOG_LEVEL=${HY2_LOG_LEVEL} 不受支持，改用 info"; HY2_LOG_LEVEL=info ;;
     esac
     if [[ -n "$HY2_LOG_LEVEL_EXPLICIT" || ! -f "$HY2_LOG_DROPIN" ]]; then
         mkdir -p "${HY2_LOG_DROPIN%/*}"
