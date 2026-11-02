@@ -601,6 +601,22 @@ is_valid_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
 }
 
+# 主机名：标签 1-63 位字母数字与连字符、不以连字符开头结尾，至少两段，总长 ≤ 253。
+# 调用方先转小写。只放行这些字符，值才能安全进 YAML / nginx / Caddyfile / 正则。
+is_valid_domain() {
+    local d="$1"
+    (( ${#d} >= 1 && ${#d} <= 253 )) || return 1
+    [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+}
+
+# ACME 通知邮箱：本地部分只放行常见安全字符，域名部分同 is_valid_domain（不区分大小写）。
+is_valid_email() {
+    local e="$1" local_part domain
+    [[ "$e" == *@* && "$e" != *@*@* ]] || return 1
+    local_part="${e%@*}"; domain="$(printf '%s' "${e#*@}" | tr 'A-Z' 'a-z')"
+    [[ "$local_part" =~ ^[A-Za-z0-9._%+-]{1,64}$ ]] && is_valid_domain "$domain"
+}
+
 # ==============================================================================
 # 交互环境自愈（必须在所有交互之前）
 # ------------------------------------------------------------------------------
@@ -655,6 +671,15 @@ if [[ -n "${HY2_NODE_MODE:-}" ]] && [[ "${HY2_NODE_MODE}" != "2" ]]; then
 fi
 if [[ "${HY2_CERT_TYPE:-}" == "3" && -z "${HY2_DOMAIN:-}" ]]; then
     log_err "HY2_CERT_TYPE=3 需要同时提供 HY2_DOMAIN=<你的域名>。"
+    exit 1
+fi
+# 免交互的域名 / 邮箱在动工前就校验，不能装到一半才在证书那步报错。
+if [[ -n "${HY2_DOMAIN:-}" ]] && ! is_valid_domain "$(printf '%s' "$HY2_DOMAIN" | tr 'A-Z' 'a-z')"; then
+    log_err "环境变量 HY2_DOMAIN='${HY2_DOMAIN}' 不是合法域名（例如 hy2.example.com）。"
+    exit 1
+fi
+if [[ -n "${HY2_EMAIL:-}" ]] && ! is_valid_email "$HY2_EMAIL"; then
+    log_err "环境变量 HY2_EMAIL='${HY2_EMAIL}' 不是合法邮箱。"
     exit 1
 fi
 
@@ -1660,8 +1685,12 @@ setup_acme_certificate() {
     else
         read -rp "请输入要绑定的域名 (例如 hy2.example.com): " SERVER_NAME || true
     fi
-    if [[ -z "$SERVER_NAME" || "$SERVER_NAME" == *"/"* || "$SERVER_NAME" == *":"* ]]; then
-        log_err "域名不能为空，且不能包含协议、路径或端口。"
+    # 域名 / 邮箱会原样进 config.yaml、nginx server_name、Caddyfile 与 grep 正则
+    # （2026-11-03 修）：旧校验只挡 / 和 :，引号、分号、花括号、空格、换行都能进去，
+    # 写坏或注入配置后 Hysteria / nginx / Caddy 反复重启。
+    SERVER_NAME="$(printf '%s' "$SERVER_NAME" | tr 'A-Z' 'a-z')"
+    if ! is_valid_domain "$SERVER_NAME"; then
+        log_err "域名格式不正确（只能是 hy2.example.com 这样的主机名，不能带协议、路径、端口或空格）。"
         return 1
     fi
     if [[ -n "${HY2_EMAIL:-}" ]]; then
@@ -1670,7 +1699,7 @@ setup_acme_certificate() {
     else
         read -rp "请输入 ACME 通知邮箱: " ACME_EMAIL || true
     fi
-    if [[ -z "$ACME_EMAIL" || "$ACME_EMAIL" != *"@"* ]]; then
+    if ! is_valid_email "$ACME_EMAIL"; then
         log_err "请输入有效的通知邮箱。"
         return 1
     fi

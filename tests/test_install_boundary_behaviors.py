@@ -199,6 +199,7 @@ setup_cert_via_existing_caddy(){ printf 'UNEXPECTED_CADDY\n' >&2; return 1; }
 setup_cert_via_nginx(){ printf 'UNEXPECTED_NGINX\n' >&2; return 1; }
 generate_self_signed_cert(){ printf 'UNEXPECTED_SELF_SIGNED\n' >&2; return 1; }
 """
+            + extract_function("is_valid_domain") + "\n" + extract_function("is_valid_email") + "\n"
             + extract_function("setup_acme_certificate")
             + """
 setup_acme_certificate
