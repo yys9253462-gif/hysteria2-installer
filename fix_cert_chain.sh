@@ -38,7 +38,16 @@ warn(){ echo "${c_ylw}[!]${c_rst} $*"; }
 err(){  echo "${c_red}[✗]${c_rst} $*"; }
 
 cert_of () {   # 从 config.yaml 取出 tls.cert 路径
-    awk '/^tls:[[:space:]]*$/{f=1;next} /^[^[:space:]]/{f=0} f && /^[[:space:]]+cert:/{sub(/^[[:space:]]+cert:[[:space:]]*/,"");print;exit}' "$1"
+    # install.sh 写的是 `cert: "/path"`（带引号）：引号与行尾注释都要去掉，
+    # 否则拿 "\"/path\"" 去找文件，必然报「证书文件不存在」（2026-11-03 修）。
+    awk '/^tls:[[:space:]]*$/{f=1;next} /^[^[:space:]]/{f=0}
+         f && /^[[:space:]]+cert:/{
+             sub(/^[[:space:]]+cert:[[:space:]]*/,"")
+             if ($0 ~ /^"/) { sub(/^"/,""); sub(/".*$/,"") }
+             else if ($0 ~ /^\047/) { sub(/^\047/,""); sub(/\047.*$/,"") }
+             else { sub(/[[:space:]]+#.*$/,""); sub(/[[:space:]]+$/,"") }
+             print; exit
+         }' "$1"
 }
 n_certs () { grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null || echo 0; }
 
