@@ -9279,7 +9279,12 @@ if __name__ == '__main__':
             with data_lock:
                 self.server.login_failures[:] = [
                     t for t in self.server.login_failures if now - t < 600]
-                if len(self.server.login_failures) >= 10:
+                # 按来源计 10 次 / 10 分钟（2026-11-03 修）：旧实现全局 10 次，知道
+                # token 的人刷 10 次错误密码就把管理员锁在门外。全局保留 200 次作
+                # 兜底，换来源爆破的总尝试次数仍然有界。
+                per_source = self.server.login_source_failures.get(self._web_source_key(), [])
+                per_source[:] = [t for t in per_source if now - t < 600]
+                if len(per_source) >= 10 or len(self.server.login_failures) >= 200:
                     # 🔴 2026-10-31：锁定必须留痕。旧实现静默返回 True，
                     # 管理员只会看到「尝试次数过多，请 10 分钟后再试」，
                     # 而日志里查不到是谁、什么时候开始的 —— 分不清是自己
@@ -9295,6 +9300,12 @@ if __name__ == '__main__':
             now = time.monotonic()
             with data_lock:
                 self.server.login_failures.append(now)
+                table = self.server.login_source_failures
+                key = self._web_source_key()
+                table.setdefault(key, []).append(now)
+                table.move_to_end(key)
+                while len(table) > 4096:
+                    table.popitem(last=False)
 
         def clear_login_failures(self):
             """登录成功后清空失败桶。
@@ -9311,6 +9322,7 @@ if __name__ == '__main__':
             """
             with data_lock:
                 self.server.login_failures.clear()
+                self.server.login_source_failures.clear()
                 self.server._login_lock_logged = False
 
         def _web_source_key(self):
@@ -14465,6 +14477,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     server.auth_limiter = AuthLimiter()
     # Web 登录专用失败桶（2026-10-25）：见 login_rate_limited() 的说明。
     server.login_failures = []
+    server.login_source_failures = collections.OrderedDict()
 
     # 启动时比较完整托管客户端列表；服务已停止但配置匹配时也尝试恢复。
     try:
