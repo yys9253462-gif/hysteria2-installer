@@ -6039,6 +6039,9 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
         if key == exclude_key:
             continue
         section = data.get(key)
+        # 停用后保留的配置段（enabled=False）只是记着端口 / 密钥，端口已经空出来了。
+        if isinstance(section, dict) and section.get('enabled') is False:
+            continue
         if isinstance(section, dict) and (key not in ('anytls_config', 'tuic_config') or section.get('enabled')):
             try:
                 if int(section.get('port') or 0) == port:
@@ -6369,8 +6372,11 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None):
             pass
     for key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
         # AnyTLS 停用后保留 secret 与端口记录（再启用要沿用），但那个端口已经空出来了。
+        # VMess / VLESS Encryption 停用后同样保留配置段并标 enabled=False（2026-11-03）。
         section = data.get(key)
         if key == 'anytls_config' and not (isinstance(section, dict) and section.get('enabled')):
+            continue
+        if isinstance(section, dict) and section.get('enabled') is False:
             continue
         if key == exclude_key:
             # 协议**自己**的端口不是冲突：重新启用时应当沿用它。
@@ -11203,7 +11209,7 @@ if __name__ == '__main__':
                 apply_xray_config_with_meter(
                     config, xray_path, portal_path.parent / 'usage-meter-config.json',
                     Path(__file__).parent)
-            new_cfg = {'port': listen_port, 'domain': domain, 'sni': sni,
+            new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
                        'ws_path': ws_path, 'uuid': vmess_uuid_for_user(MASTER_USER_ID)}
             new_cfg['uri'] = vmess_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
                                                 label='VMess-WS-' + domain)
@@ -11310,7 +11316,7 @@ if __name__ == '__main__':
                 apply_xray_config_with_meter(
                     config, xray_path, portal_path.parent / 'usage-meter-config.json',
                     Path(__file__).parent)
-            new_cfg = {'port': listen_port, 'domain': domain, 'sni': sni,
+            new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
                        'decryption': decryption, 'encryption': encryption}
             new_cfg['uri'] = vlessenc_uri_for_user(new_cfg, MASTER_USER_ID, public_ip,
                                                    label='VLESS-Enc-' + domain)
@@ -11382,7 +11388,7 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'VMess 本来就没有启用'})
                 with data_lock:
-                    closed_port = int((data.get('vmess_config') or {}).get('port') or 0)
+                    closed_port = _valid_port(config_section(data, 'vmess_config').get('port')) or 0
                 # 在统一锁序内重读并删，防止并发启用丢配置或核心卸载竞态。
                 with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                     try:
@@ -11398,7 +11404,11 @@ if __name__ == '__main__':
                         binary='/usr/local/bin/xray',
                         restart=not unit_suspended('xray'))
                 with data_lock:
-                    data.pop('vmess_config', None)
+                    # 保留 ws_path / 端口，只标停用（2026-11-03 修）：旧实现整段删除，
+                    # 再启用时换新的 ws_path、端口回到默认，已下发的订阅全部失效。
+                    _kept = dict(config_section(data, 'vmess_config'))
+                    _kept['enabled'] = False
+                    data['vmess_config'] = _kept
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
@@ -12072,7 +12082,7 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'VLESS Encryption 本来就没有启用'})
                 with data_lock:
-                    closed_port = int((data.get('vlessenc_config') or {}).get('port') or 0)
+                    closed_port = _valid_port(config_section(data, 'vlessenc_config').get('port')) or 0
                 # 在统一锁序内重读并删，防止并发启用丢配置或核心卸载竞态。
                 with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                     try:
@@ -12088,7 +12098,11 @@ if __name__ == '__main__':
                         binary='/usr/local/bin/xray',
                         restart=not unit_suspended('xray'))
                 with data_lock:
-                    data.pop('vlessenc_config', None)
+                    # 保留密钥对与端口，只标停用（2026-11-03 修）：旧实现整段删除，
+                    # 再启用时重新生成 decryption / encryption，已下发的订阅全部失效。
+                    _kept = dict(config_section(data, 'vlessenc_config'))
+                    _kept['enabled'] = False
+                    data['vlessenc_config'] = _kept
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
