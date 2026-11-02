@@ -5375,6 +5375,13 @@ def install_xray_binary():
                     staged = Path('/usr/local/bin/xray.new')
                     shutil.copyfile(str(bin_path), str(staged))
                     os.chmod(str(staged), 0o755)
+                    # 换上之前先确认新二进制能跑（2026-11-03 修）：旧实现直接 os.replace，
+                    # 新文件起不来时旧核心已被覆盖，正在跑的 Reality / VMess / VLESS-Enc
+                    # 下一次重启就全挂，而且没有可回滚的旧文件。
+                    if not _xray_version(str(staged)):
+                        staged.unlink(missing_ok=True)
+                        errors.append('%s: 新 xray 无法运行（version 检查失败），未替换' % host)
+                        continue
                     os.replace(str(staged), '/usr/local/bin/xray')
                     installed = True
                     break
@@ -11001,6 +11008,7 @@ if __name__ == '__main__':
             """POST /install-xray 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            binary_replaced = False
             try:
                 # 三个下载源 × 45 秒 + 校验/解压，全程远超 30 秒默认死线。
                 if not self._extend_deadline(300, heavy=True):
@@ -11017,6 +11025,7 @@ if __name__ == '__main__':
                         ok, msg = install_xray_binary()
                         if not ok:
                             return self.reply_json(500, {'ok': False, 'error': msg})
+                        binary_replaced = True
 
                         write_xray_unit()
                         enable_result = subprocess.run(
@@ -11050,6 +11059,11 @@ if __name__ == '__main__':
 
                 return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % data.get('reality_config', {}).get('port', '')})
             except Exception as e:
+                # 二进制已经换成新版后，后续配置一步失败（例如找不到空闲端口）时要说清楚：
+                # 旧回复只有「安装执行异常」，管理员不知道正在跑的协议下次重启就会用新核心。
+                if binary_replaced:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'Xray 核心已替换为新版本，但 Reality 配置未完成：%s' % str(e)})
                 return self.reply_json(500, {'ok': False, 'error': f'安装执行异常: {str(e)}'})
 
         def _h_post_manage_reality(self, prefix):
