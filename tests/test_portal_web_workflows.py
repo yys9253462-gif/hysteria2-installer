@@ -801,19 +801,32 @@ class WebWorkflowTests(unittest.TestCase):
                 self.assertNotIn(config_key, self.data)
 
     def test_protocol_install_paths_share_cross_process_core_lock(self):
+        """启用路径必须持有跨进程核心锁 —— 在 handler 里拿，或在它调用的 _apply_*_enable 里拿。
+
+        VMess / VLESS Encryption 的锁在 _apply_*_enable 内部；handler 再套一层会自锁
+        （见 test_vmess_and_vlessenc_enable_do_not_deadlock_on_real_locks），
+        所以这里接受两处之一，但不接受两处都拿。
+        """
         source = Path(portal.__file__).read_text(encoding='utf-8')
-        for handler, action in (('_h_post_manage_vmess', "if action == 'enable':"),
-                                ('_h_post_manage_vlessenc', "if action == 'enable':"),
-                                ('_h_post_manage_anytls', "if action == 'enable':"),
-                                ('_h_post_manage_tuic', "if action == 'enable':")):
+
+        def method_body(name):
+            start = source.index('        def ' + name + '(')
+            end = source.find('\n        def ', start + 12)
+            return source[start:end if end >= 0 else len(source)]
+
+        for handler, inner in (('_h_post_manage_vmess', '_apply_vmess_enable'),
+                               ('_h_post_manage_vlessenc', '_apply_vlessenc_enable'),
+                               ('_h_post_manage_anytls', '_apply_anytls_enable'),
+                               ('_h_post_manage_tuic', '_apply_tuic_enable')):
             with self.subTest(handler=handler):
-                start = source.index('        def ' + handler + '(')
-                end = source.find('\n        def ', start + 12)
-                body = source[start:end if end >= 0 else len(source)]
-                action_start = body.index(action)
+                body = method_body(handler)
+                action_start = body.index("if action == 'enable':")
                 action_end = body.find("if not enabled:", action_start)
                 enable_body = body[action_start:action_end if action_end >= 0 else len(body)]
-                self.assertIn('core_operation_file_lock()', enable_body)
+                in_handler = 'core_operation_file_lock()' in enable_body
+                in_inner = 'core_operation_file_lock()' in method_body(inner)
+                self.assertTrue(in_handler or in_inner, '%s 的启用路径没有拿跨进程核心锁' % handler)
+                self.assertFalse(in_handler and in_inner, '%s 在两层都拿核心锁，会自锁' % handler)
 
     def test_core_install_releases_cross_process_lock_after_operation(self):
         acquire = Mock(return_value=17)
@@ -1625,6 +1638,39 @@ class WebWorkflowTests(unittest.TestCase):
                 self.assertIn(['systemctl', 'disable', '--now', service], commands)
                 self.assertIs(self.data[key]['enabled'], False)
                 self.assertEqual(self.data[key]['secret'], 's' * 64)
+
+    def test_vmess_and_vlessenc_enable_do_not_deadlock_on_real_locks(self):
+        """用真实的锁类型（不可重入的 threading.Lock + 真 flock）跑启用分支。
+
+        旧实现在 handler 里先拿 core_operation_lock，_apply_*_enable 里又拿一次：
+        请求永远挂起，核心锁一直被占，之后每轮撤销都报「another core operation」。
+        """
+        for handler_name, method in (('_h_post_manage_vmess', '_apply_vmess_enable'),
+                                     ('_h_post_manage_vlessenc', '_apply_vlessenc_enable')):
+            with self.subTest(handler=handler_name):
+                core_lock = threading.Lock()
+                lock_dir = self.root / ('locks-' + method)
+                lock_dir.mkdir()
+                self.ns.update(
+                    core_operation_lock=core_lock,
+                    core_operation_file_lock=lambda d=lock_dir: portal.core_operation_file_lock(str(d)),
+                    reality_apply_lock=threading.Lock(), unit_suspended=lambda unit: False,
+                    has_managed_inbound=lambda config, tag: False)
+
+                def inner(ns=self.ns):
+                    # 与真实 _apply_*_enable 相同的取锁顺序。
+                    with ns['core_operation_lock'], ns['core_operation_file_lock'](), ns['reality_apply_lock']:
+                        return {'port': 2087, 'uri': 'vmess://fixture'}
+
+                setattr(self.handler, method, inner)
+                result = {}
+                worker = threading.Thread(daemon=True, target=lambda: result.update(
+                    r=self.invoke(handler_name, {'action': 'enable'})))
+                worker.start()
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), '%s 启用时自锁挂起' % handler_name)
+                self.assertEqual(result['r'][0], 200, result.get('r'))
+                self.assertFalse(core_lock.locked(), '核心锁在请求结束后仍被占用')
 
     def test_explicit_immutable_ref_does_not_make_a_branch_lookup(self):
         with patch.object(portal.urllib.request, 'urlopen') as open_:

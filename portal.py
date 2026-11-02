@@ -11335,8 +11335,10 @@ if __name__ == '__main__':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，VMess 将在控制台恢复节点时一并恢复'})
-                    with core_operation_lock, core_operation_file_lock():
-                        cfg = self._apply_vmess_enable()
+                    # _apply_vmess_enable 自己按「核心锁 → 协议锁」取锁。这里再套一层
+                    # 会在同一线程里二次获取不可重入的 core_operation_lock：请求永远
+                    # 挂起，核心 flock 一直被占，之后每轮撤销都失败（2026-11-03 修）。
+                    cfg = self._apply_vmess_enable()
                     return self.reply_json(200, {'ok': True, 'active': True,
                                                  'port': cfg['port'], 'uri': cfg['uri']})
                 if not enabled:
@@ -12025,8 +12027,8 @@ if __name__ == '__main__':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，VLESS Encryption 将在控制台恢复节点时一并恢复'})
-                    with core_operation_lock, core_operation_file_lock():
-                        cfg = self._apply_vlessenc_enable()
+                    # 锁由 _apply_vlessenc_enable 自己取，原因同 VMess（2026-11-03 修）。
+                    cfg = self._apply_vlessenc_enable()
                     return self.reply_json(200, {'ok': True, 'active': True,
                                                  'port': cfg['port'], 'uri': cfg['uri']})
                 if not enabled:
