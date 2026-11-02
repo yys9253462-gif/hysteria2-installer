@@ -141,7 +141,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.12'
+PORTAL_VERSION = '2.13'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -638,6 +638,13 @@ def add_private_network_guard(config):
     routing = config.setdefault('routing', {})
     if not isinstance(routing, dict):
         routing = config['routing'] = {}
+    # 按 IP 拦截只对 IP 目标生效（2026-11-03 修，SE 节点实测）：默认 AsIs 不解析域名，
+    # 客户端用 localhost.localdomain / localtest.me 之类解析到回环的域名照样能打到
+    # 127.0.0.1 上的门户与计量端口、169.254.169.254 云元数据。IPIfNonMatch 在没有
+    # 域名规则命中时先解析再按 IP 匹配，拦截就覆盖了域名目标。只在未设置时补上，
+    # 不覆盖运维手工选的更严格策略（IPOnDemand）。
+    if routing.get('domainStrategy') in (None, '', 'AsIs'):
+        routing['domainStrategy'] = 'IPIfNonMatch'
     rules = routing.setdefault('rules', [])
     if not isinstance(rules, list):
         rules = routing['rules'] = []
@@ -2147,6 +2154,26 @@ def read_meta_file(meta_path):
         print('[portal] client_meta.json unreadable: ' + type(exc).__name__, file=sys.stderr)
         return {}
 
+
+def read_access_file(access_path):
+    """读取 portal-access.json（门户账号 / 密码）；缺失或损坏时返回空 dict。
+
+    🔴 2026-11-03 修：regenerate_page 与首页渲染直接 json.loads，文件被截断（磁盘满）
+    或写成 [] 时抛 ValueError / AttributeError，于是每次打开管理页都失败，只能手修文件。
+    refresh 路径早就会经 ensure_portal_access 重建它，这两处读取也必须容错。
+    """
+    path = Path(access_path)
+    if not path.exists():
+        return {}
+    try:
+        access = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(access, dict):
+            raise ValueError('portal access must be a JSON object')
+        return access
+    except (OSError, ValueError) as exc:
+        print('[portal] portal-access.json unreadable: ' + type(exc).__name__, file=sys.stderr)
+        return {}
+
 def resolve_subscription_port(m, config_path='/etc/hysteria/config.yaml'):
     """解析订阅链接该用的端口。按优先级取值，**绝不返回伪造的 8443**。
 
@@ -2320,7 +2347,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     #
     # 反过来，绝不能把这份负载挂到 /api/v1/ 的 Bearer 链路上去：api_key 的权限
     # 明确低于 Basic（前者够不着门户网页端），用低权限凭据换高权限凭据就是提权。
-    access_url = f"https://{host}:{sub_port}/{token}/"
+    access_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
     access_json = json.dumps(
         portal_access_payload(access_url, username, password, api_key or ""),
         ensure_ascii=False)
@@ -2904,7 +2931,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
             <textarea class="link" id="reality-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px;display:flex;justify-content:space-between;align-items:center">
               <button class="button primary" id="btn-copy-reality-uri" type="button">复制 Reality 直链</button>
-              <button class="button" id="btn-reset-reality-keys" type="button" style="font-size:11px;color:var(--muted)" title="重置将重新生成 UUID 与密钥对">🔄 重新生成密钥对</button>
+              <button class="button" id="btn-reset-reality-keys" type="button" style="font-size:11px;color:var(--muted)" title="重置将重新生成密钥对（用户 UUID 不变）">🔄 重新生成密钥对</button>
             </div>
           </section>
 
@@ -5348,6 +5375,13 @@ def install_xray_binary():
                     staged = Path('/usr/local/bin/xray.new')
                     shutil.copyfile(str(bin_path), str(staged))
                     os.chmod(str(staged), 0o755)
+                    # 换上之前先确认新二进制能跑（2026-11-03 修）：旧实现直接 os.replace，
+                    # 新文件起不来时旧核心已被覆盖，正在跑的 Reality / VMess / VLESS-Enc
+                    # 下一次重启就全挂，而且没有可回滚的旧文件。
+                    if not _xray_version(str(staged)):
+                        staged.unlink(missing_ok=True)
+                        errors.append('%s: 新 xray 无法运行（version 检查失败），未替换' % host)
+                        continue
                     os.replace(str(staged), '/usr/local/bin/xray')
                     installed = True
                     break
@@ -7095,8 +7129,8 @@ def prepare(meta_path, port, node_api_key=None):
         m['subscription_port'] = sub_port
         Path(meta_path).write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding='utf-8')
         print(f'[portal] 订阅端口已自愈为 {sub_port}（来源: {sub_port_src}）', file=sys.stderr)
-    base = f"https://{host}:{sub_port}/{token}/"
-    subscription = f"https://{user}:{password}@{host}:{sub_port}/{token}/clash.yaml"
+    base = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
+    subscription = f"https://{user}:{password}@{_host_for_url(host)}:{sub_port}/{token}/clash.yaml"
     session_secret = secrets.token_hex(32)
     api_key = node_api_key or secrets.token_hex(24)
 
@@ -7231,7 +7265,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
     sync_download_artifacts(data, uri, clash, sing)
     
     # 域名 / 订阅端口改过之后，交给控制台的门户地址也要跟上（token 与凭据不变）。
-    access_url = f"https://{host}:{resolve_subscription_port(m)[0]}/{data['token']}/"
+    access_url = f"https://{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/"
     # Start from the latest persisted state and overlay the credentials/auth fields
     # that ensure_portal_access may have repaired in this refresh snapshot.
     # This preserves user, usage and service writes from the portal process.
@@ -7386,6 +7420,12 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     try:
         m = json.loads(meta_file.read_text(encoding='utf-8'))
     except (OSError, ValueError):
+        return False
+    # 合法 JSON 但不是对象（[] / "x" / null）时同样当作「读不到」（2026-11-03 修）：
+    # 旧写法 dict(m) 抛 TypeError、m.get 抛 AttributeError，selfheal 由 timer 每 30 分钟
+    # 和证书目录变更触发，于是每次都以 traceback 失败，自愈永远不跑。
+    if not isinstance(m, dict):
+        print('[portal] selfheal 跳过：client_meta.json 不是 JSON 对象', file=sys.stderr)
         return False
 
     before = dict(m)
@@ -8650,9 +8690,9 @@ if __name__ == '__main__':
         uri, clash, sing = artifacts(m)
         root = portal_path.parent
         access_file = root / 'portal-access.json'
-        access = json.loads(access_file.read_text(encoding='utf-8')) if access_file.exists() else {}
+        access = read_access_file(access_file)
         host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
-        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{host}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
+        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
         
         now_ts = int(time.time())
         display_users = {}
@@ -10968,6 +11008,7 @@ if __name__ == '__main__':
             """POST /install-xray 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            binary_replaced = False
             try:
                 # 三个下载源 × 45 秒 + 校验/解压，全程远超 30 秒默认死线。
                 if not self._extend_deadline(300, heavy=True):
@@ -10984,6 +11025,7 @@ if __name__ == '__main__':
                         ok, msg = install_xray_binary()
                         if not ok:
                             return self.reply_json(500, {'ok': False, 'error': msg})
+                        binary_replaced = True
 
                         write_xray_unit()
                         enable_result = subprocess.run(
@@ -11017,6 +11059,11 @@ if __name__ == '__main__':
 
                 return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % data.get('reality_config', {}).get('port', '')})
             except Exception as e:
+                # 二进制已经换成新版后，后续配置一步失败（例如找不到空闲端口）时要说清楚：
+                # 旧回复只有「安装执行异常」，管理员不知道正在跑的协议下次重启就会用新核心。
+                if binary_replaced:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'Xray 核心已替换为新版本，但 Reality 配置未完成：%s' % str(e)})
                 return self.reply_json(500, {'ok': False, 'error': f'安装执行异常: {str(e)}'})
 
         def _h_post_manage_reality(self, prefix):
@@ -11081,6 +11128,11 @@ if __name__ == '__main__':
                     # 用户的 UUID 是 uuid5 派生的，不受密钥轮换影响。
                     with core_operation_lock, core_operation_file_lock():
                         self._generate_and_apply_reality(True, force=True)
+                    # 整机超额停用时 _generate_and_apply_reality 只写配置不重启（2026-11-03 修）：
+                    # 旧回复一律写「已重启生效」，而节点仍在用旧密钥、订阅里已经是新 pbk。
+                    if unit_suspended('xray'):
+                        return self.reply_json(200, {'ok': True, 'message':
+                            '已重置密钥；节点因流量超额停用中，新密钥将在控制台恢复节点时生效'})
                     return self.reply_json(200, {'ok': True, 'message': '已重置密钥并重启生效'})
 
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
@@ -12511,6 +12563,26 @@ for t in curl jq; do
 done
 command -v curl >/dev/null 2>&1 || { echo "缺少 curl，无法继续" >&2; exit 1; }
 
+# 归属检查，与 install.sh 的 install_warp_local_proxy 同一规则（2026-11-03 修）。
+# 旧版网页安装不查也不写归属标记：机器上已有别人的 wireproxy 时直接覆盖它的
+# unit 与 wp.conf；而 install.sh 卸载只认 .hy2-warp-owned，网页装的 WARP 卸载后
+# 还在跑、开机自启、watchdog 每 3 分钟拉起一次，wp.conf 里的私钥也留在盘上。
+WARP_OWNED_MARKER="/etc/hysteria/.hy2-warp-owned"
+if [ ! -f "$WARP_OWNED_MARKER" ]; then
+    if [ -f /etc/systemd/system/wireproxy.service ] && [ -f "$WP_CFG" ] \
+            && grep -qF '# wireproxy config (managed by hysteria2-installer, do not edit)' "$WP_CFG" \
+            && grep -qF 'ExecStart=/usr/local/bin/wireproxy -c /etc/wireguard/wp.conf' \
+                /etc/systemd/system/wireproxy.service; then
+        :  # 旧版本装的，按我们的认领
+    elif [ -e "$WP_BIN" ] || [ -e /etc/systemd/system/wireproxy.service ] || [ -e "$WP_CFG" ]; then
+        echo "wireproxy 资产已存在但归属无法确认；为避免覆盖宿主服务，已停止 WARP 安装。" >&2
+        exit 1
+    fi
+fi
+# 从这里开始写的文件都归本项目：先落标记，后面任何一步失败，卸载也能清干净。
+: > "$WARP_OWNED_MARKER"
+chmod 600 "$WARP_OWNED_MARKER"
+
 ARCH=$(uname -m)
 case "$ARCH" in
     x86_64|amd64)   WG_A="amd64"; WP_A="amd64" ;;
@@ -13420,8 +13492,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 uri, clash, sing = artifacts(m)
                 root = portal_path.parent
                 access_file = root / 'portal-access.json'
-                access = (json.loads(access_file.read_text(encoding='utf-8'))
-                          if access_file.exists() else {})
+                access = read_access_file(access_file)
                 host = (m.get('public_ip', '127.0.0.1') if m.get('is_insecure')
                         else m.get('server_name', 'localhost'))
                 with data_lock:
@@ -13432,7 +13503,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 subscription = (
                     "https://%s:%s@%s:%d/%s/clash.yaml"
                     % (access.get('username', ''), access.get('password', ''),
-                       host, resolve_subscription_port(m)[0], _token))
+                       _host_for_url(host), resolve_subscription_port(m)[0], _token))
                 return page_html(m, uri, subscription, clash, sing, users=users,
                                  api_key=_api_key, token=_token,
                                  session_secret=session_secret,

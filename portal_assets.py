@@ -1599,7 +1599,7 @@ if (btnToggleReality) {
 
 if (btnResetRealityKeys) {
   btnResetRealityKeys.addEventListener('click', async () => {
-    if (!confirm("确定要重新生成 UUID 与 Reality 密钥对吗？旧客户端连接凭据将失效。")) return;
+    if (!confirm("确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。")) return;
     try {
       const res = await fetch(location.pathname + 'manage-reality', {
         method: 'POST',

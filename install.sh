@@ -1569,6 +1569,13 @@ EOF
     if ! "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
             --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null; then
+        # 与签发失败同样撤掉本次新增的验证配置（2026-11-03 修）：旧实现直接 return，
+        # 留下一个没有归属标记的 server 块 —— Nginx 继续为该域名回 404，下次运行
+        # 撞上「无法确认归属」永久走不通，卸载也认不出它。
+        if [[ "$created_owned_conf" == 1 && -n "$conf" ]]; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+        fi
         log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败。"
         return 1
     fi
@@ -2641,6 +2648,10 @@ EOTW
     # 写入 do_upgrade.sh 供 Web 控制台在线升级官方核心或面板
     cat > "$HY2_DIR/do_upgrade.sh" <<'EOUG'
 #!/usr/bin/env bash
+# 与 install.sh 相同的 umask（2026-11-03 修）：本脚本由门户服务或手工 shell 调用，
+# 继承的 umask 通常是 022，自愈重写 client_meta.json（含 auth_password /
+# obfs_password）时新文件会变成 0644，任何本地用户都能读到主密码。
+umask 077
 TARGET="${1:-}" # 'core' or 'portal'
 HY2_DIR="/etc/hysteria"
 HY2_BIN="/usr/local/bin/hysteria"
@@ -2891,11 +2902,21 @@ METEREOF2
                 _subj="$(openssl x509 -in "$_cert" -noout -subject 2>/dev/null | sed 's/^subject=//' | sed 's/ *$//')"
                 _iss="$(openssl x509 -in "$_cert" -noout -issuer 2>/dev/null | sed 's/^issuer=//' | sed 's/ *$//')"
                 _cn="$(openssl x509 -in "$_cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -1 | sed 's/ *$//')"
-                _san="$(openssl x509 -in "$_cert" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | head -1)"
+                # 与 sync_cert_meta / portal.sync_cert_trust 同一取法（2026-11-03 修）：收集全部 SAN，
+                # 当前 server_name 仍在证书里就保留，否则取第一个非通配 SAN，最后才退回 CN。
+                # 旧写法只看第一个 SAN：多域名证书会把 SNI 悄悄换成另一个域名（订阅全部失效），
+                # 第一个 SAN 是通配符时又直接跳过自愈。
+                _sans="$(openssl x509 -in "$_cert" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | tr '\n' ' ')"
                 _self="false"; [[ -n "$_subj" && "$_subj" == "$_iss" ]] && _self="true"
                 _acme="false"; grep -q '^acme:' "$HY2_DIR/config.yaml" 2>/dev/null && _acme="true"
+                _cs="$(jq -r '.server_name // empty' "$HY2_DIR/client_meta.json" 2>/dev/null || true)"
                 _nsn=""
-                if [[ -n "$_san" && "$_san" != \** ]]; then _nsn="$_san"; elif [[ -n "$_cn" && "$_cn" != \** ]]; then _nsn="$_cn"; fi
+                for _san in $_sans; do
+                    [[ -z "$_san" || "$_san" == \** ]] && continue
+                    if [[ -n "$_cs" && "$_san" == "$_cs" ]]; then _nsn="$_san"; break; fi
+                    [[ -z "$_nsn" ]] && _nsn="$_san"
+                done
+                if [[ -z "$_nsn" && -n "$_cn" && "$_cn" != \** ]]; then _nsn="$_cn"; fi
                 if [[ -n "$_nsn" ]]; then
                     if [[ "$_self" == "true" ]]; then
                         _nt="self_signed"; _ni="true"
@@ -2914,6 +2935,7 @@ METEREOF2
                         if jq --arg t "$_nt" --argjson i "$_ni" --arg s "$_nsn" --arg p "$_np" \
                               '.cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p' \
                               "$HY2_DIR/client_meta.json" > "$_tmp_meta" 2>/dev/null && [[ -s "$_tmp_meta" ]]; then
+                            chmod 600 "$_tmp_meta"
                             mv -f "$_tmp_meta" "$HY2_DIR/client_meta.json"
                             echo "证书信任模型已自愈: cert_type=${_ct:-<空>} -> ${_nt}, server_name=${_cs:-<空>} -> ${_nsn}"
                         else

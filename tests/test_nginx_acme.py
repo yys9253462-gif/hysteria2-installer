@@ -76,7 +76,7 @@ class NginxServerNameTest(unittest.TestCase):
 class SetupCertViaNginxTest(unittest.TestCase):
     """假 nginx（配置检查恒通过）+ 假 acme.sh，跑完整函数。"""
 
-    def run_fn(self, acme_ok):
+    def run_fn(self, acme_ok, install_cert_ok=True):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             fake = td / 'bin'
@@ -98,10 +98,10 @@ class SetupCertViaNginxTest(unittest.TestCase):
                 echo "acme.sh noisy output on stdout"
                 d=""; while [ $# -gt 0 ]; do case "$1" in -d) d="$2"; shift;; --fullchain-file) fc="$2"; shift;; --key-file) kf="$2"; shift;; esac; shift; done
                 case " $* " in *) ;; esac
-                if [ -n "$fc" ]; then cp "$HOME/.acme.sh/${d}_ecc/fullchain.cer" "$fc"; cp "$HOME/.acme.sh/${d}_ecc/${d}.key" "$kf"; exit 0; fi
+                if [ -n "$fc" ]; then %s cp "$HOME/.acme.sh/${d}_ecc/fullchain.cer" "$fc"; cp "$HOME/.acme.sh/${d}_ecc/${d}.key" "$kf"; exit 0; fi
                 %s
                 mkdir -p "$HOME/.acme.sh/${d}_ecc"; echo CERT > "$HOME/.acme.sh/${d}_ecc/fullchain.cer"; echo KEY > "$HOME/.acme.sh/${d}_ecc/${d}.key"
-                ''') % ('' if acme_ok else 'exit 1'), encoding='utf-8')
+                ''') % ('' if install_cert_ok else 'exit 1;', '' if acme_ok else 'exit 1'), encoding='utf-8')
             for f in (fake / 'nginx', fake / 'systemctl', acme_dir / 'acme.sh'):
                 f.chmod(0o755)
             fn = extract('setup_cert_via_nginx').replace('/etc/nginx/conf.d', bash_path(confd))
@@ -127,6 +127,16 @@ class SetupCertViaNginxTest(unittest.TestCase):
         out = self.run_fn(acme_ok=False)
         self.assertIn('RC=1', out)
         self.assertNotIn('hy2-acme-new.example.com.conf', out, '签发失败后应撤掉新增的验证配置')
+
+    def test_install_cert_failure_also_removes_added_config(self):
+        """签发成功但复制证书失败时，同样撤掉新增的 server 块（2026-11-03）。
+
+        旧实现直接 return：留下一个没有 .owned 标记的配置，下次运行判「无法确认归属」
+        永久走不通，卸载也认不出它。
+        """
+        out = self.run_fn(acme_ok=True, install_cert_ok=False)
+        self.assertIn('RC=1', out)
+        self.assertNotIn('hy2-acme-new.example.com.conf', out, '复制失败后留下了无归属的验证配置')
 
 
 class NginxAcmeOwnershipTests(unittest.TestCase):

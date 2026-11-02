@@ -431,6 +431,20 @@ class TestPortalSelfHealEntry(unittest.TestCase):
             td = Path(td)
             self.assertFalse(self._call(td))
 
+    def test_selfheal_non_object_meta_returns_false_instead_of_crashing(self):
+        """client_meta.json 是合法 JSON 但不是对象时，自愈要安静跳过（2026-11-03）。
+
+        旧写法 dict(m) 抛 TypeError / m.get 抛 AttributeError：timer 与 path 单元每次触发都
+        以 traceback 失败，自愈永远不跑。
+        """
+        for content in ('[1]', '"x"', 'null', '[]', '7'):
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory() as td:
+                    td = Path(td)
+                    (td / "client_meta.json").write_text(content, encoding="utf-8")
+                    self.assertFalse(self._call(td))
+                    self.assertEqual((td / "client_meta.json").read_text(encoding="utf-8"), content)
+
 
 # ----------------------------------------------------------------------------
 # portal.py::cert_status —— 证书状态 + 到期告警
