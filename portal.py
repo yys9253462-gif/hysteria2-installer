@@ -2,6 +2,7 @@
 采用现代轻奢 Tab 导航系统，解耦节点连接、多用户管理（支持 IP 限制与实时流量统计）与集群 API 凭据。
 """
 import ast
+import collections
 import copy
 import contextlib
 import datetime
@@ -140,7 +141,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.9'
+PORTAL_VERSION = '2.10'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -5542,6 +5543,76 @@ def parse_ip_deny(params, now):
     return user_id, entries
 
 
+def auth_rate_key(client_ip):
+    """/auth 限流的分桶键：IPv4 按单个地址，IPv6 按 /64（单台主机通常持有整段 /64，
+    按单地址分桶等于没限）；IPv4 映射地址还原成 IPv4。解析不了的原样截断。"""
+    try:
+        ip = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return str(client_ip)[:64]
+    if ip.version == 6:
+        if ip.ipv4_mapped:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.ip_network('%s/64' % ip, strict=False))
+    return str(ip)
+
+
+class AuthLimiter:
+    """/auth 的按来源限流 + 失败累计（2026-11-02，排查报告 H4）。
+
+    🔴 旧实现的速率桶与失败桶都是进程全局的：任何人用错误密码连 HY2 端口，
+    60 秒内 30 次 'User not found' 后**所有** /auth 都回 'Auth service busy'，
+    全节点合法用户连不上。现在按 hysteria 鉴权体里的 addr（客户端真实地址）分桶，
+    全局只留一个极高的速率兜底。桶数有上限，满了淘汰最久未活动的，内存有界。
+    调用方负责持锁（handler 里在 data_lock 内调用）。
+    """
+
+    def __init__(self, per_ip_rate=20, per_ip_failures=30, failure_window=60,
+                 global_rate=500, max_buckets=4096):
+        self.per_ip_rate = per_ip_rate
+        self.per_ip_failures = per_ip_failures
+        self.failure_window = failure_window
+        self.global_rate = global_rate
+        self.max_buckets = max_buckets
+        self.global_requests = collections.deque(maxlen=global_rate)
+        self.buckets = collections.OrderedDict()
+
+    def _bucket(self, key):
+        bucket = self.buckets.get(key)
+        if bucket is None:
+            bucket = (collections.deque(maxlen=self.per_ip_rate),
+                      collections.deque(maxlen=self.per_ip_failures))
+            self.buckets[key] = bucket
+            while len(self.buckets) > self.max_buckets:
+                self.buckets.popitem(last=False)
+        else:
+            self.buckets.move_to_end(key)
+        return bucket
+
+    @staticmethod
+    def _prune(items, now, window):
+        while items and now - items[0] >= window:
+            items.popleft()
+
+    def limited(self, key, now):
+        self._prune(self.global_requests, now, 1)
+        if len(self.global_requests) >= self.global_rate:
+            return True
+        requests, failures = self._bucket(key)
+        # 速率：同一来源 1 秒内超过 per_ip_rate 次直接拒
+        self._prune(requests, now, 1)
+        too_fast = len(requests) >= self.per_ip_rate
+        if not too_fast:
+            requests.append(now)
+            self.global_requests.append(now)
+        # 失败：同一来源 60 秒内失败满 per_ip_failures 次就拒（哪怕速率不超）
+        self._prune(failures, now, self.failure_window)
+        return too_fast or len(failures) >= self.per_ip_failures
+
+    def record_failure(self, key, now):
+        self._bucket(key)[1].append(now)
+
+
 def active_ip_deny(table, uid, now):
     """{ip} —— 某用户当前仍在有效期内的拦截 IP；顺手清掉过期的。
 
@@ -9015,24 +9086,16 @@ if __name__ == '__main__':
             挡不住低速爆破（每秒 1 次可以试 3 小时不停）。
             这里再叠一个 60 秒滑窗的**失败**计数，
             累计到阈值就短暂拒绝，逼迫爆破者付出时间成本。
+            按 /auth 分支里写入的 self._auth_key（客户端地址）分桶，见 AuthLimiter。
             """
             now = time.monotonic()
             with data_lock:
-                # 速率桶：1 秒内超过 20 次直接拒
-                self.server.auth_requests[:] = [t for t in self.server.auth_requests if now - t < 1]
-                too_fast = len(self.server.auth_requests) >= 20
-                if not too_fast:
-                    self.server.auth_requests.append(now)
-                # 失败桶：60 秒内失败超过 30 次就拒（哪怕速率不超）
-                self.server.auth_failures[:] = [
-                    t for t in self.server.auth_failures if now - t < 60]
-                too_many_failures = len(self.server.auth_failures) >= 30
-            return too_fast or too_many_failures
+                return self.server.auth_limiter.limited(getattr(self, '_auth_key', ''), now)
 
         def record_auth_failure(self):
             now = time.monotonic()
             with data_lock:
-                self.server.auth_failures.append(now)
+                self.server.auth_limiter.record_failure(getattr(self, '_auth_key', ''), now)
 
         def handle_one_request(self):
             """兜住所有未捕获异常：转成 500 JSON 并记录，而不是掐断连接。
@@ -9084,10 +9147,7 @@ if __name__ == '__main__':
                             ('X-Forwarded-For', 'X-Forwarded-Host',
                              'X-Forwarded-Proto', 'Forwarded'))):
                     return self.reply_json(200, {'ok': False, 'msg': 'Forbidden'})
-                if self.auth_rate_limited():
-                    # 用与成功路径相同的 200 + JSON 形态回复：不给爆破者区分信号。
-                    # （Hysteria 只会看 ok 字段；非 200 可能让它反复重试并刷日志。）
-                    return self.reply_json(200, {'ok': False, 'msg': 'Auth service busy'})
+                # 先解析出客户端地址再限流：限流按来源分桶（H4，2026-11-02）。
                 try:
                     length = int(self.headers.get('Content-Length', 0))
                     body = self.rfile.read(length).decode('utf-8', errors='replace')
@@ -9106,8 +9166,16 @@ if __name__ == '__main__':
                     except ValueError:
                         pass
                 except Exception:
+                    self._auth_key = ''
+                    if self.auth_rate_limited():
+                        return self.reply_json(200, {'ok': False, 'msg': 'Auth service busy'})
                     self.record_auth_failure()
                     return self.reply_json(200, {'ok': False, 'msg': 'Bad auth request'})
+                self._auth_key = auth_rate_key(client_ip)
+                if self.auth_rate_limited():
+                    # 用与成功路径相同的 200 + JSON 形态回复：不给爆破者区分信号。
+                    # （Hysteria 只会看 ok 字段；非 200 可能让它反复重试并刷日志。）
+                    return self.reply_json(200, {'ok': False, 'msg': 'Auth service busy'})
 
                 now_ts = time.time()
                 # 🔴 锁内只做判定与状态更新，**不要在锁内写响应**（2026-10-29 修）。
@@ -13944,6 +14012,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
     class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
         daemon_threads = True
+        # 默认 listen backlog 只有 5，东京实测开机以来溢出 208 次（2026-11-02）。
+        request_queue_size = 128
 
         # 🔴 2026-10-31（事故级）：并发槽必须**按用途分开**。
         #
@@ -14053,7 +14123,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     server.requests, server.failures, server.api_requests = [], [], []
     # /auth 专用限流桶（2026-10-09）：见 auth_rate_limited() 的说明 ——
     # /auth 经 masquerade 对公网可达，必须有独立的速率+失败计数。
-    server.auth_requests, server.auth_failures = [], []
+    # auth_requests 仍供 check_rate_limit('auth') 使用；/auth 本身走按来源分桶的 auth_limiter（H4）。
+    server.auth_requests = []
+    server.auth_limiter = AuthLimiter()
     # Web 登录专用失败桶（2026-10-25）：见 login_rate_limited() 的说明。
     server.login_failures = []
 

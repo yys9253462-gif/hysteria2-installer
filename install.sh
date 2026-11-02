@@ -24,6 +24,12 @@ HY2_SERVICE="/etc/systemd/system/hysteria-server.service"
 HY2_CERT_DIR="${HY2_DIR}/cert"
 HY2_META_FILE="${HY2_DIR}/client_meta.json"
 HY2_SUB_PORT=""   # 由 select_subscription_port() 动态分配；空值表示"尚未确定"
+# Hysteria 服务端日志级别（debug|info|warn|error）。默认 error：info/warn 级几乎全是
+# 客户端超时/被拒的噪声（东京 3 天约 1.5 万条）。安装前 export HY2_LOG_LEVEL=info 可覆盖。
+# 写成 systemd drop-in（环境变量 HYSTERIA_LOG_LEVEL，hysteria 官方支持），不改主单元。
+HY2_LOG_LEVEL_EXPLICIT="${HY2_LOG_LEVEL:+1}"
+HY2_LOG_LEVEL="${HY2_LOG_LEVEL:-error}"
+HY2_LOG_DROPIN="/etc/systemd/system/hysteria-server.service.d/loglevel.conf"
 
 # ---- AmneziaWG (AWG) ----
 # 引擎逻辑全部在 awgctl.sh 里，本脚本只做交互封装。
@@ -3113,6 +3119,20 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
 WantedBy=multi-user.target
 EOF
 
+    # 日志级别 drop-in：显式指定 HY2_LOG_LEVEL 时覆盖；未指定且已存在时保留用户的修改。
+    case "$HY2_LOG_LEVEL" in
+        debug|info|warn|error) ;;
+        *) log_warn "HY2_LOG_LEVEL=${HY2_LOG_LEVEL} 不受支持，改用 error"; HY2_LOG_LEVEL=error ;;
+    esac
+    if [[ -n "$HY2_LOG_LEVEL_EXPLICIT" || ! -f "$HY2_LOG_DROPIN" ]]; then
+        mkdir -p "${HY2_LOG_DROPIN%/*}"
+        cat > "$HY2_LOG_DROPIN" <<EOF
+# 由 hysteria2-installer 生成：Hysteria 服务端日志级别（debug|info|warn|error）
+[Service]
+Environment=HYSTERIA_LOG_LEVEL=${HY2_LOG_LEVEL}
+EOF
+    fi
+
     systemctl daemon-reload
     systemctl enable hysteria-server >/dev/null 2>&1
     # 必须 || true：restart 失败时若被 set -e 直接终止，下面那段
@@ -5221,6 +5241,10 @@ uninstall_all() {
         fi
         clear_all_hopping_rules
         rm -f "$HY2_SERVICE"
+        if [[ -f "$HY2_LOG_DROPIN" ]] && grep -qF '由 hysteria2-installer 生成' "$HY2_LOG_DROPIN"; then
+            rm -f "$HY2_LOG_DROPIN"
+            rmdir "${HY2_LOG_DROPIN%/*}" 2>/dev/null || true
+        fi
         systemctl daemon-reload
 
         log_step "清理二进制与配置目录..."

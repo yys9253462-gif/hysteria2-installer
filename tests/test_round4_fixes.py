@@ -43,6 +43,7 @@ class ForwardedAuthTest(unittest.TestCase):
                'data_lock': threading.RLock(), 'data': data, 'ip_tracker': {},
                'IP_TIMEOUT_SECONDS': 180, 'live_online_ips': lambda uid: set(),
                'user_access_denial': portal.user_access_denial,
+               'auth_rate_key': portal.auth_rate_key,
                'user_table': lambda data: (data.get('users')
                    if isinstance(data.get('users'), dict) else {})}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth', 'exec'), env)

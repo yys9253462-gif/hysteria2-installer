@@ -330,7 +330,8 @@ class MeterAccountingTest(unittest.TestCase):
         env = {'json': json, 'time': time, 'hmac': __import__('hmac'), 'ipaddress': __import__('ipaddress'), 'live_online_ips': lambda uid: set(), 'data_lock': threading.RLock(), 'data': self.data,
                'user_table': lambda data: (data.get('users')
                    if isinstance(data.get('users'), dict) else {}),
-               'user_access_denial': portal.user_access_denial}
+               'user_access_denial': portal.user_access_denial,
+               'auth_rate_key': portal.auth_rate_key}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), 'auth-quota', 'exec'), env)
         body = json.dumps({'auth': 'unchanged', 'addr': '127.0.0.1:1234'}).encode()
         class Handler:
