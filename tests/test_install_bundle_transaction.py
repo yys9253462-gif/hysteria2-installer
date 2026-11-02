@@ -121,6 +121,7 @@ exec(compile(code, "bundle-transaction", "exec"))
                 + "\n".join(re.search(r'^' + name + r'=".*"$', SOURCE, re.M).group(0)
                               for name in ("PORTAL_FILES", "METER_FILES")) + "\n"
                 + function("portal_files_ok") + "\n" + function("portal_ensure_py") + "\n"
+                + function("portal_write_meter_config") + "\n"
                 + "portal_ensure_py\n", encoding="utf-8", newline="\n")
             env = dict(os.environ, DEST=dest.as_posix(), PYTHON_EXE=Path(sys.executable).as_posix(),
                        INJECTOR=injector.as_posix(), FAIL_KIND=fail_kind, FAIL_AT=str(fail_at),

@@ -100,11 +100,14 @@ class StaticInvariantsTest(unittest.TestCase):
         只在 !-f 时写会让"配置漂移"永远治不好。
         """
         src = _read_install()
-        # 定位 portal_ensure_py 里的写点
-        m = re.search(r'^portal_ensure_py\(\)\s*\{(.*?)^\}', src, re.M | re.S)
-        self.assertIsNotNone(m, '未找到 portal_ensure_py()')
+        # 定位写点：2026-11-03 起计量配置拆到 portal_write_meter_config（安装流程要先取包、
+        # 写完 config.yaml 再写计量配置），portal_ensure_py 在非 BUNDLE_ONLY 时调用它。
+        m = re.search(r'^portal_write_meter_config\(\)\s*\{(.*?)^\}', src, re.M | re.S)
+        self.assertIsNotNone(m, '未找到 portal_write_meter_config()')
         body = m.group(1)
         self.assertIn('usage-meter-config.json', body)
+        ensure = re.search(r'^portal_ensure_py\(\)\s*\{(.*?)^\}', src, re.M | re.S).group(1)
+        self.assertIn('portal_write_meter_config', ensure)
         # 不允许"读不到 secret 就只 warn 然后继续"
         self.assertNotIn(
             'log_warn "未能从 ${HY2_CONFIG} 读到 trafficStats secret',
@@ -115,11 +118,11 @@ class StaticInvariantsTest(unittest.TestCase):
     def test_hard_fail_on_unrecoverable_meter_config(self):
         """补不上 trafficStats 时必须 return 1，禁止静默降级。"""
         src = _read_install()
-        m = re.search(r'^portal_ensure_py\(\)\s*\{(.*?)^\}', src, re.M | re.S)
+        m = re.search(r'^portal_write_meter_config\(\)\s*\{(.*?)^\}', src, re.M | re.S)
         body = m.group(1)
         self.assertIn(
             'return 1', body,
-            'portal_ensure_py() 在无法建立 trafficStats 时必须 return 1',
+            'portal_write_meter_config() 在无法建立 trafficStats 时必须 return 1',
         )
         self.assertRegex(
             body, r'拒绝以静默降级的方式继续',

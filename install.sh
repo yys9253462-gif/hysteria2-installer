@@ -2415,6 +2415,19 @@ generate_server_config() {
     fi
     select_subscription_port || { log_err "订阅端口分配失败，安装中止。"; return 1; }
 
+    # 先把门户整包取下来、校验通过、落地，再写 config.yaml（2026-11-03 修）。
+    # 旧顺序是先重写 config.yaml（auth 指向新选的 PORTAL_LOCAL_PORT），最后才在
+    # setup_portal 里取门户：三源都失败时安装中止，旧门户还在旧端口跑，config.yaml
+    # 却已指向没人监听的新端口 —— 下次 Hysteria 重启（开机 / 自愈 / 门户操作）
+    # 所有用户都连不上。portal_ensure_py 的计量配置那一步要读 config.yaml 的
+    # trafficStats.secret，所以这里只取包（PORTAL_BUNDLE_ONLY=1），计量配置留到
+    # setup_portal 里写完 config.yaml 之后再做。
+    PORTAL_BUNDLE_ONLY=1 portal_ensure_py || {
+        log_err "门户程序取不到，未改动 ${HY2_CONFIG}，现有服务保持原样。"
+        return 1
+    }
+    PORTAL_BUNDLE_PLACED=1
+
     # 真实计量的 secret：hysteria trafficStats 与 usage-meter-config.json 必须一致。
     # 缺失则计量模块启动即 FileNotFoundError，用量永远「未开始计量」（静默降级）。
     if [[ -z "${METER_SECRET:-}" ]]; then
@@ -3581,6 +3594,17 @@ PYINSTALLBUNDLE
     fi
     rm -rf "$stage"
     [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
+    # 安装流程先只取包（见 generate_server_config），计量配置等 config.yaml 写完再做。
+    if [[ "${PORTAL_BUNDLE_ONLY:-0}" == "1" ]]; then
+        log_info "门户程序已就位: ${dest_dir}/portal.py + portal_assets.py + 计量模块"
+        return 0
+    fi
+    portal_write_meter_config "$dest_dir"
+}
+
+# 计量配置 usage-meter-config.json：secret 取自本机 config.yaml 的 trafficStats。
+portal_write_meter_config() {
+    local dest_dir="${1:-$HY2_DIR}"
     # 计量配置：secret 取自本机 config.yaml 的 trafficStats，
     # 绝不写死进仓库 —— 仓库里只放 usage-meter-config.json.example。
     #
@@ -3757,7 +3781,13 @@ refresh_portal() {
 }
 
 setup_portal() {
-    portal_ensure_py
+    # generate_server_config 已在写 config.yaml 之前取好整包；这里只补计量配置
+    # （它要读刚写好的 trafficStats.secret），不再取第二次 —— 两次取包可能落到不同提交。
+    if [[ "${PORTAL_BUNDLE_PLACED:-0}" == "1" ]]; then
+        portal_write_meter_config "$HY2_DIR" || return 1
+    else
+        portal_ensure_py || return 1
+    fi
     # 只要求 portal.json：凭据文件缺失时 adopt 会重建一份（保留用户与
     # API Key），不能因为一个文件丢了就把整个用户表推倒重建（2026-10-30 修）。
     if [[ "${PRESERVE_PORTAL:-0}" == "1" && -f "$HY2_DIR/portal.json" ]]; then
