@@ -9217,6 +9217,16 @@ if __name__ == '__main__':
                         return False
                     self.server.api_requests.append(now)
                     return True
+                elif bucket == 'api_anon':
+                    # 没带有效 key 的 API 请求单独计数，打满也不影响控制台。
+                    anon = getattr(self.server, 'api_anon_requests', None)
+                    if anon is None:
+                        anon = self.server.api_anon_requests = []
+                    anon[:] = [t for t in anon if now - t < 1]
+                    if len(anon) >= 50:
+                        return False
+                    anon.append(now)
+                    return True
                 elif bucket == 'auth':
                     # 🔴 /auth 专用桶（真实漏洞，2026-10-09 修）：
                     # 原来 /auth 完全不限流，理由写的是「来自 127.0.0.1 豁免」——
@@ -9446,10 +9456,13 @@ if __name__ == '__main__':
 
             # 2. REST API 接口通道 (独立 API 速率桶)
             if self.path.startswith('/api/v1/'):
-                if not self.check_rate_limit(bucket='api'):
+                # 先验 key 再分桶（2026-11-03 修）：旧实现先扣共享的 api 桶，任何人
+                # 不带 key 每秒打 50 次，控制台的停用 / 删除就全部 429，撤销卡住。
+                api_authed = self.verify_api_key()
+                if not self.check_rate_limit(bucket='api' if api_authed else 'api_anon'):
                     return self.reply(429, b'Too many requests')
 
-                if not self.verify_api_key():
+                if not api_authed:
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized API key'})
 
                 try:
@@ -12912,9 +12925,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if self.path.split('?', 1)[0] == '/api/health':
                 return self.reply_json(200, {'ok': True})
             if self.path.startswith('/api/v1/'):
-                if not self.check_rate_limit(bucket='api'):
+                api_authed = self.verify_api_key()
+                if not self.check_rate_limit(bucket='api' if api_authed else 'api_anon'):
                     return self.reply(429, b'Too many requests')
-                if not self.verify_api_key():
+                if not api_authed:
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized API key'})
                 sub = self.path[len('/api/v1/'):].split('?', 1)[0]
                 # 下方比较前 sub 已在上游剥掉 query（见 8160 行 split('?', 1)[0]），
@@ -14413,6 +14427,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
     server = ThreadingHTTPServer(('127.0.0.1', data['port']), Handler)
     server.requests, server.failures, server.api_requests = [], [], []
+    server.api_anon_requests = []
     # /auth 专用限流桶（2026-10-09）：见 auth_rate_limited() 的说明 ——
     # /auth 经 masquerade 对公网可达，必须有独立的速率+失败计数。
     # auth_requests 仍供 check_rate_limit('auth') 使用；/auth 本身走按来源分桶的 auth_limiter（H4）。
