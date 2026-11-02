@@ -7394,6 +7394,12 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
         m = json.loads(meta_file.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return False
+    # 合法 JSON 但不是对象（[] / "x" / null）时同样当作「读不到」（2026-11-03 修）：
+    # 旧写法 dict(m) 抛 TypeError、m.get 抛 AttributeError，selfheal 由 timer 每 30 分钟
+    # 和证书目录变更触发，于是每次都以 traceback 失败，自愈永远不跑。
+    if not isinstance(m, dict):
+        print('[portal] selfheal 跳过：client_meta.json 不是 JSON 对象', file=sys.stderr)
+        return False
 
     before = dict(m)
     live_cert, _, _, _ = _resolve_live_cert(root, config_path)
