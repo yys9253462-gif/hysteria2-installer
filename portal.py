@@ -127,6 +127,12 @@ MASTER_USER_ID = 'admin_master'
 # 若允许真实用户叫这个名字，其流量会与占位记录聚合到同一 email，
 # 统计串号、按 email 收回时也会误伤。与机主账号同样禁止。
 RESERVED_USER_IDS = frozenset({MASTER_USER_ID, 'placeholder'})
+# 机主账号的到期时间：9999-12-31，与 create / renew / update 的上界一致（2026-11-03 修）。
+# 旧值 2085974400 是 2036-02-07：过了那天 /auth 对机主报「已过期」，而 renew / update
+# 都拒绝保留 ID，只能手改 portal.json。不能省略字段（省略即永久）：users/list 把
+# 永久账号报成 expires_at=0，控制台会读这个值。
+MASTER_EXPIRES_AT = 253402300799
+LEGACY_MASTER_EXPIRES_AT = 2085974400
 # user_id 的唯一格式定义。serve() 内沿用同名局部变量指向它，
 # 模块级辅助函数（撤销队列清洗等）也用它，避免两套规则漂移。
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
@@ -7169,7 +7175,7 @@ def prepare(meta_path, port, node_api_key=None):
     users = {
         MASTER_USER_ID: {
             'password': m['auth_password'],
-            'expires_at': 2085974400,
+            'expires_at': MASTER_EXPIRES_AT,
             'ip_limit': 0,
             'limit_bytes': 0,
             'used_bytes': 0,
@@ -7271,7 +7277,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
         data['users'] = {
             MASTER_USER_ID: {
                 'password': m['auth_password'],
-                'expires_at': 2085974400,
+                'expires_at': MASTER_EXPIRES_AT,
                 'ip_limit': 0,
                 'limit_bytes': 0,
                 'used_bytes': 0,
@@ -7406,8 +7412,11 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     access, _rebuilt = ensure_portal_access(root, m, data)
     data['port'] = int(port)
     master = data.setdefault('users', {}).setdefault(MASTER_USER_ID, {
-        'expires_at': 2085974400, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
+        'expires_at': MASTER_EXPIRES_AT, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
         'status': 'active', 'created_at': int(time.time()), 'note': 'Master Admin'})
+    # 老节点上的机主账号带着 2036 年的到期时间，adopt 时顺手改成新值。
+    if isinstance(master, dict) and master.get('expires_at') == LEGACY_MASTER_EXPIRES_AT:
+        master['expires_at'] = MASTER_EXPIRES_AT
     # auth_password 缺失时不要崩（旧备份 / 手写 meta 可能没有这个键）：
     # 保留旧的主密码，比让整个 adopt 失败要好。
     if isinstance(m.get('auth_password'), str) and m['auth_password']:
