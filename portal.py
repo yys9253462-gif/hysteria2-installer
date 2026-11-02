@@ -773,6 +773,25 @@ def build_warp_acl_config(original, enabled, rules):
     return text.rstrip('\n') + '\n\n' + '\n'.join(lines) + '\n'
 
 
+def _egress_pending_count(value):
+    """待应用计数；被改坏成非数字时按 0 处理。
+
+    必须在模块级（2026-11-03 修）：它曾写在 Handler 类体里，类里的方法按裸名
+    找不到它，每次「应用出站 / WARP」都在 save 之后抛 NameError 回 500，
+    配置写进了 portal.json 却从未下发。
+
+    旧写法 int(data.get('_egress_pending', 0)) 在值是 "abc"/列表/None 时
+    抛异常，位置在**返回响应之前** —— 用户点了「应用」，请求直接 500，
+    而配置其实一行都没写。
+    """
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def normalize_route_rules(rules):
     # 容器被改成数字/对象时旧写法 `for item in rules` 抛 TypeError，
     # 而它在 render_egress_config 里 —— WARP 分流保存永久失败。
@@ -10871,20 +10890,6 @@ if __name__ == '__main__':
                 return self.reply_json(500, {'ok': False, 'error': '操作超时，请查看服务器日志'})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
-
-        def _egress_pending_count(value):
-            """待应用计数；被改坏成非数字时按 0 处理。
-
-            旧写法 int(data.get('_egress_pending', 0)) 在值是 "abc"/列表/None 时
-            抛异常，位置在**返回响应之前** —— 用户点了「应用」，请求直接 500，
-            而配置其实一行都没写。
-            """
-            if isinstance(value, bool):
-                return 0
-            try:
-                return max(0, int(value))
-            except (TypeError, ValueError, OverflowError):
-                return 0
 
         def _reply_with_egress_apply(self, payload, kind='outbound'):
             with data_lock:
