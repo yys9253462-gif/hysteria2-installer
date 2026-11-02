@@ -1544,6 +1544,47 @@ class WebWorkflowTests(unittest.TestCase):
             self.assertEqual(portal.resolve_update_ref('a' * 40), 'a' * 40)
         open_.assert_not_called()
 
+    def awg_suspended_fixture(self, suspended):
+        """整机超额停用时 AWG 的启动类操作必须被拒；awgctl / systemctl 都是桩。"""
+        awg_calls = []
+        self.ns.update(
+            AWG_SVC_NAME='amneziawg-server',
+            VALID_AWG_NAME_RE=portal.re.compile(r'^[A-Za-z0-9_.\-]{1,32}$'),
+            awg_installed=lambda: True, ensure_awgctl=lambda force=False: True,
+            awg_state=lambda: {'line': '3'},
+            awg_run=lambda args, timeout=0: awg_calls.append(args) or (0, '', ''),
+            awg_err_tail=lambda *a, **kw: '',
+            awg_endpoint_error=lambda endpoint: '',
+            unit_suspended=lambda unit: suspended and unit == 'amneziawg-server')
+        return awg_calls
+
+    def test_awg_start_actions_are_refused_while_node_is_suspended(self):
+        for action, extra in (('start', {}), ('restart', {}), ('update', {}),
+                              ('set_line', {'line': '2'})):
+            with self.subTest(action=action):
+                awg_calls = self.awg_suspended_fixture(True)
+                self.run.reset_mock()
+                status, payload = self.invoke('_h_post_manage_amneziawg',
+                                              dict({'action': action}, **extra))
+                self.assertEqual(status, 409, payload)
+                self.assertEqual(awg_calls, [])
+                self.run.assert_not_called()
+
+    def test_awg_peer_changes_still_work_while_node_is_suspended(self):
+        """peer 增删只改文件，服务没跑时 awgctl 不碰接口，停用期间照常可做。"""
+        awg_calls = self.awg_suspended_fixture(True)
+        status, payload = self.invoke('_h_post_manage_amneziawg',
+                                      {'action': 'peer_del', 'name': 'phone'})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(awg_calls, [['peer-del', 'phone']])
+
+    def test_awg_start_runs_when_node_is_not_suspended(self):
+        self.awg_suspended_fixture(False)
+        status, payload = self.invoke('_h_post_manage_amneziawg', {'action': 'start'})
+        self.assertEqual(status, 200, payload)
+        self.run.assert_called_once()
+        self.assertEqual(self.run.call_args[0][0], ['systemctl', 'start', 'amneziawg-server'])
+
 
 if __name__ == '__main__':
     unittest.main()

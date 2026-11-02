@@ -10154,6 +10154,10 @@ if __name__ == '__main__':
                     if not awg_installed():
                         return self.reply_json(400, {'ok': False,
                                                      'error': 'AmneziaWG 尚未安装'})
+                    # awgctl update 结尾会重启服务：停用期间同样不能做（见 manage-amneziawg）。
+                    if unit_suspended(AWG_SVC_NAME):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
                     # 先刷新控制脚本自身，再更新二进制。不需要重启面板。
                     ensure_awgctl(force=True)
                     # awgctl update 要下载并核验二进制，超时 420 秒。
@@ -10648,6 +10652,12 @@ if __name__ == '__main__':
 
                 if not awg_installed():
                     return self.reply_json(400, {'ok': False, 'error': 'AmneziaWG 尚未安装'})
+                # 整机流量超额停用期间不能拉起 AWG（2026-11-03 修，与其它协议一致）：
+                # update / set_line 结尾会 systemctl restart，start / restart 更是直接启动，
+                # 停用就形同虚设。peer 增删只改文件、服务没跑时不碰接口，可以照常做。
+                if action in ('set_line', 'update', 'start', 'restart') and unit_suspended(AWG_SVC_NAME):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
                 if not ensure_awgctl():
                     return self.reply_json(500, {'ok': False, 'error': 'hy2-awgctl 不可用'})
 
