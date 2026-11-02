@@ -1473,7 +1473,10 @@ EOF
 acquire_lock() {
     builtin command -v flock >/dev/null 2>&1 || die "缺少 flock，无法安全串行化 AWG 修改；请安装 util-linux 后重试"
     local lock_file="${AWG_LOCK_FILE:-/run/hy2-awgctl.lock}"
-    exec 9>"$lock_file" 2>/dev/null || die "无法打开 AWG 操作锁 ${lock_file}，拒绝并发修改"
+    # 2>/dev/null 必须只作用于打开锁文件这一步（2026-11-03 修）：只有重定向的
+    # `exec 9>f 2>/dev/null` 会把 fd 2 也永久改掉，之后所有 log_err / die 与
+    # journalctl 诊断都被吞掉，门户只看到「退出码 1」。
+    { exec 9>"$lock_file"; } 2>/dev/null || die "无法打开 AWG 操作锁 ${lock_file}，拒绝并发修改"
     flock -w 300 9 || die "另一个 hy2-awgctl 操作仍在进行，请稍后重试"
 }
 

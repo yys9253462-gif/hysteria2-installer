@@ -245,6 +245,21 @@ class AwgctlLockTest(unittest.TestCase):
         result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 9, result.stdout + result.stderr)
 
+    def test_stderr_still_reaches_caller_after_taking_the_lock(self):
+        """拿到锁之后的报错必须还能到 stderr（2026-11-03）。
+
+        旧写法 `exec 9>"$lock" 2>/dev/null` 把 fd 2 永久重定向：之后 install / update /
+        peer-add 的 log_err、die、journalctl 诊断全没了，门户只看到「退出码 1」。
+        这里用真实的 die / log_err，不替换成写 stdout 的版本。
+        """
+        lock = Path(tempfile.mkdtemp()) / 'awgctl.lock'
+        script = ('source <(sed \'$d\' %s); AWG_LOCK_FILE=%s; acquire_lock; '
+                  'echo "diag-after-lock" >&2; die "fatal-after-lock"' % (ROOT / 'awgctl.sh', lock))
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('diag-after-lock', result.stderr)
+        self.assertIn('fatal-after-lock', result.stderr)
+
 
 @unittest.skipIf(shutil.which('bash') is None, 'requires Bash')
 class AwgctlUninstallSafetyTests(unittest.TestCase):
