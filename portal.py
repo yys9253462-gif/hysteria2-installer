@@ -14083,8 +14083,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(400, {'ok': False, 'error': '缺少 domain 参数'})
                 rule_error = None
                 with data_lock:
-                    rules = [({'domain': r, 'outbound': 'warp_socks'} if isinstance(r, str) else dict(r))
-                             for r in data.get('warp_rules', [])]
+                    # 与 render_egress_config 同一套归一化：缺 domain 的对象、数字等坏条目
+                    # 在这里 r['domain'] 抛 KeyError，所有规则增删都 500（2026-11-03 修）。
+                    rules = normalize_route_rules(routing_state(data)['warp_rules'])
                     if action == 'rule-add':
                         cleaned = re.sub(r'^[a-zA-Z]+://', '', dom).split('/')[0].split(':')[0].strip('.')
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()
