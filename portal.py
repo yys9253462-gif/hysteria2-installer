@@ -6629,12 +6629,15 @@ _REALITY_RESERVED_PORTS = {
 _REALITY_PORT_CANDIDATES = [443, 8443, 2053, 2083, 2087, 2096, 9443, 5443, 8444]
 
 
-def _pick_reality_port(preferred=None, extra_blocked=None):
+def _pick_reality_port(preferred=None, extra_blocked=None, default=None):
     """挑一个**确实没被占用**的端口给 Reality 用。
 
     参数：
         preferred    —— 期望端口（来自已有配置或调用方指定）。可用就直接用它。
         extra_blocked—— 额外要避开的端口（如本机 hy2 的 listen_port）。
+        default      —— 协议的默认端口（VMess 2087 等）。排在候选表最前，但和
+                        其它候选一样要查监听表；不能当作 preferred 传进来 ——
+                        preferred 视为「自己的」端口，会跳过监听检查（2026-11-03）。
 
     返回 (port, reason)：
         port 为 0 表示**没找到可用端口**，调用方应当报错而不是硬塞一个。
@@ -6725,8 +6728,10 @@ def _pick_reality_port(preferred=None, extra_blocked=None):
     if pref and free(pref):
         return pref, '沿用已配置端口 %d（空闲）' % pref
 
-    # 2) 按候选顺序找第一个空闲的
-    for cand in _REALITY_PORT_CANDIDATES:
+    # 2) 按候选顺序找第一个空闲的（协议默认端口排最前）
+    first = _as_port(default)
+    candidates = ([first] if first else []) + [c for c in _REALITY_PORT_CANDIDATES if c != first]
+    for cand in candidates:
         if free(cand):
             if pref:
                 return cand, ('原端口 %d 已被占用，自动改用 %d' % (pref, cand))
@@ -11177,7 +11182,7 @@ if __name__ == '__main__':
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config')
             blocked.add(reality_port)
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port') or 2087,
+                preferred=old.get('port'), default=2087,
                 extra_blocked=blocked)
             if not listen_port:
                 raise RuntimeError(reason)
@@ -11283,7 +11288,7 @@ if __name__ == '__main__':
                 _data_now = dict(data)
             blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config')
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port') or 2088, extra_blocked=blocked_ports)
+                preferred=old.get('port'), default=2088, extra_blocked=blocked_ports)
             if not listen_port:
                 raise RuntimeError(reason)
             decryption = old.get('decryption', '')
@@ -11694,7 +11699,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config')
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port') or 2096, extra_blocked=blocked)
+                preferred=old.get('port'), default=2096, extra_blocked=blocked)
             if not listen_port:
                 raise RuntimeError(reason)
             new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
