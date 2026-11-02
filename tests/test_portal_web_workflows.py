@@ -83,7 +83,8 @@ class WebWorkflowTests(unittest.TestCase):
                        firewall_port=Mock(return_value=True))
         self.sync = Mock(return_value=True)
         self.handler = SimpleNamespace(is_authenticated=lambda: True, server=SimpleNamespace(),
-            _sync_reality_clients=self.sync, _reply_with_warp_apply=lambda payload: self.reply_json(200, payload),
+            _sync_reality_clients=self.sync, _kick_old_password_sessions=Mock(return_value=True),
+            _reply_with_warp_apply=lambda payload: self.reply_json(200, payload),
             _generate_and_apply_reality=Mock(), _reality_restart_allowed=Mock(return_value=True),
             _extend_deadline=lambda *args, **kwargs: True,
             check_rate_limit=lambda **kwargs: True, verify_api_key=lambda: True)
@@ -867,6 +868,32 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertGreater(persisted_renew['expires_at'], persisted_update['expires_at'])
         self.assertGreater(persisted_renew['limit_bytes'], persisted_update['limit_bytes'])
         self.assertGreaterEqual(self.save.call_count, 2)
+
+    def test_password_change_kicks_sessions_using_the_old_password(self):
+        """改密码后，用旧密码连着的 Hy2 会话必须被踢；只改别的字段时不踢（2026-11-03 修）。"""
+        kick = self.handler._kick_old_password_sessions = Mock(return_value=True)
+        self.data['users']['qa-user'] = {'password': 'old', 'status': 'active',
+            'expires_at': 2200000000, 'limit_bytes': 10, 'ip_limit': 0}
+        self.assertEqual(self.invoke_api({'user_id': 'qa-user', 'ip_limit': 3}, 'users/update')[0], 200)
+        kick.assert_not_called()
+        self.assertEqual(self.invoke_api({'user_id': 'qa-user', 'password': 'rotated'}, 'users/update')[0], 200)
+        kick.assert_called_once_with('qa-user')
+        kick.reset_mock()
+        self.assertEqual(self.invoke_api({'user_id': 'qa-user', 'password': 'again', 'duration_days': 30})[0], 200)
+        kick.assert_called_once_with('qa-user')
+        kick.reset_mock()
+        self.assertEqual(self.invoke_api({'user_id': 'fresh-user', 'password': 'pw-new', 'duration_days': 30})[0], 200)
+        kick.assert_not_called()
+
+    def test_kick_helper_targets_only_hy2_and_survives_failure(self):
+        helper = extract_method('_kick_old_password_sessions', self.ns)
+        calls = []
+        self.ns['kick_hy2_users'] = lambda root, uids: calls.append(list(uids)) or True
+        self.ns.setdefault('_log_ignored', lambda *a: None)
+        self.assertTrue(helper(self.handler, 'qa-user'))
+        self.assertEqual(calls, [['qa-user']])
+        self.ns['kick_hy2_users'] = Mock(side_effect=OSError('stats down'))
+        self.assertFalse(helper(self.handler, 'qa-user'))
 
     def test_api_update_and_renew_restore_memory_on_save_failure(self):
         original = {'password': 'old', 'status': 'active', 'expires_at': 2200000000,

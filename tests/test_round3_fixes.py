@@ -184,6 +184,7 @@ class LiveIpLimitTest(unittest.TestCase):
                'data': data, 'ip_tracker': {}, 'IP_TIMEOUT_SECONDS': 180,
                'global_ip_deny': {}, 'active_ip_deny': portal.active_ip_deny,
                'user_access_denial': portal.user_access_denial,
+               'user_ip_limit': portal.user_ip_limit,
                'auth_rate_key': portal.auth_rate_key,
                'user_table': lambda data: (data.get('users')
                    if isinstance(data.get('users'), dict) else {}),

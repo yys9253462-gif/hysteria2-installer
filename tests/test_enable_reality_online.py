@@ -34,4 +34,28 @@ class EnableTests(unittest.TestCase):
    with patch.object(m.subprocess,'run',side_effect=subprocess.CalledProcessError(23,['xray'])):
     with self.assertRaises(subprocess.CalledProcessError):m.enable_reality_online(str(p),'xray','127.0.0.1:19997')
    self.assertEqual(p.read_bytes(),old)
+class BackupAndErrorTests(unittest.TestCase):
+ """备份不随改动累积；回滚重启失败不能盖住原始错误（2026-11-03 修）。"""
+ def test_repeated_changes_keep_one_backup(self):
+  with tempfile.TemporaryDirectory() as d:
+   p=Path(d)/'xray.json'
+   for level in (1,2,3):
+    p.write_text(json.dumps({'inbounds':[{'settings':{'clients':[{'id':'x','level':level}]}}]}))
+    with patch.object(m.subprocess,'run'):m.enable_reality_online(str(p),'xray','127.0.0.1:19997')
+   backups=[f.name for f in Path(d).iterdir() if 'before-reality-online' in f.name]
+   self.assertEqual(len(backups),1,backups)
+ def test_rollback_restart_failure_keeps_original_error(self):
+  with tempfile.TemporaryDirectory() as d:
+   p=Path(d)/'xray.json';old=b'{"inbounds": []}';p.write_bytes(old)
+   restarts=[]
+   def run(args,**kwargs):
+    if args[:2]==['xray','api']:raise RuntimeError('stats api unreachable')
+    if args==['systemctl','restart','xray']:
+     restarts.append(1)
+     if len(restarts)==2:  # 回滚那次重启失败
+      if kwargs.get('check'):raise subprocess.CalledProcessError(1,args)
+      return subprocess.CompletedProcess(args,1)
+   with patch.object(m.subprocess,'run',side_effect=run):
+    with self.assertRaisesRegex(RuntimeError,'stats api unreachable'):m.enable_reality_online(str(p),'xray','127.0.0.1:19997')
+   self.assertEqual(p.read_bytes(),old)
 if __name__=='__main__':unittest.main()

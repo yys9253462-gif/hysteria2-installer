@@ -49,7 +49,7 @@ extract_fn() {
 }
 
 for fn in port_owner detect_webserver_squatting find_cert_in_webserver \
-          _accept_cert_pair _nginx_cert_candidates; do
+          pem_cert_count _accept_cert_pair _nginx_cert_candidates; do
     _f="$(extract_fn "$fn")"
     if [[ -z "$_f" ]]; then
         echo "❌ 未能从 install.sh 提取到函数 $fn（脚本结构变了？）" >&2

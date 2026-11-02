@@ -127,6 +127,12 @@ MASTER_USER_ID = 'admin_master'
 # 若允许真实用户叫这个名字，其流量会与占位记录聚合到同一 email，
 # 统计串号、按 email 收回时也会误伤。与机主账号同样禁止。
 RESERVED_USER_IDS = frozenset({MASTER_USER_ID, 'placeholder'})
+# 机主账号的到期时间：9999-12-31，与 create / renew / update 的上界一致（2026-11-03 修）。
+# 旧值 2085974400 是 2036-02-07：过了那天 /auth 对机主报「已过期」，而 renew / update
+# 都拒绝保留 ID，只能手改 portal.json。不能省略字段（省略即永久）：users/list 把
+# 永久账号报成 expires_at=0，控制台会读这个值。
+MASTER_EXPIRES_AT = 253402300799
+LEGACY_MASTER_EXPIRES_AT = 2085974400
 # user_id 的唯一格式定义。serve() 内沿用同名局部变量指向它，
 # 模块级辅助函数（撤销队列清洗等）也用它，避免两套规则漂移。
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
@@ -141,7 +147,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.13'
+PORTAL_VERSION = '2.14'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -616,6 +622,10 @@ PRIVATE_REJECT_RULES = ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0
 # 规则用 routing.rules 的 ip 匹配（不是 domain）：即使客户端不做 DNS 解析、
 # 直接连 IP 也能挡住。block 出站排在 freedom 之前，且是 blackhole。
 XRAY_PRIVATE_REJECT_IPS = [c for c in PRIVATE_REJECT_RULES]
+# GOST 代理同样不能当跳板进内网 / 云元数据 / 本机门户与计量端口（2026-11-03 修）。
+# GOST 的 bypass 匹配的是请求里的目标地址，不做解析后检查：解析到内网的域名
+# 仍能穿过，这一点弱于 Xray 的 IPIfNonMatch，SE 实测确认。
+GOST_PRIVATE_BYPASS = 'hy2-private-guard'
 XRAY_BLOCK_OUTBOUND_TAG = 'block-private'
 
 
@@ -767,6 +777,25 @@ def build_warp_acl_config(original, enabled, rules):
             lines.append('    - %s(suffix:%s)' % (target, domain))
     lines.append('    - %s(all)' % tail)
     return text.rstrip('\n') + '\n\n' + '\n'.join(lines) + '\n'
+
+
+def _egress_pending_count(value):
+    """待应用计数；被改坏成非数字时按 0 处理。
+
+    必须在模块级（2026-11-03 修）：它曾写在 Handler 类体里，类里的方法按裸名
+    找不到它，每次「应用出站 / WARP」都在 save 之后抛 NameError 回 500，
+    配置写进了 portal.json 却从未下发。
+
+    旧写法 int(data.get('_egress_pending', 0)) 在值是 "abc"/列表/None 时
+    抛异常，位置在**返回响应之前** —— 用户点了「应用」，请求直接 500，
+    而配置其实一行都没写。
+    """
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def normalize_route_rules(rules):
@@ -5582,6 +5611,20 @@ REALITY_IPLIMIT_RELEASE_SECONDS = 180
 REALITY_IPLIMIT_TAG_PREFIX = 'iplimit-'
 
 
+def user_ip_limit(info):
+    """账户的设备上限，Hy2 鉴权与 Reality 设备限制共用这一份（2026-11-03 修）。
+
+    bool 是 int 的子类：True 会被静默算成「1 个设备」，把一个本应不限设备的
+    账号限成单设备（JSON 里写成 true 就会触发）。旧实现只有 Reality 一侧跳过
+    bool，同一条记录在 Hy2 上限 1 台、在 Reality 上不限。
+    无法解析时抛 ValueError / TypeError，由调用方决定拒绝还是跳过。
+    """
+    raw = info.get('ip_limit', 0)
+    if isinstance(raw, bool):
+        return 0
+    return int(raw)
+
+
 def active_ip_limits(users):
     """逐账户读取设备上限，损坏记录不能撤销其他账户的拦截。"""
     # 调用方传的是 user_table(data)，但 ip_limit worker 也会直接传快照；
@@ -5592,13 +5635,8 @@ def active_ip_limits(users):
     for uid, info in users.items():
         if not user_access_allowed(info):
             continue
-        raw = info.get('ip_limit', 0)
-        # bool 是 int 的子类：True 会被静默算成「1 个设备」，把一个本应
-        # 不限设备的账号限成单设备（JSON 里写成 true 就会触发）。
-        if isinstance(raw, bool):
-            continue
         try:
-            limit = int(raw)
+            limit = user_ip_limit(info)
         except (ValueError, TypeError, OverflowError):
             continue
         if limit > 0:
@@ -7137,7 +7175,7 @@ def prepare(meta_path, port, node_api_key=None):
     users = {
         MASTER_USER_ID: {
             'password': m['auth_password'],
-            'expires_at': 2085974400,
+            'expires_at': MASTER_EXPIRES_AT,
             'ip_limit': 0,
             'limit_bytes': 0,
             'used_bytes': 0,
@@ -7239,7 +7277,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
         data['users'] = {
             MASTER_USER_ID: {
                 'password': m['auth_password'],
-                'expires_at': 2085974400,
+                'expires_at': MASTER_EXPIRES_AT,
                 'ip_limit': 0,
                 'limit_bytes': 0,
                 'used_bytes': 0,
@@ -7374,8 +7412,11 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     access, _rebuilt = ensure_portal_access(root, m, data)
     data['port'] = int(port)
     master = data.setdefault('users', {}).setdefault(MASTER_USER_ID, {
-        'expires_at': 2085974400, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
+        'expires_at': MASTER_EXPIRES_AT, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
         'status': 'active', 'created_at': int(time.time()), 'note': 'Master Admin'})
+    # 老节点上的机主账号带着 2036 年的到期时间，adopt 时顺手改成新值。
+    if isinstance(master, dict) and master.get('expires_at') == LEGACY_MASTER_EXPIRES_AT:
+        master['expires_at'] = MASTER_EXPIRES_AT
     # auth_password 缺失时不要崩（旧备份 / 手写 meta 可能没有这个键）：
     # 保留旧的主密码，比让整个 adopt 失败要好。
     if isinstance(m.get('auth_password'), str) and m['auth_password']:
@@ -8141,6 +8182,7 @@ def serve(path):
                         },
                     },
                     'listener': {'type': 'tcp'},
+                    'bypass': GOST_PRIVATE_BYPASS,
                 }
                 if ptype == 'https':
                     cert_file, key_file = gost_tls_paths(portal_path.parent)
@@ -8148,7 +8190,9 @@ def serve(path):
                         'certFile': cert_file, 'keyFile': key_file}}
                 services.append(entry)
 
-        cfg = {'services': services}
+        cfg = {'services': services,
+               'bypasses': [{'name': GOST_PRIVATE_BYPASS,
+                             'matchers': list(PRIVATE_REJECT_RULES) + ['localhost', '*.localhost']}]}
         # gost.yml 里有代理账号密码，与 portal.json 同样必须一创建就是 0600。
         atomic_write_private(gost_cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8'))
 
@@ -8765,10 +8809,20 @@ if __name__ == '__main__':
     # 每次登录得到同一个值、永不过期（Max-Age 只约束浏览器），泄露即永久可用。
     SESSION_MAX_AGE = 30 * 86400
 
+    # 退出登录要让服务端也作废会话（2026-11-03 修）：此前只清浏览器 Cookie，
+    # 被复制走的 Cookie 在 30 天内照样能用。session_secret 同时是分享链接 k 的
+    # 密钥，不能为登出轮换它；改为把纪元号签进会话，登出时纪元 +1。
+    def session_epoch():
+        value = data.get('session_epoch', 0)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    def _session_sig(token, issued_at, epoch):
+        msg = f'sess:{token}:{issued_at}' if epoch == 0 else f'sess:{token}:{issued_at}:{epoch}'
+        return hmac.new(session_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
     def sign_session(token, issued_at=None):
         issued_at = int(time.time()) if issued_at is None else int(issued_at)
-        sig = hmac.new(session_secret.encode(), f'sess:{token}:{issued_at}'.encode(), hashlib.sha256).hexdigest()
-        return f'{token}.{issued_at}.{sig}'
+        return f'{token}.{issued_at}.{_session_sig(token, issued_at, session_epoch())}'
 
     def verify_session(cookie_header):
         if not cookie_header:
@@ -8786,7 +8840,7 @@ if __name__ == '__main__':
         t, issued_at, sig = parts
         if not 0 <= time.time() - int(issued_at) <= SESSION_MAX_AGE:
             return False
-        expected = hmac.new(session_secret.encode(), f'sess:{t}:{issued_at}'.encode(), hashlib.sha256).hexdigest()
+        expected = _session_sig(t, issued_at, session_epoch())
         return hmac.compare_digest(t, data['token']) and hmac.compare_digest(sig, expected)
 
     # SPEEDTEST_TARGETS 是 /api/v1/speedtest 的**唯一**靶点来源。
@@ -8829,6 +8883,20 @@ if __name__ == '__main__':
     )
 
     class Handler(BaseHTTPRequestHandler):
+        def _kick_old_password_sessions(self, user_id):
+            """改密码后断开该用户的 Hy2 会话（2026-11-03 修）。
+
+            用户仍然允许接入，不在撤销名单里：旧实现下用泄露的旧密码连着的会话
+            一直保持到自然断开。只踢 Hy2 —— 走 apply_access(force_ids) 会重启
+            Xray，把所有人的 Reality / VMess 会话一起断掉。踢失败不影响改密结果，
+            断线重连时 /auth 已经只认新密码。
+            """
+            try:
+                return kick_hy2_users(portal_path.parent, [user_id])
+            except Exception as exc:
+                _log_ignored('password_change_kick', exc)
+                return False
+
         def _sync_reality_clients(self, core_lock_fd=None):
             # 名字保留（调用点很多），实际语义已扩展为「同步所有托管入站」：
             # Reality 与 VMess 的 clients 都由 enforce_node_access 一并收回。
@@ -9348,7 +9416,7 @@ if __name__ == '__main__':
                         if deny is None and client_ip and client_ip in active_ip_deny(global_ip_deny, matched_uid, now_ts):
                             deny = 'Device limit exceeded across nodes'
                         try:
-                            ip_limit = int(matched_user.get('ip_limit', 0))
+                            ip_limit = user_ip_limit(matched_user)
                         except (ValueError, TypeError, OverflowError):
                             deny = deny or 'Invalid user record'
                         if deny is None:
@@ -9484,6 +9552,7 @@ if __name__ == '__main__':
                     # 时会阻塞到连接超时）等于把全节点的鉴权一起卡住。
                     conflict = None
                     durability_uncertain = False
+                    password_changed = False
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
                         # 只认明确的真值：字符串 "0"/"false" 不该被当成 true。
@@ -9532,6 +9601,8 @@ if __name__ == '__main__':
                                     record['expires_at'] = existing.get('expires_at', record['expires_at'])
                             if existing is not None:
                                 rotate_user_view_key_on_change(existing, record)
+                                password_changed = (isinstance(existing, dict)
+                                                    and existing.get('password') != record.get('password'))
                             if conflict is None and 'used_bytes' in params:
                                 # 同一共享锁覆盖对账、用户写入和落盘；失败时仅回滚
                                 # 本请求的两个字段。replace 后目录 fsync 失败属于未知
@@ -9597,6 +9668,8 @@ if __name__ == '__main__':
                     else:
                         if not self._sync_reality_clients():
                             return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if password_changed:
+                        self._kick_old_password_sessions(user_id)
                     if durability_uncertain:
                         return self.reply_json(503, {'ok': False,
                             'error': 'Reconciliation saved but durability uncertain; verify and retry'})
@@ -9686,6 +9759,7 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid attribute'})
                     conflict = None
                     durability_uncertain = False
+                    password_changed = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
                         if u is None:
@@ -9695,6 +9769,7 @@ if __name__ == '__main__':
                         else:
                             previous = copy.deepcopy(u)
                             u.update(changes)
+                            password_changed = previous.get('password') != u.get('password')
                             rotate_user_view_key_on_change(previous, u)
                             try:
                                 save_data()
@@ -9715,6 +9790,8 @@ if __name__ == '__main__':
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if password_changed:
+                        self._kick_old_password_sessions(user_id)
                     if durability_uncertain:
                         return self.reply_json(503, {'ok': False,
                             'error': 'User update saved but durability uncertain; verify and retry'})
@@ -10080,6 +10157,15 @@ if __name__ == '__main__':
             # 退出登录（2026-10-29 加）：此前没有任何登出入口，勾了「记住我」
             # 的用户只能去浏览器里手删 Cookie，共用电脑时不安全。
             if self.path == prefix + 'logout':
+                # 只有带着有效会话的登出才作废服务端会话：不鉴权的登出若也能
+                # 推进纪元，任何人反复 POST 就能把机主一直踢下线。
+                if verify_session(self.headers.get('Cookie')):
+                    with data_lock:
+                        data['session_epoch'] = session_epoch() + 1
+                    try:
+                        save_data()
+                    except OSError as exc:
+                        _log_ignored('logout_epoch_save', exc)
                 self.send_response(302)
                 self._responded = True
                 self.send_header('Location', prefix)
@@ -10855,20 +10941,6 @@ if __name__ == '__main__':
                 return self.reply_json(500, {'ok': False, 'error': '操作超时，请查看服务器日志'})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
-
-        def _egress_pending_count(value):
-            """待应用计数；被改坏成非数字时按 0 处理。
-
-            旧写法 int(data.get('_egress_pending', 0)) 在值是 "abc"/列表/None 时
-            抛异常，位置在**返回响应之前** —— 用户点了「应用」，请求直接 500，
-            而配置其实一行都没写。
-            """
-            if isinstance(value, bool):
-                return 0
-            try:
-                return max(0, int(value))
-            except (TypeError, ValueError, OverflowError):
-                return 0
 
         def _reply_with_egress_apply(self, payload, kind='outbound'):
             with data_lock:
@@ -14062,8 +14134,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(400, {'ok': False, 'error': '缺少 domain 参数'})
                 rule_error = None
                 with data_lock:
-                    rules = [({'domain': r, 'outbound': 'warp_socks'} if isinstance(r, str) else dict(r))
-                             for r in data.get('warp_rules', [])]
+                    # 与 render_egress_config 同一套归一化：缺 domain 的对象、数字等坏条目
+                    # 在这里 r['domain'] 抛 KeyError，所有规则增删都 500（2026-11-03 修）。
+                    rules = normalize_route_rules(routing_state(data)['warp_rules'])
                     if action == 'rule-add':
                         cleaned = re.sub(r'^[a-zA-Z]+://', '', dom).split('/')[0].split(':')[0].strip('.')
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()

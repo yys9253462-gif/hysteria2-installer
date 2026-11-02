@@ -610,8 +610,15 @@ render_server_config() {
         # WireGuard 官方文档同样是两个方向都放行。
         # 回程方向额外用 conntrack 限定为已建立连接：比官方写法更严
         # （避免任意来源的包都被转发进隧道），对"客户端上网"这个场景完全够用。
-        echo "PostUp = sysctl -qw net.ipv4.ip_forward=1; iptables -I FORWARD -i ${AWG_LINK} -j ACCEPT; iptables -I FORWARD -o ${AWG_LINK} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o ${wan} -j MASQUERADE"
-        echo "PostDown = iptables -D FORWARD -i ${AWG_LINK} -j ACCEPT; iptables -D FORWARD -o ${AWG_LINK} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o ${wan} -j MASQUERADE"
+        # 客户端不能经隧道访问内网与云元数据（2026-11-03 修）：DROP 在 ACCEPT 之后
+        # 用 -I 插入，所以排在它前面先命中；`! -o` 放过客户端之间的互访。
+        local guard_up="" guard_down="" cidr
+        for cidr in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+            guard_up+="; iptables -I FORWARD -i ${AWG_LINK} ! -o ${AWG_LINK} -d ${cidr} -j DROP"
+            guard_down+="; iptables -D FORWARD -i ${AWG_LINK} ! -o ${AWG_LINK} -d ${cidr} -j DROP"
+        done
+        echo "PostUp = sysctl -qw net.ipv4.ip_forward=1; iptables -I FORWARD -i ${AWG_LINK} -j ACCEPT${guard_up}; iptables -I FORWARD -o ${AWG_LINK} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o ${wan} -j MASQUERADE"
+        echo "PostDown = iptables -D FORWARD -i ${AWG_LINK} -j ACCEPT${guard_down}; iptables -D FORWARD -o ${AWG_LINK} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o ${wan} -j MASQUERADE"
 
         if [[ -s "$AWG_PEERS_FILE" ]]; then
             jq -r '
