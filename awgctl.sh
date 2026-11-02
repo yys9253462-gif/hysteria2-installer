@@ -366,8 +366,11 @@ download_binaries() {
     log_info "来源: ${url}"
 
     tmpd="$(mktemp -d)"
-    if ! curl -fL --connect-timeout 20 --retry 2 --retry-delay 2 \
-            -o "${tmpd}/awg.tar.gz" "$url" 2>/dev/null; then
+    # --max-time 与 `9>&-`（2026-11-03 修）：门户 420 秒超时只杀 bash，不杀 curl；
+    # curl 又继承了持锁的 fd 9。下载卡住时孤儿 curl 一直占着锁，之后每个改 AWG
+    # 的命令都等 300 秒再失败，EXIT 回滚也不会执行。两次下载 + 校验必须在 420 秒内完。
+    if ! curl -fL --connect-timeout 20 --max-time 240 --retry 2 --retry-delay 2 \
+            -o "${tmpd}/awg.tar.gz" "$url" 2>/dev/null 9>&-; then
         rm -rf "$tmpd"
         log_err "下载失败。可能原因："
         log_err "  1) 仓库 Release 尚未构建 —— 请在 GitHub Actions 中手动运行"
@@ -383,7 +386,7 @@ download_binaries() {
     #    缺摘要就拒绝安装，不存在绕过路径。
     local sums_url want got
     sums_url="https://github.com/${AWG_REPO}/releases/download/${AWG_RELEASE_TAG}/SHA256SUMS"
-    if ! curl -fsSL --connect-timeout 20 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null; then
+    if ! curl -fsSL --connect-timeout 20 --max-time 60 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null 9>&-; then
         # curl -o 会先建文件：失败时可能留下空/半截的 SHA256SUMS，
         # 一并清掉，避免被当成"清单存在但没有该资产"。
         rm -rf "$tmpd"
