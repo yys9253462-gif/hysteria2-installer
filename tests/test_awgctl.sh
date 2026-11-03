@@ -283,7 +283,7 @@ for line in 2 3; do
     # 客户端必备项
     check_eq "  客户端 Address 为 /32" "$(conf_get "$CLIENT_TEXT" "Address")" "10.66.66.2/32"
     check_eq "  客户端 Endpoint 使用客户端自定义值" "$(conf_get "$CLIENT_TEXT" "Endpoint")" "vpn.example.com:51820"
-    check_eq "  客户端 AllowedIPs 全流量" "$(conf_get "$CLIENT_TEXT" "AllowedIPs")" "0.0.0.0/0"
+    check_eq "  客户端 AllowedIPs 全流量（含 IPv6，防泄露）" "$(conf_get "$CLIENT_TEXT" "AllowedIPs")" "0.0.0.0/0, ::/0"
     check_eq "  客户端含 PresharedKey" "$(conf_get "$CLIENT_TEXT" "PresharedKey")" "CPSK"
 done
 

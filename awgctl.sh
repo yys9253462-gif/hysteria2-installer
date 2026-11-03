@@ -693,7 +693,10 @@ render_client_config() {
     else
         echo "Endpoint = ${endpoint}:${port}"
     fi
-    echo "AllowedIPs = 0.0.0.0/0"
+    # IPv6 也进隧道（2026-11-04 修）：只写 0.0.0.0/0 时，双栈网络上的手机把全部 IPv6 流量
+    # 走本地出口，真实 IPv6 地址照样暴露。服务端没有 IPv6 路由，进隧道的 IPv6 会被丢弃，
+    # 客户端随之回落到 IPv4 —— 不通，但不泄露。
+    echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = 25"
 }
 
