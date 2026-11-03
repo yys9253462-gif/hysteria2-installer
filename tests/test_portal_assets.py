@@ -351,6 +351,35 @@ globalThis.fetch = async () => reply;
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_reality_qr_is_cleared_when_the_server_sends_none(self):
+        """重置密钥后没有新二维码时清掉旧的，不让用户扫旧 pbk（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('async function checkRealityStatus() {')
+        end = script.index('\n}\n', start) + 3
+        harness = r"""
+const assert = require('assert');
+const els = {};
+const el = () => ({style: {}, textContent: '', innerHTML: '', value: '', classList: {add(){}, remove(){}, toggle(){}}, dataset: {}});
+globalThis.document = {getElementById: id => els[id] ||= el(), querySelectorAll: () => []};
+const location = {pathname: '/fixture/'};
+const realityBadge = el(), realityQrBox = el(), realityUriVal = el(), realitySniVal = el(), realityUuidVal = el();
+const realityContentBox = el(), btnToggleReality = el(), btnResetRealityKeys = el();
+realityQrBox.innerHTML = '<svg>OLD-PBK</svg>';
+const btnInstallXray = el();
+globalThis.fetch = async () => ({ok: true, json: async () => ({ok: true, installed: true, active: true,
+  config: {uri: 'vless://new', qr_svg: '', port: 8444, sni: 'www.apple.com', uuid: 'u'}})});
+"""
+        checks = r"""
+(async () => {
+  try { await checkRealityStatus(); } catch (e) { console.error('THROWN', e.message); }
+  assert(!realityQrBox.innerHTML.includes('OLD-PBK'), '旧二维码还留着');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]

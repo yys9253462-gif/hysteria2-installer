@@ -1589,7 +1589,9 @@ async function checkRealityStatus() {
     if (json.config) {
       const cfg = json.config;
       if (realityUriVal) realityUriVal.value = cfg.uri || '';
-      if (realityQrBox && cfg.qr_svg) realityQrBox.innerHTML = cfg.qr_svg;
+      // 没有新二维码时清空旧的（2026-11-04 修，与 VMess 一致）：重置密钥后 qrencode 超时
+      // 返回空，旧二维码留在页面上，里面还是旧 pbk，扫了连不上。
+      if (realityQrBox) realityQrBox.innerHTML = cfg.qr_svg || '';
       if (realitySniVal) realitySniVal.textContent = (cfg.sni || 'www.apple.com') + ':' + (cfg.port || 443);
       if (realityUuidVal) realityUuidVal.textContent = cfg.uuid || '-';
       if (realityPubkeyVal) realityPubkeyVal.textContent = cfg.pub_key || '-';
