@@ -7461,6 +7461,12 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
                 epoch = latest.get('session_epoch', 0)
                 epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
                 latest['session_epoch'] = epoch + 1
+            # 上面补出来的 users / proxy_services 也要带过去：只叠加派生键会把迁移丢掉，
+            # 缺 users 的老 portal.json 刷新后照旧缺，serve() 直接拒绝启动（2026-11-04 修）。
+            if not isinstance(latest.get('users'), dict):
+                latest['users'] = data['users']
+            if not isinstance(latest.get('proxy_services'), list):
+                latest['proxy_services'] = data['proxy_services']
             latest.pop('page', None)
             data = latest
     except (OSError, ValueError):
@@ -7554,9 +7560,15 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     access_path = root / 'portal-access.json'
     access, _rebuilt = ensure_portal_access(root, m, data)
     data['port'] = int(port)
-    master = data.setdefault('users', {}).setdefault(MASTER_USER_ID, {
-        'expires_at': MASTER_EXPIRES_AT, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
-        'status': 'active', 'created_at': int(time.time()), 'note': 'Master Admin'})
+    # users 为 null / 列表、机主条目不是 dict 时按空处理，与 user_table 一致；
+    # 旧实现直接 AttributeError / TypeError，保留门户的重装中途失败（2026-11-04 修）。
+    if not isinstance(data.get('users'), dict):
+        data['users'] = {}
+    if not isinstance(data['users'].get(MASTER_USER_ID), dict):
+        data['users'][MASTER_USER_ID] = {
+            'expires_at': MASTER_EXPIRES_AT, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
+            'status': 'active', 'created_at': int(time.time()), 'note': 'Master Admin'}
+    master = data['users'][MASTER_USER_ID]
     # 老节点上的机主账号带着 2036 年的到期时间，adopt 时顺手改成新值。
     if isinstance(master, dict) and master.get('expires_at') == LEGACY_MASTER_EXPIRES_AT:
         master['expires_at'] = MASTER_EXPIRES_AT
