@@ -2797,24 +2797,14 @@ function showProxyResult(data) {
     resPQr.innerHTML = data.qr;
   }
 
+  // 代理详情的复制按钮都走统一兜底（2026-11-03 修）：剪贴板接口不可用时旧写法
+  // 只弹「复制失败」，现在退回 execCommand，仍不行才提示手动复制。
   if (btnCopyPUrl) {
-    btnCopyPUrl.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(url);
-        btnCopyPUrl.textContent = '已复制 ✓';
-        setTimeout(() => { btnCopyPUrl.textContent = '复制 URL'; }, 1800);
-      } catch (_) { alert('复制失败，请手动选择复制'); }
-    };
+    btnCopyPUrl.onclick = () => copyWithFeedback(url, btnCopyPUrl, '已复制 ✓');
   }
 
   if (btnCopyPFmt) {
-    btnCopyPFmt.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(fmt);
-        btnCopyPFmt.textContent = '已复制 ✓';
-        setTimeout(() => { btnCopyPFmt.textContent = '复制格式'; }, 1800);
-      } catch (_) { alert('复制失败，请手动选择复制'); }
-    };
+    btnCopyPFmt.onclick = () => copyWithFeedback(fmt, btnCopyPFmt, '已复制 ✓');
   }
 
   document.querySelectorAll('[data-copy-field]').forEach(b => {
@@ -2954,14 +2944,7 @@ async function loadProxyServices() {
     }).join('');
 
     proxyTbody.querySelectorAll('[data-copy-link]').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        try {
-          await navigator.clipboard.writeText(btn.dataset.copyLink);
-          const orig = btn.textContent;
-          btn.textContent = '已复制 ✓';
-          setTimeout(() => { btn.textContent = orig; }, 1800);
-        } catch (_) { alert('复制失败'); }
-      });
+      btn.addEventListener('click', () => copyWithFeedback(btn.dataset.copyLink, btn, '已复制 ✓'));
     });
     proxyTbody.querySelectorAll('[data-proxy-del]').forEach(btn => {
       btn.addEventListener('click', async () => {

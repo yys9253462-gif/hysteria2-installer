@@ -262,6 +262,21 @@ assert.strictEqual(obEls.list.innerHTML.match(/data-ob-addr="([^"]*)"/)[1], 'pro
                                 capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_proxy_copy_buttons_use_the_shared_fallback(self):
+        """代理 URL / 格式 / 列表链接的复制都走 copyWithFeedback（2026-11-03 修）。
+
+        copyWithFeedback 的兜底行为由下一个用例在 node 里实测；这里锁住这几个按钮
+        不再各自调用 navigator.clipboard（那样剪贴板不可用时只能弹「复制失败」）。
+        """
+        script = portal.SCRIPT
+        start = script.index('if (btnCopyPUrl) {')
+        section = script[start:script.index("proxyModal.classList.add('show');", start)]
+        self.assertNotIn('navigator.clipboard', section)
+        self.assertEqual(section.count('copyWithFeedback('), 3)
+        links = script[script.index("proxyTbody.querySelectorAll('[data-copy-link]')"):]
+        links = links[:links.index('});') + 3]
+        self.assertIn('copyWithFeedback(btn.dataset.copyLink', links)
+
     @unittest.skipUnless(NODE, 'requires node')
     def test_copy_field_falls_back_when_clipboard_is_unavailable(self):
         """代理详情里的单字段复制在剪贴板不可用时退回 execCommand（2026-11-03 修）。
