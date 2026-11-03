@@ -191,7 +191,8 @@ STUB
 chmod +x "$AWG_BIN"
 if ! peer_apply_live_add pub psk 10.66.66.2; then exit 1; fi
 if ! peer_apply_live_del pub; then exit 1; fi
-grep -qx 'systemctl restart amneziawg-server' "$ROOT/systemctl.log"
+# 热添加与热移除失败时都要重启接口（2026-11-04：peer-add 也补上）。
+[ "$(grep -cx 'systemctl restart amneziawg-server' "$ROOT/systemctl.log")" = 2 ]
 ''')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
