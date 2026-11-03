@@ -2313,6 +2313,15 @@ if (btnRebootServer) {
         method: 'POST',
         credentials: 'same-origin'
       });
+      // 看服务器怎么答（2026-11-04 修）：有重型任务在跑时回 409、会话过期回 401，
+      // 旧实现一律倒计时 25 秒再刷新，机器其实从未重启。
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        alert('未能发起重启：' + (json.error || ('服务器返回 ' + res.status)));
+        btnRebootServer.disabled = false;
+        btnRebootServer.textContent = '🔄 立即重启服务器生效';
+        return;
+      }
       alert("服务器正在重启中，系统将在 25 秒后自动刷新页面！");
       let countdown = 25;
       const timer = setInterval(() => {

@@ -316,6 +316,41 @@ globalThis.document = {
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_reboot_button_reports_refusal_instead_of_counting_down(self):
+        """服务器拒绝重启（409 / 401）时报错并恢复按钮，不倒计时刷新（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('if (btnRebootServer) {')
+        end = script.index('\n}\n', start) + 3
+        prelude = script[:script.index('// 全局高颜值 Promise 确认框与 Toast 机制')]
+        harness = r"""
+const assert = require('assert');
+const alerts = [], intervals = [];
+globalThis.alert = m => alerts.push(m);
+globalThis.setInterval = fn => { intervals.push(fn); return 1; };
+const location = {pathname: '/fixture/', reload() {}};
+let handler;
+const btnRebootServer = {addEventListener: (k, fn) => { handler = fn; }, disabled: false, textContent: 'x'};
+const showConfirm = async () => true;
+let reply;
+globalThis.fetch = async () => reply;
+"""
+        checks = r"""
+(async () => {
+  reply = new Response(JSON.stringify({ok: false, error: '已有重型任务在运行'}), {status: 409});
+  await handler();
+  assert.strictEqual(intervals.length, 0, '被拒绝时仍开始了倒计时');
+  assert(alerts[0].includes('已有重型任务在运行'), alerts[0]);
+  assert.strictEqual(btnRebootServer.disabled, false);
+  reply = new Response(JSON.stringify({ok: true}), {status: 200});
+  await handler();
+  assert.strictEqual(intervals.length, 1);
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + prelude + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]
