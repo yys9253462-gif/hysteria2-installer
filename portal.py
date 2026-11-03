@@ -14085,7 +14085,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 'ok': True,
                 'gost_installed': Path('/usr/local/bin/gost').exists(),
                 'gost_active': gost_status(),
-                'host': host,
+                # 前端把它直接拼进 socks5:// / http:// 链接：IPv6 要带方括号（2026-11-04 修），
+                # 与新增代理时返回的 url 同一写法。
+                'host': _host_for_url(host),
                 'services': services
             })
 
