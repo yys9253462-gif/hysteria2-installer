@@ -9503,8 +9503,14 @@ if __name__ == '__main__':
                                 else:
                                     active_ips[client_ip] = now_ts
                             elif client_ip:
-                                tracker = ip_tracker.setdefault(matched_uid, {})
+                                # 不限设备的用户同样剪掉过期 IP（2026-11-03 修）：旧实现只追加，
+                                # 换 IP 频繁的长期在线用户（移动网络 / CGNAT）表项无界增长，
+                                # users/list 与 /traffic-speed 每次都要遍历。
+                                tracker = ip_tracker.get(matched_uid)
+                                tracker = {ip: t for ip, t in tracker.items()
+                                           if now_ts - t < IP_TIMEOUT_SECONDS} if isinstance(tracker, dict) else {}
                                 tracker[client_ip] = now_ts
+                                ip_tracker[matched_uid] = tracker
 
                 if deny == 'User not found':
                     self.record_auth_failure()
