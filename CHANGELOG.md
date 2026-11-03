@@ -1,3 +1,16 @@
+## 2026-11-03 — 第五批十项修复，门户 2.15
+
+- Clash / mihomo 订阅里的 Reality 节点改用 mihomo 的字段写法（`tls: true`、`reality-opts`）：此前 mihomo v1.19.15 整份配置加载失败（SE 上用真 mihomo 校验）。
+- 启用 VLESS Encryption 后 sing-box 订阅重新可用：sing-box 不支持这个协议，带 `encryption` 字段时整份 sing-box.json 加载失败，连 Hy2 节点一起不可用（SE 上 sing-box 1.14.4 校验）。sing-box 订阅里不再下发这一条，Clash 订阅照旧。
+- 不带有效 key 的 API 请求单独限流，打满也不影响控制台的停用 / 删除。
+- Web 失败请求按来源计数：拿到分享链接的人不再能让管理页和所有人的订阅更新都 429。
+- 登录失败按来源计数（每来源 10 次 / 10 分钟，全局 200 次兜底），别人刷错误密码不再把机主锁在门外。来源取 Hysteria masquerade 写入的 X-Forwarded-For（v2.13.0 实测会覆盖客户端自带的值）。
+- 门户访问凭据重建后，用旧密码登录的会话失效；分享链接不受影响。
+- AnyTLS 端口被改坏时停用不再报错，面板状态与实际一致。
+- 卸载时 AmneziaWG 移除失败会如实报错，并保留 `hy2-awgctl`。
+- `hy2-awgctl resync` 新配置起不来时回滚到原配置。
+- `hy2-awgctl peer-add` 失败（例如地址池满）不再留下含全部客户端私钥的备份文件。
+
 ## 2026-11-03 — 第四批十项修复，门户 2.14
 
 - GOST 代理拒绝访问内网、云元数据与本机地址：此前买家拿到的 SOCKS5 / HTTP 代理能读 169.254.169.254，也能连本机的门户与 Xray API（SE 节点用真 gost 3.2.6 实测）。GOST 只按请求里的目标地址匹配，解析到内网的域名仍能穿过。
