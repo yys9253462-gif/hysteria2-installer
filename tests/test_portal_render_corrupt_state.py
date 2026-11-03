@@ -60,6 +60,13 @@ class RenderCorruptStateTests(unittest.TestCase):
         return portal.user_page_html('h.example.com', '1.2.3.4', 443, '', 'u', dict(base, **fields),
                                      'hysteria2://x@h:1/', 'clash', 'sing', '', 'tok', 'k', sub_port=8443)
 
+    def test_user_page_shows_unlimited_for_boolean_ip_limit(self):
+        """ip_limit=true 实际不限设备（与鉴权同一判据），页面不能写「1 个网络」（2026-11-03 修）。"""
+        page = self.render_user(ip_limit=True)
+        self.assertNotIn('1 个网络', page)
+        self.assertIn('不限制', page)
+        self.assertIn('3 个网络', self.render_user(ip_limit=3))
+
     def test_infinite_expiry_is_not_shown_as_permanent(self):
         """expires_at=inf 时鉴权拒绝该用户，页面不能写「永久有效」（2026-11-03 修）。"""
         for bad in (float('inf'), 'inf', '1e999', float('nan')):

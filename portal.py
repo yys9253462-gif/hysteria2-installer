@@ -2330,7 +2330,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         expires_str = _expiry_text(u.get("expires_at"))
         # 设备上限与在线数可能是 `"5"`、None 或旧格式（在线 IP 存成数字）。
         # 直接比较 `> 0` / `len(...)` 会让整页 500 —— 与 created_at 同一类问题。
-        ip_limit = _safe_int(u.get("ip_limit") or 0)
+        # 与鉴权同一判据（user_ip_limit）：ip_limit=true 实际不限设备，旧写法 int(True)
+        # 显示成「1 IP」（2026-11-03 修）。
+        ip_limit = _display_ip_limit(u)
         ip_limit_str = f"{ip_limit} IP" if ip_limit > 0 else "不限"
         online_raw = u.get("online_ips")
         online_ips = len(online_raw) if isinstance(online_raw, (dict, list)) else _safe_int(online_raw or 0)
@@ -3664,7 +3666,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
 
     expires_str = _expiry_text(uinfo.get("expires_at"))
     # 与总览页同一处理：设备上限可能是 "5" / None（手工编辑或旧格式）。
-    ip_limit = _safe_int(uinfo.get("ip_limit") or 0)
+    ip_limit = _display_ip_limit(uinfo)
     # 按公网 IP 计：同一 Wi-Fi 下多台设备只占 1 个名额，文案不能写成「台设备」。
     ip_limit_str = f"{ip_limit} 个网络（同一网络下设备不限）" if ip_limit > 0 else "不限制"
 
@@ -5625,6 +5627,14 @@ def user_access_allowed(info, now=None):
 
 REALITY_IPLIMIT_RELEASE_SECONDS = 180
 REALITY_IPLIMIT_TAG_PREFIX = 'iplimit-'
+
+
+def _display_ip_limit(info):
+    """页面显示用的设备上限；记录损坏时按 0（不限）显示，不让渲染抛异常。"""
+    try:
+        return max(0, user_ip_limit(info)) if isinstance(info, dict) else 0
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def user_ip_limit(info):
