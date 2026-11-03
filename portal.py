@@ -4249,7 +4249,12 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
         except Exception as exc:
             _log_ignored('cert_info.heal_state', exc)
 
-    info['ok'] = True
+    # 只有 openssl 真读出了有效期才算「可读」（2026-11-04 修）：旧实现文件存在即 ok，
+    # 截断 / 非 PEM 的证书显示成温和的「到期时间未知」，「无法读取证书」那条严重告警
+    # 永远出不来 —— 而 Hysteria 加载不了这张证书。
+    info['ok'] = bool(info['not_after'])
+    if not info['ok']:
+        info['error'] = '无法读取证书内容（文件可能已截断或不是 PEM 格式）'
     return info
 
 
