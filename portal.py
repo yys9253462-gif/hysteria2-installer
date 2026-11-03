@@ -8870,6 +8870,21 @@ if __name__ == '__main__':
             return None
         return tcfg
 
+    def _served_singbox_config(cfg, service):
+        """给订阅用：sing-box 协议还得服务在跑才下发（2026-11-04 修）。
+
+        _active_*_config 只看「已启用 + 配置文件在」，供启停 / 卸载判断用；订阅要再看服务：
+        hy2-anytls / hy2-tuic 崩溃后，旧实现照样把节点写进 clash / sing-box，手动选它的
+        用户连不上。与 Xray 协议的 managed_inbound_active 同一口径。整机超额停用期间
+        服务本就停着，节点照旧保留，恢复后就能用。没有 systemd 的环境 state 为空，按在跑处理。
+        """
+        if not cfg:
+            return None
+        if unit_suspended(service):
+            return cfg
+        state = _systemd_state(service)
+        return cfg if (not state or state == 'active') else None
+
     def regenerate_page():
         m = read_meta_file(meta_path)
         uri, clash, sing = artifacts(m)
@@ -9881,8 +9896,8 @@ if __name__ == '__main__':
                     rcfg = _active_reality_config()
                     vcfg_active = _active_vmess_config()
                     ecfg_active = _active_vlessenc_config()
-                    acfg_active = _active_anytls_config()
-                    tcfg_active = _active_tuic_config()
+                    acfg_active = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
+                    tcfg_active = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
                     m = read_meta_file(meta_path)
                     # artifacts 传入 reality + user_id ⇒ 输出「Hy2 + Reality」双节点
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
@@ -13655,8 +13670,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     reality=_active_reality_config(), user_id=target_uid,
                     vmess=_active_vmess_config(),
                     vlessenc=_active_vlessenc_config(),
-                    anytls=_active_anytls_config(),
-                    tuic=_active_tuic_config())
+                    anytls=_served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE),
+                    tuic=_served_singbox_config(_active_tuic_config(), TUIC_SERVICE))
 
                 if action_file == 'clash.yaml':
                     return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml')
@@ -13757,8 +13772,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     reality=_active_reality_config(), user_id=target_uid,
                     vmess=_active_vmess_config(),
                     vlessenc=_active_vlessenc_config(),
-                    anytls=_active_anytls_config(),
-                    tuic=_active_tuic_config())
+                    anytls=_served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE),
+                    tuic=_served_singbox_config(_active_tuic_config(), TUIC_SERVICE))
                 qr_svg = ""
                 try:
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')

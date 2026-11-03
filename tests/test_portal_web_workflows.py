@@ -78,6 +78,7 @@ class WebWorkflowTests(unittest.TestCase):
                        _active_vlessenc_config=lambda: self.data.get('vlessenc_config'),
                        _active_anytls_config=lambda: None,
                        _active_tuic_config=lambda: None,
+                       _served_singbox_config=lambda cfg, service: cfg,
                        # 真实 firewall_port 会探测本机 ufw/firewalld/nft 并执行；
                        # 默认桩成成功，需要验证防火墙行为的用例自己再覆盖。
                        firewall_port=Mock(return_value=True))
