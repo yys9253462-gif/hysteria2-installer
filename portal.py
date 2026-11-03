@@ -6968,14 +6968,17 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         r_sid = reality.get('short_id', '')
         if ruri and r_pbk and r_sid and r_port:
             rname = name + '-Reality'
+            # mihomo 的写法：tls 是布尔值，reality-opts 用连字符键（2026-11-03 修）。
+            # 旧写法 tls=dict(...) / reality_opts 让 mihomo v1.19.15 整份配置加载失败
+            # （"'tls' expected type 'bool'"），SE 上用真 mihomo 校验确认。
             reality_proxy = dict(name=rname, type='vless', server=public_ip,
                                  port=r_port, uuid=r_uuid, udp=True,
-                                 tls=dict(servername=r_sni),
+                                 tls=True,
                                  flow='xtls-rprx-vision',
                                  servername=r_sni,
-                                 reality_opts=dict(public_key=r_pbk,
-                                                   short_id=r_sid),
-                                 **{'client-fingerprint': 'chrome'})
+                                 **{'reality-opts': {'public-key': r_pbk,
+                                                     'short-id': r_sid},
+                                    'client-fingerprint': 'chrome'})
             reality_sing = dict(type='vless', tag=rname, server=public_ip,
                                server_port=r_port, uuid=r_uuid,
                                flow='xtls-rprx-vision',
