@@ -13183,6 +13183,40 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
 
+        def do_HEAD(self):
+            """HEAD 与 GET 走同一套路由，只是不发正文（2026-11-04 修）。
+
+            BaseHTTPRequestHandler 没有 do_HEAD 时一律回 501：订阅管理器与可用性探测
+            用 HEAD 检查链接时，好好的订阅被报成「失效」。GET 路由都是只读的，
+            有副作用的操作只接 POST，所以复用 GET 是安全的。
+            """
+            real = self.wfile
+
+            class _HeadersOnly:
+                """状态行与响应头照常写出；end_headers 之后的正文丢弃。"""
+                def __init__(self, handler):
+                    self.handler = handler
+                def write(self, data):
+                    if getattr(self.handler, '_head_body_started', False):
+                        return len(data)
+                    return real.write(data)
+                def flush(self):
+                    return real.flush()
+
+            self.wfile = _HeadersOnly(self)
+            original_end_headers = self.end_headers
+
+            def end_headers():
+                original_end_headers()
+                real.flush()
+                self._head_body_started = True
+            self.end_headers = end_headers
+            try:
+                return self.do_GET()
+            finally:
+                self.wfile = real
+                self.end_headers = original_end_headers
+
         def do_GET(self):
             # 存活探针：面板自更新后据此判断新版本是否真的起来了（失败则回滚）。
             # 无需鉴权、不含任何数据，只回答「进程活着且能处理请求」。
