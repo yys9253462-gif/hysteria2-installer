@@ -1000,6 +1000,26 @@ class WebWorkflowTests(unittest.TestCase):
         extract_method('do_POST', self.ns)(self.handler)
         return self.response
 
+    def test_dot_only_user_ids_cannot_be_created(self):
+        """'.' / '..' 开户会让分享链接被折叠成别的地址，开户时就拒绝（2026-11-04 修）。"""
+        self.ns['user_id_shareable'] = portal.user_id_shareable
+        for uid in ('.', '..', '...'):
+            with self.subTest(endpoint='api', uid=uid):
+                status, _ = self.invoke_api({'user_id': uid, 'password': 'pw-dots'})
+                self.assertEqual(status, 400)
+                self.assertNotIn(uid, self.data['users'])
+            with self.subTest(endpoint='web', uid=uid):
+                status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': uid,
+                                                                'password': 'pw-dots-web'})
+                self.assertEqual(status, 400)
+                self.assertNotIn(uid, self.data['users'])
+        self.assertTrue(portal.user_id_shareable('a.b'))
+        # 历史上已经存在的 '..' 用户仍要能删掉。
+        self.data['users']['..'] = {'password': 'pw-legacy', 'status': 'active'}
+        status, _ = self.invoke('_h_post_manage_user', {'action': 'delete', 'user_id': '..'})
+        self.assertNotEqual(status, 400)
+        self.assertNotIn('..', self.data['users'])
+
     def test_api_rejects_booleans_for_numeric_user_fields(self):
         """布尔值不能被当成数字：ip_limit / expires_at 一直在入口拒绝，traffic_gb 曾漏掉（2026-11-04 修）。
 

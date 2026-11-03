@@ -138,6 +138,19 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 # user_id 的唯一格式定义。serve() 内沿用同名局部变量指向它，
 # 模块级辅助函数（撤销队列清洗等）也用它，避免两套规则漂移。
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
+
+
+def user_id_shareable(user_id):
+    """新开户的 user_id 能否放进分享链接 /u/<uid>/（2026-11-04 修）。
+
+    USER_ID_RE 允许点，于是 "." / ".." 也能开户：quote('..') 原样返回，链接成了
+    /<token>/u/../clash.yaml，浏览器与客户端把它折叠成 /<token>/clash.yaml（机主订阅，
+    要 Basic 认证），用户永远打不开自己的链接。只在开户时拦：已存在的同名用户仍能
+    被查询、改动和删除。
+    """
+    return bool(user_id) and user_id.strip('.') != ''
+
+
 # 面板自更新与 AWG 资源的来源仓库（模块级：resolve_update_ref 也要用）。
 AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 
@@ -9642,6 +9655,9 @@ if __name__ == '__main__':
                     user_id = (params.get('user_id') or ('hy2_' + secrets.token_hex(6))).strip()
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
+                    if not user_id_shareable(user_id):
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'user_id 不能只由点组成（分享链接 /u/../ 会被浏览器折叠成别的地址）'})
                     if user_id in RESERVED_USER_IDS:
                         # 分开提示：机主账号是节点主密码，placeholder 是计量占位名。
                         # 旧文案把它们混成「ID 格式错误」，排查时会被带偏。
@@ -12632,6 +12648,8 @@ if __name__ == '__main__':
                 # Xray 的占位 client 撞 email，admin_master 是机主账号）。
                 if action == 'create' and user_id in RESERVED_USER_IDS:
                     return self.reply(400, b'Reserved user_id')
+                if action == 'create' and not user_id_shareable(user_id):
+                    return self.reply(400, 'user_id 不能只由点组成'.encode('utf-8'))
 
                 if action == 'create' and user_id:
                     pwd = form.get('password', [''])[0].strip() or secrets.token_hex(16)
