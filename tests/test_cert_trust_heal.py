@@ -161,6 +161,26 @@ class TestPortalSyncCertTrust(unittest.TestCase):
             self.assertIs(after["is_insecure"], False)
             self.assertEqual(after["server_name"], "node.example.com")
 
+    def test_sync_pin_uses_the_certificate_actually_in_use(self):
+        """自签证书不在 cert/server.crt 时，pin 也要按实际在用的那张算（2026-11-04 修）。"""
+        sys.path.insert(0, str(REPO))
+        try:
+            import portal  # noqa
+        finally:
+            sys.path.pop(0)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _make_self_signed(td / "cert", cn="old.example.com")
+            _make_self_signed(td / "custom", cn="node.example.com")
+            (td / "config.yaml").write_text(
+                "listen: :443\ntls:\n  cert: %s\n  key: %s\n"
+                % (td / "custom" / "server.crt", td / "custom" / "server.key"))
+            meta = {"is_insecure": True, "pin_sha256": "not-a-pin"}
+            (td / "client_meta.json").write_text(json.dumps(meta))
+            portal.sync_pin(meta, td, str(td / "client_meta.json"))
+            self.assertEqual(meta["pin_sha256"], _pin_of(td / "custom" / "server.crt"))
+            self.assertNotEqual(meta["pin_sha256"], _pin_of(td / "cert" / "server.crt"))
+
     def test_self_signed_heals_all_four_fields(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

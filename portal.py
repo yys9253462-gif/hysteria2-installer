@@ -7191,7 +7191,11 @@ def sync_pin(m, root, meta_path):
     if m.get('is_insecure'):
         cur = (m.get('pin_sha256') or '').strip().lower()
         if len(cur) != 64 or any(c not in '0123456789abcdef' for c in cur):
-            new = get_cert_pin_sha256(root)
+            # 按实际在用的证书算 pin（2026-11-04 修），与 sync_cert_trust 同一来源：
+            # 旧实现固定读 cert/server.crt，自签证书放在别处时写进一张无关证书的 pin，
+            # 客户端 pin 校验全部失败。
+            live = _resolve_live_cert(root, str(Path(root) / 'config.yaml'))[0]
+            new = pin_sha256_of_file(live) if Path(live).exists() else get_cert_pin_sha256(root)
             if new != m.get('pin_sha256'):
                 m['pin_sha256'] = new
                 Path(meta_path).write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
