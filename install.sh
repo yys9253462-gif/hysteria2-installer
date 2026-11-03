@@ -2006,9 +2006,16 @@ setup_ports_and_obfs() {
     # 脚本本来就有现成的 port_owner()（80/443 检测在用），但主监听端口从没查过。
     # 撞上已占用端口时 hysteria bind 失败 → 服务反复重启，
     # 而用户看到的报错完全指不到「你选的这个端口被别人占了」。
-    # 这里提前拦下，并报出占用者进程名；已装的机器（服务本就在跑）跳过。
+    # 这里提前拦下，并报出占用者进程名。
+    # 只在「沿用正在运行的 Hysteria 自己的端口」时跳过（2026-11-03 修）：旧条件是
+    # 「服务没在跑」，重新配置 / 重装时服务总在跑，换成被 TUIC / AWG 占着的新端口
+    # 也不提示，Hysteria 绑不上、节点直接掉线。
+    _running_port=""
+    if systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f "$HY2_META_FILE" ]]; then
+        _running_port="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
     if [[ -n "${LISTEN_PORT:-}" ]] && is_valid_port "$LISTEN_PORT" \
-       && ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
+       && [[ "$LISTEN_PORT" != "$_running_port" ]]; then
         _port_user="$(port_owner udp "$LISTEN_PORT")"
         if [[ -n "$_port_user" ]]; then
             log_err "所选主监听 UDP 端口 ${LISTEN_PORT} 已被占用（占用进程: ${_port_user}）。"
