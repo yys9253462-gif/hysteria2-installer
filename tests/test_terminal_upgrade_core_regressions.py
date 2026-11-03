@@ -123,7 +123,9 @@ esac
         result = self.invoke('core', FAIL_FIRST='1')
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.binary.read_bytes(), OLD)
-        self.assertEqual(self.calls(), ['restart hysteria-server', 'restart hysteria-server'])
+        # 回滚后的重启也要确认旧核心确实起来了（2026-11-03：restart 之后查 is-active）。
+        self.assertEqual(self.calls(), ['restart hysteria-server', 'restart hysteria-server',
+                                        'is-active --quiet hysteria-server'])
 
     @unittest.skipIf(os.name == 'nt', 'Windows filesystems do not preserve POSIX executable mode bits')
     def test_successful_upgrade_preserves_normal_binary_permissions(self):
