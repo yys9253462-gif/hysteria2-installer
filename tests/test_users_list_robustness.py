@@ -8,7 +8,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TREE = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
-HELPERS = {'users_list_rows', 'active_online_ips', 'users_list_entry'}
+HELPERS = {'users_list_rows', 'active_online_ips', 'users_list_entry', '_display_ip_limit', 'user_ip_limit'}
 
 
 def branch(value):
@@ -45,6 +45,15 @@ class UsersListRobustnessTests(unittest.TestCase):
                 return status, payload
 
         return env['listing'](Handler())
+
+    def test_list_fields_are_stable_and_match_authentication(self):
+        """缺 created_at 时每次都报 0，不是「此刻」；ip_limit=true 报 0（2026-11-04 修）。"""
+        first = self.run_listing({'u': {'used_bytes': 0, 'ip_limit': True}}, {})[1]['users'][0]
+        time.sleep(1.1)
+        second = self.run_listing({'u': {'used_bytes': 0, 'ip_limit': True}}, {})[1]['users'][0]
+        self.assertEqual(first['created_at'], second['created_at'])
+        self.assertEqual(first['created_at'], 0)
+        self.assertEqual(first['ip_limit'], 0)
 
     def test_corrupt_user_record_is_skipped_not_fatal(self):
         status, body = self.run_listing(

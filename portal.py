@@ -4704,8 +4704,11 @@ def users_list_entry(uid, info, tracker, now_ts, summary, ip_timeout):
         'used_bytes': info.get('used_bytes', 0),
         **summary,
         'online_ips': active_online_ips(tracker, uid, now_ts, ip_timeout),
-        'ip_limit': info.get('ip_limit', 0),
-        'created_at': info.get('created_at', now_ts),
+        # 与鉴权同一判据：ip_limit=true 实际不限，报 0（2026-11-04 修）。
+        'ip_limit': _display_ip_limit(info),
+        # 缺 created_at 时报 0（未知）而不是「此刻」（2026-11-04 修）：旧实现每次轮询都给一个
+        # 新时间戳，控制台按它比对 / 排序时，这些用户每轮都像刚变过、年龄永远是 0。
+        'created_at': info.get('created_at', 0),
     }
 
 
