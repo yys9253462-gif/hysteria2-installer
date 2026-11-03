@@ -986,7 +986,11 @@ function renderOutboundList(outs) {
   }
   obEls.list.innerHTML = outs.map((o, idx) => {
     const t = OB_TYPE_LABEL[o.type] || { label: o.type, cls: '' };
-    const testAddr = (o.type === 'socks5') ? (o.addr || '') : (o.url || '');
+    // 带认证的 SOCKS5 要把账号密码一起带上，与表单里的「测试」同一写法（2026-11-03 修）：
+    // 旧写法只发 host:port，需要认证的出站从列表里测永远「探测失败」。
+    const socksAuth = (o.username || o.password)
+      ? encodeURIComponent(o.username || '') + ':' + encodeURIComponent(o.password || '') + '@' : '';
+    const testAddr = (o.type === 'socks5') ? (o.addr ? socksAuth + o.addr : '') : (o.url || '');
     return '<div class="ob-item">'
       + '<div class="ob-item-main">'
       + '<div class="ob-item-name">' + obEsc(o.name)
@@ -1628,7 +1632,8 @@ if (btnResetRealityKeys) {
       });
       const json = await res.json();
       if (json.ok) {
-        alert('密钥与 UUID 已重新生成并生效！');
+        // 用服务端的说明（2026-11-03 修）：UUID 从不变；节点停用期间新密钥要等恢复后才生效。
+        alert(json.message || '密钥对已重新生成，请让客户端重新导入订阅');
         await checkRealityStatus();
       } else {
         alert(json.error || '重置失败');
@@ -2815,14 +2820,9 @@ function showProxyResult(data) {
   document.querySelectorAll('[data-copy-field]').forEach(b => {
     b.onclick = async () => {
       const el = document.getElementById(b.dataset.copyField);
-      if (el) {
-        try {
-          await navigator.clipboard.writeText(el.textContent);
-          const orig = b.textContent;
-          b.textContent = '✓';
-          setTimeout(() => { b.textContent = orig; }, 1500);
-        } catch (_) {}
-      }
+      // 走统一的复制兜底（2026-11-03 修）：旧写法 catch 里什么都不做，剪贴板不可用时
+      // 点了毫无反应，看起来像按钮坏了。
+      if (el) copyWithFeedback(el.textContent, b, '✓');
     };
   });
 

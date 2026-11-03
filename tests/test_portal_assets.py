@@ -209,6 +209,98 @@ globalThis.fetch = async () => reply;
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_reality_reset_shows_the_server_message(self):
+        """重置 Reality 密钥后显示服务端说明，不是写死的「UUID 已重新生成并生效」（2026-11-03 修）。"""
+        script = portal.SCRIPT
+        start = script.index('if (btnResetRealityKeys) {')
+        end = script.index('\n}\n', start) + 3
+        harness = r"""
+const assert = require('assert');
+const alerts = [];
+globalThis.alert = m => alerts.push(m);
+globalThis.confirm = () => true;
+const location = {pathname: '/fixture/'};
+let handler;
+const btnResetRealityKeys = {addEventListener: (k, fn) => { handler = fn; }};
+const checkRealityStatus = async () => {};
+globalThis.fetch = async () => ({json: async () => ({ok: true, message: '已重置密钥；节点当前已停用，新密钥将在控制台恢复节点时生效'})});
+"""
+        checks = r"""
+(async () => {
+  await handler();
+  assert.strictEqual(alerts.length, 1);
+  assert(alerts[0].includes('恢复节点时生效'), alerts[0]);
+  assert(!alerts[0].includes('UUID 已重新生成'), alerts[0]);
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + script[start:end] + checks], capture_output=True,
+                                text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_outbound_list_test_button_carries_socks_credentials(self):
+        """列表里的「测出口」要带上 SOCKS5 账号密码（2026-11-03 修）。"""
+        script = portal.SCRIPT
+        start = script.index('function renderOutboundList(outs) {')
+        end = script.index('\n}\n', start) + 3
+        helpers = script[script.index('function obEsc('):script.index('\n}\n', script.index('function obEsc(')) + 3]
+        harness = r"""
+const assert = require('assert');
+const obEls = {list: {innerHTML: ''}, count: null};
+const OB_TYPE_LABEL = {socks5: {label: 'SOCKS5', cls: ''}};
+const obMetaOf = o => o.addr;
+"""
+        checks = r"""
+renderOutboundList([{name: 'p1', type: 'socks5', addr: 'proxy.example:1080', username: 'u@x', password: 'p:w'}]);
+const m = obEls.list.innerHTML.match(/data-ob-addr="([^"]*)"/);
+assert(m, obEls.list.innerHTML);
+assert.strictEqual(m[1], 'u%40x:p%3Aw@proxy.example:1080');
+renderOutboundList([{name: 'p2', type: 'socks5', addr: 'proxy.example:1080'}]);
+assert.strictEqual(obEls.list.innerHTML.match(/data-ob-addr="([^"]*)"/)[1], 'proxy.example:1080');
+"""
+        result = subprocess.run([NODE, '-e', harness + helpers + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_copy_field_falls_back_when_clipboard_is_unavailable(self):
+        """代理详情里的单字段复制在剪贴板不可用时退回 execCommand（2026-11-03 修）。
+
+        旧写法 catch 为空：点了毫无反应。
+        """
+        script = portal.SCRIPT
+        helper_start = script.index('function copyWithFeedback(')
+        helper = script[helper_start:script.index('\n}\n', helper_start) + 3]
+        start = script.index("  document.querySelectorAll('[data-copy-field]').forEach(b => {")
+        end = script.index('  });\n', start) + len('  });\n')
+        harness = r"""
+const assert = require('assert');
+const copied = [];
+const button = {dataset: {copyField: 'f1'}, textContent: '复制'};
+const fieldEl = {textContent: 'socks5://u:p@host:1080'};
+globalThis.navigator = {};
+globalThis.alert = m => { throw new Error('alert: ' + m); };
+globalThis.setTimeout = () => {};
+globalThis.document = {
+  getElementById: id => id === 'f1' ? fieldEl : null,
+  querySelectorAll: sel => sel === '[data-copy-field]' ? [button] : [],
+  createElement: () => ({style: {}, select() {}, remove() {}, set value(v) { this._v = v; }, get value() { return this._v; }}),
+  body: {appendChild: el => { globalThis._last = el; }},
+  execCommand: cmd => { copied.push(globalThis._last.value); return cmd === 'copy'; },
+};
+"""
+        checks = r"""
+(async () => {
+  await button.onclick();
+  assert.deepStrictEqual(copied, ['socks5://u:p@host:1080']);
+  assert.strictEqual(button.textContent, '✓');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + helper + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]

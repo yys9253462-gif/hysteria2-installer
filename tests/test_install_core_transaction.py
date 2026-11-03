@@ -92,7 +92,15 @@ jq() {{
 flock() {{
     [[ "$*" == '-n 9' || "$*" == '-n 10' ]] || return 99
 }}
+sleep() {{ :; }}
+journalctl() {{ :; }}
 systemctl() {{
+    if [[ "$*" == 'is-active --quiet hysteria-server' ]]; then
+        # dies_after_start：restart 返回 0，但新核心随即退出（Type=simple）；
+        # 回滚后的旧核心正常存活。
+        [[ "$FAILURE" == dies_after_start && "$("$HY2_BIN" version)" == *new-tested* ]] && return 3
+        return 0
+    fi
     [[ "$*" == 'restart hysteria-server' ]] || return 99
     # 记录重启时实际存在的二进制，证明回滚重启用的是本次旧版本。
     "$HY2_BIN" version >> "$HY2_DIR/restarts.log"
@@ -186,6 +194,21 @@ mv() {{
                 self.assertEqual(files['restarts.log'], b'Version: new-tested\n')
                 self.assertIn('暂不重启', result.stdout + result.stderr)
                 protected.pop('portal.json')  # 模拟控制台在重启期间写入停用状态。
+                self.assert_protected(files, protected)
+                self.assert_clean(files)
+
+    def test_core_that_dies_right_after_start_is_rolled_back(self):
+        """systemctl restart 返回 0 但新核心立刻退出，也要回滚（2026-11-03 修）。
+
+        单元是 Type=simple，restart 在 fork 时就返回成功。旧实现据此删掉回滚副本、
+        报升级成功，新核心随后崩溃循环，所有 Hy2 用户掉线且无法回滚。
+        """
+        for route in ('generated', 'cli'):
+            with self.subTest(route=route):
+                result, files, protected = self.run_case(route, failure='dies_after_start')
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(files['hysteria'], OLD, '立刻退出的新核心没有被回滚')
+                self.assertIn('回滚', result.stdout + result.stderr)
                 self.assert_protected(files, protected)
                 self.assert_clean(files)
 

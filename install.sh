@@ -2006,9 +2006,16 @@ setup_ports_and_obfs() {
     # 脚本本来就有现成的 port_owner()（80/443 检测在用），但主监听端口从没查过。
     # 撞上已占用端口时 hysteria bind 失败 → 服务反复重启，
     # 而用户看到的报错完全指不到「你选的这个端口被别人占了」。
-    # 这里提前拦下，并报出占用者进程名；已装的机器（服务本就在跑）跳过。
+    # 这里提前拦下，并报出占用者进程名。
+    # 只在「沿用正在运行的 Hysteria 自己的端口」时跳过（2026-11-03 修）：旧条件是
+    # 「服务没在跑」，重新配置 / 重装时服务总在跑，换成被 TUIC / AWG 占着的新端口
+    # 也不提示，Hysteria 绑不上、节点直接掉线。
+    _running_port=""
+    if systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f "$HY2_META_FILE" ]]; then
+        _running_port="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
     if [[ -n "${LISTEN_PORT:-}" ]] && is_valid_port "$LISTEN_PORT" \
-       && ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
+       && [[ "$LISTEN_PORT" != "$_running_port" ]]; then
         _port_user="$(port_owner udp "$LISTEN_PORT")"
         if [[ -n "$_port_user" ]]; then
             log_err "所选主监听 UDP 端口 ${LISTEN_PORT} 已被占用（占用进程: ${_port_user}）。"
@@ -2760,7 +2767,13 @@ if [[ "$TARGET" == "core" ]]; then
         echo "核心已更新；节点因流量超额被停用，暂不重启"
         exit 0
     fi
-    if ! systemctl restart hysteria-server 2>/dev/null; then
+    # Type=simple：restart 返回 0 只说明进程起来了，要等几秒确认没有立刻退出（2026-11-03 修）。
+    hy2_restarted_ok() {
+        systemctl restart hysteria-server 2>/dev/null || return 1
+        sleep 3
+        systemctl is-active --quiet hysteria-server
+    }
+    if ! hy2_restarted_ok; then
         if ! mv -f "$ROLLBACK_FILE" "$HY2_BIN"; then
             echo "新版本启动失败，回滚失败；本次旧核心保留在 ${ROLLBACK_FILE}" >&2
             exit 1
@@ -2769,7 +2782,7 @@ if [[ "$TARGET" == "core" ]]; then
             echo "新版本启动失败，已恢复本次旧核心；节点已停用，暂不重启" >&2
             exit 1
         fi
-        if ! systemctl restart hysteria-server 2>/dev/null; then
+        if ! hy2_restarted_ok; then
             echo "已恢复本次旧核心，但旧版本重启仍失败，请检查服务日志" >&2
             exit 1
         fi
@@ -5190,6 +5203,15 @@ restart_service() {
     refuse_if_suspended || return 1
     log_step "重启 Hysteria 2 服务..."
     systemctl restart hysteria-server || return 1
+    # 单元是 Type=simple：restart 在进程 fork 出来时就返回 0（2026-11-03 修）。
+    # 新核心不认配置、绑不上端口时约 0.1 秒后就退出，旧实现照样报「已重启」，
+    # 核心升级随即删掉回滚副本。等几秒再确认它还活着。
+    sleep 3
+    if ! systemctl is-active --quiet hysteria-server; then
+        log_err "Hysteria 2 启动后立即退出，最近日志："
+        journalctl -u hysteria-server -n 15 --no-pager >&2 || true
+        return 1
+    fi
     log_info "已重启。"
 }
 

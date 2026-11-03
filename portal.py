@@ -147,7 +147,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.16'
+PORTAL_VERSION = '2.17'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -6728,7 +6728,7 @@ _REALITY_RESERVED_PORTS = {
 _REALITY_PORT_CANDIDATES = [443, 8443, 2053, 2083, 2087, 2096, 9443, 5443, 8444]
 
 
-def _pick_reality_port(preferred=None, extra_blocked=None, default=None):
+def _pick_reality_port(preferred=None, extra_blocked=None, default=None, own_active=True):
     """挑一个**确实没被占用**的端口给 Reality 用。
 
     参数：
@@ -6737,6 +6737,9 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None):
         default      —— 协议的默认端口（VMess 2087 等）。排在候选表最前，但和
                         其它候选一样要查监听表；不能当作 preferred 传进来 ——
                         preferred 视为「自己的」端口，会跳过监听检查（2026-11-03）。
+        own_active   —— preferred 此刻是否真由本协议在监听。停用后保留的端口不算
+                        「自己的」：再启用前别的服务可能已占了它，要照常查监听表
+                        （2026-11-03 修）。默认 True，保持既有调用的行为。
 
     返回 (port, reason)：
         port 为 0 表示**没找到可用端口**，调用方应当报错而不是硬塞一个。
@@ -6815,9 +6818,9 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None):
         # 22 / 80 无论如何都不给（SSH 与 ACME 验证），沿用原端口也不行。
         if p in (22, 80):
             return False
-        if p == pref:
+        if p == pref and own_active:
             return True
-        if p in reserved:
+        if p in reserved and p != pref:
             return False
         # 以**实际监听表**为准。黑名单只是补充 ——
         # 因为「8443 归谁」在不同节点上完全不同，写死数字必然出错。
@@ -11395,7 +11398,8 @@ if __name__ == '__main__':
             blocked.add(reality_port)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2087,
-                extra_blocked=blocked)
+                extra_blocked=blocked,
+                own_active=has_managed_inbound(_cfg_now or {}, VMESS_INBOUND_TAG))
             if not listen_port:
                 raise RuntimeError(reason)
             ws_path = self._vmess_ws_path()
@@ -11469,6 +11473,11 @@ if __name__ == '__main__':
             regenerate_page()
             if not firewall_port(listen_port, 'tcp', open_=True):
                 raise RuntimeError('VMess 配置已保存，但防火墙放行端口失败')
+            # 换了端口要收回旧端口的放行规则，与 Reality 一致（2026-11-03 修）：旧实现只放行
+            # 新端口，旧端口的入站规则一直留着，之后别的服务监听在那里就直接暴露在公网。
+            _old_port = _valid_port(old.get('port'))
+            if _old_port and _old_port != listen_port:
+                close_protocol_port(_old_port, 'tcp', 'vmess_config')
             return new_cfg
 
         def _apply_vlessenc_enable(self):
@@ -11500,7 +11509,8 @@ if __name__ == '__main__':
                 _data_now = dict(data)
             blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config')
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port'), default=2088, extra_blocked=blocked_ports)
+                preferred=old.get('port'), default=2088, extra_blocked=blocked_ports,
+                own_active=has_managed_inbound(_cfg_now or {}, VLESSENC_INBOUND_TAG))
             if not listen_port:
                 raise RuntimeError(reason)
             decryption = old.get('decryption', '')
@@ -11576,6 +11586,11 @@ if __name__ == '__main__':
             regenerate_page()
             if not firewall_port(listen_port, 'tcp', open_=True):
                 raise RuntimeError('VLESS Encryption 配置已保存，但防火墙放行端口失败')
+            # 换了端口要收回旧端口的放行规则，与 Reality 一致（2026-11-03 修）：旧实现只放行
+            # 新端口，旧端口的入站规则一直留着，之后别的服务监听在那里就直接暴露在公网。
+            _old_port = _valid_port(old.get('port'))
+            if _old_port and _old_port != listen_port:
+                close_protocol_port(_old_port, 'tcp', 'vlessenc_config')
             return new_cfg
 
         def _h_post_manage_vmess(self, prefix):
@@ -11911,7 +11926,8 @@ if __name__ == '__main__':
                 _cfg_now = None
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config')
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port'), default=2096, extra_blocked=blocked)
+                preferred=old.get('port'), default=2096, extra_blocked=blocked,
+                own_active=_systemd_state(ANYTLS_SERVICE) == 'active')
             if not listen_port:
                 raise RuntimeError(reason)
             new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
@@ -11967,6 +11983,11 @@ if __name__ == '__main__':
             regenerate_page()
             if not firewall_port(listen_port, 'tcp', open_=True):
                 raise RuntimeError('AnyTLS 配置已保存，但防火墙放行端口失败')
+            # 换了端口要收回旧端口的放行规则，与 Reality 一致（2026-11-03 修）：旧实现只放行
+            # 新端口，旧端口的入站规则一直留着，之后别的服务监听在那里就直接暴露在公网。
+            _old_port = _valid_port(old.get('port'))
+            if _old_port and _old_port != listen_port:
+                close_protocol_port(_old_port, 'tcp', 'anytls_config')
             return new_cfg
 
         def _h_post_manage_anytls(self, prefix):
@@ -12160,6 +12181,11 @@ if __name__ == '__main__':
             regenerate_page()
             if not firewall_port(listen_port, 'udp', open_=True):
                 raise RuntimeError('TUIC 配置已保存，但防火墙放行端口失败')
+            # 换了端口要收回旧端口的放行规则，与 Reality 一致（2026-11-03 修）：旧实现只放行
+            # 新端口，旧端口的入站规则一直留着，之后别的服务监听在那里就直接暴露在公网。
+            _old_port = _valid_port(old.get('port'))
+            if _old_port and _old_port != listen_port:
+                close_protocol_port(_old_port, 'udp', 'tuic_config')
             return new_cfg
 
         def _h_post_manage_tuic(self, prefix):
@@ -13103,6 +13129,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     except Exception:
                         portal_version = ''
 
+                    # 端口一律经 _valid_port（2026-11-03 修）：任何一个协议段的端口被改坏成
+                    # 字符串，旧写法 int() 抛异常，整个 capabilities 回 500，控制台看不到这台节点。
                     return self.reply_json(200, {
                         'ok': True,
                         'portal_version': portal_version,
@@ -13112,7 +13140,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'hysteria2': {
                                 'installed': True,
                                 'active': _svc_active('hysteria-server'),
-                                'port': int(m.get('listen_port', 0) or 0),
+                                'port': _valid_port(m.get('listen_port')),
                             },
                             'vless_reality': dict(
                                 {
@@ -13120,7 +13148,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     # 与 /reality-status 同一判据：看 Reality 入站是否存在。
                                     # 只看 Xray 进程会让「只开了 VMess」的节点报 Reality 运行中。
                                     'active': d_snap['reality_inbound'],
-                                    'port': int(d_snap['reality'].get('port', 0) or 0),
+                                    'port': _valid_port(d_snap['reality'].get('port')),
                                     # 是否已配置。
                                     #
                                     # short_id 是配置过的可靠标志（每次生成配置都会写它）。
@@ -13149,7 +13177,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'active': d_snap['vmess_inbound'],
                                     'configured': bool(d_snap['vmess'].get('domain')),
                                 },
-                                **({'port': int(d_snap['vmess'].get('port') or 0)}
+                                **({'port': _valid_port(d_snap['vmess'].get('port'))}
                                    if d_snap['vmess'].get('port') else {}),
                                 **({'domain': d_snap['vmess']['domain']}
                                    if d_snap['vmess'].get('domain') else {}),
@@ -13166,7 +13194,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'active': d_snap['vlessenc_inbound'],
                                     'configured': bool(d_snap['vlessenc'].get('domain')),
                                 },
-                                **({'port': int(d_snap['vlessenc'].get('port') or 0)}
+                                **({'port': _valid_port(d_snap['vlessenc'].get('port'))}
                                    if d_snap['vlessenc'].get('port') else {}),
                                 **({'domain': d_snap['vlessenc']['domain']}
                                    if d_snap['vlessenc'].get('domain') else {}),
@@ -13186,7 +13214,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                               and _svc_active(ANYTLS_SERVICE),
                                     'configured': bool(d_snap['anytls'].get('domain')),
                                 },
-                                **({'port': int(d_snap['anytls'].get('port') or 0)}
+                                **({'port': _valid_port(d_snap['anytls'].get('port'))}
                                    if d_snap['anytls'].get('port') else {}),
                                 **({'domain': d_snap['anytls']['domain']}
                                    if d_snap['anytls'].get('domain') else {}),
@@ -13201,7 +13229,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                               and _svc_active(TUIC_SERVICE),
                                     'configured': bool(d_snap['tuic'].get('domain')),
                                 },
-                                **({'port': int(d_snap['tuic'].get('port') or 0)}
+                                **({'port': _valid_port(d_snap['tuic'].get('port'))}
                                    if d_snap['tuic'].get('port') else {}),
                                 **({'domain': d_snap['tuic']['domain']}
                                    if d_snap['tuic'].get('domain') else {}),
@@ -13214,7 +13242,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                      'active': _svc_active('gost'),
                                      'services': len(d_snap['proxy_services'])},
                             'amneziawg': {'installed': _bin('amneziawg-go'),
-                                          'active': _svc_active('amneziawg-go')},
+                                          # 单元名是 amneziawg-server，amneziawg-go 只是二进制名（2026-11-03 修）：
+                                          # 旧写法查一个不存在的单元，控制台上每台节点的 AWG 都显示停止。
+                                          'active': _svc_active(AWG_SVC_NAME)},
                             'warp': {'installed': Path('/etc/hysteria/warp').exists()
                                      or _bin('wireproxy'),
                                      'enabled': d_snap['warp_enabled']},
@@ -14190,15 +14220,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         return self.reply_json(400, {'ok': False, 'error': '缺少 name 参数'})
                     missing_outbound = False
                     with data_lock:
-                        outs = list(data.get('custom_outbounds', []))
+                        # 容器或条目被改坏时只丢坏条目（2026-11-03 修）：旧写法 o.get 遇到
+                        # 字符串条目、`for r in 7` 遇到数字容器都在 data_lock 内抛异常，
+                        # 连接被掐断，这个出站从面板上永远删不掉。
+                        state = routing_state(data)
+                        outs = [o for o in state['custom_outbounds'] if isinstance(o, dict)]
                         if not any(o.get('name') == name for o in outs):
                             missing_outbound = True
                         else:
                             data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
                             # 🔴 必须同步清理引用它的分流规则，否则 ACL 里会留下
                             #    不存在的出站名 ⇒ Hysteria 启动失败（且用户毫无察觉）。
-                            data['warp_rules'] = [r for r in data.get('warp_rules', [])
-                                                  if (r.get('outbound') if isinstance(r, dict) else None) != name]
+                            data['warp_rules'] = [r for r in normalize_route_rules(state['warp_rules'])
+                                                  if r.get('outbound') != name]
                     if missing_outbound:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(404, {'ok': False, 'error': '出站不存在'})

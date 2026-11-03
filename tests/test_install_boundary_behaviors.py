@@ -236,6 +236,7 @@ openssl(){ printf fixture-secret; }
 systemctl(){ return 0; }
 rm(){ printf 'rm:%s\n' "$*"; }
 clear_all_hopping_rules(){ :; }
+port_owner(){ :; }
 iptables(){ printf 'UNEXPECTED_FIREWALL\n' >&2; return 99; }
 """
             + ("command(){ if [[ \"$1\" == -v && \"$2\" == iptables ]]; then return 1; fi; builtin command \"$@\"; }\n" if not available else "")
