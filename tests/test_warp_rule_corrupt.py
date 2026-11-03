@@ -27,7 +27,10 @@ class WarpRuleCorruptTest(surface.EndpointAuthTest):
             original_prepare(meta, port)
             p = Path(meta).parent / 'portal.json'
             data = json.loads(p.read_text(encoding='utf-8'))
-            data['warp_rules'] = [{'outbound': 'warp_socks'}, 'keep.example.com', 7]
+            data['warp_rules'] = [{'outbound': 'warp_socks'}, 'keep.example.com', 7,
+                                  {'domain': 'via.example.com', 'outbound': 'proxy_a'}]
+            data['custom_outbounds'] = ['legacy-string-entry',
+                                        {'name': 'proxy_a', 'type': 'socks5', 'addr': '127.0.0.1:1'}]
             p.write_text(json.dumps(data), encoding='utf-8')
         surface.portal.prepare = prepare
         try:
@@ -52,6 +55,20 @@ class WarpRuleCorruptTest(surface.EndpointAuthTest):
         self.assertIn('new.example.com', domains)
         self.assertIn('keep.example.com', domains, '合法规则被一起丢掉了')
 
+
+    def test_outbound_delete_survives_malformed_entries(self):
+        """删除出站时坏条目不能掐断连接（2026-11-03 修）。
+
+        旧实现 o.get 遇到字符串条目在 data_lock 内抛 AttributeError，连接被重置，
+        这个出站从面板上永远删不掉。删除时引用它的分流规则一并清掉。
+        """
+        status, body = self.request('POST', self.prefix + 'manage-outbounds',
+                                    {'action': 'delete', 'name': 'proxy_a'}, self.auth())
+        self.assertEqual(status, 200, body[:300])
+        saved = json.loads((self.root / 'portal.json').read_text(encoding='utf-8'))
+        self.assertFalse(any(isinstance(o, dict) and o.get('name') == 'proxy_a'
+                             for o in saved['custom_outbounds']))
+        self.assertNotIn('via.example.com', [r['domain'] for r in saved['warp_rules']])
 
 # 父类的用例不在这里重复跑。
 for _name in list(vars(surface.EndpointAuthTest)):

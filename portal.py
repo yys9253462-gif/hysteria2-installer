@@ -14192,15 +14192,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         return self.reply_json(400, {'ok': False, 'error': '缺少 name 参数'})
                     missing_outbound = False
                     with data_lock:
-                        outs = list(data.get('custom_outbounds', []))
+                        # 容器或条目被改坏时只丢坏条目（2026-11-03 修）：旧写法 o.get 遇到
+                        # 字符串条目、`for r in 7` 遇到数字容器都在 data_lock 内抛异常，
+                        # 连接被掐断，这个出站从面板上永远删不掉。
+                        state = routing_state(data)
+                        outs = [o for o in state['custom_outbounds'] if isinstance(o, dict)]
                         if not any(o.get('name') == name for o in outs):
                             missing_outbound = True
                         else:
                             data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
                             # 🔴 必须同步清理引用它的分流规则，否则 ACL 里会留下
                             #    不存在的出站名 ⇒ Hysteria 启动失败（且用户毫无察觉）。
-                            data['warp_rules'] = [r for r in data.get('warp_rules', [])
-                                                  if (r.get('outbound') if isinstance(r, dict) else None) != name]
+                            data['warp_rules'] = [r for r in normalize_route_rules(state['warp_rules'])
+                                                  if r.get('outbound') != name]
                     if missing_outbound:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(404, {'ok': False, 'error': '出站不存在'})
