@@ -1079,8 +1079,8 @@ setup_certificates() {
     fi
 
     if [[ "$cert_choice" == "2" ]]; then
-        read -rp "请输入证书公钥文件完整路径 (fullchain.pem/cert.crt): " input_cert
-        read -rp "请输入证书私钥文件完整路径 (privkey.pem/private.key): " input_key
+        read -rp "请输入证书公钥文件完整路径 (fullchain.pem/cert.crt): " input_cert || true
+        read -rp "请输入证书私钥文件完整路径 (privkey.pem/private.key): " input_key || true
         if [[ ! -f "$input_cert" || ! -f "$input_key" ]]; then
             log_err "指定的文件不存在，将回退为自签名证书！"
             generate_self_signed_cert
@@ -1096,7 +1096,7 @@ setup_certificates() {
                 else
                     log_err "警告：$(basename "$input_cert") 仅含叶证书，缺少中间证书。"
                     log_err "v2rayNG/Xray/hysteria 会报 'certificate signed by unknown authority' 而无法连接。"
-                    read -rp "仍要继续使用该证书吗？(y/N): " force_leaf
+                    read -rp "仍要继续使用该证书吗？(y/N): " force_leaf || true
                     [[ "$force_leaf" =~ ^[Yy]$ ]] || chain_ok=0
                 fi
             fi
@@ -1104,8 +1104,15 @@ setup_certificates() {
                 CERT_TYPE="custom"
                 CERT_FILE="$input_cert"
                 KEY_FILE="$input_key"
-                read -rp "请输入证书绑定的域名 (SNI): " SERVER_NAME
-                SERVER_NAME=${SERVER_NAME:-$PUBLIC_IP}
+                read -rp "请输入证书绑定的域名 (SNI): " SERVER_NAME || true
+                # 必须是合法域名（2026-11-04 修）：旧实现回车就退回公网 IP 且标成可信证书，
+                # 生成的链接是 sni=<IP>、不带 insecure，客户端拿域名证书校验 IP 必然失败。
+                SERVER_NAME="$(printf '%s' "${SERVER_NAME:-}" | tr 'A-Z' 'a-z')"
+                if ! is_valid_domain "$SERVER_NAME"; then
+                    log_err "证书绑定的域名不合法或为空（${SERVER_NAME:-<空>}），已取消，回退为自签名证书。"
+                    generate_self_signed_cert
+                    return 0
+                fi
                 IS_INSECURE="false"
             else
                 log_err "已取消，回退为自签名证书。"
@@ -1893,7 +1900,9 @@ setup_acme_certificate() {
     if [[ $dns_rc -eq 1 ]]; then
         # 完全没解析到任何记录 — 强烈不建议继续
         echo -e "${RED}若继续，Let's Encrypt HTTP-01 验证几乎必然失败，Hysteria 服务将反复重启。${PLAIN}"
-        read -rp "仍要继续申请 ACME 证书吗? [y/N, 默认 N]: " force_continue
+        # EOF（无人值守）按默认 N 处理并给出中止原因（2026-11-04 修）：没有 || true 时
+        # set -e 让脚本在这里静默退出，只剩退出码 1。
+        read -rp "仍要继续申请 ACME 证书吗? [y/N, 默认 N]: " force_continue || true
         force_continue=${force_continue:-N}
         if [[ ! "$force_continue" =~ ^[Yy]$ ]]; then
             log_err "已中止 ACME 证书申请。请先把 DNS A 记录指向本机 IP 后再重试。"
@@ -1903,7 +1912,9 @@ setup_acme_certificate() {
     elif [[ $dns_rc -eq 2 ]]; then
         # 解析到了别的 IP — 同样不推荐继续
         echo -e "${RED}域名当前指向的不是本机，Let's Encrypt 验证必然失败。${PLAIN}"
-        read -rp "仍要继续申请 ACME 证书吗? [y/N, 默认 N]: " force_continue
+        # EOF（无人值守）按默认 N 处理并给出中止原因（2026-11-04 修）：没有 || true 时
+        # set -e 让脚本在这里静默退出，只剩退出码 1。
+        read -rp "仍要继续申请 ACME 证书吗? [y/N, 默认 N]: " force_continue || true
         force_continue=${force_continue:-N}
         if [[ ! "$force_continue" =~ ^[Yy]$ ]]; then
             log_err "已中止 ACME 证书申请。请先把 DNS A 记录修正为本机 IP 后再重试。"
