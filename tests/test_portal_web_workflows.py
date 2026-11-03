@@ -2018,6 +2018,7 @@ class WebWorkflowTests(unittest.TestCase):
             awg_run=lambda args, timeout=0: awg_calls.append(args) or (0, '', ''),
             awg_err_tail=lambda *a, **kw: '',
             awg_endpoint_error=lambda endpoint: '',
+            awg_operation_lock=threading.Lock(),
             unit_suspended=lambda unit: suspended and unit == 'amneziawg-server')
         return awg_calls
 
@@ -2048,6 +2049,15 @@ class WebWorkflowTests(unittest.TestCase):
         self.run.assert_called_once()
         self.assertEqual(self.run.call_args[0][0], ['systemctl', 'start', 'amneziawg-server'])
 
+
+    def test_awg_peer_delete_extends_its_deadline(self):
+        """peer_del 排队等 AWG 锁时不能被 30 秒死线掐断（2026-11-04 修）。"""
+        self.awg_suspended_fixture(False)
+        extended = []
+        self.handler._extend_deadline = lambda seconds, heavy=False: extended.append(seconds) or True
+        status, payload = self.invoke('_h_post_manage_amneziawg', {'action': 'peer_del', 'name': 'phone'})
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(extended and max(extended) >= 90, extended)
 
 if __name__ == '__main__':
     unittest.main()

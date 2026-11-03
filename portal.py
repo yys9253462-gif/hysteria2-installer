@@ -11099,6 +11099,12 @@ if __name__ == '__main__':
                     name = (form.get('name', [''])[0] or '').strip()
                     if not VALID_AWG_NAME_RE.match(name):
                         return self.reply_json(400, {'ok': False, 'error': '客户端名称非法'})
+                    # 与 peer_add 同样抬死线（2026-11-04 修）：awg_run 先排队等 AWG 操作锁，
+                    # update 占锁时可达 420 秒；默认 30 秒死线先关掉连接，浏览器报网络错误，
+                    # 删除却在锁空出来后照常执行，重试只拿到「客户端不存在」。
+                    if not self._extend_deadline(120, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     rc, out, err = awg_run(['peer-del', name], timeout=90)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False, 'error': '删除失败：' + awg_err_tail(rc, out, err, 400)})
