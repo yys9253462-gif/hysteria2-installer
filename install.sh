@@ -5366,6 +5366,21 @@ uninstall_all() {
         if [[ "$nginx_removed" == 1 ]] && command -v nginx >/dev/null 2>&1; then
             nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; } || true
         fi
+        # 撤掉安装器登记的 acme.sh 续期（2026-11-03 修）：签发时 --install-cert 把证书
+        # 写进 ${HY2_CERT_DIR}/acme-<域名>.crt，并登记 reloadcmd。不撤的话 acme.sh 的 cron
+        # 卸载后照样续期：Nginx 验证站点已删就每次报错，DNS API 方式则续期成功、又把
+        # /etc/hysteria/cert 建回来。只处理 HY2_CERT_DIR 里有对应证书的域名；
+        # acme.sh 自己的证书与账户不动（--remove 只是不再续期）。
+        local acme_cert acme_domain acme_bin="$HOME/.acme.sh/acme.sh"
+        if [[ -x "$acme_bin" ]]; then
+            for acme_cert in "$HY2_CERT_DIR"/acme-*.crt; do
+                [[ -f "$acme_cert" ]] || continue
+                acme_domain="${acme_cert##*/acme-}"
+                acme_domain="${acme_domain%.crt}"
+                is_valid_domain "$acme_domain" || continue
+                "$acme_bin" --remove -d "$acme_domain" --ecc >/dev/null 2>&1 || true
+            done
+        fi
         # 仅删除首次安装时存在 marker 的安装器资产；旧版没有 marker 时保留，避免误删用户文件。
         if [[ -f "$HY2_DIR/.hy2-installer-owned" \
                 && -f /etc/sysctl.d/99-hysteria2.conf ]] \
