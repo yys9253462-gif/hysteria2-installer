@@ -180,6 +180,35 @@ assert.strictEqual(btnAddAwgPeer.disabled,false, 'button should be restored');
 
 class VersionUiBehaviorTests(unittest.TestCase):
     @unittest.skipUnless(NODE, 'requires node')
+    def test_plain_text_errors_reach_the_admin_as_readable_messages(self):
+        """限流 429 / 会话过期 401 是纯文本：面板要给出原因，不是 JSON 解析错误（2026-11-03 修）。
+
+        跑页面脚本开头的真实代码，再用真实的 awgPost 发请求。
+        """
+        script = portal.SCRIPT
+        code = script[:script.index('// 全局高颜值 Promise 确认框与 Toast 机制')]
+        awg = script[script.index('function awgPost('):script.index('function setAwgBadge(')]
+        harness = "const assert = require('assert');\nconst location = {pathname: '/fixture/'};\nlet reply;\n"
+        checks = r"""
+globalThis.fetch = async () => reply;
+(async () => {
+  reply = new Response('Authentication required', {status: 401});
+  let json = await awgPost('manage-amneziawg', {action: 'peer-add'});
+  assert.strictEqual(json.ok, false);
+  assert(json.error.includes('登录已过期'), json.error);
+  reply = new Response('Too many requests', {status: 429});
+  json = await awgPost('manage-amneziawg', {action: 'peer-add'});
+  assert(json.error.includes('请求太频繁'), json.error);
+  reply = new Response('{"ok":true,"peer":"a"}', {status: 200});
+  json = await awgPost('manage-amneziawg', {action: 'peer-add'});
+  assert.deepStrictEqual(json, {ok: true, peer: 'a'});
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + code + awg + checks], capture_output=True,
+                                text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]
