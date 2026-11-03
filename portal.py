@@ -8211,6 +8211,7 @@ def serve(path):
                 'measurement_scope': 'unavailable'}
 
     gost_written_ports = []
+    speedtest_lock = threading.Lock()
 
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
@@ -14033,6 +14034,18 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'error_label': '节点未安装 ping，无法测速',
                     'results': [],
                 })
+            # 同一时刻只跑一轮（2026-11-04 修）：每轮最长约 60 秒、占 8 个 ping 子进程。
+            # 控制台重试或多个面板同时点「测速」时，并发请求各占一个 quick 槽一分钟，
+            # 32 个槽被占满后 /auth 也拿不到槽，新连接全部鉴权失败。后来者直接 429。
+            if not speedtest_lock.acquire(blocking=False):
+                return self.reply_json(429, {'ok': False, 'error': 'SPEEDTEST_BUSY',
+                                             'error_label': '已有一轮测速在进行，请稍后再试'})
+            try:
+                return self._run_speedtest()
+            finally:
+                speedtest_lock.release()
+
+        def _run_speedtest(self):
             # 18 个靶点 × 10 包，单个 ping 约 11 秒、最坏 20 秒：8 路并行共 3 批，
             # 约 35 秒、最坏 60 秒，30 秒死线不够。
             self._extend_deadline(120)

@@ -83,7 +83,7 @@ class DeadlineExtensionTest(unittest.TestCase):
                         'manage-amneziawg 的慢路径必须调用 _extend_deadline')
 
     def test_speedtest_unlock_check_extend_deadline(self):
-        for name in ('_h_api_speedtest', '_h_api_unlock_check'):
+        for name in ('_run_speedtest', '_h_api_unlock_check'):
             node = self._find_handler_body(name)
             self.assertTrue(self._calls_extend(node),
                             '%s 必须调用 _extend_deadline' % name)

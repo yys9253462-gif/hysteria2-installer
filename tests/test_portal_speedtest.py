@@ -105,7 +105,8 @@ class SpeedtestTargetListTest(unittest.TestCase):
                       '靶点清单必须是源码内硬编码常量，不接受调用方传入')
 
         # 端点实现里不得出现读 query 的痕迹（parse_qs / self.query / query.get）。
-        m = re.search(r'def _h_api_speedtest\(self\):(.*?)\n        def ', src, re.S)
+        # 实现分在 _h_api_speedtest（单飞锁）与 _run_speedtest（真正测速）两段。
+        m = re.search(r'def _h_api_speedtest\(self\):(.*?)\n        def _ping_one', src, re.S)
         self.assertIsNotNone(m, '未找到 _h_api_speedtest 实现')
         body = m.group(1)
         for danger in ('parse_qs', 'self.query', 'query.get(', 'urlparse'):
@@ -235,6 +236,29 @@ class SpeedtestEndpointTest(unittest.TestCase):
 
     def bearer(self):
         return 'Bearer ' + self.data['api_key']
+
+    def test_concurrent_runs_are_refused_not_stacked(self):
+        """同一时刻只跑一轮测速，后来者 429（2026-11-04 修）。
+
+        每轮最长约 60 秒；并发请求各占一个 quick 槽，32 个槽被占满后 /auth 也拿不到槽。
+        这里把假 ping 换成慢的，同时发两个请求。
+        """
+        import threading
+        slow = self.root / 'bin' / 'ping'
+        original = slow.read_text(encoding='utf-8')
+        slow.write_text('#!/bin/sh\nsleep 2\n' + original.split('\n', 1)[1], encoding='utf-8')
+        try:
+            results = []
+            threads = [threading.Thread(target=lambda: results.append(
+                self.get('/api/v1/speedtest', auth=self.bearer())[0])) for _ in range(2)]
+            for t in threads:
+                t.start()
+                time.sleep(0.3)
+            for t in threads:
+                t.join()
+            self.assertEqual(sorted(results), [200, 429])
+        finally:
+            slow.write_text(original, encoding='utf-8')
 
     def test_requires_api_key(self):
         """没鉴权必须 401 —— 这是新增端点最容易忘的一步。"""
