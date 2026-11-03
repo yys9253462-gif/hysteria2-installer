@@ -12899,9 +12899,15 @@ if [ ! -f "$WARP_OWNED_MARKER" ]; then
         exit 1
     fi
 fi
-# 从这里开始写的文件都归本项目：先落标记，后面任何一步失败，卸载也能清干净。
-: > "$WARP_OWNED_MARKER"
-chmod 600 "$WARP_OWNED_MARKER"
+# 标记在真正写入第一个 wireproxy 资产前才落（2026-11-04 修，与 install.sh 一致）：
+# 旧实现在下载之前就写，下载失败退出后标记留着，之后机主自己装的 wireproxy
+# 会被下次网页安装直接覆盖、被卸载当成本项目的删掉。
+claim_warp_assets() {
+    if [ ! -f "$WARP_OWNED_MARKER" ]; then
+        : > "$WARP_OWNED_MARKER"
+        chmod 600 "$WARP_OWNED_MARKER"
+    fi
+}
 
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -13002,6 +13008,7 @@ if [ ! -x "$WP_BIN" ]; then
     fi
     install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD"; exit 1; }
     rm -rf "$TD"; trap - EXIT
+    claim_warp_assets
     mv -f "${WP_BIN}.new" "$WP_BIN"
 fi
 
@@ -13038,6 +13045,7 @@ if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ]; then
     exit 1
 fi
 
+claim_warp_assets
 cat > "$WP_CFG" <<WPEOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
