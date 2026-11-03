@@ -14488,7 +14488,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             return self.reply_json(200, awg_state())
 
-        def reply(self, code, body, mime='text/plain', www_auth=False):
+        # 默认带 charset（2026-11-04 修）：网页表单的错误回复是中文 UTF-8，旧默认值没写
+        # charset，浏览器按本地编码解出乱码（例如「该密码已被其他用户使用」）。
+        def reply(self, code, body, mime='text/plain; charset=utf-8', www_auth=False):
             self.send_response(code)
             self._responded = True
             self.send_header('Content-Type', mime)
