@@ -238,6 +238,31 @@ globalThis.fetch = async () => ({json: async () => ({ok: true, message: '已重�
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_outbound_list_test_button_carries_socks_credentials(self):
+        """列表里的「测出口」要带上 SOCKS5 账号密码（2026-11-03 修）。"""
+        script = portal.SCRIPT
+        start = script.index('function renderOutboundList(outs) {')
+        end = script.index('\n}\n', start) + 3
+        helpers = script[script.index('function obEsc('):script.index('\n}\n', script.index('function obEsc(')) + 3]
+        harness = r"""
+const assert = require('assert');
+const obEls = {list: {innerHTML: ''}, count: null};
+const OB_TYPE_LABEL = {socks5: {label: 'SOCKS5', cls: ''}};
+const obMetaOf = o => o.addr;
+"""
+        checks = r"""
+renderOutboundList([{name: 'p1', type: 'socks5', addr: 'proxy.example:1080', username: 'u@x', password: 'p:w'}]);
+const m = obEls.list.innerHTML.match(/data-ob-addr="([^"]*)"/);
+assert(m, obEls.list.innerHTML);
+assert.strictEqual(m[1], 'u%40x:p%3Aw@proxy.example:1080');
+renderOutboundList([{name: 'p2', type: 'socks5', addr: 'proxy.example:1080'}]);
+assert.strictEqual(obEls.list.innerHTML.match(/data-ob-addr="([^"]*)"/)[1], 'proxy.example:1080');
+"""
+        result = subprocess.run([NODE, '-e', harness + helpers + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]

@@ -986,7 +986,11 @@ function renderOutboundList(outs) {
   }
   obEls.list.innerHTML = outs.map((o, idx) => {
     const t = OB_TYPE_LABEL[o.type] || { label: o.type, cls: '' };
-    const testAddr = (o.type === 'socks5') ? (o.addr || '') : (o.url || '');
+    // 带认证的 SOCKS5 要把账号密码一起带上，与表单里的「测试」同一写法（2026-11-03 修）：
+    // 旧写法只发 host:port，需要认证的出站从列表里测永远「探测失败」。
+    const socksAuth = (o.username || o.password)
+      ? encodeURIComponent(o.username || '') + ':' + encodeURIComponent(o.password || '') + '@' : '';
+    const testAddr = (o.type === 'socks5') ? (o.addr ? socksAuth + o.addr : '') : (o.url || '');
     return '<div class="ob-item">'
       + '<div class="ob-item-main">'
       + '<div class="ob-item-name">' + obEsc(o.name)
