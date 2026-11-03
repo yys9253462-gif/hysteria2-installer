@@ -333,9 +333,19 @@ endpoint_has_port() {
 }
 
 validate_endpoint() {
-    local ep="$1" port=""
+    local ep="$1" port="" host=""
     if [[ "$ep" =~ ^[A-Za-z0-9_.-]+(:([0-9]{1,5}))?$ ]] || [[ "$ep" =~ ^\[[0-9A-Fa-f:.]+\](:([0-9]{1,5}))?$ ]]; then
         port="${BASH_REMATCH[2]}"
+        # 形状对了还得真是个主机（2026-11-04 修）：旧规则放过 "..."、"-"、"[:]"、"[1.2.3.4]"，
+        # 写进客户端配置后永远握不上手，管理员却看到成功。
+        host="${ep%:"$port"}"; [[ -n "$port" ]] || host="$ep"
+        if [[ "$host" == \[*\] ]]; then
+            host="${host#[}"; host="${host%]}"
+            python3 -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]).version == 6 else 1)'                 "$host" 2>/dev/null || { log_err "方括号里必须是 IPv6 地址: ${ep}"; return 1; }
+        elif [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+            log_err "连接地址不是有效的域名或 IPv4: ${ep}"
+            return 1
+        fi
         # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置。
         if [[ -n "$port" ]]; then
             port="$((10#$port))"

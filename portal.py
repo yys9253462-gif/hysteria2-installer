@@ -7818,6 +7818,21 @@ def serve(path):
     def awg_endpoint_error(endpoint):
         if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
             return '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'
+        # 与 awgctl 的 validate_endpoint 同一规则（2026-11-04 修）：形状对了还得真是个主机，
+        # 旧规则放过 "..." / "[:]" / "[1.2.3.4]"，客户端拿到后永远握不上手。
+        host = endpoint
+        if host.startswith('['):
+            inner = host[1:host.index(']')]
+            try:
+                if ipaddress.ip_address(inner).version != 6:
+                    raise ValueError
+            except ValueError:
+                return '方括号里必须是 IPv6 地址'
+        else:
+            host = host.rsplit(':', 1)[0] if ':' in host else host
+            if not re.fullmatch(r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
+                                r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
+                return '连接地址不是有效的域名或 IPv4'
         port_match = re.search(r':([0-9]+)$', endpoint)
         if port_match:
             raw_port = port_match.group(1)
