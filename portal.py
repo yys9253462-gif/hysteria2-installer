@@ -8193,6 +8193,8 @@ def serve(path):
                 'measurement_started_at': None,
                 'measurement_scope': 'unavailable'}
 
+    gost_written_ports = []
+
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
         gost_cfg_path = portal_path.parent / 'gost.yml'
@@ -8234,6 +8236,8 @@ def serve(path):
                         'certFile': cert_file, 'keyFile': key_file}}
                 services.append(entry)
 
+        # 记下真正写进配置的端口，gost_ports_ready 只等这些（2026-11-03 修）。
+        gost_written_ports[:] = [int(s['addr'].lstrip(':')) for s in services]
         cfg = {'services': services,
                'bypasses': [{'name': GOST_PRIVATE_BYPASS,
                              'matchers': list(PRIVATE_REJECT_RULES) + ['localhost', '*.localhost']}]}
@@ -8241,15 +8245,11 @@ def serve(path):
         atomic_write_private(gost_cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8'))
 
     def gost_ports_ready():
+        # 只等 write_gost_config 实际写进配置的端口（2026-11-03 修）：旧实现自己再解析
+        # 一遍 proxy_services，True 被当成端口 1、70000 照收，而这些条目根本没写进
+        # gost.yml —— gost 永远不会监听它们，于是每次增删代理都判「未生效」并回滚。
         with data_lock:
-            # 容错：数据里某条记录的 port 被改坏时，跳过它而不是让整个
-            # reload 因 ValueError 失败（2026-10-29 修）。
-            ports = []
-            for item in proxy_services(data):
-                try:
-                    ports.append(int(item['port']))
-                except (KeyError, TypeError, ValueError):
-                    continue
+            ports = list(gost_written_ports)
         if not ports:
             return True
         # 读监听表而不是逐个 create_connection（2026-10-29 改）：
