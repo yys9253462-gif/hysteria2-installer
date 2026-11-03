@@ -169,12 +169,15 @@ class PortalMeter:
     def _read(self, source, cfg):
         if source=='hysteria':
             counters=readers.read_hysteria(cfg['url'],cfg['secret'])
+            # 计数与采样时间一起在锁内换掉（2026-11-04 修）：旧实现分两句、在锁外赋值，
+            # summary() 恰好落在两句之间时，会拿新计数配时间 0，或 None 计数配新时间 ——
+            # 后者在 .get 上抛 AttributeError，用户页随之 500。
             try:
-                self.online_counts=readers.read_hysteria_online(cfg['url'],cfg['secret'])
-                self.online_sampled_at=time.time()
+                online=(readers.read_hysteria_online(cfg['url'],cfg['secret']),time.time())
             except Exception:
-                self.online_counts=None
-                self.online_sampled_at=0
+                online=(None,0)
+            with self.lock:
+                self.online_counts,self.online_sampled_at=online
             return counters
         return readers.read_xray(cfg['binary'],cfg['address'])
 
@@ -310,6 +313,7 @@ class PortalMeter:
 
     def summary(self, uid):
         with self.lock:
+            online_counts, online_sampled_at = self.online_counts, self.online_sampled_at
             m=self.data.get('usage_meter',{})
             if not isinstance(m, dict):
                 m={}
@@ -332,7 +336,7 @@ class PortalMeter:
                 'measurement_complete': initialized and not gaps,
                 'current_online': copy.deepcopy(self.live_snapshot.get('users',{}).get(uid,{})) if self.live_snapshot is not None and time.time()-self.live_sampled_at < 45 else {'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'},
                 'online_ip_scope': 'recent_authentication',
-                'online_devices': self.online_counts.get(uid, 0) if self.online_counts is not None and time.time()-self.online_sampled_at < 30 else None,
+                'online_devices': online_counts.get(uid, 0) if online_counts is not None and time.time()-online_sampled_at < 30 else None,
                 'online_devices_scope': 'hysteria_core_instances_only',
                 'measurement_scope':'since_measurement_started',
                 'measurement_sources':{s:copy.deepcopy(health.get(s, {})) for s in enabled},

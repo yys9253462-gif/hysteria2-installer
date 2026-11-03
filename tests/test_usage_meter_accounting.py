@@ -243,6 +243,52 @@ class MeterAccountingTest(unittest.TestCase):
         self.meter.poll()
         self.assertNotIn('gone', self.data['usage_meter'].get('retired_users', []))
 
+    def test_online_counts_and_their_timestamp_change_together_under_the_lock(self):
+        """在线计数与采样时间要在锁内一起换掉（2026-11-04 修）。
+
+        旧实现分两句在锁外赋值，summary() 落在两句之间时拿到 None 计数配新时间，
+        在 .get 上抛 AttributeError，用户页 500。这里记录每次赋值时锁是否被持有。
+        """
+        held = []
+
+        class TrackingLock:
+            def __init__(self):
+                self.inner = threading.RLock()
+                self.depth = 0
+            def __enter__(self):
+                self.inner.acquire()
+                self.depth += 1
+            def __exit__(self, *exc):
+                self.depth -= 1
+                self.inner.release()
+                return False
+
+        lock = TrackingLock()
+        meter = runtime.PortalMeter(self.data, lock, lambda: None, {'hysteria': {'url': 'http://127.0.0.1:1', 'secret': 's'}},
+                                    on_speed=lambda *a: None)
+        cls = type(meter)
+
+        class Watched(cls):
+            def __setattr__(self, name, value):
+                if name in ('online_counts', 'online_sampled_at') and hasattr(self, 'online_sampled_at'):
+                    held.append(lock.depth > 0)
+                object.__setattr__(self, name, value)
+
+        meter.__class__ = Watched
+        orig_read, orig_online = runtime.readers.read_hysteria, runtime.readers.read_hysteria_online
+        runtime.readers.read_hysteria = lambda url, secret: {}
+        try:
+            runtime.readers.read_hysteria_online = lambda url, secret: {'u': 1}
+            meter._read('hysteria', {'url': 'http://127.0.0.1:1', 'secret': 's'})
+            def boom(url, secret):
+                raise OSError('down')
+            runtime.readers.read_hysteria_online = boom
+            meter._read('hysteria', {'url': 'http://127.0.0.1:1', 'secret': 's'})
+        finally:
+            runtime.readers.read_hysteria, runtime.readers.read_hysteria_online = orig_read, orig_online
+        self.assertTrue(held)
+        self.assertTrue(all(held), '在线计数在锁外被赋值')
+
     def test_core_and_runtime_revision_match(self):
         self.assertEqual(runtime.core.ACCOUNTING_REVISION, runtime.ACCOUNTING_REVISION)
 
