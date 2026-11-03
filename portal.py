@@ -14578,14 +14578,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
     # 启动时比较完整托管客户端列表；服务已停止但配置匹配时也尝试恢复。
     try:
-        if Path('/etc/hysteria/xray.json').exists():
+        # 与 apply_access 用同一个文件（portal_path.parent），检查与修复看的是同一份配置。
+        _startup_xray = portal_path.parent / 'xray.json'
+        if _startup_xray.exists():
             with data_lock:
                 _want = {REALITY_INBOUND_TAG: reality_clients(data),
                          VMESS_INBOUND_TAG: vmess_clients(data),
                          VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
             _got = {}
             try:
-                _cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                _cfg = json.loads(_startup_xray.read_text(encoding='utf-8'))
                 for _tag in MANAGED_INBOUND_TAGS:
                     _idx, _inb = managed_inbound_index(_cfg, _tag)
                     if _idx >= 0:
@@ -14594,12 +14596,24 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 _got = {}
             _mismatch = any(_want[tag] != (_got.get(tag) or []) for tag in _got)
             _stopped = bool(_got) and _systemd_state('xray') != 'active'
-            if (_mismatch or _stopped) and not unit_suspended('xray'):
+            if _mismatch and not unit_suspended('xray'):
+                # clients 与 portal.json 不一致时要按 data 重写 xray.json（2026-11-03 修）：
+                # 旧实现只 restart，Xray 重读的还是同一份旧文件。门户在 portal.json 已存、
+                # xray.json 未写时崩溃，新开 / 续费的用户就一直连不上 Reality / VMess。
+                # 先 reset-failed：停止状态的 xray 会被 apply 视为停用而不重启。
+                subprocess.run(['systemctl', 'reset-failed', 'xray'],
+                               capture_output=True, timeout=5)
+                # current != wanted 时 apply_access 自己就会改写并重启，不需要 force_ids。
+                if apply_access():
+                    print('[portal] 启动时按 portal.json 重写了 xray clients', file=sys.stderr)
+                else:
+                    print('[portal] 启动时补同步 clients 失败，交给撤销线程重试', file=sys.stderr)
+            elif _stopped and not unit_suspended('xray'):
                 subprocess.run(['systemctl', 'reset-failed', 'xray'],
                                capture_output=True, timeout=5)
                 subprocess.run(['systemctl', 'restart', 'xray'],
                                capture_output=True, timeout=10)
-                print('[portal] 启动时恢复了 xray 服务或补同步 clients', file=sys.stderr)
+                print('[portal] 启动时恢复了 xray 服务', file=sys.stderr)
     except Exception as e:
         print('[portal] 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
 
