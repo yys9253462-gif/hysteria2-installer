@@ -162,6 +162,18 @@ def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
     return found
 
 
+def api_error_text(exc):
+    """API 回给调用方的错误文字：主动抛的 RuntimeError 说明照给，其它只给异常类型。
+
+    OSError / JSONDecodeError 的原文带绝对路径与解析上下文（2026-11-04 修），API key
+    持有者不需要也不该看到 /etc/hysteria 下的文件布局；完整原文写进门户日志。
+    """
+    if type(exc) is RuntimeError:
+        return str(exc)[:300]
+    print('[portal] api error: %s: %s' % (type(exc).__name__, str(exc)[:300]), file=sys.stderr)
+    return type(exc).__name__
+
+
 def warp_backend_installed():
     """本机是否装了 WARP 出口：wgcf + wireproxy，或旧节点的官方 warp-cli。"""
     return (shutil.which('wireproxy') is not None
@@ -10294,7 +10306,7 @@ if __name__ == '__main__':
                     try:
                         status, payload = self._manage_proxy_operation('create', params)
                     except Exception as exc:
-                        return self.reply_json(500, {'ok': False, 'error': 'proxy add failed: %s' % exc})
+                        return self.reply_json(500, {'ok': False, 'error': 'proxy add failed: ' + api_error_text(exc)})
                     return self.reply_json(status, payload)
 
                 elif sub == 'proxy-services/list':
@@ -10316,7 +10328,7 @@ if __name__ == '__main__':
                     try:
                         status, payload = self._manage_proxy_operation('delete', params)
                     except Exception as exc:
-                        return self.reply_json(500, {'ok': False, 'error': 'proxy delete failed: %s' % exc})
+                        return self.reply_json(500, {'ok': False, 'error': 'proxy delete failed: ' + api_error_text(exc)})
                     return self.reply_json(status, payload)
 
                 elif sub == 'node/suspend':
