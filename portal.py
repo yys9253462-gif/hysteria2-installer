@@ -14518,7 +14518,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if not ok:
                         return self.reply_json(400, {'ok': False, 'error': err})
                     with data_lock:
-                        outs = list(data.get('custom_outbounds', []))
+                        # 容器被改坏成 null / 数字时按空表处理（2026-11-04 修，与删除一致）：
+                        # 旧写法 list(None) 在 data_lock 内抛 TypeError，新增出站一律失败。
+                        outs = [o for o in routing_state(data)['custom_outbounds'] if isinstance(o, dict)]
                         existing_index = next(
                             (i for i, outbound in enumerate(outs)
                              if isinstance(outbound, dict) and outbound.get('name') == cleaned['name']),
