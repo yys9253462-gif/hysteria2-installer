@@ -13129,6 +13129,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     except Exception:
                         portal_version = ''
 
+                    # 端口一律经 _valid_port（2026-11-03 修）：任何一个协议段的端口被改坏成
+                    # 字符串，旧写法 int() 抛异常，整个 capabilities 回 500，控制台看不到这台节点。
                     return self.reply_json(200, {
                         'ok': True,
                         'portal_version': portal_version,
@@ -13138,7 +13140,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'hysteria2': {
                                 'installed': True,
                                 'active': _svc_active('hysteria-server'),
-                                'port': int(m.get('listen_port', 0) or 0),
+                                'port': _valid_port(m.get('listen_port')),
                             },
                             'vless_reality': dict(
                                 {
@@ -13146,7 +13148,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     # 与 /reality-status 同一判据：看 Reality 入站是否存在。
                                     # 只看 Xray 进程会让「只开了 VMess」的节点报 Reality 运行中。
                                     'active': d_snap['reality_inbound'],
-                                    'port': int(d_snap['reality'].get('port', 0) or 0),
+                                    'port': _valid_port(d_snap['reality'].get('port')),
                                     # 是否已配置。
                                     #
                                     # short_id 是配置过的可靠标志（每次生成配置都会写它）。
@@ -13175,7 +13177,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'active': d_snap['vmess_inbound'],
                                     'configured': bool(d_snap['vmess'].get('domain')),
                                 },
-                                **({'port': int(d_snap['vmess'].get('port') or 0)}
+                                **({'port': _valid_port(d_snap['vmess'].get('port'))}
                                    if d_snap['vmess'].get('port') else {}),
                                 **({'domain': d_snap['vmess']['domain']}
                                    if d_snap['vmess'].get('domain') else {}),
@@ -13192,7 +13194,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'active': d_snap['vlessenc_inbound'],
                                     'configured': bool(d_snap['vlessenc'].get('domain')),
                                 },
-                                **({'port': int(d_snap['vlessenc'].get('port') or 0)}
+                                **({'port': _valid_port(d_snap['vlessenc'].get('port'))}
                                    if d_snap['vlessenc'].get('port') else {}),
                                 **({'domain': d_snap['vlessenc']['domain']}
                                    if d_snap['vlessenc'].get('domain') else {}),
@@ -13212,7 +13214,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                               and _svc_active(ANYTLS_SERVICE),
                                     'configured': bool(d_snap['anytls'].get('domain')),
                                 },
-                                **({'port': int(d_snap['anytls'].get('port') or 0)}
+                                **({'port': _valid_port(d_snap['anytls'].get('port'))}
                                    if d_snap['anytls'].get('port') else {}),
                                 **({'domain': d_snap['anytls']['domain']}
                                    if d_snap['anytls'].get('domain') else {}),
@@ -13227,7 +13229,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                               and _svc_active(TUIC_SERVICE),
                                     'configured': bool(d_snap['tuic'].get('domain')),
                                 },
-                                **({'port': int(d_snap['tuic'].get('port') or 0)}
+                                **({'port': _valid_port(d_snap['tuic'].get('port'))}
                                    if d_snap['tuic'].get('port') else {}),
                                 **({'domain': d_snap['tuic']['domain']}
                                    if d_snap['tuic'].get('domain') else {}),

@@ -1,4 +1,7 @@
-"""capabilities 报 AmneziaWG 状态要查真正的单元 amneziawg-server（2026-11-03 修）。
+"""capabilities 的两处修复（2026-11-03）：AWG 状态查真正的单元 amneziawg-server；
+协议段端口被改坏时不能让整个端点 500。
+
+capabilities 报 AmneziaWG 状态要查真正的单元 amneziawg-server。
 
 旧实现查 `amneziawg-go`（那是二进制名，不是 systemd 单元），每台节点都报停止。
 起真门户进程，PATH 里放一个只认 amneziawg-server 为 active 的假 systemctl。
@@ -40,6 +43,10 @@ class CapabilitiesAwgUnitTest(unittest.TestCase):
             (root / 'meta.json').write_text(json.dumps(META), encoding='utf-8')
             portal.prepare(root / 'meta.json', port)
             data = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
+            # 端口被改坏的协议段不能让整个 capabilities 500（2026-11-03 修）。
+            data['anytls_config'] = {'enabled': True, 'port': 'abc', 'domain': 'hy2.example.com'}
+            data['reality_config'] = {'port': 'x', 'short_id': 'ab'}
+            (root / 'portal.json').write_text(json.dumps(data), encoding='utf-8')
             env = dict(os.environ, PATH=str(fake) + os.pathsep + os.environ.get('PATH', ''))
             proc = subprocess.Popen([sys.executable, portal.__file__, 'serve', str(root / 'portal.json')],
                                     env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -57,6 +64,7 @@ class CapabilitiesAwgUnitTest(unittest.TestCase):
                 body = json.loads(resp.read())
                 self.assertEqual(resp.status, 200, body)
                 self.assertIs(body['extras']['amneziawg']['active'], True, body['extras']['amneziawg'])
+                self.assertEqual(body['protocols']['vless_reality']['port'], 0)
             finally:
                 proc.terminate()
                 proc.wait(timeout=5)
