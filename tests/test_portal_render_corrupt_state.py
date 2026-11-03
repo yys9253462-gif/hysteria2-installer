@@ -76,6 +76,21 @@ class RenderCorruptStateTests(unittest.TestCase):
                 page = self.render_user(expires_at=bad)
                 self.assertNotIn('永久有效', page)
 
+    def test_bad_listen_port_does_not_break_page_rendering(self):
+        """client_meta.json 的 listen_port 是 null / 字符串时，管理页与用户页照常渲染（2026-11-04 修）。"""
+        for bad in (None, 'abc', True, -1):
+            with self.subTest(bad=bad):
+                page = portal.user_page_html('h.example.com', '1.2.3.4', bad, '', 'u',
+                                             {'status': 'active'}, 'hysteria2://x@h:1/', 'c', 's', '',
+                                             'tok', 'k', sub_port=8443)
+                self.assertIn('UDP 19984', page)
+                meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com', 'subscription_port': 8443,
+                        'listen_port': bad, 'hop_port_range': '', 'auth_password': 'p',
+                        'obfs_password': '', 'cert_type': 'acme', 'is_insecure': False, 'pin_sha256': ''}
+                html_page = portal.page_html(meta, 'hysteria2://x@h:1/', '#s', 'c', '{}',
+                                             users={}, token='t', session_secret='s')
+                self.assertIn('<!doctype html', html_page.lower())
+
     def test_page_html_tolerates_non_string_password(self):
         """旧版本会把数字密码原样落盘；单条坏密码不能让整个总览页渲染失败。"""
         meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com',

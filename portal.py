@@ -2343,7 +2343,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
                  f'自签证书 SHA-256 指纹 (HEX · 已写入直链 pinSHA256 / Xray 的 pinnedPeerCertSha256)</div>'
                  f'<div class="api-key-code" id="api-pin-val">{html.escape(pin_sha256)}</div></div>'
                  f'<button class="button" type="button" data-copy="api-pin-val" data-orig="复制指纹">复制指纹</button></div>') if pin_sha256 else ''
-    listen_port = m.get("listen_port", 19984)
+    # 与 artifacts() 同一容错（2026-11-04 修）：client_meta.json 的 listen_port 被写成
+    # null / 字符串时，下面的 int() 让管理页、用户页与所有账号操作的页面重建都 500。
+    listen_port = _valid_port(m.get("listen_port")) or 19984
     obfs_pw = m.get("obfs_password", "")
     # 非 dict 的 users（null / list / 截断写入）按空表渲染：下面多处用
     # len(users) 与 users.items()，任一抛异常都会让整页 500。
@@ -2526,7 +2528,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="card-head"><span class="step">01</span><div><h2>节点直链 (URI)</h2><p>v2rayN / Nekobox / Shadowrocket</p></div></div>
         {field_hy2}
         <div class="actions">{copy_hy2}</div>
-        <p class="note">{html.escape(host)} · UDP {int(listen_port)}</p>
+        <p class="note">{html.escape(host)} · UDP {_valid_port(listen_port) or 19984}</p>
       </section>
       <section class="card">
         <div class="card-head"><span class="step">02</span><div><h2>Clash 订阅</h2><p>适用于 Clash Meta / Mihomo 内核</p></div></div>
@@ -3771,7 +3773,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-hy2-uri">复制直链</button>
       </div>
-      <p class="note">{html.escape(host)} · UDP {int(listen_port)}</p>
+      <p class="note">{html.escape(host)} · UDP {_valid_port(listen_port) or 19984}</p>
     </section>
 
     <section class="card">
