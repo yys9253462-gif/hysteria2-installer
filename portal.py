@@ -2238,6 +2238,16 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
 
 
 
+def meta_display_host(m):
+    """订阅 / 门户地址里的节点主机，与 artifacts() 同一条回落规则。
+
+    prepare / refresh 原先直接取 m['is_insecure'] / m['server_name']：老 meta 或手写
+    meta 缺键时 KeyError，刷新门户与证书自愈一起失败（2026-11-04 修）。
+    """
+    server_name = m.get('server_name') or m.get('public_ip', 'localhost')
+    return m.get('public_ip', server_name) if m.get('is_insecure', False) else server_name
+
+
 def read_meta_file(meta_path):
     """读取 client_meta.json；文件损坏时返回空 dict 而不是抛异常。
 
@@ -7297,7 +7307,7 @@ def prepare(meta_path, port, node_api_key=None):
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
-    host = m['public_ip'] if m['is_insecure'] else m['server_name']
+    host = meta_display_host(m)
     # 初始化时把订阅端口**解析并写回** client_meta.json（自愈）：
     # 历史机器上这个键可能缺失或是错的，写回真实值后，
     # 后续所有读取路径（含用户专属页）都不会再落到伪造的 8443 上。
@@ -7397,7 +7407,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     # 「刷新页面」「证书自愈」这类日常操作直接抛异常（2026-10-30 修）。
     access, _rebuilt = ensure_portal_access(root, m, data)
     uri, clash, sing = artifacts(m)
-    host = m['public_ip'] if m['is_insecure'] else m['server_name']
+    host = meta_display_host(m)
     subscription = (f"https://{access['username']}:{access['password']}@"
                     f"{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml")
     

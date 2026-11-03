@@ -78,5 +78,22 @@ class RefreshQrOutsideLockTests(unittest.TestCase):
         self.assertEqual(after['qr'], '<svg/>')
 
 
+
+class RefreshSparseMetaTests(unittest.TestCase):
+    def test_refresh_without_is_insecure_or_server_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = PortalStateMigrationTests._root(None, d, {
+                'port': 1111, 'token': 'tok', 'api_key': 'k' * 32, 'auth_hash': 'a' * 64,
+                'session_secret': 's' * 64, 'users': {}, 'proxy_services': []})
+            meta = dict(META)
+            del meta['is_insecure'], meta['server_name']
+            (root / 'client_meta.json').write_text(json.dumps(meta), encoding='utf-8')
+            with mock.patch.object(portal, 'sync_cert_trust', lambda *a, **k: None), \
+                    mock.patch.object(portal, 'sync_pin', lambda *a, **k: None):
+                portal.refresh(root / 'client_meta.json')
+            access = json.loads((root / 'portal-access.json').read_text(encoding='utf-8'))
+        self.assertIn('192.0.2.1', access['url'])
+
+
 if __name__ == '__main__':
     unittest.main()
