@@ -141,6 +141,27 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
 
 
+def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
+    """/etc/sysctl.conf 里与 wanted 冲突的设置，返回 ['key = value', ...]。
+
+    systemd-sysctl 按文件名排序加载，99-sysctl.conf（指向 /etc/sysctl.conf）排在
+    99-bbr.conf 之后，同一个键以它为准。
+    """
+    try:
+        text = Path(path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return []
+    found = []
+    for raw in text.splitlines():
+        line = raw.split('#', 1)[0].split(';', 1)[0].strip()
+        if '=' not in line:
+            continue
+        key, value = (x.strip() for x in line.split('=', 1))
+        if key in wanted and wanted[key] and value != wanted[key]:
+            found.append('%s = %s' % (key, value))
+    return found
+
+
 def warp_backend_installed():
     """本机是否装了 WARP 出口：wgcf + wireproxy，或旧节点的官方 warp-cli。"""
     return (shutil.which('wireproxy') is not None
@@ -14321,6 +14342,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 need_reboot = False
                 if configured_bbr and configured_bbr != cc_out:
                     need_reboot = True
+                # /etc/sysctl.conf 经 99-sysctl.conf 在 99-bbr.conf 之后加载（2026-11-04 修）：
+                # 里面另写了拥塞算法 / qdisc 时，开机后它覆盖我们的设置，重启永远消不掉
+                # need_reboot。把冲突的那一行指出来，而不是让用户一遍遍重启。
+                overridden_by = sysctl_conf_overrides(
+                    {'net.ipv4.tcp_congestion_control': configured_bbr} if configured_bbr else {})
+                if overridden_by:
+                    need_reboot = False
 
                 with data_lock:
                     target_ver = data.get('bbr_target_version', '')
@@ -14342,7 +14370,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'qdisc': qdisc_out or 'fq_codel',
                     'kernel': kernel_ver,
                     'configured': configured_bbr or target_ver or cc_out,
-                    'need_reboot': need_reboot
+                    'need_reboot': need_reboot,
+                    'overridden_by': overridden_by,
                 })
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
