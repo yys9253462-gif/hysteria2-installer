@@ -78,6 +78,17 @@ class MeterAccountingTest(unittest.TestCase):
         self.assertEqual(self.samples[0][1] / self.samples[0][3], 1048576)
         self.assertEqual(self.samples[1][1:4], (0, 0, 7))
 
+    def test_disconnected_user_gets_a_zero_speed_sample(self):
+        """断开（从计数里消失）的用户补一个 0 速样本，不在 15 秒里继续显示旧网速（2026-11-04 修）。"""
+        with patch.object(runtime.time, 'monotonic', side_effect=[100, 105, 110]):
+            self.meter.poll()
+            self.counters['hysteria']['admin_master']['tx'] = 5 * 1048576
+            self.meter.poll()
+            self.counters['hysteria'].pop('admin_master')
+            self.meter.poll()
+        self.assertEqual(self.samples[-1][0], 'admin_master')
+        self.assertEqual(self.samples[-1][1:3], (0, 0), self.samples)
+
     def test_recent_gap_cache_distinguishes_same_length_and_last_timestamp(self):
         recent = '2026-10-30T00:00:00+00:00'
         old = '2000-01-01T00:00:00+00:00'

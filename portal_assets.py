@@ -463,6 +463,25 @@ SCRIPT = r"""
   };
 })();
 
+// 会话过期后停掉后台轮询（2026-11-04 修）：旧实现每 2 秒 / 10 秒继续发未认证请求，
+// 页面上的网速停在旧数值像是实时的，这些请求还在消耗本来源的限流额度。
+// 任何一个本站请求回 401 就置位；轮询函数看到它直接跳过，并提示刷新。
+let portalSessionExpired = false;
+(function () {
+  if (typeof globalThis.fetch !== 'function') return;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async function (...args) {
+    const res = await realFetch.apply(this, args);
+    if (res && res.status === 401 && !portalSessionExpired) {
+      portalSessionExpired = true;
+      try {
+        if (typeof showToast === 'function') showToast('登录已过期，请刷新页面重新登录', 'error');
+      } catch (_) {}
+    }
+    return res;
+  };
+})();
+
 // 全局高颜值 Promise 确认框与 Toast 机制
 function showToast(msg, type = 'info') {
   const container = document.getElementById('toast-container');
@@ -898,7 +917,7 @@ if (btnResetWarpRules) {
 }
 
 checkWarpStatus();
-setInterval(() => { if (!document.hidden) checkWarpStatus(); }, 10000);
+setInterval(() => { if (!document.hidden && !portalSessionExpired) checkWarpStatus(); }, 10000);
 
 // ============================================================================
 // 自定义出站（Custom Outbounds）
@@ -2153,11 +2172,26 @@ function certShortIssuer(issuer) {
 async function checkCertStatus() {
   if (!certBadge) return;
   let json;
+  // 取不到状态也要在卡片上说出来（2026-11-04 修）：旧实现静默 return，卡片一直停在
+  // 「检测中…」—— 而这张卡片的用途正是把证书故障摆到眼前。
+  const showFetchError = (msg) => {
+    certBadge.textContent = '⚠️ 证书状态获取失败';
+    certBadge.style.background = '#fff1f0';
+    certBadge.style.color = '#a8071a';
+    if (certRenewalNote) certRenewalNote.textContent = msg;
+  };
   try {
     const res = await fetch(location.pathname + 'cert-status', { credentials: 'same-origin' });
-    if (!res.ok) return;
     json = await res.json();
-  } catch (_) { return; }
+    // HTTP 失败 = 状态取不到；HTTP 200 + ok:false 是「证书不可读」，交给下面正常渲染。
+    if (!res.ok || !json) {
+      showFetchError((json && json.error) || ('服务器返回 ' + res.status));
+      return;
+    }
+  } catch (e) {
+    showFetchError('请求异常：' + (e && e.message ? e.message : e));
+    return;
+  }
 
   certSetField('cert-cn', json.common_name);
   // 后端正常返回数组，但数据被改坏/版本不一致时可能是字符串或 null。
@@ -2705,7 +2739,7 @@ function fmtSpeed(bytesPerSec) {
 
 let trafficPollPending = false;
 async function pollTrafficSpeed() {
-  if (document.hidden || trafficPollPending) return;
+  if (document.hidden || trafficPollPending || portalSessionExpired) return;
   trafficPollPending = true;
   try {
     const res = await fetch(location.pathname + 'traffic-speed', { credentials: 'same-origin' });

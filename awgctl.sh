@@ -789,7 +789,12 @@ peer_apply_live_add() {
     printf '%s\n' "$psk" > "$pskf"
     if ! "$AWG_BIN" set "$AWG_LINK" peer "$pub" preshared-key "$pskf" allowed-ips "${addr}/32" 2>/dev/null; then
         rm -f "$pskf"
-        log_err "客户端已写入文件，但未能同步到运行中的 AWG 接口；请执行 hy2-awgctl resync。"
+        # 热添加失败时按刚渲染好的配置重启接口（2026-11-04 修，与 peer-del 一致）：旧实现
+        # 只打一句「请 resync」并照报创建成功，用户拿到的配置永远握不上手。
+        if ! systemctl restart "$AWG_SERVICE_NAME"; then
+            die "客户端已写入配置，但未能加入运行中的 AWG 接口（重启 ${AWG_SERVICE_NAME} 失败）"
+        fi
+        log_warn "无法热添加该客户端，已按新配置重启 AmneziaWG（其他客户端会短暂重连）。"
         return 0
     fi
     rm -f "$pskf"

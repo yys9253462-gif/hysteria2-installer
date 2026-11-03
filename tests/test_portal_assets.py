@@ -397,6 +397,68 @@ assert.strictEqual(fmtVer('2.6.4', '2.6.4', false, true), '2.6.4（最新）');
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_cert_card_reports_a_failed_status_fetch(self):
+        """/cert-status 失败时卡片说明原因，不停在「检测中…」（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('async function checkCertStatus() {')
+        end = script.index('\n}\n', start) + 3
+        prelude = script[:script.index('// 全局高颜值 Promise 确认框与 Toast 机制')]
+        harness = r"""
+const assert = require('assert');
+const location = {pathname: '/fixture/'};
+const certBadge = {textContent: '检测中…', style: {}};
+const certRenewalNote = {textContent: ''};
+const certSetField = () => {};
+let reply;
+globalThis.fetch = async () => reply;
+"""
+        checks = r"""
+(async () => {
+  reply = new Response(JSON.stringify({ok: false, error: 'openssl timeout'}), {status: 500});
+  await checkCertStatus();
+  assert(certBadge.textContent.includes('获取失败'), certBadge.textContent);
+  assert(certRenewalNote.textContent.includes('openssl timeout'), certRenewalNote.textContent);
+  certBadge.textContent = '检测中…';
+  globalThis.fetch = async () => { throw new Error('network down'); };
+  await checkCertStatus();
+  assert(certBadge.textContent.includes('获取失败'), certBadge.textContent);
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + prelude + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_background_polling_stops_after_the_session_expires(self):
+        """会话过期（任一请求回 401）后，网速轮询不再发请求（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        prelude = script[:script.index('// 全局高颜值 Promise 确认框与 Toast 机制')]
+        start = script.index('async function pollTrafficSpeed() {')
+        end = script.index('\n}\n', start) + 3
+        harness = r"""
+const assert = require('assert');
+let calls = 0;
+globalThis.fetch = async () => { calls++; return new Response('Authentication required', {status: 401}); };
+globalThis.document = {hidden: false, getElementById: () => null, querySelectorAll: () => []};
+const location = {pathname: '/fixture/'};
+let trafficPollPending = false;
+const speedRxEl = null, speedTxEl = null;
+"""
+        checks = r"""
+(async () => {
+  await pollTrafficSpeed();
+  const after = calls;
+  assert.strictEqual(after, 1);
+  await pollTrafficSpeed();
+  await pollTrafficSpeed();
+  assert.strictEqual(calls, after, '会话过期后仍在轮询');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + prelude + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]

@@ -708,6 +708,20 @@ class TestCertStatus(unittest.TestCase):
             self.assertFalse(info["expired"])
             self.assertFalse(info["renewal_managed"])
 
+    def test_corrupt_certificate_is_reported_as_unreadable(self):
+        """证书文件存在但读不出有效期时 ok=False，卡片显示「证书不可读」（2026-11-04 修）。"""
+        p = self._portal()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            (td / "cert").mkdir()
+            (td / "cert" / "server.crt").write_text("-----BEGIN CERTIFICATE-----\ntruncated")
+            (td / "config.yaml").write_text(
+                "listen: :443\ntls:\n  cert: cert/server.crt\n  key: cert/server.key\n")
+            info = p.cert_status(td, {"cert_type": "custom"}, str(td / "config.yaml"))
+            self.assertTrue(info["cert_exists"])
+            self.assertFalse(info["ok"], "截断的证书被当成可读")
+            self.assertTrue(info.get("error"))
+
     def test_builtin_acme_status_marks_renewal_as_managed(self):
         p = self._portal()
         with tempfile.TemporaryDirectory() as td:

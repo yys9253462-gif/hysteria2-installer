@@ -2479,6 +2479,20 @@ EOF
 }
 
 # 5. 生成服务端配置文件与 Systemd 服务
+# 门户需要 systemd 247+ 的凭据隔离（2026-11-04 抽出）：安装流程在申请证书之前就要
+# 查，旧实现只在 generate_server_config 里查，老 systemd 的机器先签完 ACME 证书
+# （占 Let's Encrypt 配额）再中止。
+require_systemd_247() {
+    local systemd_version
+    # 非 systemd 环境（容器/极简镜像）下 systemctl 不存在，直接取会让
+    # set -e 终止，用户看不到下面那条「需要 systemd 247+」的说明。
+    systemd_version=$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}') || systemd_version=""
+    if [[ ! "$systemd_version" =~ ^[0-9]+$ ]] || (( systemd_version < 247 )); then
+        log_err "私密网页需要 systemd 247+ 的凭据隔离功能（当前: ${systemd_version:-未检测到 systemd}）。"
+        return 1
+    fi
+}
+
 generate_server_config() {
     log_step "生成 Hysteria 2 服务端配置: ${HY2_CONFIG}..."
     mkdir -p "$HY2_DIR"
@@ -2487,14 +2501,7 @@ generate_server_config() {
     command -v python3 >/dev/null 2>&1 || install_dependencies
     command -v qrencode >/dev/null 2>&1 || log_warn "未安装 qrencode，二维码将不可用（其余功能正常）。"
     python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "需要 Python 3.9+")'
-    local systemd_version
-    # 非 systemd 环境（容器/极简镜像）下 systemctl 不存在，直接取会让
-    # set -e 终止，用户看不到下面那条「需要 systemd 247+」的说明。
-    systemd_version=$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}') || systemd_version="" 
-    if [[ ! "$systemd_version" =~ ^[0-9]+$ ]] || (( systemd_version < 247 )); then
-        log_err "私密网页需要 systemd 247+ 的凭据隔离功能。"
-        return 1
-    fi
+    require_systemd_247 || return 1
     select_subscription_port || { log_err "订阅端口分配失败，安装中止。"; return 1; }
 
     # 先把门户整包取下来、校验通过、落地，再写 config.yaml（2026-11-03 修）。
@@ -5619,6 +5626,7 @@ flow_install() {
     if [[ -f "$HY2_CONFIG" ]]; then
         backup_state_before_reconfigure || return 1
     fi
+    require_systemd_247 || return 1
     install_dependencies
     get_public_ip
     install_binary
@@ -5706,6 +5714,7 @@ flow_reconfigure() {
     ask_preserve_portal
     acquire_installer_core_lock || return 1
     backup_state_before_reconfigure || return 1
+    require_systemd_247 || return 1
     install_dependencies
     get_public_ip
     setup_certificates
@@ -5891,6 +5900,7 @@ if [[ $# -gt 0 ]]; then
             if [[ -f "$HY2_DIR/portal.json" ]]; then
                 PRESERVE_PORTAL="${HY2_PRESERVE_PORTAL:-1}"
             fi
+            require_systemd_247 || exit 1
             install_dependencies
             get_public_ip || exit 1
             install_binary

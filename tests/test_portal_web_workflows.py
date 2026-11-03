@@ -350,6 +350,40 @@ class WebWorkflowTests(unittest.TestCase):
             self.assertEqual(self.data['bbr_target_version'], 'v1')
             self.assertEqual([p.read_text(encoding='utf-8') for p in paths], ['original', 'original'])
 
+    def test_bbr_applies_when_an_optional_tuning_key_is_missing(self):
+        """内核没有 tcp_notsent_lowat 时照样开 BBR，只是不写这一项（2026-11-04 修）。"""
+        applied = {}
+        def run(args, **kw):
+            if args == ['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control']:
+                return SimpleNamespace(returncode=0, stdout='reno cubic bbr', stderr='')
+            if args == ['sysctl', '-n', 'net.ipv4.tcp_notsent_lowat']:
+                return SimpleNamespace(returncode=255, stdout='', stderr='sysctl: cannot stat')
+            if args[:2] == ['sysctl', '-n']:
+                value = applied.get(args[2], {'net.ipv4.tcp_congestion_control': 'cubic',
+                                              'net.core.default_qdisc': 'fq_codel'}.get(args[2], '1'))
+                return SimpleNamespace(returncode=0, stdout=value, stderr='')
+            if args[:2] == ['sysctl', '-p']:
+                for line in Path(args[2]).read_text(encoding='utf-8').splitlines():
+                    if '=' in line and not line.startswith('#'):
+                        k, v = (x.strip() for x in line.split('=', 1))
+                        applied[k] = v
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        self.run.side_effect = run
+        self.ns['subprocess'].run = self.run
+        conf = self.root / 'etc/sysctl.d/99-bbr.conf'
+        mod = self.root / 'etc/modules-load.d/bbr.conf'
+        for path in (conf, mod):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        original_path = self.ns['Path']
+        self.ns['Path'] = lambda value: (self.root / str(value).lstrip('/')
+            if str(value) in ('/etc/modules-load.d/bbr.conf', '/etc/sysctl.d/99-bbr.conf') else original_path(value))
+        status, body = self.invoke('_h_post_set_bbr', {'version': 'v1'})
+        self.assertEqual(status, 200, body)
+        text = conf.read_text(encoding='utf-8')
+        self.assertIn('net.ipv4.tcp_congestion_control = bbr', text)
+        self.assertNotIn('tcp_notsent_lowat', text)
+
     def test_failed_sysctl_is_not_reported_as_reboot_success(self):
         def run(args, **kw):
             return SimpleNamespace(returncode=1 if '-p' in args else 0,
@@ -2018,6 +2052,7 @@ class WebWorkflowTests(unittest.TestCase):
             awg_run=lambda args, timeout=0: awg_calls.append(args) or (0, '', ''),
             awg_err_tail=lambda *a, **kw: '',
             awg_endpoint_error=lambda endpoint: '',
+            awg_operation_lock=threading.Lock(),
             unit_suspended=lambda unit: suspended and unit == 'amneziawg-server')
         return awg_calls
 
@@ -2048,6 +2083,26 @@ class WebWorkflowTests(unittest.TestCase):
         self.run.assert_called_once()
         self.assertEqual(self.run.call_args[0][0], ['systemctl', 'start', 'amneziawg-server'])
 
+
+    def test_awg_peer_delete_extends_its_deadline(self):
+        """peer_del 排队等 AWG 锁时不能被 30 秒死线掐断（2026-11-04 修）。"""
+        self.awg_suspended_fixture(False)
+        extended = []
+        self.handler._extend_deadline = lambda seconds, heavy=False: extended.append(seconds) or True
+        status, payload = self.invoke('_h_post_manage_amneziawg', {'action': 'peer_del', 'name': 'phone'})
+        self.assertEqual(status, 200, payload)
+        self.assertTrue(extended and max(extended) >= 90, extended)
+
+    def test_awg_service_actions_wait_for_other_awg_operations(self):
+        """启停 AWG 要与 peer 增删 / 更新串行（2026-11-04 修）。"""
+        self.awg_suspended_fixture(False)
+        held = []
+        lock = self.ns['awg_operation_lock']
+        self.run.side_effect = lambda args, **kw: held.append(lock.locked()) or SimpleNamespace(
+            returncode=0, stdout='', stderr='')
+        status, payload = self.invoke('_h_post_manage_amneziawg', {'action': 'stop'})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(held, [True], '启停 AWG 时没有持有 AWG 操作锁')
 
 if __name__ == '__main__':
     unittest.main()

@@ -170,7 +170,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.21'
+PORTAL_VERSION = '2.22'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -4249,7 +4249,12 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
         except Exception as exc:
             _log_ignored('cert_info.heal_state', exc)
 
-    info['ok'] = True
+    # 只有 openssl 真读出了有效期才算「可读」（2026-11-04 修）：旧实现文件存在即 ok，
+    # 截断 / 非 PEM 的证书显示成温和的「到期时间未知」，「无法读取证书」那条严重告警
+    # 永远出不来 —— 而 Hysteria 加载不了这张证书。
+    info['ok'] = bool(info['not_after'])
+    if not info['ok']:
+        info['error'] = '无法读取证书内容（文件可能已截断或不是 PEM 格式）'
     return info
 
 
@@ -4699,8 +4704,11 @@ def users_list_entry(uid, info, tracker, now_ts, summary, ip_timeout):
         'used_bytes': info.get('used_bytes', 0),
         **summary,
         'online_ips': active_online_ips(tracker, uid, now_ts, ip_timeout),
-        'ip_limit': info.get('ip_limit', 0),
-        'created_at': info.get('created_at', now_ts),
+        # 与鉴权同一判据：ip_limit=true 实际不限，报 0（2026-11-04 修）。
+        'ip_limit': _display_ip_limit(info),
+        # 缺 created_at 时报 0（未知）而不是「此刻」（2026-11-04 修）：旧实现每次轮询都给一个
+        # 新时间戳，控制台按它比对 / 排序时，这些用户每轮都像刚变过、年龄永远是 0。
+        'created_at': info.get('created_at', 0),
     }
 
 
@@ -11094,6 +11102,12 @@ if __name__ == '__main__':
                     name = (form.get('name', [''])[0] or '').strip()
                     if not VALID_AWG_NAME_RE.match(name):
                         return self.reply_json(400, {'ok': False, 'error': '客户端名称非法'})
+                    # 与 peer_add 同样抬死线（2026-11-04 修）：awg_run 先排队等 AWG 操作锁，
+                    # update 占锁时可达 420 秒；默认 30 秒死线先关掉连接，浏览器报网络错误，
+                    # 删除却在锁空出来后照常执行，重试只拿到「客户端不存在」。
+                    if not self._extend_deadline(120, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     rc, out, err = awg_run(['peer-del', name], timeout=90)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False, 'error': '删除失败：' + awg_err_tail(rc, out, err, 400)})
@@ -11120,8 +11134,11 @@ if __name__ == '__main__':
 
                 if action in ('start', 'stop', 'restart'):
                     label = {'start': '启动', 'stop': '停止', 'restart': '重启'}.get(action, action)
-                    proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
-                                          capture_output=True, text=True, timeout=30)
+                    # 与 peer 增删 / 更新串行（2026-11-04 修）：在它们中途停掉接口，热添加会
+                    # 落在正在关闭的接口上，更新自己的重启也会和这里打架。
+                    with awg_operation_lock:
+                        proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
+                                              capture_output=True, text=True, timeout=30)
                     if proc.returncode != 0:
                         return self.reply_json(500, {'ok': False, 'error': '服务' + label + '失败：' + (proc.stderr or '').strip()[-400:]})
                     return self.reply_json(200, {'ok': True, 'message': '服务已' + label})
@@ -12570,10 +12587,17 @@ if __name__ == '__main__':
                             'net.ipv4.tcp_notsent_lowat': '16384',
                             'net.ipv4.tcp_slow_start_after_idle': '0'}
                 runtime = {}
-                for key in settings:
+                # 两个调优项是锦上添花（2026-11-04 修）：容器或老内核没有 tcp_notsent_lowat 时，
+                # 旧实现整个拒绝开 BBR，而真正要的 qdisc / 拥塞算法两项完全可用。读不到的调优项
+                # 直接不写；必需的两项读不到才拒绝。
+                required = ('net.core.default_qdisc', 'net.ipv4.tcp_congestion_control')
+                for key in list(settings):
                     result = subprocess.run(['sysctl', '-n', key], capture_output=True, text=True, timeout=3)
                     if result.returncode != 0 or not result.stdout.strip():
-                        return self.reply_json(500, {'ok': False, 'error': '读取 sysctl 失败，未修改配置'})
+                        if key in required:
+                            return self.reply_json(500, {'ok': False, 'error': '读取 sysctl 失败，未修改配置'})
+                        settings.pop(key)
+                        continue
                     runtime[key] = result.stdout.strip()
                 paths = [Path('/etc/modules-load.d/bbr.conf'), Path('/etc/sysctl.d/99-bbr.conf')]
                 originals = {path: path.read_bytes() if path.exists() else None for path in paths}
