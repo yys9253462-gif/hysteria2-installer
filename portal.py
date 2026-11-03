@@ -5856,7 +5856,20 @@ def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
                 blocked[ip][1] = now
             elif now - blocked[ip][1] >= release_after:
                 blocked.pop(ip)
-        occupied = set(hy2_ips.get(uid) or ()) | set(admitted)
+        # 上限被调低时收回多出来的 Reality 名额（2026-11-03 修）：旧实现只评估
+        # 尚未放行的 IP，已放行的每轮刷新时间戳，ip_limit 从 3 改成 1 后三台设备
+        # 一直在线。只收回 Reality 自己放行的 IP —— Hy2 的设备由 /auth 管。
+        hy2_set = set(hy2_ips.get(uid) or ())
+        surplus = len(hy2_set | set(admitted)) - limit
+        if surplus > 0:
+            # 同一轮在线的 IP 时间戳相同，按 IP 排序保证每轮收回的是同一批，
+            # 不会在两台设备之间来回切换。
+            evictable = sorted(ip for ip in admitted if ip not in hy2_set)
+            for ip in evictable[len(evictable) - surplus:] if surplus <= len(evictable) else evictable:
+                admitted.pop(ip)
+                if ip in seen:
+                    blocked[ip] = [now, now]
+        occupied = hy2_set | set(admitted)
         # 先处理等待最久的被拦 IP，再处理新出现的；同一时间按 IP 排序保证结果确定。
         waiting = sorted((ip for ip in seen if ip not in admitted),
                          key=lambda ip: (ip not in blocked, blocked[ip][0] if ip in blocked else now, ip))

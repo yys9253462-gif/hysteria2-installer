@@ -28,6 +28,26 @@ class PlanTests(unittest.TestCase):
         blocked = plan({'u': 2}, {'u': {'1.1.1.1', '2.2.2.2', '3.3.3.3'}}, {}, state, 110)
         self.assertEqual(blocked, {'u': {'3.3.3.3'}})
 
+    def test_lowering_the_limit_evicts_already_admitted_devices(self):
+        """ip_limit 调低后多出来的 Reality 设备要被拦（2026-11-03 修）。
+
+        旧实现只评估尚未放行的 IP，已放行的每轮刷新时间戳：3 改成 1 后三台一直在线。
+        """
+        state = {}
+        ips = {'1.1.1.1', '2.2.2.2', '3.3.3.3'}
+        self.assertEqual(plan({'u': 3}, {'u': ips}, {}, state, 100), {})
+        blocked = plan({'u': 1}, {'u': ips}, {}, state, 105)
+        self.assertEqual(len(blocked.get('u', ())), 2, blocked)
+        # 下一轮不能来回切换：同一台设备继续放行，另两台继续拦。
+        again = plan({'u': 1}, {'u': ips}, {}, state, 110)
+        self.assertEqual(again, blocked)
+
+    def test_lowering_the_limit_counts_hy2_devices_first(self):
+        state = {}
+        plan({'u': 2}, {'u': {'3.3.3.3'}}, {'u': {'1.1.1.1'}}, state, 100)
+        blocked = plan({'u': 1}, {'u': {'3.3.3.3'}}, {'u': {'1.1.1.1'}}, state, 105)
+        self.assertEqual(blocked, {'u': {'3.3.3.3'}})
+
     def test_hy2_ips_share_the_same_quota(self):
         state = {}
         blocked = plan({'u': 2}, {'u': {'3.3.3.3'}}, {'u': {'1.1.1.1', '2.2.2.2'}}, state, 100)
