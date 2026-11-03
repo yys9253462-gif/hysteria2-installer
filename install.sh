@@ -1257,7 +1257,14 @@ find_cert_in_webserver() {
     # 🔴 Nginx（certbot 签发）：布局完全不同，且路径由配置决定，不能硬编码。
     # Nginx 装机量远大于 Caddy，缺了这条会让大量用户仍退回自签。
     for c in $(_nginx_cert_candidates); do
-        k="${c%.crt}.key"; [[ -s "$k" ]] || k="${c%.fullchain.pem}.privkey.pem"
+        # certbot 的私钥是同目录的 privkey.pem（2026-11-04 修）：旧写法
+        # ${c%.fullchain.pem} 去不掉 "/fullchain.pem" 里的斜杠，拼出
+        # fullchain.pem.privkey.pem，Nginx + certbot 的证书永远复用不上。
+        case "${c##*/}" in
+            fullchain.pem) k="${c%/*}/privkey.pem" ;;
+            *.crt)         k="${c%.crt}.key" ;;
+            *.pem)         k="${c%.pem}.key"; [[ -s "$k" ]] || k="${c%.pem}-key.pem" ;;
+        esac
         _accept_cert_pair "$c" "$k" || continue
         if _cert_matches_domain "$c" "$domain"; then
             echo "$c|$k"; return 0
@@ -1302,7 +1309,9 @@ _nginx_cert_candidates() {
     for d in /etc/letsencrypt/live/*/ /etc/nginx/certs/ /etc/nginx/ssl/ \
              /var/lib/letsencrypt/live/*/ /usr/local/nginx/conf/ssl/; do
         [[ -d "$d" ]] || continue
-        find "$d" -maxdepth 1 -type f \( -name 'fullchain.pem' -o -name '*.crt' -o -name '*.pem' \) 2>/dev/null
+        # -L：certbot 的 live/<域名>/ 里全是指向 archive/ 的符号链接，-type f 一个都
+        # 找不到（2026-11-04 修，SE 上实测）。
+        find -L "$d" -maxdepth 1 -type f \( -name 'fullchain.pem' -o -name '*.crt' -o -name '*.pem' \) 2>/dev/null
     done
 }
 

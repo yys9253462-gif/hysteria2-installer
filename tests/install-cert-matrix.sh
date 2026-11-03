@@ -265,6 +265,22 @@ if _cert_matches_domain "$_p/fullchain.pem" "other.test.com"; then
 else
     ok "场景2b: 不会误匹配其他域名"
 fi
+# 🔴 2026-11-04：端到端走 find_cert_in_webserver。certbot 的 live/<域名>/ 里是指向
+# archive/ 的符号链接，私钥叫 privkey.pem；旧实现 find -type f 找不到符号链接、
+# 私钥又被拼成 fullchain.pem.privkey.pem，Nginx + certbot 的证书永远复用不上。
+_cb="$(mktemp -d)"; mkdir -p "$_cb/archive/nginx.test.com" "$_cb/live/nginx.test.com"
+cp "$_p/fullchain.pem" "$_cb/archive/nginx.test.com/fullchain1.pem"
+cp "$_p/privkey.pem" "$_cb/archive/nginx.test.com/privkey1.pem"
+ln -s ../../archive/nginx.test.com/fullchain1.pem "$_cb/live/nginx.test.com/fullchain.pem"
+ln -s ../../archive/nginx.test.com/privkey1.pem "$_cb/live/nginx.test.com/privkey.pem"
+eval "$(declare -f _nginx_cert_candidates | sed "s#/etc/letsencrypt/live/\*/#$_cb/live/*/#")"
+_found="$(CADDY_CERT_ROOT="$_cb/no-caddy" find_cert_in_webserver nginx.test.com || true)"
+if [[ "$_found" == "$_cb/live/nginx.test.com/fullchain.pem|$_cb/live/nginx.test.com/privkey.pem" ]]; then
+    ok "场景2b: certbot 符号链接布局能被 find_cert_in_webserver 复用"
+else
+    bad "场景2b: certbot 证书没有被复用（得到: ${_found:-空}）"
+fi
+rm -rf "$_cb"
 # 🔴 公私钥不配对必须被拒 —— 装上去握手 100% 失败，且报错极难定位
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$_p/other.key"     -out "$_p/other.crt" -days 30 -subj "/CN=nginx.test.com" >/dev/null 2>&1
 cat "$_p/other.crt" "$_p/other.crt" > "$_p/mismatch.pem"
