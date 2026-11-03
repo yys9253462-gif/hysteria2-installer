@@ -7508,6 +7508,31 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
             raise
 
 
+CLI_OWNED_PORTAL_KEYS = ('port', 'api_key', 'auth_hash', 'session_secret', 'session_epoch',
+                         'clash', 'sing', 'qr', 'page_digest')
+
+
+def merge_cli_owned_state(data, disk):
+    """把 adopt / refresh 写到磁盘的键并进运行中门户的内存 data（原地修改）。
+
+    只取 CLI 负责的键与机主的密码 / 到期时间；用户、用量、代理服务仍以内存为准。
+    """
+    for key in CLI_OWNED_PORTAL_KEYS:
+        if key in disk:
+            data[key] = disk[key]
+    disk_users = disk.get('users')
+    disk_master = disk_users.get(MASTER_USER_ID) if isinstance(disk_users, dict) else None
+    users = data.get('users')
+    if isinstance(disk_master, dict) and isinstance(users, dict):
+        master = users.get(MASTER_USER_ID)
+        if not isinstance(master, dict):
+            users[MASTER_USER_ID] = dict(disk_master)
+        else:
+            for key in ('password', 'expires_at'):
+                if key in disk_master:
+                    master[key] = disk_master[key]
+
+
 def ensure_portal_access(root, meta, data):
     """读取 portal-access.json；缺失时重建并返回 (access, rebuilt)。
 
@@ -7769,7 +7794,10 @@ def persist_interrupted_core_job(portal_path, data):
 
 def serve(path):
     portal_path = Path(path)
-    data = json.loads(portal_path.read_text(encoding='utf-8'))
+    _loaded_bytes = portal_path.read_bytes()
+    data = json.loads(_loaded_bytes.decode('utf-8'))
+    # 本进程最后一次读到 / 写出的 portal.json 摘要，save_data 用它识别 CLI 带外写入。
+    disk_state = {'digest': hashlib.sha256(_loaded_bytes).digest()}
     # 必需字段缺失时给出明确中文错误再退出。旧行为是在后面的 data['port']
     # 处抛 KeyError，日志里只有一段 traceback —— 而门户是 Hysteria 的鉴权后端，
     # 它起不来等于全部用户连不上（2026-10-29 加）。
@@ -7961,8 +7989,24 @@ def serve(path):
             # 直接 UnicodeEncodeError 把 HTTP handler 打死，客户端看到的是
             # "Remote end closed connection without response"，
             # 排查时完全看不出是编码问题。
+            # adopt / refresh 是另一个进程，写完就 restart 本服务：SIGTERM 时的
+            # save_data 会拿旧内存把它们刚写的 api_key / 凭据 / 机主密码盖回去，
+            # 控制台随即 401（2026-11-04 修）。磁盘自上次读写后变了，就先采纳这些
+            # CLI 管的键，再写本进程管的其余状态（用户、用量、代理服务）。
+            try:
+                current = portal_path.read_bytes()
+            except OSError:
+                current = None
+            if current is not None and hashlib.sha256(current).digest() != disk_state['digest']:
+                try:
+                    disk = json.loads(current.decode('utf-8'))
+                except ValueError:
+                    disk = None
+                if isinstance(disk, dict):
+                    merge_cli_owned_state(data, disk)
             payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
             atomic_write_private(portal_path, payload)
+            disk_state['digest'] = hashlib.sha256(payload).digest()
 
     # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
     #
