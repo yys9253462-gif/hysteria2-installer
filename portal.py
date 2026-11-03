@@ -13214,7 +13214,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                      'active': _svc_active('gost'),
                                      'services': len(d_snap['proxy_services'])},
                             'amneziawg': {'installed': _bin('amneziawg-go'),
-                                          'active': _svc_active('amneziawg-go')},
+                                          # 单元名是 amneziawg-server，amneziawg-go 只是二进制名（2026-11-03 修）：
+                                          # 旧写法查一个不存在的单元，控制台上每台节点的 AWG 都显示停止。
+                                          'active': _svc_active(AWG_SVC_NAME)},
                             'warp': {'installed': Path('/etc/hysteria/warp').exists()
                                      or _bin('wireproxy'),
                                      'enabled': d_snap['warp_enabled']},
