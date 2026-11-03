@@ -78,6 +78,7 @@ class WebWorkflowTests(unittest.TestCase):
                        _active_vlessenc_config=lambda: self.data.get('vlessenc_config'),
                        _active_anytls_config=lambda: None,
                        _active_tuic_config=lambda: None,
+                       _served_singbox_config=lambda cfg, service: cfg,
                        # 真实 firewall_port 会探测本机 ufw/firewalld/nft 并执行；
                        # 默认桩成成功，需要验证防火墙行为的用例自己再覆盖。
                        firewall_port=Mock(return_value=True))
@@ -1504,6 +1505,16 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual([item['name'] for item in self.data['custom_outbounds']],
                          ['first_proxy', 'second_proxy'])
         self.assertEqual(self.data['custom_outbounds'][0]['addr'], '127.0.0.1:2080')
+
+    def test_outbound_save_survives_a_corrupt_container(self):
+        """custom_outbounds 是 null / 数字时新增出站照常成功（2026-11-04 修）。"""
+        for bad in (None, 7):
+            with self.subTest(bad=bad):
+                self.data['custom_outbounds'] = bad
+                status, body = self.invoke('_ob_manage', {'action': 'save', 'name': 'proxy_b',
+                                                          'type': 'socks5', 'addr': '127.0.0.1:1081'})
+                self.assertEqual(status, 200, body)
+                self.assertEqual([o['name'] for o in self.data['custom_outbounds']], ['proxy_b'])
 
     def test_warp_dict_rule_delete_preserves_non_warp_routes(self):
         self.data['warp_rules'] = [{'domain': 'openai.com', 'outbound': 'warp_socks'},

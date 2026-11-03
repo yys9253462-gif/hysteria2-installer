@@ -333,9 +333,19 @@ endpoint_has_port() {
 }
 
 validate_endpoint() {
-    local ep="$1" port=""
+    local ep="$1" port="" host=""
     if [[ "$ep" =~ ^[A-Za-z0-9_.-]+(:([0-9]{1,5}))?$ ]] || [[ "$ep" =~ ^\[[0-9A-Fa-f:.]+\](:([0-9]{1,5}))?$ ]]; then
         port="${BASH_REMATCH[2]}"
+        # 形状对了还得真是个主机（2026-11-04 修）：旧规则放过 "..."、"-"、"[:]"、"[1.2.3.4]"，
+        # 写进客户端配置后永远握不上手，管理员却看到成功。
+        host="${ep%:"$port"}"; [[ -n "$port" ]] || host="$ep"
+        if [[ "$host" == \[*\] ]]; then
+            host="${host#[}"; host="${host%]}"
+            python3 -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]).version == 6 else 1)'                 "$host" 2>/dev/null || { log_err "方括号里必须是 IPv6 地址: ${ep}"; return 1; }
+        elif [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+            log_err "连接地址不是有效的域名或 IPv4: ${ep}"
+            return 1
+        fi
         # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置。
         if [[ -n "$port" ]]; then
             port="$((10#$port))"
@@ -693,7 +703,10 @@ render_client_config() {
     else
         echo "Endpoint = ${endpoint}:${port}"
     fi
-    echo "AllowedIPs = 0.0.0.0/0"
+    # IPv6 也进隧道（2026-11-04 修）：只写 0.0.0.0/0 时，双栈网络上的手机把全部 IPv6 流量
+    # 走本地出口，真实 IPv6 地址照样暴露。服务端没有 IPv6 路由，进隧道的 IPv6 会被丢弃，
+    # 客户端随之回落到 IPv4 —— 不通，但不泄露。
+    echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = 25"
 }
 
@@ -1422,15 +1435,17 @@ cmd_qr() {
     if ! command -v qrencode >/dev/null 2>&1; then
         die "缺少 qrencode，请先安装：apt-get install -y qrencode"
     fi
-    if [[ -n "$endpoint" ]]; then
-        validate_endpoint "$endpoint" || die "连接地址非法"
-    fi
+    # 与 client-conf 同一套检查（2026-11-04 修）：旧实现不查客户端是否存在、只验显式传入
+    # 的 --endpoint，存下的坏地址照样编进二维码，扫了永远握不上手。
+    require_jq
+    peer_exists "$name" || die "客户端不存在: ${name}"
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
             '.peers[]? | select(.name==$n) | .endpoint // empty' "$AWG_PEERS_FILE")"
     fi
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
+    validate_endpoint "$endpoint" || die "连接地址非法"
     render_client_config "$name" "$endpoint" | qrencode -t ANSIUTF8
 }
 

@@ -141,6 +141,39 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
 
 
+def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
+    """/etc/sysctl.conf 里与 wanted 冲突的设置，返回 ['key = value', ...]。
+
+    systemd-sysctl 按文件名排序加载，99-sysctl.conf（指向 /etc/sysctl.conf）排在
+    99-bbr.conf 之后，同一个键以它为准。
+    """
+    try:
+        text = Path(path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return []
+    found = []
+    for raw in text.splitlines():
+        line = raw.split('#', 1)[0].split(';', 1)[0].strip()
+        if '=' not in line:
+            continue
+        key, value = (x.strip() for x in line.split('=', 1))
+        if key in wanted and wanted[key] and value != wanted[key]:
+            found.append('%s = %s' % (key, value))
+    return found
+
+
+def api_error_text(exc):
+    """API 回给调用方的错误文字：主动抛的 RuntimeError 说明照给，其它只给异常类型。
+
+    OSError / JSONDecodeError 的原文带绝对路径与解析上下文（2026-11-04 修），API key
+    持有者不需要也不该看到 /etc/hysteria 下的文件布局；完整原文写进门户日志。
+    """
+    if type(exc) is RuntimeError:
+        return str(exc)[:300]
+    print('[portal] api error: %s: %s' % (type(exc).__name__, str(exc)[:300]), file=sys.stderr)
+    return type(exc).__name__
+
+
 def warp_backend_installed():
     """本机是否装了 WARP 出口：wgcf + wireproxy，或旧节点的官方 warp-cli。"""
     return (shutil.which('wireproxy') is not None
@@ -170,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.22'
+PORTAL_VERSION = '2.23'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2322,7 +2355,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
                  f'自签证书 SHA-256 指纹 (HEX · 已写入直链 pinSHA256 / Xray 的 pinnedPeerCertSha256)</div>'
                  f'<div class="api-key-code" id="api-pin-val">{html.escape(pin_sha256)}</div></div>'
                  f'<button class="button" type="button" data-copy="api-pin-val" data-orig="复制指纹">复制指纹</button></div>') if pin_sha256 else ''
-    listen_port = m.get("listen_port", 19984)
+    # 与 artifacts() 同一容错（2026-11-04 修）：client_meta.json 的 listen_port 被写成
+    # null / 字符串时，下面的 int() 让管理页、用户页与所有账号操作的页面重建都 500。
+    listen_port = _valid_port(m.get("listen_port")) or 19984
     obfs_pw = m.get("obfs_password", "")
     # 非 dict 的 users（null / list / 截断写入）按空表渲染：下面多处用
     # len(users) 与 users.items()，任一抛异常都会让整页 500。
@@ -2505,7 +2540,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="card-head"><span class="step">01</span><div><h2>节点直链 (URI)</h2><p>v2rayN / Nekobox / Shadowrocket</p></div></div>
         {field_hy2}
         <div class="actions">{copy_hy2}</div>
-        <p class="note">{html.escape(host)} · UDP {int(listen_port)}</p>
+        <p class="note">{html.escape(host)} · UDP {_valid_port(listen_port) or 19984}</p>
       </section>
       <section class="card">
         <div class="card-head"><span class="step">02</span><div><h2>Clash 订阅</h2><p>适用于 Clash Meta / Mihomo 内核</p></div></div>
@@ -3750,7 +3785,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-hy2-uri">复制直链</button>
       </div>
-      <p class="note">{html.escape(host)} · UDP {int(listen_port)}</p>
+      <p class="note">{html.escape(host)} · UDP {_valid_port(listen_port) or 19984}</p>
     </section>
 
     <section class="card">
@@ -5734,9 +5769,14 @@ def parse_ip_deny(params, now):
     raw = params.get('ips', [])
     if not isinstance(raw, list) or len(raw) > IP_DENY_MAX_IPS:
         raise ValueError('ips must be a list of at most %d addresses' % IP_DENY_MAX_IPS)
+    # 与其它 users/ 数字字段同一规则（2026-11-04 修）：json.loads 收下 Infinity，int(inf)
+    # 抛 OverflowError 漏到外层成了 500；1.9 被静默截成 1；true 被当成 1。
+    raw_ttl = params.get('ttl', 600)
+    if isinstance(raw_ttl, bool) or (isinstance(raw_ttl, float) and not raw_ttl.is_integer()):
+        raise ValueError('Invalid ttl')
     try:
-        ttl = int(params.get('ttl', 600))
-    except (TypeError, ValueError):
+        ttl = int(raw_ttl)
+    except (TypeError, ValueError, OverflowError):
         raise ValueError('Invalid ttl')
     if not IP_DENY_TTL_RANGE[0] <= ttl <= IP_DENY_TTL_RANGE[1]:
         raise ValueError('ttl must be between %d and %d seconds' % IP_DENY_TTL_RANGE)
@@ -7790,6 +7830,21 @@ def serve(path):
     def awg_endpoint_error(endpoint):
         if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
             return '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'
+        # 与 awgctl 的 validate_endpoint 同一规则（2026-11-04 修）：形状对了还得真是个主机，
+        # 旧规则放过 "..." / "[:]" / "[1.2.3.4]"，客户端拿到后永远握不上手。
+        host = endpoint
+        if host.startswith('['):
+            inner = host[1:host.index(']')]
+            try:
+                if ipaddress.ip_address(inner).version != 6:
+                    raise ValueError
+            except ValueError:
+                return '方括号里必须是 IPv6 地址'
+        else:
+            host = host.rsplit(':', 1)[0] if ':' in host else host
+            if not re.fullmatch(r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
+                                r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
+                return '连接地址不是有效的域名或 IPv4'
         port_match = re.search(r':([0-9]+)$', endpoint)
         if port_match:
             raw_port = port_match.group(1)
@@ -8847,6 +8902,21 @@ if __name__ == '__main__':
             return None
         return tcfg
 
+    def _served_singbox_config(cfg, service):
+        """给订阅用：sing-box 协议还得服务在跑才下发（2026-11-04 修）。
+
+        _active_*_config 只看「已启用 + 配置文件在」，供启停 / 卸载判断用；订阅要再看服务：
+        hy2-anytls / hy2-tuic 崩溃后，旧实现照样把节点写进 clash / sing-box，手动选它的
+        用户连不上。与 Xray 协议的 managed_inbound_active 同一口径。整机超额停用期间
+        服务本就停着，节点照旧保留，恢复后就能用。没有 systemd 的环境 state 为空，按在跑处理。
+        """
+        if not cfg:
+            return None
+        if unit_suspended(service):
+            return cfg
+        state = _systemd_state(service)
+        return cfg if (not state or state == 'active') else None
+
     def regenerate_page():
         m = read_meta_file(meta_path)
         uri, clash, sing = artifacts(m)
@@ -9858,8 +9928,8 @@ if __name__ == '__main__':
                     rcfg = _active_reality_config()
                     vcfg_active = _active_vmess_config()
                     ecfg_active = _active_vlessenc_config()
-                    acfg_active = _active_anytls_config()
-                    tcfg_active = _active_tuic_config()
+                    acfg_active = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
+                    tcfg_active = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
                     m = read_meta_file(meta_path)
                     # artifacts 传入 reality + user_id ⇒ 输出「Hy2 + Reality」双节点
                     # 且 Clash / Sing-box 的策略组变成 url-test（自动择优）。
@@ -10236,7 +10306,7 @@ if __name__ == '__main__':
                     try:
                         status, payload = self._manage_proxy_operation('create', params)
                     except Exception as exc:
-                        return self.reply_json(500, {'ok': False, 'error': 'proxy add failed: %s' % exc})
+                        return self.reply_json(500, {'ok': False, 'error': 'proxy add failed: ' + api_error_text(exc)})
                     return self.reply_json(status, payload)
 
                 elif sub == 'proxy-services/list':
@@ -10258,7 +10328,7 @@ if __name__ == '__main__':
                     try:
                         status, payload = self._manage_proxy_operation('delete', params)
                     except Exception as exc:
-                        return self.reply_json(500, {'ok': False, 'error': 'proxy delete failed: %s' % exc})
+                        return self.reply_json(500, {'ok': False, 'error': 'proxy delete failed: ' + api_error_text(exc)})
                     return self.reply_json(status, payload)
 
                 elif sub == 'node/suspend':
@@ -13632,8 +13702,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     reality=_active_reality_config(), user_id=target_uid,
                     vmess=_active_vmess_config(),
                     vlessenc=_active_vlessenc_config(),
-                    anytls=_active_anytls_config(),
-                    tuic=_active_tuic_config())
+                    anytls=_served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE),
+                    tuic=_served_singbox_config(_active_tuic_config(), TUIC_SERVICE))
 
                 if action_file == 'clash.yaml':
                     return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml')
@@ -13734,8 +13804,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     reality=_active_reality_config(), user_id=target_uid,
                     vmess=_active_vmess_config(),
                     vlessenc=_active_vlessenc_config(),
-                    anytls=_active_anytls_config(),
-                    tuic=_active_tuic_config())
+                    anytls=_served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE),
+                    tuic=_served_singbox_config(_active_tuic_config(), TUIC_SERVICE))
                 qr_svg = ""
                 try:
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
@@ -14321,6 +14391,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 need_reboot = False
                 if configured_bbr and configured_bbr != cc_out:
                     need_reboot = True
+                # /etc/sysctl.conf 经 99-sysctl.conf 在 99-bbr.conf 之后加载（2026-11-04 修）：
+                # 里面另写了拥塞算法 / qdisc 时，开机后它覆盖我们的设置，重启永远消不掉
+                # need_reboot。把冲突的那一行指出来，而不是让用户一遍遍重启。
+                overridden_by = sysctl_conf_overrides(
+                    {'net.ipv4.tcp_congestion_control': configured_bbr} if configured_bbr else {})
+                if overridden_by:
+                    need_reboot = False
 
                 with data_lock:
                     target_ver = data.get('bbr_target_version', '')
@@ -14342,7 +14419,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'qdisc': qdisc_out or 'fq_codel',
                     'kernel': kernel_ver,
                     'configured': configured_bbr or target_ver or cc_out,
-                    'need_reboot': need_reboot
+                    'need_reboot': need_reboot,
+                    'overridden_by': overridden_by,
                 })
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
@@ -14440,7 +14518,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if not ok:
                         return self.reply_json(400, {'ok': False, 'error': err})
                     with data_lock:
-                        outs = list(data.get('custom_outbounds', []))
+                        # 容器被改坏成 null / 数字时按空表处理（2026-11-04 修，与删除一致）：
+                        # 旧写法 list(None) 在 data_lock 内抛 TypeError，新增出站一律失败。
+                        outs = [o for o in routing_state(data)['custom_outbounds'] if isinstance(o, dict)]
                         existing_index = next(
                             (i for i, outbound in enumerate(outs)
                              if isinstance(outbound, dict) and outbound.get('name') == cleaned['name']),

@@ -29,7 +29,11 @@ class ParseTests(unittest.TestCase):
     def test_rejects_bad_input(self):
         for params in ({'user_id': 'bad id', 'ips': []}, {'user_id': 'u', 'ips': 'x'},
                        {'user_id': 'u', 'ips': ['not-an-ip']}, {'user_id': 'u', 'ips': [], 'ttl': 5},
-                       {'user_id': 'u', 'ips': ['1.1.1.1'] * 65}):
+                       {'user_id': 'u', 'ips': ['1.1.1.1'] * 65},
+                       # 2026-11-04：Infinity 曾抛 OverflowError 成 500；1.9 被截成 1；true 被当成 1。
+                       {'user_id': 'u', 'ips': [], 'ttl': float('inf')},
+                       {'user_id': 'u', 'ips': [], 'ttl': 600.5},
+                       {'user_id': 'u', 'ips': [], 'ttl': True}):
             with self.assertRaises(ValueError):
                 portal.parse_ip_deny(params, 0)
 

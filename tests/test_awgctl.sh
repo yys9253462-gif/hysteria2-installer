@@ -283,7 +283,7 @@ for line in 2 3; do
     # 客户端必备项
     check_eq "  客户端 Address 为 /32" "$(conf_get "$CLIENT_TEXT" "Address")" "10.66.66.2/32"
     check_eq "  客户端 Endpoint 使用客户端自定义值" "$(conf_get "$CLIENT_TEXT" "Endpoint")" "vpn.example.com:51820"
-    check_eq "  客户端 AllowedIPs 全流量" "$(conf_get "$CLIENT_TEXT" "AllowedIPs")" "0.0.0.0/0"
+    check_eq "  客户端 AllowedIPs 全流量（含 IPv6，防泄露）" "$(conf_get "$CLIENT_TEXT" "AllowedIPs")" "0.0.0.0/0, ::/0"
     check_eq "  客户端含 PresharedKey" "$(conf_get "$CLIENT_TEXT" "PresharedKey")" "CPSK"
 done
 
@@ -362,6 +362,14 @@ exit 0
 ) >/dev/null 2>&1
 check_eq "缺公钥的 peer-del 会重启接口（两次）" "$(grep -c '^systemctl restart' "$_live_calls")" "2"
 check_eq "有公钥时只做热移除" "$(grep -c '^awg set awg0 peer pub-real remove' "$_live_calls")" "1"
+
+# qr 与 client-conf 同一套检查：存下的坏地址不能编进二维码（2026-11-04 修）。
+_qr_out="$( (is_installed() { return 0; }; qrencode() { cat >/dev/null; echo QR-RENDERED; }
+             meta_set endpoint "..."; cmd_qr one) 2>&1 || true)"
+if [[ "$_qr_out" == *QR-RENDERED* ]]; then bad "qr 把非法的存储地址编进了二维码"; else ok; fi
+_qr_out="$( (is_installed() { return 0; }; qrencode() { cat >/dev/null; echo QR-RENDERED; }
+             cmd_qr no-such-client vpn.example.com) 2>&1 || true)"
+if [[ "$_qr_out" == *QR-RENDERED* ]]; then bad "qr 给不存在的客户端出了二维码"; else ok; fi
 
 # 渲染失败时 peer-add / peer-del 必须恢复 peers 和 server config，且不触碰运行态。
 cp -p "$AWG_PEERS_FILE" "${WORK}/peers.before"

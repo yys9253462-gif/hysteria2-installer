@@ -2134,7 +2134,13 @@ async function checkBbrStatus() {
     }
 
     if (bbrRebootTip && btnRebootServer) {
-      if (json.need_reboot) {
+      // /etc/sysctl.conf 覆盖了我们的设置时，重启也没用：直接说出冲突的那一行。
+      if (Array.isArray(json.overridden_by) && json.overridden_by.length) {
+        bbrRebootTip.style.display = 'block';
+        bbrRebootTip.textContent = '⚠️ /etc/sysctl.conf 里的「' + json.overridden_by.join('；')
+          + '」会在开机时覆盖 BBR 设置，请删除或改成 ' + json.configured + ' 后再重启。';
+        btnRebootServer.style.display = 'none';
+      } else if (json.need_reboot) {
         bbrRebootTip.style.display = 'block';
         bbrRebootTip.textContent = '⚠️ 已成功配置 ' + json.configured.toUpperCase() + '，需要重启服务器后生效！';
         btnRebootServer.style.display = 'inline-flex';
