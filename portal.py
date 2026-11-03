@@ -5757,9 +5757,14 @@ def parse_ip_deny(params, now):
     raw = params.get('ips', [])
     if not isinstance(raw, list) or len(raw) > IP_DENY_MAX_IPS:
         raise ValueError('ips must be a list of at most %d addresses' % IP_DENY_MAX_IPS)
+    # 与其它 users/ 数字字段同一规则（2026-11-04 修）：json.loads 收下 Infinity，int(inf)
+    # 抛 OverflowError 漏到外层成了 500；1.9 被静默截成 1；true 被当成 1。
+    raw_ttl = params.get('ttl', 600)
+    if isinstance(raw_ttl, bool) or (isinstance(raw_ttl, float) and not raw_ttl.is_integer()):
+        raise ValueError('Invalid ttl')
     try:
-        ttl = int(params.get('ttl', 600))
-    except (TypeError, ValueError):
+        ttl = int(raw_ttl)
+    except (TypeError, ValueError, OverflowError):
         raise ValueError('Invalid ttl')
     if not IP_DENY_TTL_RANGE[0] <= ttl <= IP_DENY_TTL_RANGE[1]:
         raise ValueError('ttl must be between %d and %d seconds' % IP_DENY_TTL_RANGE)
