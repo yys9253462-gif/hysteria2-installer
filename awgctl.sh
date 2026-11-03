@@ -1435,15 +1435,17 @@ cmd_qr() {
     if ! command -v qrencode >/dev/null 2>&1; then
         die "缺少 qrencode，请先安装：apt-get install -y qrencode"
     fi
-    if [[ -n "$endpoint" ]]; then
-        validate_endpoint "$endpoint" || die "连接地址非法"
-    fi
+    # 与 client-conf 同一套检查（2026-11-04 修）：旧实现不查客户端是否存在、只验显式传入
+    # 的 --endpoint，存下的坏地址照样编进二维码，扫了永远握不上手。
+    require_jq
+    peer_exists "$name" || die "客户端不存在: ${name}"
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
             '.peers[]? | select(.name==$n) | .endpoint // empty' "$AWG_PEERS_FILE")"
     fi
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
+    validate_endpoint "$endpoint" || die "连接地址非法"
     render_client_config "$name" "$endpoint" | qrencode -t ANSIUTF8
 }
 

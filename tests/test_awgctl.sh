@@ -363,6 +363,14 @@ exit 0
 check_eq "缺公钥的 peer-del 会重启接口（两次）" "$(grep -c '^systemctl restart' "$_live_calls")" "2"
 check_eq "有公钥时只做热移除" "$(grep -c '^awg set awg0 peer pub-real remove' "$_live_calls")" "1"
 
+# qr 与 client-conf 同一套检查：存下的坏地址不能编进二维码（2026-11-04 修）。
+_qr_out="$( (is_installed() { return 0; }; qrencode() { cat >/dev/null; echo QR-RENDERED; }
+             meta_set endpoint "..."; cmd_qr one) 2>&1 || true)"
+if [[ "$_qr_out" == *QR-RENDERED* ]]; then bad "qr 把非法的存储地址编进了二维码"; else ok; fi
+_qr_out="$( (is_installed() { return 0; }; qrencode() { cat >/dev/null; echo QR-RENDERED; }
+             cmd_qr no-such-client vpn.example.com) 2>&1 || true)"
+if [[ "$_qr_out" == *QR-RENDERED* ]]; then bad "qr 给不存在的客户端出了二维码"; else ok; fi
+
 # 渲染失败时 peer-add / peer-del 必须恢复 peers 和 server config，且不触碰运行态。
 cp -p "$AWG_PEERS_FILE" "${WORK}/peers.before"
 cp -p "$AWG_CONFIG" "${WORK}/config.before"
