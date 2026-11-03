@@ -147,7 +147,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.15'
+PORTAL_VERSION = '2.16'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1979,6 +1979,17 @@ def rotate_user_view_key_on_change(previous, current):
             (previous.get('status', 'active') != 'disabled' and
              current.get('status', 'active') == 'disabled')):
         current['view_nonce'] = secrets.token_hex(16)
+
+
+def user_metered(user):
+    """计量是否给这个账户记账（2026-11-03 修）。
+
+    旧实现直接用 user_access_allowed：超额 / 到期的用户判为「不允许接入」，计量
+    随之把它当作停用户，只挪游标不记账。撤销有延迟或失败时，超额之后继续跑的
+    流量从不进 used_bytes；续费后第一次采样又被当成新基线，这段流量永久丢失。
+    现在只有**被停用**（status=disabled）或记录损坏的账户不记账。
+    """
+    return isinstance(user, dict) and user.get('status', 'active') != 'disabled'
 
 
 def user_share_available(user, now=None):
@@ -5856,7 +5867,20 @@ def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
                 blocked[ip][1] = now
             elif now - blocked[ip][1] >= release_after:
                 blocked.pop(ip)
-        occupied = set(hy2_ips.get(uid) or ()) | set(admitted)
+        # 上限被调低时收回多出来的 Reality 名额（2026-11-03 修）：旧实现只评估
+        # 尚未放行的 IP，已放行的每轮刷新时间戳，ip_limit 从 3 改成 1 后三台设备
+        # 一直在线。只收回 Reality 自己放行的 IP —— Hy2 的设备由 /auth 管。
+        hy2_set = set(hy2_ips.get(uid) or ())
+        surplus = len(hy2_set | set(admitted)) - limit
+        if surplus > 0:
+            # 同一轮在线的 IP 时间戳相同，按 IP 排序保证每轮收回的是同一批，
+            # 不会在两台设备之间来回切换。
+            evictable = sorted(ip for ip in admitted if ip not in hy2_set)
+            for ip in evictable[len(evictable) - surplus:] if surplus <= len(evictable) else evictable:
+                admitted.pop(ip)
+                if ip in seen:
+                    blocked[ip] = [now, now]
+        occupied = hy2_set | set(admitted)
         # 先处理等待最久的被拦 IP，再处理新出现的；同一时间按 IP 排序保证结果确定。
         waiting = sorted((ip for ip in seen if ip not in admitted),
                          key=lambda ip: (ip not in blocked, blocked[ip][0] if ip in blocked else now, ip))
@@ -6185,7 +6209,10 @@ def firewall_port(port, proto='tcp', open_=True):
                 handled = True
         if shutil.which('firewall-cmd') and _systemd_state('firewalld') == 'active':
             flag = '--add-port=' if open_ else '--remove-port='
-            result = subprocess.run(['firewall-cmd', '--zone=public', flag + spec, '--permanent'],
+            # 不写死 --zone=public（2026-11-03 修）：默认区是 drop / external 等的机器上
+            # 规则落进一个不生效的区，端口照样不通、日志却说已放行。不带 --zone 就是默认区，
+            # 与 install.sh / awgctl.sh 同一口径。
+            result = subprocess.run(['firewall-cmd', flag + spec, '--permanent'],
                                     capture_output=True, timeout=15)
             if result.returncode != 0:
                 return False
@@ -7995,7 +8022,7 @@ def serve(path):
         usage_meter = _usage_runtime.from_file(data, data_lock, save_meter_data,
                                               portal_path.parent / 'usage-meter-config.json',
                                               on_speed=_meter_speed_sample)
-        usage_meter.user_allowed = user_access_allowed
+        usage_meter.user_allowed = user_metered
     except Exception as _usage_exc:
         print('[portal] 真实计量未初始化: ' + type(_usage_exc).__name__, file=sys.stderr)
 
@@ -9487,8 +9514,14 @@ if __name__ == '__main__':
                                 else:
                                     active_ips[client_ip] = now_ts
                             elif client_ip:
-                                tracker = ip_tracker.setdefault(matched_uid, {})
+                                # 不限设备的用户同样剪掉过期 IP（2026-11-03 修）：旧实现只追加，
+                                # 换 IP 频繁的长期在线用户（移动网络 / CGNAT）表项无界增长，
+                                # users/list 与 /traffic-speed 每次都要遍历。
+                                tracker = ip_tracker.get(matched_uid)
+                                tracker = {ip: t for ip, t in tracker.items()
+                                           if now_ts - t < IP_TIMEOUT_SECONDS} if isinstance(tracker, dict) else {}
                                 tracker[client_ip] = now_ts
+                                ip_tracker[matched_uid] = tracker
 
                 if deny == 'User not found':
                     self.record_auth_failure()
@@ -12836,6 +12869,10 @@ fi
 WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF")
 WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF")
 WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF")
+# 与 install.sh 一致：用 wgcf 下发的双栈地址，否则解析到 IPv6 的 WARP 域名连不上。
+WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+[ -n "$WG_ADDR" ] || WG_ADDR="172.16.0.2/32"
+case "$WG_ADDR" in *:*) WG_ALLOWED="0.0.0.0/0, ::/0" ;; *) WG_ALLOWED="0.0.0.0/0" ;; esac
 if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ]; then
     echo "WireGuard 配置解析失败 (PrivateKey/PublicKey/Endpoint 缺失)" >&2
     exit 1
@@ -12844,14 +12881,14 @@ fi
 cat > "$WP_CFG" <<WPEOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
-Address = 172.16.0.2/32
+Address = ${WG_ADDR}
 PrivateKey = ${WG_PRIV}
 DNS = 1.1.1.1
 
 [Peer]
 PublicKey = ${WG_PUB}
 Endpoint = ${WG_EP}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = ${WG_ALLOWED}
 PersistentKeepalive = 25
 
 [Socks5]

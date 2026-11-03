@@ -37,6 +37,8 @@ class AuthEndToEndHarness:
         cls = ast.ClassDef(name='H', bases=[], keywords=[], decorator_list=[],
                            body=_handler_methods() + [fn])
         self.env = dict(portal.__dict__, data={'users': users}, data_lock=threading.RLock(),
+                        # serve() 里的局部常量：单独摘出 /auth 分支时补进环境。
+                        IP_TIMEOUT_SECONDS=180,
                         ip_tracker={}, global_ip_deny={}, live_online_ips=lambda uid: set(),
                         reality_live_ips=lambda uid: set())
         exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),

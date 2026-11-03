@@ -196,6 +196,53 @@ class MeterAccountingTest(unittest.TestCase):
         self.meter.poll()
         self.assertEqual(self.data['users']['admin_master']['used_bytes'], 110)
 
+    def test_over_quota_traffic_is_still_metered(self):
+        """超额后仍在跑的流量要记账（2026-11-03 修）。
+
+        撤销有延迟或失败时，超额用户的会话还开着。旧实现按 user_access_allowed
+        判定，超额即「停用」，这段流量从不进 used_bytes；续费后第一次采样又被当作
+        新基线，永久丢失。用门户实际接进计量的判据跑。
+        """
+        portal_module = __import__('portal')
+        self.meter.user_allowed = portal_module.user_metered
+        self.data['users']['admin_master'].update(limit_bytes=100, status='active')
+        self.meter.poll()
+        self.counters['hysteria']['admin_master'] = {'tx': 100, 'rx': 0}
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 100)
+        self.assertFalse(portal_module.user_access_allowed(self.data['users']['admin_master']))
+        self.counters['hysteria']['admin_master'] = {'tx': 160, 'rx': 0}
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 160,
+                         '超额之后的流量没有记账')
+        # 停用的用户照旧不记账。
+        self.data['users']['admin_master']['status'] = 'disabled'
+        self.counters['hysteria']['admin_master'] = {'tx': 200, 'rx': 0}
+        self.meter.poll()
+        self.assertEqual(self.data['users']['admin_master']['used_bytes'], 160)
+
+    def test_retired_users_are_forgotten_once_no_source_holds_their_cursor(self):
+        """retired_users 不能只增不减（2026-11-03 修）。
+
+        已删用户只要还有数据源留着它的游标就得记住（防止同名重建时把旧计数算进去）；
+        服务重启换了 epoch、游标清空后就该忘掉，否则按订单开号删号的节点无界增长。
+        """
+        portal_module = __import__('portal')
+        self.meter.user_allowed = portal_module.user_metered
+        self.meter.poll()
+        self.data['users']['gone'] = {'password': 'x', 'status': 'active'}
+        self.counters['hysteria']['gone'] = {'tx': 50, 'rx': 0}
+        self.meter.poll()
+        del self.data['users']['gone']
+        portal_module.drop_meter_totals(self.data, 'gone')
+        self.meter.poll()
+        self.assertIn('gone', self.data['usage_meter']['retired_users'], '游标还在时必须记住')
+        # 服务重启：新 epoch，计数器里不再有这个用户。
+        self.counters['hysteria'].pop('gone')
+        self.meter.epoch = lambda service: 'epoch-after-restart'
+        self.meter.poll()
+        self.assertNotIn('gone', self.data['usage_meter'].get('retired_users', []))
+
     def test_core_and_runtime_revision_match(self):
         self.assertEqual(runtime.core.ACCOUNTING_REVISION, runtime.ACCOUNTING_REVISION)
 

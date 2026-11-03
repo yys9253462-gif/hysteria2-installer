@@ -76,6 +76,10 @@ class LiveTests(unittest.TestCase):
  def test_ipv6(self):self.assertEqual(list(m.parse_events([row('client connected',addr='[2001:db8::1]:1234')])),[('user','2001:db8::1')])
  def test_invalid_rejected(self):
   with self.assertRaises(ValueError):m.parse_events([row('client connected',addr='not-ip:1')])
+ def test_portless_addresses_of_both_families(self):
+  # 不带端口的 IPv6 曾被截成 '2001:db8:'，整台节点的在线快照失败（2026-11-03 修）。
+  self.assertEqual(list(m.parse_events([row('client connected',addr='2001:db8::1')])),[('user','2001:db8::1')])
+  self.assertEqual(list(m.parse_events([row('client connected',addr='203.0.113.9')])),[('user','203.0.113.9')])
  def test_users_isolated(self):self.assertEqual(len(m.parse_events([row('client connected'),row('client connected',uid='other')])),2)
  def test_structured_logs(self):self.assertEqual(len(m.parse_events([{'MESSAGE':json.dumps({'msg':'client connected','id':'u','addr':'203.0.113.7:1'})}])),1)
  # 2026-11-02 生产实测（东京③）：端口跳跃 / QUIC 迁移后断开事件的源端口与连上时不同，

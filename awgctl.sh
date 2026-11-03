@@ -278,27 +278,29 @@ detect_wan_iface() {
 }
 
 # 找一个可用的 UDP 端口（必须避开 Hysteria2 的端口跳跃区间）
+# 只读 ss 的监听表，不用 socket bind 探测（2026-11-03 修，见 AGENTS.md：某些环境
+# 下 bind 会卡住）。ss 拿不到监听表时直接失败，不猜。
 pick_port() {
-    local hy2_port="${1:-}" port
-    port="$(python3 - "$AWG_PORT_MIN" "$AWG_PORT_MAX" "$hy2_port" <<'PY'
-import secrets, socket, sys
-lo, hi = int(sys.argv[1]), int(sys.argv[2])
-hy2 = sys.argv[3]
-for _ in range(500):
-    p = lo + secrets.randbelow(hi - lo + 1)
-    if hy2.isdigit() and int(hy2) == p:
-        continue
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        try:
-            s.bind(('0.0.0.0', p))
-        except OSError:
-            continue
-        print(p)
-        break
-else:
-    raise SystemExit('no-free-udp-port')
-PY
-)" || true
+    local hy2_port="${1:-}" listening port
+    listening="$(ss -Hlun 2>/dev/null)" || return 1
+    port="$(printf '%s
+' "$listening" | python3 -c '
+import secrets, sys
+lo, hi, hy2 = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+used = set()
+for line in sys.stdin:
+    parts = line.split()
+    if len(parts) >= 4 and ":" in parts[3]:
+        tail = parts[3].rsplit(":", 1)[1]
+        if tail.isdigit():
+            used.add(int(tail))
+if hy2.isdigit():
+    used.add(int(hy2))
+free = [p for p in range(lo, hi + 1) if p not in used]
+if not free:
+    raise SystemExit("no-free-udp-port")
+print(free[secrets.randbelow(len(free))])
+' "$AWG_PORT_MIN" "$AWG_PORT_MAX" "$hy2_port")" || true
     [[ -n "$port" ]] || return 1
     echo "$port"
 }
@@ -736,7 +738,7 @@ allow_firewall() {
         log_info "已放行 UFW: ${port}/udp"
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --zone=public --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
         log_info "已放行 firewalld: ${port}/udp"
     fi

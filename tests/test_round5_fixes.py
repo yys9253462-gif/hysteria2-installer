@@ -170,7 +170,26 @@ class FirewallPortTest(unittest.TestCase):
 
     def test_firewalld_open(self):
         calls = self.call(8443, ufw=False, firewalld=True)
-        self.assertIn(['firewall-cmd', '--zone=public', '--add-port=8443/tcp', '--permanent'], calls)
+        self.assertIn(['firewall-cmd', '--add-port=8443/tcp', '--permanent'], calls)
+
+    def test_firewalld_uses_the_default_zone(self):
+        """不写死 public（2026-11-03 修）：默认区是 drop / external 的机器上规则不生效。
+
+        firewall-cmd 省略 --zone 时作用于默认区（firewall-cmd(1)）。
+        """
+        for open_ in (True, False):
+            calls = self.call(8443, ufw=False, firewalld=True, open_=open_)
+            fw = [c for c in calls if c and c[0] == 'firewall-cmd' and '--reload' not in c]
+            self.assertTrue(fw)
+            self.assertFalse(any(arg.startswith('--zone') for c in fw for arg in c), fw)
+
+    def test_shell_installers_use_the_default_zone(self):
+        root = Path(portal.__file__).resolve().parent
+        for name in ('install.sh', 'awgctl.sh'):
+            text = (root / name).read_text(encoding='utf-8')
+            calls = [l for l in text.splitlines() if l.strip().startswith('firewall-cmd ')]
+            self.assertTrue(calls, name)
+            self.assertFalse([l for l in calls if '--zone=' in l], name)
 
     def test_no_firewall_means_no_calls(self):
         self.assertEqual(self.call(8443, ufw=False, firewalld=False), [])

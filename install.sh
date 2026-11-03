@@ -2070,14 +2070,16 @@ setup_system_firewall() {
         log_info "已放行 UFW 防火墙端口。"
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --zone=public --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
-        firewall-cmd --zone=public --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+        # 不带 --zone：写进默认区（2026-11-03 修）。写死 public 在默认区是 drop / external
+        # 的机器上不生效，端口照样不通、日志却说已放行。
+        firewall-cmd --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
         if [[ "$CERT_TYPE" == "acme" ]]; then
-            firewall-cmd --zone=public --add-port="80/tcp" --permanent >/dev/null 2>&1 || true
-            firewall-cmd --zone=public --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --add-port="80/tcp" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
         fi
         if [[ -n "$s_port" && -n "$e_port" ]]; then
-            firewall-cmd --zone=public --add-port="${s_port}-${e_port}/udp" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --add-port="${s_port}-${e_port}/udp" --permanent >/dev/null 2>&1 || true
         fi
         firewall-cmd --reload >/dev/null 2>&1 || true
         log_info "已放行 firewalld 端口。"
@@ -2434,6 +2436,9 @@ Before=hysteria-server.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/bash -c "iptables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}; iptables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}"
+# IPv6 跳跃规则同样要在开机时恢复（2026-11-03 修）：安装时加了 ip6tables 规则，
+# 这里却只恢复 IPv4，没有 netfilter-persistent 的机器重启后 IPv6 跳跃全部失效。
+ExecStart=/bin/bash -c "command -v ip6tables >/dev/null 2>&1 || exit 0; ip6tables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || ip6tables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null; ip6tables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || ip6tables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null; exit 0"
 
 [Install]
 WantedBy=multi-user.target
@@ -4193,17 +4198,23 @@ install_warp_local_proxy() {
 ')
     WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF" | tr -d '
 ')
+    # 用 wgcf 下发的地址（含 IPv6），AllowedIPs 同时放行 ::/0（2026-11-03 修）：
+    # 旧配置只写 IPv4，走 WARP 的域名一旦解析到 IPv6 就连不上（SE 上实测）。
+    WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+    [[ -n "$WG_ADDR" ]] || WG_ADDR="172.16.0.2/32"
+    WG_ALLOWED="0.0.0.0/0"
+    [[ "$WG_ADDR" == *:* ]] && WG_ALLOWED="0.0.0.0/0, ::/0"
     cat > "$WP_CFG" <<EOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
-Address = 172.16.0.2/32
+Address = ${WG_ADDR}
 PrivateKey = ${WG_PRIV}
 DNS = 1.1.1.1
 
 [Peer]
 PublicKey = ${WG_PUB}
 Endpoint = ${WG_EP}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = ${WG_ALLOWED}
 PersistentKeepalive = 25
 
 [Socks5]

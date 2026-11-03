@@ -444,6 +444,25 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 # ============================================================================
 SCRIPT = r"""
 
+// 非 JSON 响应统一变成可读的 {ok:false,error}（2026-11-03 修）：限流 429、
+// 会话过期的 401 等是纯文本，旧代码 `await res.json()` 直接抛
+// "Unexpected token 'T'…"，管理员看到的是一串解析错误而不是原因。
+(function () {
+  const parseJson = Response.prototype.json;
+  Response.prototype.json = async function () {
+    const copy = this.clone();
+    try {
+      return await parseJson.call(this);
+    } catch (err) {
+      let text = '';
+      try { text = (await copy.text()).trim().slice(0, 200); } catch (_) {}
+      if (this.status === 401) return { ok: false, error: '登录已过期，请刷新页面重新登录' };
+      if (this.status === 429) return { ok: false, error: '请求太频繁，请稍后再试' };
+      return { ok: false, error: text ? ('服务器返回 ' + this.status + '：' + text) : ('服务器返回 ' + this.status) };
+    }
+  };
+})();
+
 // 全局高颜值 Promise 确认框与 Toast 机制
 function showToast(msg, type = 'info') {
   const container = document.getElementById('toast-container');
