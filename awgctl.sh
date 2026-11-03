@@ -831,6 +831,12 @@ cmd_peer_add() {
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
     local priv pub psk addr tmp peers_backup config_backup had_config=0
+    # 先生成密钥、分配地址，再做备份（2026-11-03 修）：地址池满 / genkey 失败时
+    # 旧实现在备份之后 die，每次都留下一份带全部客户端私钥的备份文件。
+    priv="$(genkey)"
+    pub="$(pubkey_of "$priv")"
+    psk="$(genpsk)"
+    addr="$(next_peer_address)" || die "隧道地址池已满（10.66.66.0/24 上限 253 个客户端）"
     config_backup="${AWG_DIR}/.conf-backup.$$"
     peers_backup="${AWG_DIR}/.peers-backup.$$"
     (umask 077; cp -p "$AWG_PEERS_FILE" "$peers_backup") || { rm -f "$peers_backup"; die "无法备份客户端列表"; }
@@ -841,10 +847,6 @@ cmd_peer_add() {
         : > "$config_backup"
         chmod 600 "$config_backup"
     fi
-    priv="$(genkey)"
-    pub="$(pubkey_of "$priv")"
-    psk="$(genpsk)"
-    addr="$(next_peer_address)" || die "隧道地址池已满（10.66.66.0/24 上限 253 个客户端）"
 
     tmp="$(mktemp "${AWG_DIR}/.peers.XXXXXX")"
     jq --arg n "$name" --arg ip "$addr" --arg priv "$priv" \
