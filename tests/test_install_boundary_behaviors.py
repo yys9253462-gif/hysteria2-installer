@@ -91,6 +91,19 @@ done <<'CASES'
         )
         self.check_addresses([(ip, "0", ip) for ip in addresses])
 
+    def test_junk_answer_from_first_source_falls_through_to_the_next(self):
+        """第一个源回一张错误页时要继续试下一个（2026-11-04 修）。
+
+        旧实现只要回答非空就不再换源，ipify 回 502 页面时安装直接报「无法获取公网 IP」。
+        """
+        stub = r'''curl(){ case "$*" in *ipify*) printf '<html>502 Bad Gateway</html>';; *icanhazip*) printf '203.0.113.7\n';; esac; }
+'''
+        check = r'''
+get_public_ip && [[ "$PUBLIC_IP" == 203.0.113.7 ]]
+'''
+        result = run_shell(stub + extract_function("get_public_ip") + check)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_reserved_cidr_endpoints_remain_blocked(self):
         addresses = (
             "100.64.0.0", "100.127.255.255", "198.18.0.0", "198.19.255.255",

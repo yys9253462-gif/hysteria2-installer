@@ -727,15 +727,19 @@ get_public_ip() {
     #      印在信息页 URL 上、还拿去做 DNS 校验。用户的节点会「看起来装好了」，
     #      但生成的订阅/二维码指向 127.0.0.1，客户端永远连不上 —— 且毫无提示。
     # 现在：取不到就返回非 0，让调用点那条 `|| exit 1` 真正生效。
-    PUBLIC_IP=$(curl -4 -s --max-time 5 https://api.ipify.org 2>/dev/null || true)
-    if [[ -z "$PUBLIC_IP" ]]; then
-        PUBLIC_IP=$(curl -4 -s --max-time 5 https://icanhazip.com 2>/dev/null || true)
-    fi
-    if [[ -z "$PUBLIC_IP" ]]; then
-        PUBLIC_IP=$(curl -4 -s --max-time 5 https://ipinfo.io/ip 2>/dev/null || true)
-    fi
-    # 清洗：去掉空白与换行，并校验「像一个可用的公网 IPv4」
-    PUBLIC_IP="$(printf '%s' "$PUBLIC_IP" | tr -d '[:space:]')"
+    # 每个源的回答先清洗、验形状再采用（2026-11-04 修）：旧实现只要第一个源返回
+    # 非空内容就不再试下一个，ipify 回一张 502 / 运营商劫持页时安装直接报
+    # 「无法获取公网 IP」，后面两个好用的源根本没机会。
+    local _ip_src _ip_answer
+    PUBLIC_IP=""
+    for _ip_src in https://api.ipify.org https://icanhazip.com https://ipinfo.io/ip; do
+        _ip_answer="$(curl -4 -s --max-time 5 "$_ip_src" 2>/dev/null || true)"
+        _ip_answer="$(printf '%s' "$_ip_answer" | tr -d '[:space:]')"
+        if [[ "$_ip_answer" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            PUBLIC_IP="$_ip_answer"
+            break
+        fi
+    done
     if ! [[ "$PUBLIC_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
         log_err "无法获取本机公网 IP（已尝试 api.ipify.org / icanhazip.com / ipinfo.io）。"
         log_err "常见原因：服务器没有公网出口、出口被防火墙拦截、或 DNS 异常。"
