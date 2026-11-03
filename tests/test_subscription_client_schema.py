@@ -41,6 +41,14 @@ class SubscriptionSchemaTests(unittest.TestCase):
         self.assertNotIn('reality_opts', p)
         self.assertEqual(p['servername'], 'www.apple.com')
 
+    def test_sing_box_has_no_xray_only_fields(self):
+        outbounds = json.loads(self.sing)['outbounds']
+        self.assertFalse(any('encryption' in o for o in outbounds),
+                         'sing-box 不认识 encryption 字段，整份订阅会加载失败')
+        tags = {o.get('tag') for o in outbounds}
+        group = next(o for o in outbounds if o.get('type') in ('urltest', 'selector'))
+        self.assertTrue(set(group['outbounds']) <= tags, '分组引用了不存在的出站')
+
     def test_clash_still_offers_vless_encryption(self):
         self.assertTrue(any(k.endswith('-VLESS-Enc') for k in proxies(self.clash)))
 

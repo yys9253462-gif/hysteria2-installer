@@ -7033,11 +7033,11 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                               tls=True, servername=e_sni, network='tcp',
                               encryption=e_enc,
                               **{'client-fingerprint': 'chrome'})
-        vlessenc_sing = dict(type='vless', tag=e_name, server=e_host,
-                             server_port=e_port, uuid=e_uuid,
-                             encryption=e_enc,
-                             tls=dict(enabled=True, server_name=e_sni,
-                                      utls=dict(enabled=True, fingerprint='chrome')))
+        # sing-box 的 VLESS 出站没有 encryption（那是 Xray 独有的）：带上它，
+        # sing-box 1.14.4 报 unknown field，整份 sing-box.json 加载失败，连 Hy2
+        # 节点一起用不了；去掉它又连不上 VLESS Encryption 入站。所以 sing-box
+        # 订阅里不下发这一条（2026-11-03 修，SE 上用真 sing-box check 确认）。
+        vlessenc_sing = None
 
     # ---- AnyTLS（可选，2026-10-28 加）----
     # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
