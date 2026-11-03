@@ -7381,7 +7381,7 @@ def sync_download_artifacts(data, uri, clash, sing, qr=_QR_UNSET):
     return data
 
 
-def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
+def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', precomputed_qr=None):
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先修信任模型再对齐 pin。
@@ -7439,7 +7439,11 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
     # 的旧节点。页面文本框显示的是新 sni、二维码却是旧的 —— 用户扫了码导入，
     # 立刻 CRYPTO_ERROR 0x150，而面板看起来一切正常。这正是 sync_cert_trust
     # 要消灭的失败模式，只是从下一层又冒了出来。
-    sync_download_artifacts(data, uri, clash, sing)
+    # 锁外预先算好的二维码只在 uri 没变时用（sync_cert_trust 可能刚改过 meta）。
+    if precomputed_qr is not None and precomputed_qr[0] == uri:
+        sync_download_artifacts(data, uri, clash, sing, precomputed_qr[1])
+    else:
+        sync_download_artifacts(data, uri, clash, sing)
     
     # 域名 / 订阅端口改过之后，交给控制台的门户地址也要跟上（token 与凭据不变）。
     access_url = f"https://{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/"
@@ -7490,11 +7494,19 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     root = Path(meta_path).parent
     portal_file = root / 'portal.json'
     access_file = root / 'portal-access.json'
+    # qrencode 最长 20 秒，先在状态锁外跑：运行中门户的 save_data 持 data_lock 等这把锁，
+    # 锁内跑子进程会让所有 /auth 跟着卡住（2026-11-04 修）。
+    precomputed_qr = None
+    try:
+        _uri = artifacts(json.loads(Path(meta_path).read_text(encoding='utf-8')))[0]
+        precomputed_qr = (_uri, qr_svg_for(_uri))
+    except Exception as exc:
+        _log_ignored('refresh_qr_precompute', exc)
     with portal_state_file_lock(root):
         old_portal = portal_file.read_bytes()
         old_access = access_file.read_bytes() if access_file.exists() else None
         try:
-            _refresh_portal_state(meta_path, config_path)
+            _refresh_portal_state(meta_path, config_path, precomputed_qr)
         except Exception:
             try:
                 atomic_write_private(portal_file, old_portal)

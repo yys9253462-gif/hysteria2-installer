@@ -48,5 +48,35 @@ class PortalStateMigrationTests(unittest.TestCase):
                 self.assertEqual(after['users'][portal.MASTER_USER_ID]['password'], 'pw')
 
 
+
+class RefreshQrOutsideLockTests(unittest.TestCase):
+    def test_qrencode_runs_outside_state_lock(self):
+        import contextlib
+        held = []
+        seen = []
+
+        @contextlib.contextmanager
+        def lock(_root):
+            held.append(1)
+            try:
+                yield
+            finally:
+                held.pop()
+
+        def qr(uri):
+            seen.append(bool(held))
+            return '<svg/>'
+        with tempfile.TemporaryDirectory() as d:
+            root = PortalStateMigrationTests._root(None, d, {
+                'port': 1111, 'token': 'tok', 'api_key': 'k' * 32, 'auth_hash': 'a' * 64,
+                'session_secret': 's' * 64, 'users': {}, 'proxy_services': []})
+            with mock.patch.object(portal, 'portal_state_file_lock', lock), \
+                    mock.patch.object(portal, 'qr_svg_for', qr):
+                portal.refresh(root / 'client_meta.json')
+            after = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
+        self.assertEqual(seen, [False], '二维码在状态锁内生成')
+        self.assertEqual(after['qr'], '<svg/>')
+
+
 if __name__ == '__main__':
     unittest.main()
