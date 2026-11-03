@@ -2070,14 +2070,16 @@ setup_system_firewall() {
         log_info "已放行 UFW 防火墙端口。"
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --zone=public --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
-        firewall-cmd --zone=public --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+        # 不带 --zone：写进默认区（2026-11-03 修）。写死 public 在默认区是 drop / external
+        # 的机器上不生效，端口照样不通、日志却说已放行。
+        firewall-cmd --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
         if [[ "$CERT_TYPE" == "acme" ]]; then
-            firewall-cmd --zone=public --add-port="80/tcp" --permanent >/dev/null 2>&1 || true
-            firewall-cmd --zone=public --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --add-port="80/tcp" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
         fi
         if [[ -n "$s_port" && -n "$e_port" ]]; then
-            firewall-cmd --zone=public --add-port="${s_port}-${e_port}/udp" --permanent >/dev/null 2>&1 || true
+            firewall-cmd --add-port="${s_port}-${e_port}/udp" --permanent >/dev/null 2>&1 || true
         fi
         firewall-cmd --reload >/dev/null 2>&1 || true
         log_info "已放行 firewalld 端口。"

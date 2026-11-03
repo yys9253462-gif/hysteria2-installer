@@ -738,7 +738,7 @@ allow_firewall() {
         log_info "已放行 UFW: ${port}/udp"
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --zone=public --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
         log_info "已放行 firewalld: ${port}/udp"
     fi

@@ -6198,7 +6198,10 @@ def firewall_port(port, proto='tcp', open_=True):
                 handled = True
         if shutil.which('firewall-cmd') and _systemd_state('firewalld') == 'active':
             flag = '--add-port=' if open_ else '--remove-port='
-            result = subprocess.run(['firewall-cmd', '--zone=public', flag + spec, '--permanent'],
+            # 不写死 --zone=public（2026-11-03 修）：默认区是 drop / external 等的机器上
+            # 规则落进一个不生效的区，端口照样不通、日志却说已放行。不带 --zone 就是默认区，
+            # 与 install.sh / awgctl.sh 同一口径。
+            result = subprocess.run(['firewall-cmd', flag + spec, '--permanent'],
                                     capture_output=True, timeout=15)
             if result.returncode != 0:
                 return False
