@@ -9871,6 +9871,11 @@ if __name__ == '__main__':
                     if 'limit_bytes' in params:
                         limit_bytes = int(params['limit_bytes'])
                     initial_used = int(params.get('used_bytes', 0))
+                    # 与 users/renew 同一上界：超过 int64 的额度能开户，之后却永远续不了期
+                    # （renew 拒绝 new_limit > 2**63-1），用量计数也会溢出 Hysteria 侧（2026-11-04 修）。
+                    if not 0 <= limit_bytes <= 2**63 - 1 or not 0 <= initial_used <= 2**63 - 1:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: limit_bytes / used_bytes out of range'})
                     # active 同理：旧实现校验了却始终写 status=active，
                     # 控制台传 {"active": false} 开户会拿到 200 但用户照样能连。
                     want_active = params.get('active', True)
@@ -10071,7 +10076,8 @@ if __name__ == '__main__':
                     try:
                         changes = {}
                         if 'password' in params:
-                            if not isinstance(params['password'], str) or not params['password']:
+                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修）。
+                            if not isinstance(params['password'], str) or not params['password'].strip():
                                 raise ValueError()
                             changes['password'] = params['password']
                         if 'expires_at' in params:
