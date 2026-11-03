@@ -5387,6 +5387,14 @@ uninstall_all() {
                 && grep -qF '(由 hysteria2-installer 自动生成)' /etc/sysctl.d/99-hysteria2.conf; then
             rm -f /etc/sysctl.d/99-hysteria2.conf
         fi
+        # 门户「BBR 加速」写的两个文件：首行有归属标记才删（2026-11-03 修，标记见
+        # portal.py BBR_FILE_MARKER）。没有标记的是旧版门户或用户自己写的，保留。
+        local bbr_file
+        for bbr_file in /etc/modules-load.d/bbr.conf /etc/sysctl.d/99-bbr.conf; do
+            if [[ -f "$bbr_file" ]] && [[ "$(head -n 1 "$bbr_file")" == '# 由 hysteria2-installer 门户生成（BBR）' ]]; then
+                rm -f "$bbr_file"
+            fi
+        done
         clear_all_hopping_rules
         rm -f "$HY2_SERVICE"
         if [[ -f "$HY2_LOG_DROPIN" ]] && grep -qF '由 hysteria2-installer 生成' "$HY2_LOG_DROPIN"; then

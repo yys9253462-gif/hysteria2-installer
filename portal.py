@@ -121,6 +121,8 @@ urllib.request.install_opener(urllib.request.build_opener(GitHubTokenHandler()))
 # 机主账号。它的 password 就是 Hysteria 的 auth_password —— /auth 是遍历
 # data['users'] 按密码匹配的，这条记录一旦被删，主密码立刻变成 "User not found"，
 # 机主本人都会被踢下线且再也连不上（只能重装）。因此全站禁止注销它。
+# 门户写的 BBR 配置文件首行；install.sh 卸载按它识别（必须与 install.sh 一致）。
+BBR_FILE_MARKER = '# 由 hysteria2-installer 门户生成（BBR）'
 MASTER_USER_ID = 'admin_master'
 # 保留名：三种协议的 clients 在「没有任何活跃用户」时都会写一条
 # email='placeholder' 的占位记录（Xray 的 clients 为空会拒绝所有连接）。
@@ -12476,8 +12478,12 @@ if __name__ == '__main__':
                 paths = [Path('/etc/modules-load.d/bbr.conf'), Path('/etc/sysctl.d/99-bbr.conf')]
                 originals = {path: path.read_bytes() if path.exists() else None for path in paths}
                 try:
-                    paths[0].write_text('tcp_' + target + '\n', encoding='utf-8')
-                    paths[1].write_text('\n'.join('%s = %s' % item for item in settings.items()) + '\n', encoding='utf-8')
+                    # 带上归属标记，卸载时据此认出并删除（2026-11-03 修）：旧文件没有标记，
+                    # 卸载后重启仍加载 BBR 模块、套用这些 sysctl。
+                    paths[0].write_text(BBR_FILE_MARKER + '\ntcp_' + target + '\n', encoding='utf-8')
+                    paths[1].write_text(BBR_FILE_MARKER + '\n'
+                                        + '\n'.join('%s = %s' % item for item in settings.items()) + '\n',
+                                        encoding='utf-8')
                     applied = subprocess.run(['sysctl', '-p', str(paths[1])], capture_output=True, text=True, timeout=5)
                     if applied.returncode != 0:
                         raise RuntimeError('sysctl 应用失败')
