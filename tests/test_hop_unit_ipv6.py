@@ -49,7 +49,7 @@ class HopUnitIpv6Tests(unittest.TestCase):
             calls = log.read_text(encoding='utf-8')
             for family in ('iptables', 'ip6tables'):
                 for chain in ('PREROUTING', 'OUTPUT'):
-                    self.assertRegex(calls, r'(?m)^%s -t nat -A %s -p udp --dport 20000:40000 ' % (family, chain),
+                    self.assertRegex(calls, r'(?m)^%s -t nat -A %s -p udp (-m addrtype --dst-type LOCAL )?--dport 20000:40000 ' % (family, chain),
                                      '%s %s 没有在开机时恢复' % (family, chain))
 
 

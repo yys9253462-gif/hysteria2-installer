@@ -2451,11 +2451,13 @@ setup_iptables_port_hopping() {
     
     # 注入新规则 (IPv4 + IPv6)
     # BUGFIX #12: 同时加 PREROUTING + OUTPUT 链, 这样本机 loopback 拨测也能跳到主监听端口
+    # OUTPUT 只认目的为本机地址（2026-11-04 修）：不限目的时，代理替用户发往远端
+    # 20000-40000 端口的 UDP（游戏、WebRTC、VoIP）也被 REDIRECT 到本机监听口，直接断流。
     iptables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
-    iptables -t nat -A OUTPUT     -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
+    iptables -t nat -A OUTPUT     -p udp -m addrtype --dst-type LOCAL --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
     if command -v ip6tables >/dev/null 2>&1; then
         ip6tables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
-        ip6tables -t nat -A OUTPUT     -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
+        ip6tables -t nat -A OUTPUT     -p udp -m addrtype --dst-type LOCAL --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
     fi
 
     # 保存规则持久化（兼顾 netfilter-persistent 与原生 systemd 自愈守护）
@@ -2475,10 +2477,10 @@ Before=hysteria-server.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c "iptables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}; iptables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}"
+ExecStart=/bin/bash -c "iptables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}; iptables -t nat -C OUTPUT -p udp -m addrtype --dst-type LOCAL --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A OUTPUT -p udp -m addrtype --dst-type LOCAL --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}"
 # IPv6 跳跃规则同样要在开机时恢复（2026-11-03 修）：安装时加了 ip6tables 规则，
 # 这里却只恢复 IPv4，没有 netfilter-persistent 的机器重启后 IPv6 跳跃全部失效。
-ExecStart=/bin/bash -c "command -v ip6tables >/dev/null 2>&1 || exit 0; ip6tables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || ip6tables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null; ip6tables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || ip6tables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null; exit 0"
+ExecStart=/bin/bash -c "command -v ip6tables >/dev/null 2>&1 || exit 0; ip6tables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || ip6tables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null; ip6tables -t nat -C OUTPUT -p udp -m addrtype --dst-type LOCAL --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || ip6tables -t nat -A OUTPUT -p udp -m addrtype --dst-type LOCAL --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null; exit 0"
 
 [Install]
 WantedBy=multi-user.target
