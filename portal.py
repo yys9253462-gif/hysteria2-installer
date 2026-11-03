@@ -1370,7 +1370,8 @@ def _prune_portal_backups(directory, keep=3, protected=()):
                 continue
 
 
-def portal_update_restart_script(port, backups, created, wait_seconds=20):
+def portal_update_restart_script(port, backups, created, wait_seconds=20,
+                                  marker_path='/etc/hysteria/portal-rollback-failed'):
     """面板自更新后的重启脚本：起不来就自动回滚到旧版本。
 
     门户同时是 Hy2 的鉴权后端和 Teyir 管理节点的唯一入口。新版本一旦启动即崩，
@@ -1383,20 +1384,22 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20):
     restore = ' '.join('cp -p -f %s %s;' % (shlex.quote(str(bak)), shlex.quote(str(dest)))
                        for dest, bak in backups)
     remove = ' '.join('rm -f %s;' % shlex.quote(str(dest)) for dest in created)
-    marker = shlex.quote('/etc/hysteria/portal-rollback-failed')
+    marker = shlex.quote(str(marker_path))
     # 回滚后再做一次健康检查：旧版本本身也可能起不来（更新前就处于 failed）。
     # 旧脚本只重启、不复查，最终状态是「服务挂着、界面打不开」，日志却说
     # 「已自动回滚」（2026-10-29 修）。复查仍失败就写一个明确的标记文件，
     # 下次启动 / 人工排查能直接看到。
+    # 新版本起来了就清掉上一次留下的失败标记（2026-11-04 修）：旧脚本只写不删，
+    # 一次双重失败之后标记永远留着，谁读它都会把早已过去的故障当成当前状态。
     return ('sleep 1; systemctl restart hysteria-portal; '
-            'for i in $(seq 1 %d); do sleep 1; python3 -c %s && exit 0; done; '
+            'for i in $(seq 1 %d); do sleep 1; python3 -c %s && { rm -f %s; exit 0; }; done; '
             'logger -t hysteria-portal "面板更新后未能启动，已自动回滚到旧版本"; '
             '%s %s systemctl restart hysteria-portal; '
             'for i in $(seq 1 10); do sleep 1; python3 -c %s && '
             '{ logger -t hysteria-portal "回滚后已恢复"; exit 0; }; done; '
             'logger -t hysteria-portal "回滚后仍未启动，需要人工介入"; '
             'echo "portal rollback failed at $(date -Is)" > %s'
-            % (int(wait_seconds), shlex.quote(probe), restore, remove,
+            % (int(wait_seconds), shlex.quote(probe), marker, restore, remove,
                shlex.quote(probe), marker))
 
 

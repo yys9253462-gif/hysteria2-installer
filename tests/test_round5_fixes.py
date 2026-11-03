@@ -100,7 +100,11 @@ class SelfUpdateRollbackTest(unittest.TestCase):
         bak.chmod(0o600)
         added = td / 'added.py'
         added.write_text('new file')
-        script = portal.portal_update_restart_script(1, [(dest, bak)], [added], wait_seconds=2)
+        self.marker = td / 'portal-rollback-failed'
+        if getattr(self, 'stale_marker', False):
+            self.marker.write_text('portal rollback failed at 2026-10-01\n')
+        script = portal.portal_update_restart_script(1, [(dest, bak)], [added], wait_seconds=2,
+                                                     marker_path=self.marker)
         script = script.replace('sleep 1', 'sleep 0')
         env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'])
         subprocess.run(['bash', '-c', script], env=env, timeout=30, check=False)
@@ -122,6 +126,23 @@ class SelfUpdateRollbackTest(unittest.TestCase):
         self.assertEqual(calls.count('systemctl restart hysteria-portal'), 1)
 
 
+@unittest.skipIf(os.name != 'posix', '需要 POSIX shell 与可执行桩')
+class RollbackMarkerTest(SelfUpdateRollbackTest):
+    """成功更新后清掉上一次的回滚失败标记，双重失败时才写（2026-11-04 修）。"""
+    stale_marker = True
+
+    def test_healthy_update_clears_stale_marker(self):
+        self.run_script(healthy=True)
+        self.assertFalse(self.marker.exists(), '旧的回滚失败标记在成功更新后仍然留着')
+
+    def test_double_failure_writes_marker(self):
+        self.run_script(healthy=False)
+        self.assertIn('portal rollback failed', self.marker.read_text())
+
+    test_unhealthy_update_rolls_back_and_restarts = None
+    test_healthy_update_is_kept = None
+
+
 class SelfUpdateScriptShapeTest(unittest.TestCase):
     def test_script_probes_health_and_restores_backups(self):
         script = portal.portal_update_restart_script(
@@ -130,7 +151,7 @@ class SelfUpdateScriptShapeTest(unittest.TestCase):
         self.assertIn('127.0.0.1:18080/api/health', script)
         self.assertIn('portal.py.bak', script)
         self.assertIn('new.py', script)
-        self.assertIn('&& exit 0', script)
+        self.assertIn('&& { rm -f', script)  # 健康后清掉旧的回滚失败标记再退出
 
     def test_update_handler_uses_rollback_script(self):
         src = (ROOT / 'portal.py').read_text(encoding='utf-8')
