@@ -2434,6 +2434,9 @@ Before=hysteria-server.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/bash -c "iptables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}; iptables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || iptables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port}"
+# IPv6 跳跃规则同样要在开机时恢复（2026-11-03 修）：安装时加了 ip6tables 规则，
+# 这里却只恢复 IPv4，没有 netfilter-persistent 的机器重启后 IPv6 跳跃全部失效。
+ExecStart=/bin/bash -c "command -v ip6tables >/dev/null 2>&1 || exit 0; ip6tables -t nat -C PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || ip6tables -t nat -A PREROUTING -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null; ip6tables -t nat -C OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null || ip6tables -t nat -A OUTPUT -p udp --dport ${s_port}:${e_port} -m comment --comment hy2-installer -j REDIRECT --to-ports ${l_port} 2>/dev/null; exit 0"
 
 [Install]
 WantedBy=multi-user.target
