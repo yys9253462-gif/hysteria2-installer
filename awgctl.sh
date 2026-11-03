@@ -273,7 +273,6 @@ detect_wan_iface() {
     # 那条 MASQUERADE 规则会静默不生效 —— 表现是客户端握手成功、
     # 隧道也通，但上不了网，属于最难排查的一类故障（2026-10-29 修）。
     log_err "无法确定默认出口网卡（ip route 输出为空或网卡不存在）。"
-    log_err "请用 --wan <网卡名> 指定，或确认本机存在默认路由。"
     return 1
 }
 
@@ -562,7 +561,8 @@ render_server_config() {
     port="$(meta_get port)"
     priv="$(meta_get server_private_key)"
     hp="$(meta_get HeaderProtectionKey)"
-    wan="$(detect_wan_iface)" || die "无法确定出口网卡，AWG 配置未生成"
+    # 出口网卡只写进注释：NAT 规则按隧道网段匹配，不依赖网卡名（见下方 PostUp）。
+    wan="$(detect_wan_iface 2>/dev/null)" || wan="（未探测到默认路由，按隧道网段 NAT）"
 
     [[ -n "$port" ]] || die "meta 中缺少 port，无法渲染配置"
     [[ -n "$priv" ]] || die "meta 中缺少 server_private_key，无法渲染配置"
@@ -612,6 +612,9 @@ render_server_config() {
         # WireGuard 官方文档同样是两个方向都放行。
         # 回程方向额外用 conntrack 限定为已建立连接：比官方写法更严
         # （避免任意来源的包都被转发进隧道），对"客户端上网"这个场景完全够用。
+        # NAT 按隧道网段匹配、不写死出口网卡名（2026-11-04 修）：旧规则 -o <安装时的网卡>，
+        # 网卡改名或默认路由换到另一张网卡后，重启时 MASQUERADE 落在旧网卡上，客户端
+        # 握手成功却上不了网，直到有人手动 resync。SE 上在独立网络命名空间里验证过规则。
         # 客户端不能经隧道访问内网与云元数据（2026-11-03 修）：DROP 在 ACCEPT 之后
         # 用 -I 插入，所以排在它前面先命中；`! -o` 放过客户端之间的互访。
         local guard_up="" guard_down="" cidr
@@ -619,8 +622,8 @@ render_server_config() {
             guard_up+="; iptables -I FORWARD -i ${AWG_LINK} ! -o ${AWG_LINK} -d ${cidr} -j DROP"
             guard_down+="; iptables -D FORWARD -i ${AWG_LINK} ! -o ${AWG_LINK} -d ${cidr} -j DROP"
         done
-        echo "PostUp = sysctl -qw net.ipv4.ip_forward=1; iptables -I FORWARD -i ${AWG_LINK} -j ACCEPT${guard_up}; iptables -I FORWARD -o ${AWG_LINK} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o ${wan} -j MASQUERADE"
-        echo "PostDown = iptables -D FORWARD -i ${AWG_LINK} -j ACCEPT${guard_down}; iptables -D FORWARD -o ${AWG_LINK} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -o ${wan} -j MASQUERADE"
+        echo "PostUp = sysctl -qw net.ipv4.ip_forward=1; iptables -I FORWARD -i ${AWG_LINK} -j ACCEPT${guard_up}; iptables -I FORWARD -o ${AWG_LINK} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s ${AWG_SUBNET}.0/24 ! -o ${AWG_LINK} -j MASQUERADE"
+        echo "PostDown = iptables -D FORWARD -i ${AWG_LINK} -j ACCEPT${guard_down}; iptables -D FORWARD -o ${AWG_LINK} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s ${AWG_SUBNET}.0/24 ! -o ${AWG_LINK} -j MASQUERADE"
 
         if [[ -s "$AWG_PEERS_FILE" ]]; then
             jq -r '
