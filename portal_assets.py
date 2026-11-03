@@ -2583,6 +2583,9 @@ const btnRecheckUpdate = document.getElementById('btn-recheck-update');
 function fmtVer(current, latest, hasUpdate, installed) {
   if (installed === false) return '未安装';
   if (!current || current === '未安装') return '未安装';
+  // 后端读不出版本时给的是「未知」（2026-11-04 修）：旧实现照样拼上「（最新）」并隐藏
+  // 更新按钮，坏掉 / 读超时的核心被显示成已是最新。
+  if (current === '未知') return '未知（本机版本读取失败，无法比对）';
   if (hasUpdate) return current + ' → ' + (latest || '新版本（部分文件尚未完成比对）') + ' 有新版本';
   if (!latest) return current + '（远端未取到，无法比对）';
   return current + '（最新）';

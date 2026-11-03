@@ -380,6 +380,23 @@ globalThis.fetch = async () => ({ok: true, json: async () => ({ok: true, install
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_unreadable_core_version_is_not_shown_as_latest(self):
+        """核心版本读不出来（「未知」）时不能显示「（最新）」（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('function fmtVer(')
+        end = script.index('\n}\n', start) + 3
+        checks = r"""
+const assert = require('assert');
+const text = fmtVer('未知', '2.6.4', false, true);
+assert(!text.includes('（最新）'), text);
+assert(text.includes('读取失败'), text);
+assert.strictEqual(fmtVer('2.6.4', '2.6.4', false, true), '2.6.4（最新）');
+"""
+        result = subprocess.run([NODE, '-e', script[start:end] + checks], capture_output=True,
+                                text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]
