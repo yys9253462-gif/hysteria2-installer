@@ -11340,6 +11340,17 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': new_active})
 
                 elif action == 'reset':
+                    # Reality 已关闭时不能借「重置密钥」把它重新打开（2026-11-04 修）：重建会
+                    # 写回入站、重启 Xray、重新放行端口，而回复只说「已重置密钥」。
+                    xray_path = Path('/etc/hysteria/xray.json')
+                    try:
+                        cfg_now = (json.loads(xray_path.read_text(encoding='utf-8'))
+                                   if xray_path.exists() else None)
+                    except ValueError:
+                        cfg_now = None
+                    if not (cfg_now and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            'Reality 当前未开启；请先开启 Reality，再重置密钥'})
                     # force=True：只有「重置密钥」按钮才真的换密钥对。
                     # 用户的 UUID 是 uuid5 派生的，不受密钥轮换影响。
                     with core_operation_lock, core_operation_file_lock():

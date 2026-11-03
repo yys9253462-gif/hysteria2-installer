@@ -267,6 +267,21 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(picked.get('preferred'), 443)
         self.assertIs(picked.get('own_active'), False, picked)
 
+    def test_reset_keys_does_not_turn_a_disabled_reality_back_on(self):
+        """Reality 已关闭时「重置密钥」回 409，不能顺手把它重新打开（2026-11-04 修）。"""
+        self.ns.update(has_managed_inbound=portal.has_managed_inbound,
+                       REALITY_INBOUND_TAG=portal.REALITY_INBOUND_TAG)
+        self.handler._generate_and_apply_reality = Mock()
+        (self.hdir / 'xray.json').write_text('{"inbounds": []}', encoding='utf-8')
+        status, body = self.invoke('_h_post_manage_reality', {'action': 'reset'})
+        self.assertEqual(status, 409, body)
+        self.handler._generate_and_apply_reality.assert_not_called()
+        (self.hdir / 'xray.json').write_text(json.dumps({'inbounds': [
+            {'tag': portal.REALITY_INBOUND_TAG, 'protocol': 'vless', 'port': 8444}]}), encoding='utf-8')
+        status, body = self.invoke('_h_post_manage_reality', {'action': 'reset'})
+        self.assertEqual(status, 200, body)
+        self.handler._generate_and_apply_reality.assert_called_once()
+
     def test_reality_keygen_failure_never_uses_a_shared_static_key(self):
         self.run.return_value = SimpleNamespace(returncode=1, stdout='', stderr='keygen failed')
         generate = extract_method('_generate_and_apply_reality', self.ns)
@@ -1897,6 +1912,12 @@ class WebWorkflowTests(unittest.TestCase):
                 self.ns['core_operation_lock'] = threading.Lock()
                 self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
                 self.handler._generate_and_apply_reality = Mock()
+                # 重置只对已开启的 Reality 生效（2026-11-04），夹具里放一个 Reality 入站。
+                self.ns.update(has_managed_inbound=portal.has_managed_inbound,
+                               REALITY_INBOUND_TAG=portal.REALITY_INBOUND_TAG)
+                (self.hdir / 'xray.json').write_text(json.dumps({'inbounds': [
+                    {'tag': portal.REALITY_INBOUND_TAG, 'protocol': 'vless', 'port': 8444}]}),
+                    encoding='utf-8')
                 status, payload = self.invoke('_h_post_manage_reality', {'action': 'reset'})
                 self.assertEqual(status, 200, payload)
                 self.assertIn(expected, payload['message'])
