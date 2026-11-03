@@ -10170,7 +10170,10 @@ if __name__ == '__main__':
                             try:
                                 base_time = max(int(u.get('expires_at') or 0), now_ts)
                                 new_expiry = int(base_time) + days * 86400
-                                new_limit = int(u.get('limit_bytes', 0)) + added_bytes
+                                # limit_bytes=0 表示不限量：加流量不能把它变成「只有本次加的量」，
+                                # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
+                                old_limit = int(u.get('limit_bytes', 0))
+                                new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
                                 if not 0 <= new_expiry <= 253402300799 or not 0 <= new_limit <= 2**63 - 1:
                                     raise ValueError()
                             except (ValueError, TypeError, OverflowError):

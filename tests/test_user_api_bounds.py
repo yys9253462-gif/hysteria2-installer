@@ -24,5 +24,15 @@ class UserApiBoundsTest(PortalServer):  # noqa: E302
         self.assertEqual(self.api('users/create', {'user_id': 'edge', 'limit_bytes': 2 ** 63 - 1})[0], 200)
 
 
+
+class RenewUnlimitedTest(PortalServer):
+    def test_adding_traffic_keeps_unlimited_user_unlimited(self):
+        self.assertEqual(self.api('users/create', {'user_id': 'unl', 'used_bytes': 50 * 1024 ** 3})[0], 200)
+        self.assertEqual(self.api('users/renew', {'user_id': 'unl', 'extend_days': 30, 'add_traffic_gb': 10})[0], 200)
+        import json
+        users = json.loads((self.root / 'portal.json').read_text(encoding='utf-8'))['users']
+        self.assertEqual(users['unl']['limit_bytes'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
