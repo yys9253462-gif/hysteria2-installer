@@ -42,6 +42,41 @@ mkdir -p "$AWG_DIR" "$(dirname "$AWG_SERVICE")" "$(dirname "$AWG_BIN")"
                                   capture_output=True, timeout=20,
                                   encoding='utf-8', errors='replace')
 
+    def test_resync_that_fails_to_start_restores_the_working_config(self):
+        """resync 写出起不来的配置时要回到旧配置（2026-11-03 修）。
+
+        旧实现直接覆盖 awg0.conf 再 restart：meta 被改坏时服务起不来，旧配置
+        已经没了，所有客户端掉线直到有人手修 meta。
+        """
+        result = self.run_shell(r"""
+printf 'working-config\n' > "$AWG_CONFIG"
+printf '{}\n' > "$AWG_META_FILE"
+STATE_ACTIVE=active
+STATE_ENABLED=enabled
+systemctl() {
+    case "$*" in
+        'is-active amneziawg-server') printf '%s' "$STATE_ACTIVE" ;;
+        'is-active --quiet amneziawg-server') [[ "$STATE_ACTIVE" == active ]] ;;
+        'is-enabled amneziawg-server') printf '%s' "$STATE_ENABLED" ;;
+        'restart amneziawg-server')
+            if grep -q broken "$AWG_CONFIG"; then STATE_ACTIVE=failed; return 1; fi
+            STATE_ACTIVE=active ;;
+        *) return 0 ;;
+    esac
+}
+require_root() { :; }
+require_jq() { :; }
+is_installed() { return 0; }
+render_server_config() { printf 'broken-config\n' > "$AWG_CONFIG"; }
+sleep() { :; }
+( cmd_resync ) && echo RESYNC_OK || echo RESYNC_FAILED
+cat "$AWG_CONFIG"
+echo "STATE=$STATE_ACTIVE"
+""")
+        self.assertIn('RESYNC_FAILED', result.stdout, result.stderr)
+        self.assertIn('working-config', result.stdout, '起不来的新配置留在了磁盘上')
+        self.assertNotIn('broken-config', result.stdout)
+
     def test_restore_recovers_all_files_and_enabled_active_state(self):
         result = self.run_shell(r'''
 for path in "$AWG_META_FILE" "$AWG_CONFIG" "$AWG_PEERS_FILE" "$AWG_SERVICE" \

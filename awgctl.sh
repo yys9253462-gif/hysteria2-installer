@@ -1381,10 +1381,17 @@ cmd_resync() {
     require_root
     require_jq
     is_installed || die "AmneziaWG 尚未安装。"
+    # 与 update 同一套快照回滚（2026-11-03 修）：meta 被改坏时新配置起不来，
+    # 旧实现已经覆盖了 awg0.conf，所有客户端掉线直到有人手修 meta。
+    awg_transaction_snapshot || die "无法为 AWG 重新同步创建回滚快照"
+    trap awg_transaction_on_exit EXIT
     render_server_config
-    systemctl restart "$AWG_SERVICE_NAME"
+    systemctl restart "$AWG_SERVICE_NAME" || die "重载后服务异常，已恢复原配置"
     sleep 2
-    service_active && log_info "配置已重新同步，服务正常。" || die "重载后服务异常"
+    service_active || die "重载后服务异常，已恢复原配置"
+    awg_transaction_finish
+    trap - EXIT
+    log_info "配置已重新同步，服务正常。"
 }
 
 # ==============================================================================
