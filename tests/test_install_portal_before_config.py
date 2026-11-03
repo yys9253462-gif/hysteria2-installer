@@ -48,6 +48,7 @@ class InstallOrderTests(unittest.TestCase):
                 'portal_ensure_py(){ echo "ensure ONLY=${PORTAL_BUNDLE_ONLY:-0}" >> %s; return %d; }'
                 % (calls, 0 if fetch_ok else 1),
                 'setup_portal(){ echo "setup_portal PLACED=${PORTAL_BUNDLE_PLACED:-0}" >> %s; }' % calls,
+                function('require_systemd_247'),
                 function('generate_server_config'),
                 'generate_server_config',
                 'echo "after PLACED=${PORTAL_BUNDLE_PLACED:-unset}" >> %s' % calls,
