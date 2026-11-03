@@ -13094,9 +13094,9 @@ if ! curl --proxy "socks5h://${WARP_SOCKS_ADDR}" --silent --fail --max-time 10 h
 fi
 log "WARP socks5 探活成功"
 
-if [ -f "$HY2_CONF" ]; then
-    sed -i "s|addr: 127.0.0.1:40000|addr: ${WARP_SOCKS_ADDR}|g" "$HY2_CONF"
-fi
+# config.yaml 里旧 40000 端口的 WARP 出站不在这里 sed（2026-11-04 修）：脚本在出站
+# 应用锁之外，与正在进行的应用 / 回滚互相覆盖，且原地改写不落盘同步。脚本成功后
+# 由门户在 warp_apply_lock 内改写并原子落盘。
 
 if systemctl list-unit-files 2>/dev/null | grep -q '^warp-svc'; then
     log "检测到旧的 cloudflare-warp 客户端，已停用（统一走 wireproxy 出口）"
@@ -13157,6 +13157,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                       % res.returncode)
                     return self.reply_json(500, {'ok': False, 'error': f'安装失败: {err_detail[-400:]}'})
 
+                # 旧版官方 cloudflare-warp 客户端监听 40000：wireproxy 装好后把 config.yaml
+                # 里指向它的出站改成 19898。在出站应用锁内改，并原子落盘（2026-11-04 修）：
+                # 旧实现由安装脚本在锁外 sed -i，与正在进行的应用 / 回滚互相覆盖。
+                with warp_apply_lock:
+                    hy2_conf = Path('/etc/hysteria/config.yaml')
+                    try:
+                        conf_text = hy2_conf.read_text(encoding='utf-8')
+                    except OSError:
+                        conf_text = None
+                    if conf_text is not None:
+                        migrated = re.sub(r'(?m)^(\s+addr:\s*)127\.0\.0\.1:40000\s*$',
+                                          r'\g<1>127.0.0.1:19898', conf_text)
+                        if migrated != conf_text:
+                            atomic_write_private(hy2_conf, migrated.encode('utf-8'))
                 # Install success is not routing success: apply the domain ACL
                 # directly, never call the legacy script with mismatched arguments.
                 with data_lock:

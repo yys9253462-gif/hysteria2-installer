@@ -885,6 +885,37 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual({key: self.data[key] for key in original}, original)
         self.assertEqual(scheduled, [])
 
+    def test_install_warp_migrates_legacy_port_under_the_apply_lock(self):
+        """旧版 40000 端口的 WARP 出站在应用锁内改成 19898，不再由脚本锁外 sed（2026-11-04 修）。"""
+        conf = self.hdir / 'config.yaml'
+        conf.write_text('outbounds:\n  - name: warp\n    type: socks5\n    socks5:\n'
+                        '      addr: 127.0.0.1:40000\n', encoding='utf-8')
+        held = []
+
+        class RecordingLock:
+            def __enter__(self_inner):
+                held.append(True)
+            def __exit__(self_inner, *exc):
+                held.append(False)
+                return False
+
+        writes = []
+        def atomic_write(path, payload):
+            writes.append(bool(held) and held[-1])
+            Path(path).write_bytes(payload)
+        self.ns.update(
+            Path=lambda value: conf if str(value) == '/etc/hysteria/config.yaml' else Path(value),
+            warp_apply_lock=RecordingLock(), atomic_write_private=atomic_write,
+            DEFAULT_WARP_DOMAINS=portal.DEFAULT_WARP_DOMAINS)
+        self.run.side_effect = lambda args, **kw: SimpleNamespace(returncode=0, stdout='', stderr='')
+        self.handler._reply_with_warp_apply = lambda payload: self.reply_json(200, payload)
+        status, body = self.invoke('_h_post_install_warp', {})
+        self.assertEqual(status, 200, body)
+        self.assertIn('addr: 127.0.0.1:19898', conf.read_text(encoding='utf-8'))
+        self.assertEqual(writes, [True], '没有在 warp_apply_lock 内写 config.yaml')
+        script = next(c.args[0][2] for c in self.run.call_args_list if c.args[0][:2] == ['bash', '-c'])
+        self.assertNotIn('sed -i "s|addr: 127.0.0.1:40000', script)
+
     def test_warp_cannot_be_enabled_when_not_installed(self):
         """没装 WARP 时开启回 409，不把流量导向没人监听的 19898（2026-11-04 修）。"""
         self.data.update({'warp_enabled': False, 'warp_rules': []})
