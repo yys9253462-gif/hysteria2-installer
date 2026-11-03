@@ -26,7 +26,7 @@ echo
 # 计量配置 2026-11-03 拆成 portal_write_meter_config（portal_ensure_py 末尾调用）。
 for fn in hy2_git_blob_sha portal_remote_blob_shas portal_verify_blobs \
           portal_files_ok portal_fetch_files portal_fetch_py portal_ensure_py \
-          portal_write_meter_config; do
+          portal_write_meter_config traffic_stats_secret; do
     eval "$(sed -n "/^${fn}() {/,/^}/p" install.sh)"
 done
 

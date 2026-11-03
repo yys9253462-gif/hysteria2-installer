@@ -195,6 +195,13 @@ class WebWorkflowTests(unittest.TestCase):
         status, _ = self.invoke('_h_post_manage_user', {'action': 'not-an-action', 'user_id': 'qa-user'})
         self.assertEqual(status, 400)
 
+    def test_save_failure_after_create_is_reported_as_server_error(self):
+        """建户后保存失败要回 500 并说明原因，不是 400「Bad request」（2026-11-04 修）。"""
+        self.ns['regenerate_page'] = Mock(side_effect=OSError('No space left on device'))
+        status, body = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user',
+                                                           'password': 'pw-new-user'})
+        self.assertEqual(status, 500, body)
+
     def test_invalid_user_duration_does_not_create_expired_record(self):
         status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user', 'duration_days': '-1'})
         self.assertEqual(status, 400)
@@ -869,6 +876,7 @@ class WebWorkflowTests(unittest.TestCase):
                                                            'outbound': 'direct'}]}
         self.data.update(copy.deepcopy(original))
         self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        self.ns['warp_backend_installed'] = lambda: True
         scheduled = []
         self.handler._reply_with_warp_apply = Mock(side_effect=lambda payload:
             scheduled.append(payload) or self.reply_json(200, payload))
@@ -876,6 +884,26 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 500, body)
         self.assertEqual({key: self.data[key] for key in original}, original)
         self.assertEqual(scheduled, [])
+
+    def test_warp_cannot_be_enabled_when_not_installed(self):
+        """没装 WARP 时开启回 409，不把流量导向没人监听的 19898（2026-11-04 修）。"""
+        self.data.update({'warp_enabled': False, 'warp_rules': []})
+        self.ns['warp_backend_installed'] = lambda: False
+        scheduled = []
+        self.handler._reply_with_warp_apply = Mock(side_effect=lambda payload:
+            scheduled.append(payload) or self.reply_json(200, payload))
+        for action in ('enable', 'toggle'):
+            with self.subTest(action=action):
+                status, body = self.invoke('_h_post_manage_warp', {'action': action})
+                self.assertEqual(status, 409, body)
+                self.assertFalse(self.data['warp_enabled'])
+                self.assertEqual(self.data['warp_rules'], [])
+        self.assertEqual(scheduled, [])
+        # 关闭不受影响。
+        self.data['warp_enabled'] = True
+        status, _ = self.invoke('_h_post_manage_warp', {'action': 'disable'})
+        self.assertEqual(status, 200)
+        self.assertFalse(self.data['warp_enabled'])
 
     def test_egress_schedule_save_failure_still_starts_apply_worker(self):
         self.ns['save_data'] = Mock(side_effect=[OSError('disk full')])
@@ -992,6 +1020,26 @@ class WebWorkflowTests(unittest.TestCase):
         self.handler.rfile = io.BytesIO(body)
         extract_method('do_POST', self.ns)(self.handler)
         return self.response
+
+    def test_dot_only_user_ids_cannot_be_created(self):
+        """'.' / '..' 开户会让分享链接被折叠成别的地址，开户时就拒绝（2026-11-04 修）。"""
+        self.ns['user_id_shareable'] = portal.user_id_shareable
+        for uid in ('.', '..', '...'):
+            with self.subTest(endpoint='api', uid=uid):
+                status, _ = self.invoke_api({'user_id': uid, 'password': 'pw-dots'})
+                self.assertEqual(status, 400)
+                self.assertNotIn(uid, self.data['users'])
+            with self.subTest(endpoint='web', uid=uid):
+                status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': uid,
+                                                                'password': 'pw-dots-web'})
+                self.assertEqual(status, 400)
+                self.assertNotIn(uid, self.data['users'])
+        self.assertTrue(portal.user_id_shareable('a.b'))
+        # 历史上已经存在的 '..' 用户仍要能删掉。
+        self.data['users']['..'] = {'password': 'pw-legacy', 'status': 'active'}
+        status, _ = self.invoke('_h_post_manage_user', {'action': 'delete', 'user_id': '..'})
+        self.assertNotEqual(status, 400)
+        self.assertNotIn('..', self.data['users'])
 
     def test_api_rejects_booleans_for_numeric_user_fields(self):
         """布尔值不能被当成数字：ip_limit / expires_at 一直在入口拒绝，traffic_gb 曾漏掉（2026-11-04 修）。

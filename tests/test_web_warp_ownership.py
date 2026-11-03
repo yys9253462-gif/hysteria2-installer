@@ -24,8 +24,10 @@ UNIT = 'ExecStart=/usr/local/bin/wireproxy -c /etc/wireguard/wp.conf\n'
 def guard_section(root):
     script = SOURCE[SOURCE.index("install_warp_sh = r'''") + len("install_warp_sh = r'''"):]
     script = script[:script.index("\n'''")]
-    end = script.index('chmod 600 "$WARP_OWNED_MARKER"') + len('chmod 600 "$WARP_OWNED_MARKER"')
-    section = script[:end]
+    # 守卫段到 claim_warp_assets 定义结束为止；最后补一次调用，代表「真正开始写资产」。
+    end = script.index('claim_warp_assets() {')
+    end = script.index('\n}\n', end) + 3
+    section = script[:end] + 'claim_warp_assets\n'
     for real in ('/usr/local/bin', '/etc/wireguard', '/etc/hysteria', '/etc/systemd/system'):
         section = section.replace(real, str(root) + real)
     return section
@@ -53,6 +55,25 @@ class WebWarpOwnershipTests(unittest.TestCase):
         self.assertIn('归属无法确认', result.stderr)
         self.assertNotIn('GUARD-PASSED', result.stdout)
         self.assertFalse(marker)
+
+    def test_marker_is_not_written_before_any_asset(self):
+        """下载失败退出时不能留下归属标记（2026-11-04 修）。
+
+        旧实现在下载前就落标记：失败后机主自己装的 wireproxy 会被下次网页安装覆盖、
+        被卸载当成本项目的删掉。这里只跑到守卫结束（不调用 claim_warp_assets）就退出。
+        """
+        script = SOURCE[SOURCE.index("install_warp_sh = r'''") + len("install_warp_sh = r'''"):]
+        script = script[:script.index("\n'''")]
+        guard_only = script[:script.index('claim_warp_assets() {')]
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for sub in ('usr/local/bin', 'etc/wireguard', 'etc/hysteria', 'etc/systemd/system'):
+                (root / sub).mkdir(parents=True)
+            for real in ('/usr/local/bin', '/etc/wireguard', '/etc/hysteria', '/etc/systemd/system'):
+                guard_only = guard_only.replace(real, str(root) + real)
+            subprocess.run(['bash', '-c', guard_only + '\nexit 1'], capture_output=True, text=True, timeout=30)
+            self.assertFalse((root / 'etc/hysteria/.hy2-warp-owned').exists(),
+                             '还没写任何资产就落下了归属标记')
 
     def test_fresh_install_writes_the_ownership_marker(self):
         result, marker = self.run_guard(lambda root: None)

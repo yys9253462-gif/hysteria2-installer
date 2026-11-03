@@ -138,6 +138,26 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 # user_id 的唯一格式定义。serve() 内沿用同名局部变量指向它，
 # 模块级辅助函数（撤销队列清洗等）也用它，避免两套规则漂移。
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
+
+
+def warp_backend_installed():
+    """本机是否装了 WARP 出口：wgcf + wireproxy，或旧节点的官方 warp-cli。"""
+    return (shutil.which('wireproxy') is not None
+            or shutil.which('warp-cli') is not None
+            or Path('/etc/systemd/system/wireproxy.service').exists())
+
+
+def user_id_shareable(user_id):
+    """新开户的 user_id 能否放进分享链接 /u/<uid>/（2026-11-04 修）。
+
+    USER_ID_RE 允许点，于是 "." / ".." 也能开户：quote('..') 原样返回，链接成了
+    /<token>/u/../clash.yaml，浏览器与客户端把它折叠成 /<token>/clash.yaml（机主订阅，
+    要 Basic 认证），用户永远打不开自己的链接。只在开户时拦：已存在的同名用户仍能
+    被查询、改动和删除。
+    """
+    return bool(user_id) and user_id.strip('.') != ''
+
+
 # 面板自更新与 AWG 资源的来源仓库（模块级：resolve_update_ref 也要用）。
 AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 
@@ -149,7 +169,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.19'
+PORTAL_VERSION = '2.20'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1350,7 +1370,8 @@ def _prune_portal_backups(directory, keep=3, protected=()):
                 continue
 
 
-def portal_update_restart_script(port, backups, created, wait_seconds=20):
+def portal_update_restart_script(port, backups, created, wait_seconds=20,
+                                  marker_path='/etc/hysteria/portal-rollback-failed'):
     """面板自更新后的重启脚本：起不来就自动回滚到旧版本。
 
     门户同时是 Hy2 的鉴权后端和 Teyir 管理节点的唯一入口。新版本一旦启动即崩，
@@ -1363,20 +1384,22 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20):
     restore = ' '.join('cp -p -f %s %s;' % (shlex.quote(str(bak)), shlex.quote(str(dest)))
                        for dest, bak in backups)
     remove = ' '.join('rm -f %s;' % shlex.quote(str(dest)) for dest in created)
-    marker = shlex.quote('/etc/hysteria/portal-rollback-failed')
+    marker = shlex.quote(str(marker_path))
     # 回滚后再做一次健康检查：旧版本本身也可能起不来（更新前就处于 failed）。
     # 旧脚本只重启、不复查，最终状态是「服务挂着、界面打不开」，日志却说
     # 「已自动回滚」（2026-10-29 修）。复查仍失败就写一个明确的标记文件，
     # 下次启动 / 人工排查能直接看到。
+    # 新版本起来了就清掉上一次留下的失败标记（2026-11-04 修）：旧脚本只写不删，
+    # 一次双重失败之后标记永远留着，谁读它都会把早已过去的故障当成当前状态。
     return ('sleep 1; systemctl restart hysteria-portal; '
-            'for i in $(seq 1 %d); do sleep 1; python3 -c %s && exit 0; done; '
+            'for i in $(seq 1 %d); do sleep 1; python3 -c %s && { rm -f %s; exit 0; }; done; '
             'logger -t hysteria-portal "面板更新后未能启动，已自动回滚到旧版本"; '
             '%s %s systemctl restart hysteria-portal; '
             'for i in $(seq 1 10); do sleep 1; python3 -c %s && '
             '{ logger -t hysteria-portal "回滚后已恢复"; exit 0; }; done; '
             'logger -t hysteria-portal "回滚后仍未启动，需要人工介入"; '
             'echo "portal rollback failed at $(date -Is)" > %s'
-            % (int(wait_seconds), shlex.quote(probe), restore, remove,
+            % (int(wait_seconds), shlex.quote(probe), marker, restore, remove,
                shlex.quote(probe), marker))
 
 
@@ -4391,6 +4414,19 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
 
     # 证书解析统一走 _resolve_live_cert —— 自愈与界面显示必须是同一张证书，
     # 否则会出现「卡片显示 A、自愈修 B」这种更隐蔽的不一致。
+    # config.yaml 写明了证书路径、文件却不在时不做任何改动（2026-11-04 修）：
+    # _resolve_live_cert 会退回 cert/server.crt —— 常常是安装时留下的旧自签证书。
+    # 旧实现据此把 meta 改成 self_signed + insecure + 一个无关证书的 pin，所有订阅
+    # 随之变成「跳过校验」，而 Hysteria 实际出示（或加载失败）的是配置里那条路径。
+    configured = _config_tls_cert_path(config_path)
+    if configured:
+        configured_path = Path(configured)
+        if not configured_path.is_absolute():
+            configured_path = Path(config_path).parent / configured_path
+        if not configured_path.exists():
+            print('[portal] 证书自愈跳过：config.yaml 指向的证书 %s 不存在' % configured_path,
+                  file=sys.stderr)
+            return False
     cert_file, cn, sans, self_signed = _resolve_live_cert(root, config_path)
     if not cert_file.exists():
         # 证书都读不到，不做任何猜测 —— 交给原来的行为。
@@ -7178,7 +7214,11 @@ def sync_pin(m, root, meta_path):
     if m.get('is_insecure'):
         cur = (m.get('pin_sha256') or '').strip().lower()
         if len(cur) != 64 or any(c not in '0123456789abcdef' for c in cur):
-            new = get_cert_pin_sha256(root)
+            # 按实际在用的证书算 pin（2026-11-04 修），与 sync_cert_trust 同一来源：
+            # 旧实现固定读 cert/server.crt，自签证书放在别处时写进一张无关证书的 pin，
+            # 客户端 pin 校验全部失败。
+            live = _resolve_live_cert(root, str(Path(root) / 'config.yaml'))[0]
+            new = pin_sha256_of_file(live) if Path(live).exists() else get_cert_pin_sha256(root)
             if new != m.get('pin_sha256'):
                 m['pin_sha256'] = new
                 Path(meta_path).write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
@@ -9625,6 +9665,9 @@ if __name__ == '__main__':
                     user_id = (params.get('user_id') or ('hy2_' + secrets.token_hex(6))).strip()
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
+                    if not user_id_shareable(user_id):
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'user_id 不能只由点组成（分享链接 /u/../ 会被浏览器折叠成别的地址）'})
                     if user_id in RESERVED_USER_IDS:
                         # 分开提示：机主账号是节点主密码，placeholder 是计量占位名。
                         # 旧文案把它们混成「ID 格式错误」，排查时会被带偏。
@@ -11165,6 +11208,7 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': '未知 WARP 操作'})
 
                 bad_domain = False
+                warp_not_installed = False
                 with data_lock:
                     previous_warp_state_exists = 'warp_enabled' in data
                     previous_warp_rules_exists = 'warp_rules' in data
@@ -11175,6 +11219,13 @@ if __name__ == '__main__':
                         data['warp_enabled'] = not bool(data.get('warp_enabled'))
                     elif action in ('enable', 'disable'):
                         data['warp_enabled'] = action == 'enable'
+                    # 没装 WARP 就不能开（2026-11-04 修）：旧实现照样置 True，渲染出指向
+                    # 127.0.0.1:19898 的 warp_socks 出站，AI 等默认分流域名全部发往一个没人
+                    # 监听的端口，用户只看到这些网站打不开。关闭始终允许。
+                    warp_not_installed = (data.get('warp_enabled') and not previous_warp_state
+                                          and not warp_backend_installed())
+                    if warp_not_installed:
+                        data['warp_enabled'] = previous_warp_state
                     elif action == 'add_rule':
                         raw = form.get('domain', [''])[0].strip().lower()
                         domain = re.sub(r'^[a-zA-Z]+://', '', raw).split('/')[0].split(':')[0].strip('.')
@@ -11197,6 +11248,15 @@ if __name__ == '__main__':
                 if bad_domain:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
+                if warp_not_installed:
+                    # 规则改动（如果有）与开关一起作废，不落盘。
+                    with data_lock:
+                        if previous_warp_rules_exists:
+                            data['warp_rules'] = previous_warp_rules
+                        else:
+                            data.pop('warp_rules', None)
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '本机尚未安装 WARP（wireproxy），请先在「出站分流」里安装 WARP 再开启'})
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
@@ -12615,6 +12675,8 @@ if __name__ == '__main__':
                 # Xray 的占位 client 撞 email，admin_master 是机主账号）。
                 if action == 'create' and user_id in RESERVED_USER_IDS:
                     return self.reply(400, b'Reserved user_id')
+                if action == 'create' and not user_id_shareable(user_id):
+                    return self.reply(400, 'user_id 不能只由点组成'.encode('utf-8'))
 
                 if action == 'create' and user_id:
                     pwd = form.get('password', [''])[0].strip() or secrets.token_hex(16)
@@ -12728,8 +12790,15 @@ if __name__ == '__main__':
                 self.send_header('Location', prefix + '#users')
                 self.end_headers()
                 return
-            except Exception:
+            except (ValueError, TypeError, UnicodeDecodeError):
                 return self.reply(400, b'Bad request')
+            except Exception as exc:
+                # 保存 / 同步阶段的失败不是请求的错（2026-11-04 修）：旧实现一律回 400，
+                # 磁盘满时管理员看到「Bad request」，重试又撞「用户已存在」。
+                print('[portal] manage-user failed: %s: %s' % (type(exc).__name__, str(exc)[:160]),
+                      file=sys.stderr)
+                return self.reply(500, ('用户操作未能完成（%s），请检查服务器磁盘与日志后刷新页面确认'
+                                        % type(exc).__name__).encode('utf-8'))
 
         def _h_post_login(self, prefix):
             """POST /login 的处理逻辑（从 do_POST 机械搬移而来）。"""
@@ -12833,9 +12902,15 @@ if [ ! -f "$WARP_OWNED_MARKER" ]; then
         exit 1
     fi
 fi
-# 从这里开始写的文件都归本项目：先落标记，后面任何一步失败，卸载也能清干净。
-: > "$WARP_OWNED_MARKER"
-chmod 600 "$WARP_OWNED_MARKER"
+# 标记在真正写入第一个 wireproxy 资产前才落（2026-11-04 修，与 install.sh 一致）：
+# 旧实现在下载之前就写，下载失败退出后标记留着，之后机主自己装的 wireproxy
+# 会被下次网页安装直接覆盖、被卸载当成本项目的删掉。
+claim_warp_assets() {
+    if [ ! -f "$WARP_OWNED_MARKER" ]; then
+        : > "$WARP_OWNED_MARKER"
+        chmod 600 "$WARP_OWNED_MARKER"
+    fi
+}
 
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -12936,6 +13011,7 @@ if [ ! -x "$WP_BIN" ]; then
     fi
     install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD"; exit 1; }
     rm -rf "$TD"; trap - EXIT
+    claim_warp_assets
     mv -f "${WP_BIN}.new" "$WP_BIN"
 fi
 
@@ -12972,6 +13048,7 @@ if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ]; then
     exit 1
 fi
 
+claim_warp_assets
 cat > "$WP_CFG" <<WPEOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
@@ -14399,9 +14476,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 overridden = state['outbound_mode'] == 'global' and bool(state['custom_outbounds'])
             # 统一到 wgcf + wireproxy(127.0.0.1:19898)；同时兼容尚未升级、
             # 仍跑官方 cloudflare-warp(127.0.0.1:40000) 的旧节点，避免误报「未安装」
-            is_installed = (shutil.which('wireproxy') is not None
-                            or shutil.which('warp-cli') is not None
-                            or Path('/etc/systemd/system/wireproxy.service').exists())
+            is_installed = warp_backend_installed()
             connected = False
             outbound_ip = ''
             if is_installed and enabled:
@@ -14488,7 +14563,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             return self.reply_json(200, awg_state())
 
-        def reply(self, code, body, mime='text/plain', www_auth=False):
+        # 默认带 charset（2026-11-04 修）：网页表单的错误回复是中文 UTF-8，旧默认值没写
+        # charset，浏览器按本地编码解出乱码（例如「该密码已被其他用户使用」）。
+        def reply(self, code, body, mime='text/plain; charset=utf-8', www_auth=False):
             self.send_response(code)
             self._responded = True
             self.send_header('Content-Type', mime)

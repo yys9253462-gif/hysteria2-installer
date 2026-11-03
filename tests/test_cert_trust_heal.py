@@ -139,6 +139,48 @@ class TestPortalSyncCertTrust(unittest.TestCase):
         finally:
             sys.path.pop(0)
 
+    def test_missing_configured_cert_does_not_fall_back_to_old_self_signed(self):
+        """config.yaml 指向的证书不在时不改 meta（2026-11-04 修）。
+
+        旧实现退回 cert/server.crt（常是安装时留下的旧自签证书），把一个可信证书节点
+        改成 self_signed + insecure + 无关 pin，所有订阅随之变成跳过校验。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _make_self_signed(td / "cert", cn="www.bing.com")
+            (td / "config.yaml").write_text(
+                "listen: :443\ntls:\n  cert: /nonexistent/moved/fullchain.pem\n"
+                "  key: /nonexistent/moved/privkey.pem\n")
+            meta = {"public_ip": "1.2.3.4", "server_name": "node.example.com",
+                    "cert_type": "custom", "is_insecure": False, "pin_sha256": ""}
+            (td / "client_meta.json").write_text(json.dumps(meta))
+            changed = self._call(td, dict(meta))
+            self.assertFalse(changed)
+            after = json.loads((td / "client_meta.json").read_text())
+            self.assertEqual(after["cert_type"], "custom")
+            self.assertIs(after["is_insecure"], False)
+            self.assertEqual(after["server_name"], "node.example.com")
+
+    def test_sync_pin_uses_the_certificate_actually_in_use(self):
+        """自签证书不在 cert/server.crt 时，pin 也要按实际在用的那张算（2026-11-04 修）。"""
+        sys.path.insert(0, str(REPO))
+        try:
+            import portal  # noqa
+        finally:
+            sys.path.pop(0)
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _make_self_signed(td / "cert", cn="old.example.com")
+            _make_self_signed(td / "custom", cn="node.example.com")
+            (td / "config.yaml").write_text(
+                "listen: :443\ntls:\n  cert: %s\n  key: %s\n"
+                % (td / "custom" / "server.crt", td / "custom" / "server.key"))
+            meta = {"is_insecure": True, "pin_sha256": "not-a-pin"}
+            (td / "client_meta.json").write_text(json.dumps(meta))
+            portal.sync_pin(meta, td, str(td / "client_meta.json"))
+            self.assertEqual(meta["pin_sha256"], _pin_of(td / "custom" / "server.crt"))
+            self.assertNotEqual(meta["pin_sha256"], _pin_of(td / "cert" / "server.crt"))
+
     def test_self_signed_heals_all_four_fields(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

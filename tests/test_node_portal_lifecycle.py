@@ -82,19 +82,22 @@ class Lifecycle(unittest.TestCase):
     def test_master_create_guard_executes_before_business_code(self):
         branch = next(n for n in ast.walk(TREE) if isinstance(n, ast.If)
                       and ast.unparse(n.test) == "sub == 'users/create'")
-        # 保留名校验从「ID 格式」里拆开了，两道守卫都要跑。
-        guards = [branch.body[1], branch.body[2]]
+        # ID 格式、只含点（2026-11-04）、保留名三道守卫都要跑。
+        guards = [branch.body[1], branch.body[2], branch.body[3]]
         class Handler:
             def reply_json(self, status, payload):
                 return status
         import re
         env = dict(self=Handler(), user_id='admin_master',
                    RESERVED_USER_IDS=frozenset({'admin_master', 'placeholder'}),
+                   user_id_shareable=lambda uid: bool(uid) and uid.strip('.') != '',
                    VALID_USER_ID_RE=re.compile(r'^[a-zA-Z0-9_.-]{1,64}$'))
         fn = ast.FunctionDef(name='guard', args=ast.arguments(posonlyargs=[], args=[],
             kwonlyargs=[], kw_defaults=[], defaults=[]), body=guards, decorator_list=[])
         exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])),
                      'guard', 'exec'), env)
+        self.assertEqual(env['guard'](), 400)
+        env['user_id'] = '..'
         self.assertEqual(env['guard'](), 400)
         env['user_id'] = 'ordinary'
         self.assertIsNone(env['guard']())

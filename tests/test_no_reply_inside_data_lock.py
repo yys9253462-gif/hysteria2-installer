@@ -77,6 +77,7 @@ class ConflictBranchTests(unittest.TestCase):
         env = dict(data=state, data_lock=threading.RLock(),
                    VALID_USER_ID_RE=re.compile(r'^[a-z_]+$'),
                    MASTER_USER_ID='admin_master', RESERVED_USER_IDS=frozenset({'admin_master'}),
+                   user_id_shareable=lambda uid: bool(uid) and uid.strip('.') != '',
                    password_taken=lambda u, p, o: password_taken_result,
                    rotate_user_view_key_on_change=lambda a, b: None,
                    reality_registry=lambda d: {},

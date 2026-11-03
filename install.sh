@@ -2890,7 +2890,30 @@ for it in items if isinstance(items, list) else []:
         # `真实计量未初始化: FileNotFoundError` —— 换模块也治不好。
         # 这里幂等补写 trafficStats 并重建 usage-meter-config.json。
         if [[ -f "$HY2_DIR/config.yaml" ]] && [[ ! -f "$HY2_DIR/usage-meter-config.json" ]]; then
-            _upd_secret="$(awk '/^trafficStats:/{f=1;next} f&&/secret:/{gsub(/[^0-9a-f]/,"",$2); print $2; exit}' "$HY2_DIR/config.yaml" 2>/dev/null || true)"
+            # 按 YAML 读 secret 原值，与 install.sh 的 traffic_stats_secret 同一规则
+            # （2026-11-04 修）。旧写法 gsub(/[^0-9a-f]/,"") 会把手工改过的 secret 截短。
+            # 本脚本是独立文件，不能调用 install.sh 的函数，所以内联同一段。
+            _upd_secret="$(python3 -I - "$HY2_DIR/config.yaml" 2>/dev/null <<'PYSECRET'
+import re, sys
+in_block = False
+for line in open(sys.argv[1], encoding='utf-8'):
+    if re.match(r'^trafficStats:\s*(#.*)?$', line):
+        in_block = True
+        continue
+    if in_block and line.strip() and not line[:1].isspace():
+        break
+    m = re.match(r'^\s+secret:\s*(.*?)\s*$', line) if in_block else None
+    if m:
+        v = m.group(1)
+        if v[:1] in ('"', "'") and v[-1:] == v[:1] and len(v) >= 2:
+            v = v[1:-1]
+        else:
+            v = re.sub(r'\s+#.*$', '', v)
+        if re.fullmatch(r'[A-Za-z0-9._~+/=-]{8,128}', v):
+            print(v)
+        break
+PYSECRET
+)" || _upd_secret=""
             if [[ -z "$_upd_secret" ]]; then
                 _upd_secret="$(openssl rand -hex 16)"
                 python3 - "$HY2_DIR/config.yaml" "$_upd_secret" <<'PYEOF2'
@@ -3316,7 +3339,13 @@ show_client_configs() {
     else
         echo -e "    ${YELLOW}私密信息页端口见上方 URL${PLAIN}"
     fi
-    if [[ "${CERT_TYPE:-}" == "acme" ]]; then
+    # 菜单 3 / `info` 在子 shell 里跑，CERT_TYPE 只在安装流程里赋值（2026-11-04 修）：
+    # 旧实现在这里永远读到空值，ACME 节点从不提示要放行 TCP 80，安全组一关续期就失败。
+    local _cert_type_display="${CERT_TYPE:-}"
+    if [[ -z "$_cert_type_display" && -f "$HY2_META_FILE" ]]; then
+        _cert_type_display="$(jq -r '.cert_type // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
+    if [[ "$_cert_type_display" == "acme" ]]; then
         echo -e "    ${GREEN}TCP 80${PLAIN}        申请 / 续期 Let's Encrypt 证书用"
     fi
 
@@ -3714,7 +3743,7 @@ portal_write_meter_config() {
     # /traffic-speed 恒 0、users/list 的 measurement_ok 恒 false，
     # 而安装**看起来完全成功**。这是本项目最忌的静默降级。
     # 现在改为：先尝试幂等补写 trafficStats 段；补不上就硬失败返回 1。
-    _meter_secret="$(awk '/^trafficStats:/{f=1;next} f&&/secret:/{gsub(/[^0-9a-f]/,"",$2); print $2; exit}' "$HY2_CONFIG" 2>/dev/null || true)"
+    _meter_secret="$(traffic_stats_secret "$HY2_CONFIG")"
     if [[ -z "$_meter_secret" ]]; then
         log_warn "config.yaml 缺 trafficStats 段，正在幂等补写以满足真实计量..."
         if [[ -z "${METER_SECRET:-}" ]]; then
@@ -3737,7 +3766,7 @@ if not re.search(r'^trafficStats:', s, re.M):
         s = s.rstrip('\n') + '\n' + block
 io.open(path, 'w', encoding='utf-8', newline='\n').write(s)
 PYEOF
-        _meter_secret="$(awk '/^trafficStats:/{f=1;next} f&&/secret:/{gsub(/[^0-9a-f]/,"",$2); print $2; exit}' "$HY2_CONFIG" 2>/dev/null || true)"
+        _meter_secret="$(traffic_stats_secret "$HY2_CONFIG")"
     fi
     if [[ -z "$_meter_secret" ]]; then
         log_err "无法在 ${HY2_CONFIG} 中建立 trafficStats.secret —— 真实计量无法启用。"
@@ -3750,6 +3779,35 @@ METEREOF
     chmod 600 "${dest_dir}/usage-meter-config.json"
     unset _meter_secret
     log_info "门户程序已就位: ${dest_dir}/portal.py + portal_assets.py + 计量模块"
+}
+
+# config.yaml 里 trafficStats.secret 的原值（2026-11-04 修）。
+# 旧实现 `awk ... gsub(/[^0-9a-f]/,"")` 把非小写十六进制字符全部删掉：手工改成
+# `AbCd-Efgh_123456` 的 secret 被截成 `bdf123456`，写进 usage-meter-config.json 后
+# 与 Hysteria 实际用的 secret 对不上，计量每次都 401（SE 上实测）。现在按 YAML 读出
+# 原值；只接受常见安全字符，含引号 / 反斜杠等会破坏后面 JSON 的值时返回空，
+# 让调用方走「补写新 secret」或硬失败。
+traffic_stats_secret() {
+    python3 -I - "$1" <<'PYSECRET' 2>/dev/null || true
+import re, sys
+in_block = False
+for line in open(sys.argv[1], encoding='utf-8'):
+    if re.match(r'^trafficStats:\s*(#.*)?$', line):
+        in_block = True
+        continue
+    if in_block and line.strip() and not line[:1].isspace():
+        break
+    m = re.match(r'^\s+secret:\s*(.*?)\s*$', line) if in_block else None
+    if m:
+        v = m.group(1)
+        if v[:1] in ('"', "'") and v[-1:] == v[:1] and len(v) >= 2:
+            v = v[1:-1]
+        else:
+            v = re.sub(r'\s+#.*$', '', v)
+        if re.fullmatch(r'[A-Za-z0-9._~+/=-]{8,128}', v):
+            print(v)
+        break
+PYSECRET
 }
 
 # 证书信任模型自愈（2026-10-08）。
