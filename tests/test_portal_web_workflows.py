@@ -215,6 +215,73 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertFalse(body.get('ok'))
 
+    def test_reality_rebuild_takes_clients_under_the_apply_lock(self):
+        """重建 Reality 时，等锁期间被撤销的用户不能被写回（2026-11-04 修）。
+
+        旧实现在拿 reality_apply_lock 之前就拍好 clients：apply_access 此时撤掉某人并清掉
+        待撤销记录，重建拿到锁后写的仍是旧名单，这人又能连 Reality、且不会再被撤销。
+        这里让锁在进入时删掉用户，模拟「等锁期间完成了撤销」。
+        """
+        self.data['users']['gone'] = {'password': 'pw-gone', 'status': 'active', 'expires_at': 4102444800}
+        written = {}
+        data = self.data
+
+        class RevokingLock:
+            def __enter__(self_inner):
+                data['users'].pop('gone', None)
+            def __exit__(self_inner, *exc):
+                return False
+
+        def capture(cfg, *a, **kw):
+            written['cfg'] = copy.deepcopy(cfg)
+        self.ns.update(reality_apply_lock=RevokingLock(), reality_clients=portal.reality_clients,
+                       reality_registry=portal.reality_registry,
+                       apply_xray_config_transaction=Mock(side_effect=capture))
+        self.data['reality_config'] = {'private_key': 'k' * 43, 'public_key': 'p' * 43,
+                                       'short_id': 'abcd1234', 'dest_sni': 'www.apple.com', 'port': 8444}
+        portal.reality_registry(self.data)
+        generate = extract_method('_generate_and_apply_reality', self.ns)
+        try:
+            generate(self.handler, restart=False)
+        except Exception:
+            pass  # 写完配置之后的步骤（重启、防火墙）不在本用例关心范围内
+        cfg = written.get('cfg')
+        self.assertIsNotNone(cfg, '没有走到写配置那一步')
+        inbound = next(i for i in cfg['inbounds'] if i.get('tag') == portal.REALITY_INBOUND_TAG)
+        self.assertNotIn('gone', [c.get('email') for c in inbound['settings']['clients']])
+
+    def test_reenabling_reality_rechecks_its_saved_port(self):
+        """Reality 已关闭时，保留的端口被别人占了要换一个（2026-11-04 修）。"""
+        self.data['reality_config'] = {'private_key': 'k' * 43, 'public_key': 'p' * 43,
+                                       'short_id': 'abcd1234', 'dest_sni': 'www.apple.com', 'port': 443}
+        picked = {}
+        def pick(**kw):
+            picked.update(kw)
+            raise RuntimeError('stop after picking')
+        self.ns.update(_pick_reality_port=pick, has_managed_inbound=portal.has_managed_inbound,
+                       REALITY_INBOUND_TAG=portal.REALITY_INBOUND_TAG)
+        (self.hdir / 'xray.json').write_text('{"inbounds": []}', encoding='utf-8')
+        generate = extract_method('_generate_and_apply_reality', self.ns)
+        with self.assertRaises(RuntimeError):
+            generate(self.handler, restart=False)
+        self.assertEqual(picked.get('preferred'), 443)
+        self.assertIs(picked.get('own_active'), False, picked)
+
+    def test_reset_keys_does_not_turn_a_disabled_reality_back_on(self):
+        """Reality 已关闭时「重置密钥」回 409，不能顺手把它重新打开（2026-11-04 修）。"""
+        self.ns.update(has_managed_inbound=portal.has_managed_inbound,
+                       REALITY_INBOUND_TAG=portal.REALITY_INBOUND_TAG)
+        self.handler._generate_and_apply_reality = Mock()
+        (self.hdir / 'xray.json').write_text('{"inbounds": []}', encoding='utf-8')
+        status, body = self.invoke('_h_post_manage_reality', {'action': 'reset'})
+        self.assertEqual(status, 409, body)
+        self.handler._generate_and_apply_reality.assert_not_called()
+        (self.hdir / 'xray.json').write_text(json.dumps({'inbounds': [
+            {'tag': portal.REALITY_INBOUND_TAG, 'protocol': 'vless', 'port': 8444}]}), encoding='utf-8')
+        status, body = self.invoke('_h_post_manage_reality', {'action': 'reset'})
+        self.assertEqual(status, 200, body)
+        self.handler._generate_and_apply_reality.assert_called_once()
+
     def test_reality_keygen_failure_never_uses_a_shared_static_key(self):
         self.run.return_value = SimpleNamespace(returncode=1, stdout='', stderr='keygen failed')
         generate = extract_method('_generate_and_apply_reality', self.ns)
@@ -925,6 +992,25 @@ class WebWorkflowTests(unittest.TestCase):
         self.handler.rfile = io.BytesIO(body)
         extract_method('do_POST', self.ns)(self.handler)
         return self.response
+
+    def test_api_rejects_booleans_for_numeric_user_fields(self):
+        """布尔值不能被当成数字：ip_limit / expires_at 一直在入口拒绝，traffic_gb 曾漏掉（2026-11-04 修）。
+
+        float(True) == 1.0：{"traffic_gb": true} 会被当成 1 GB 配额。
+        """
+        self.data['users']['qa-user'] = {'password': 'old', 'status': 'active',
+            'expires_at': 2200000000, 'limit_bytes': 10, 'ip_limit': 0}
+        before = copy.deepcopy(self.data['users']['qa-user'])
+        for field in ('ip_limit', 'expires_at'):
+            with self.subTest(endpoint='update', field=field):
+                status, _ = self.invoke_api({'user_id': 'qa-user', field: True}, 'users/update')
+                self.assertEqual(status, 400)
+                self.assertEqual(self.data['users']['qa-user'], before)
+        for field in ('ip_limit', 'expires_at', 'duration_days', 'traffic_gb'):
+            with self.subTest(endpoint='create', field=field):
+                status, _ = self.invoke_api({'user_id': 'fresh-user', 'password': 'pw-x', field: True})
+                self.assertEqual(status, 400)
+                self.assertNotIn('fresh-user', self.data['users'])
 
     def test_api_update_and_renew_persist_user_changes(self):
         self.data['users']['qa-user'] = {'password': 'old', 'status': 'active',
@@ -1826,6 +1912,12 @@ class WebWorkflowTests(unittest.TestCase):
                 self.ns['core_operation_lock'] = threading.Lock()
                 self.ns['core_operation_file_lock'] = lambda: __import__('contextlib').nullcontext()
                 self.handler._generate_and_apply_reality = Mock()
+                # 重置只对已开启的 Reality 生效（2026-11-04），夹具里放一个 Reality 入站。
+                self.ns.update(has_managed_inbound=portal.has_managed_inbound,
+                               REALITY_INBOUND_TAG=portal.REALITY_INBOUND_TAG)
+                (self.hdir / 'xray.json').write_text(json.dumps({'inbounds': [
+                    {'tag': portal.REALITY_INBOUND_TAG, 'protocol': 'vless', 'port': 8444}]}),
+                    encoding='utf-8')
                 status, payload = self.invoke('_h_post_manage_reality', {'action': 'reset'})
                 self.assertEqual(status, 200, payload)
                 self.assertIn(expected, payload['message'])

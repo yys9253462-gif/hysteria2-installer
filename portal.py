@@ -149,7 +149,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.18'
+PORTAL_VERSION = '2.19'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -8211,6 +8211,8 @@ def serve(path):
                 'measurement_scope': 'unavailable'}
 
     gost_written_ports = []
+    speedtest_lock = threading.Lock()
+    unlock_check_lock = threading.Lock()
 
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
@@ -9063,8 +9065,12 @@ if __name__ == '__main__':
             with data_lock:
                 _data_now = dict(data)
             _avoid |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='reality_config')
+            # 已关闭的 Reality 保留下来的端口不算「自己的」（2026-11-04 修，与 VMess /
+            # VLESS-Enc / AnyTLS 一致）：停用期间 Caddy / Nginx 可能已占了它，再开启时
+            # 照旧沿用就绑不上、回 500，而不是换一个空闲端口。
             listen_port, port_reason = _pick_reality_port(
-                preferred=rcfg_old.get('port'), extra_blocked=_avoid)
+                preferred=rcfg_old.get('port'), extra_blocked=_avoid,
+                own_active=has_managed_inbound(_cfg_now or {}, REALITY_INBOUND_TAG))
             if not listen_port:
                 # 找不到空闲端口 ⇒ **明确失败**，不生成一份注定冲突的配置。
                 #
@@ -9134,6 +9140,11 @@ if __name__ == '__main__':
             # 后拿到锁的那次会用**较早读到的旧快照**覆盖磁盘，把先写入的
             # 另一个协议静默丢掉（两个请求都返回成功，用户下次重启才发现）。
             with reality_apply_lock:
+                # clients 也要在锁内重新取（2026-11-04 修，与 VMess / VLESS-Enc 一致）：上面
+                # 那份是锁外拍的快照，等锁期间 apply_access 可能已撤掉某个刚删 / 到期的用户
+                # 并清掉待撤销记录，再写旧快照就把他加回 Reality，且不会再被撤销。
+                with data_lock:
+                    desired_inbound['settings']['clients'] = reality_clients(data)
                 previous_xray_bytes = xray_path.read_bytes() if xray_path.exists() else None
                 previous_xray = json.loads(previous_xray_bytes) if previous_xray_bytes is not None else None
                 previous_service_state = _systemd_service_snapshot('xray')
@@ -9596,6 +9607,10 @@ if __name__ == '__main__':
                                 if params[key] < (1 if key == 'duration_days' else 0):
                                     raise ValueError()
                         if 'traffic_gb' in params:
+                            # 与上面的整数字段一样拒绝 bool（2026-11-04 修）：float(True) == 1.0，
+                            # {"traffic_gb": true} 被当成 1 GB 配额写进去。
+                            if isinstance(params['traffic_gb'], bool):
+                                raise ValueError()
                             params['traffic_gb'] = float(params['traffic_gb'])
                             if not math.isfinite(params['traffic_gb']) or params['traffic_gb'] < 0:
                                 raise ValueError()
@@ -10823,6 +10838,19 @@ if __name__ == '__main__':
                                 staged = Path('/usr/local/bin/gost.new')
                                 shutil.copyfile(str(src_bin), str(staged))
                                 os.chmod(str(staged), 0o755)
+                                # 先确认新文件能跑再替换（2026-11-04 修，与 Xray 安装一致）：
+                                # 摘要对得上不代表能执行（架构判错、noexec、依赖缺失），
+                                # 旧实现直接覆盖正在用的 gost，所有代理随下次重启全部失效。
+                                try:
+                                    probe = subprocess.run([str(staged), '-V'], capture_output=True,
+                                                           text=True, timeout=10)
+                                    runs = probe.returncode == 0 and 'gost' in (probe.stdout + probe.stderr).lower()
+                                except (OSError, subprocess.SubprocessError):
+                                    runs = False
+                                if not runs:
+                                    staged.unlink(missing_ok=True)
+                                    errors.append('%s: 下载的 gost 无法在本机运行，未替换现有版本' % host)
+                                    continue
                                 os.replace(str(staged), '/usr/local/bin/gost')
                                 assets_modified = True
                                 installed = True
@@ -11312,6 +11340,17 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'active': new_active})
 
                 elif action == 'reset':
+                    # Reality 已关闭时不能借「重置密钥」把它重新打开（2026-11-04 修）：重建会
+                    # 写回入站、重启 Xray、重新放行端口，而回复只说「已重置密钥」。
+                    xray_path = Path('/etc/hysteria/xray.json')
+                    try:
+                        cfg_now = (json.loads(xray_path.read_text(encoding='utf-8'))
+                                   if xray_path.exists() else None)
+                    except ValueError:
+                        cfg_now = None
+                    if not (cfg_now and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            'Reality 当前未开启；请先开启 Reality，再重置密钥'})
                     # force=True：只有「重置密钥」按钮才真的换密钥对。
                     # 用户的 UUID 是 uuid5 派生的，不受密钥轮换影响。
                     with core_operation_lock, core_operation_file_lock():
@@ -13965,8 +14004,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             以节点 IP 出口的任意 HTTP 代理。
             各项并发执行、单项 8 秒超时，整体约 10 秒内返回。
             """
-            self._extend_deadline(60)
-            results = run_unlock_checks()
+            # 与测速同理只跑一轮（2026-11-04 修）：每轮十几个并发外连，重叠请求只会
+            # 互相拖慢、占满 quick 槽，结果也不会更新。
+            if not unlock_check_lock.acquire(blocking=False):
+                return self.reply_json(429, {'ok': False, 'error': 'UNLOCK_CHECK_BUSY'})
+            try:
+                self._extend_deadline(60)
+                results = run_unlock_checks()
+            finally:
+                unlock_check_lock.release()
             return self.reply_json(200, {'ok': True, 'results': results, 'time': int(time.time())})
 
         def _h_api_speedtest(self):
@@ -14016,6 +14062,18 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'error_label': '节点未安装 ping，无法测速',
                     'results': [],
                 })
+            # 同一时刻只跑一轮（2026-11-04 修）：每轮最长约 60 秒、占 8 个 ping 子进程。
+            # 控制台重试或多个面板同时点「测速」时，并发请求各占一个 quick 槽一分钟，
+            # 32 个槽被占满后 /auth 也拿不到槽，新连接全部鉴权失败。后来者直接 429。
+            if not speedtest_lock.acquire(blocking=False):
+                return self.reply_json(429, {'ok': False, 'error': 'SPEEDTEST_BUSY',
+                                             'error_label': '已有一轮测速在进行，请稍后再试'})
+            try:
+                return self._run_speedtest()
+            finally:
+                speedtest_lock.release()
+
+        def _run_speedtest(self):
             # 18 个靶点 × 10 包，单个 ping 约 11 秒、最坏 20 秒：8 路并行共 3 批，
             # 约 35 秒、最坏 60 秒，30 秒死线不够。
             self._extend_deadline(120)

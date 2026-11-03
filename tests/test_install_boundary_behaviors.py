@@ -91,6 +91,19 @@ done <<'CASES'
         )
         self.check_addresses([(ip, "0", ip) for ip in addresses])
 
+    def test_junk_answer_from_first_source_falls_through_to_the_next(self):
+        """第一个源回一张错误页时要继续试下一个（2026-11-04 修）。
+
+        旧实现只要回答非空就不再换源，ipify 回 502 页面时安装直接报「无法获取公网 IP」。
+        """
+        stub = r'''curl(){ case "$*" in *ipify*) printf '<html>502 Bad Gateway</html>';; *icanhazip*) printf '203.0.113.7\n';; esac; }
+'''
+        check = r'''
+get_public_ip && [[ "$PUBLIC_IP" == 203.0.113.7 ]]
+'''
+        result = run_shell(stub + extract_function("get_public_ip") + check)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_reserved_cidr_endpoints_remain_blocked(self):
         addresses = (
             "100.64.0.0", "100.127.255.255", "198.18.0.0", "198.19.255.255",
@@ -150,6 +163,36 @@ if [[ "$status" == 0 ]]; then
 fi
 """
         )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    @unittest.skipUnless(shutil.which("openssl"), "requires openssl")
+    def test_wildcard_first_san_is_not_used_as_sni(self):
+        """证书第一个 SAN 是通配符时，SNI 取第一个具体域名（2026-11-04 修）。
+
+        旧实现取第一个 DNS 名：*.example.com 被写进订阅，客户端发出非法 SNI。
+        """
+        result = run_shell(r"""
+mkdir -p live/example acme home
+openssl req -x509 -newkey rsa:2048 -nodes -keyout live/example/privkey.pem -out leaf.pem -days 2 \
+    -subj "/CN=*.example.com" -addext "subjectAltName=DNS:*.example.com,DNS:example.com" >/dev/null 2>&1
+cat leaf.pem leaf.pem > live/example/fullchain.pem
+find(){
+    local arg args=()
+    for arg in "$@"; do
+        case "$arg" in
+            /etc/letsencrypt/live) arg="$PWD/live" ;;
+            /root/.acme.sh) arg="$PWD/acme" ;;
+            /home) arg="$PWD/home" ;;
+        esac
+        args+=("$arg")
+    done
+    command find "${args[@]}"
+}
+SERVER_NAME=""
+""" + extract_function("select_local_certificate") + r"""
+select_local_certificate </dev/null
+[[ "$SERVER_NAME" == example.com ]] || { echo "SERVER_NAME=$SERVER_NAME" >&2; exit 1; }
+""")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_certbot_live_symlinks_are_selected_without_resolving_archive_paths(self):
