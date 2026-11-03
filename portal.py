@@ -8231,7 +8231,13 @@ def serve(path):
                     'bypass': GOST_PRIVATE_BYPASS,
                 }
                 if ptype == 'https':
-                    cert_file, key_file = gost_tls_paths(portal_path.parent)
+                    # 证书不可用时只跳过这一条（2026-11-03 修）：旧实现在这里抛异常，
+                    # reload_gost 一律失败，增删任何代理（包括删掉这条坏的）都被回滚。
+                    try:
+                        cert_file, key_file = gost_tls_paths(portal_path.parent)
+                    except RuntimeError as exc:
+                        print('[portal] HTTPS 代理 :%d 已跳过：%s' % (port, exc), file=sys.stderr)
+                        continue
                     entry['listener'] = {'type': 'tls', 'tls': {
                         'certFile': cert_file, 'keyFile': key_file}}
                 services.append(entry)

@@ -127,5 +127,17 @@ class GostConfigCorruptStateTests(unittest.TestCase):
         env['_listening_ports_detail'] = lambda: (set(), True)
         self.assertFalse(env['gost_ports_ready']())
 
+    def test_https_proxy_without_certificate_does_not_block_others(self):
+        """一条 HTTPS 代理拿不到证书时只跳过它（2026-11-03 修）。"""
+        def no_cert(root):
+            raise RuntimeError('no usable certificate')
+        env, written = self.setup_env([{'type': 'https', 'port': 25003},
+                                       {'type': 'socks5', 'port': 25001}], tls=no_cert)
+        env['write_gost_config']()
+        cfg = json.loads(written['payload'])
+        self.assertEqual([s['addr'] for s in cfg['services']], [':25001'])
+        env['_listening_ports_detail'] = lambda: ({25001}, True)
+        self.assertTrue(env['gost_ports_ready']())
+
 if __name__ == '__main__':
     unittest.main()
