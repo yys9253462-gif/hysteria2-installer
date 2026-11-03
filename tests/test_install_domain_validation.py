@@ -49,7 +49,10 @@ class DomainValidationTests(unittest.TestCase):
         """免交互的坏值在动工前就退出，并说明是哪个变量（与 CI 里 HY2_PORT 的检查同一层）。"""
         for env, needle in (({'HY2_CERT_TYPE': '3', 'HY2_DOMAIN': 'evil.com";x'}, 'HY2_DOMAIN'),
                             ({'HY2_CERT_TYPE': '3', 'HY2_DOMAIN': 'ok.example.com',
-                              'HY2_EMAIL': 'bad email@x.com'}, 'HY2_EMAIL')):
+                              'HY2_EMAIL': 'bad email@x.com'}, 'HY2_EMAIL'),
+                            # 写成 true / yes 时旧脚本静默重建门户、清空用户（2026-11-04 修）。
+                            ({'HY2_PRESERVE_PORTAL': 'true'}, 'HY2_PRESERVE_PORTAL'),
+                            ({'HY2_PRESERVE_PORTAL': ' 1'}, 'HY2_PRESERVE_PORTAL')):
             with self.subTest(env=env):
                 result = subprocess.run(['bash', str(INSTALL), 'install'], capture_output=True,
                                         text=True, timeout=30, env=dict(os.environ, **env),

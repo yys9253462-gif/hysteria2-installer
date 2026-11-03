@@ -3,6 +3,7 @@
 """
 import ast
 import collections
+import signal
 import copy
 import contextlib
 import datetime
@@ -169,7 +170,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.20'
+PORTAL_VERSION = '2.21'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -13094,9 +13095,9 @@ if ! curl --proxy "socks5h://${WARP_SOCKS_ADDR}" --silent --fail --max-time 10 h
 fi
 log "WARP socks5 探活成功"
 
-if [ -f "$HY2_CONF" ]; then
-    sed -i "s|addr: 127.0.0.1:40000|addr: ${WARP_SOCKS_ADDR}|g" "$HY2_CONF"
-fi
+# config.yaml 里旧 40000 端口的 WARP 出站不在这里 sed（2026-11-04 修）：脚本在出站
+# 应用锁之外，与正在进行的应用 / 回滚互相覆盖，且原地改写不落盘同步。脚本成功后
+# 由门户在 warp_apply_lock 内改写并原子落盘。
 
 if systemctl list-unit-files 2>/dev/null | grep -q '^warp-svc'; then
     log "检测到旧的 cloudflare-warp 客户端，已停用（统一走 wireproxy 出口）"
@@ -13157,6 +13158,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                       % res.returncode)
                     return self.reply_json(500, {'ok': False, 'error': f'安装失败: {err_detail[-400:]}'})
 
+                # 旧版官方 cloudflare-warp 客户端监听 40000：wireproxy 装好后把 config.yaml
+                # 里指向它的出站改成 19898。在出站应用锁内改，并原子落盘（2026-11-04 修）：
+                # 旧实现由安装脚本在锁外 sed -i，与正在进行的应用 / 回滚互相覆盖。
+                with warp_apply_lock:
+                    hy2_conf = Path('/etc/hysteria/config.yaml')
+                    try:
+                        conf_text = hy2_conf.read_text(encoding='utf-8')
+                    except OSError:
+                        conf_text = None
+                    if conf_text is not None:
+                        migrated = re.sub(r'(?m)^(\s+addr:\s*)127\.0\.0\.1:40000\s*$',
+                                          r'\g<1>127.0.0.1:19898', conf_text)
+                        if migrated != conf_text:
+                            atomic_write_private(hy2_conf, migrated.encode('utf-8'))
                 # Install success is not routing success: apply the domain ACL
                 # directly, never call the legacy script with mismatched arguments.
                 with data_lock:
@@ -13168,6 +13183,40 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 })
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
+
+        def do_HEAD(self):
+            """HEAD 与 GET 走同一套路由，只是不发正文（2026-11-04 修）。
+
+            BaseHTTPRequestHandler 没有 do_HEAD 时一律回 501：订阅管理器与可用性探测
+            用 HEAD 检查链接时，好好的订阅被报成「失效」。GET 路由都是只读的，
+            有副作用的操作只接 POST，所以复用 GET 是安全的。
+            """
+            real = self.wfile
+
+            class _HeadersOnly:
+                """状态行与响应头照常写出；end_headers 之后的正文丢弃。"""
+                def __init__(self, handler):
+                    self.handler = handler
+                def write(self, data):
+                    if getattr(self.handler, '_head_body_started', False):
+                        return len(data)
+                    return real.write(data)
+                def flush(self):
+                    return real.flush()
+
+            self.wfile = _HeadersOnly(self)
+            original_end_headers = self.end_headers
+
+            def end_headers():
+                original_end_headers()
+                real.flush()
+                self._head_body_started = True
+            self.end_headers = end_headers
+            try:
+                return self.do_GET()
+            finally:
+                self.wfile = real
+                self.end_headers = original_end_headers
 
         def do_GET(self):
             # 存活探针：面板自更新后据此判断新版本是否真的起来了（失败则回滚）。
@@ -14824,6 +14873,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         usage_meter.start()
     threading.Thread(target=expiry_access_worker,name="portal-expiry-enforcer",daemon=True).start()
     threading.Thread(target=reality_iplimit_worker,name="portal-reality-iplimit",daemon=True).start()
+
+    # systemd 停止 / 重启 / 关机时先把内存里的计量落盘（2026-11-04 修）：计量每 60 秒
+    # 才写一次，旧实现收到 SIGTERM 直接退出，最多丢一分钟流量；关机时 Hy2 / Xray
+    # 也一起重启换了 epoch，这段流量再也补算不回来，used_bytes 永久偏低。
+    def _flush_and_exit(signum, frame):
+        try:
+            save_data()
+        except Exception as exc:
+            print('[portal] 退出前保存失败: %s' % type(exc).__name__, file=sys.stderr)
+        raise SystemExit(0)
+    # 只有主线程能装信号处理器；测试里在线程中跑 serve() 时跳过，不能让门户因此起不来。
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _flush_and_exit)
     server.serve_forever()
 
 

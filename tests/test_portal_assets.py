@@ -316,6 +316,87 @@ globalThis.document = {
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_reboot_button_reports_refusal_instead_of_counting_down(self):
+        """服务器拒绝重启（409 / 401）时报错并恢复按钮，不倒计时刷新（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('if (btnRebootServer) {')
+        end = script.index('\n}\n', start) + 3
+        prelude = script[:script.index('// 全局高颜值 Promise 确认框与 Toast 机制')]
+        harness = r"""
+const assert = require('assert');
+const alerts = [], intervals = [];
+globalThis.alert = m => alerts.push(m);
+globalThis.setInterval = fn => { intervals.push(fn); return 1; };
+const location = {pathname: '/fixture/', reload() {}};
+let handler;
+const btnRebootServer = {addEventListener: (k, fn) => { handler = fn; }, disabled: false, textContent: 'x'};
+const showConfirm = async () => true;
+let reply;
+globalThis.fetch = async () => reply;
+"""
+        checks = r"""
+(async () => {
+  reply = new Response(JSON.stringify({ok: false, error: '已有重型任务在运行'}), {status: 409});
+  await handler();
+  assert.strictEqual(intervals.length, 0, '被拒绝时仍开始了倒计时');
+  assert(alerts[0].includes('已有重型任务在运行'), alerts[0]);
+  assert.strictEqual(btnRebootServer.disabled, false);
+  reply = new Response(JSON.stringify({ok: true}), {status: 200});
+  await handler();
+  assert.strictEqual(intervals.length, 1);
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + prelude + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_reality_qr_is_cleared_when_the_server_sends_none(self):
+        """重置密钥后没有新二维码时清掉旧的，不让用户扫旧 pbk（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('async function checkRealityStatus() {')
+        end = script.index('\n}\n', start) + 3
+        harness = r"""
+const assert = require('assert');
+const els = {};
+const el = () => ({style: {}, textContent: '', innerHTML: '', value: '', classList: {add(){}, remove(){}, toggle(){}}, dataset: {}});
+globalThis.document = {getElementById: id => els[id] ||= el(), querySelectorAll: () => []};
+const location = {pathname: '/fixture/'};
+const realityBadge = el(), realityQrBox = el(), realityUriVal = el(), realitySniVal = el(), realityUuidVal = el();
+const realityContentBox = el(), btnToggleReality = el(), btnResetRealityKeys = el();
+realityQrBox.innerHTML = '<svg>OLD-PBK</svg>';
+const btnInstallXray = el();
+globalThis.fetch = async () => ({ok: true, json: async () => ({ok: true, installed: true, active: true,
+  config: {uri: 'vless://new', qr_svg: '', port: 8444, sni: 'www.apple.com', uuid: 'u'}})});
+"""
+        checks = r"""
+(async () => {
+  try { await checkRealityStatus(); } catch (e) { console.error('THROWN', e.message); }
+  assert(!realityQrBox.innerHTML.includes('OLD-PBK'), '旧二维码还留着');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_unreadable_core_version_is_not_shown_as_latest(self):
+        """核心版本读不出来（「未知」）时不能显示「（最新）」（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('function fmtVer(')
+        end = script.index('\n}\n', start) + 3
+        checks = r"""
+const assert = require('assert');
+const text = fmtVer('未知', '2.6.4', false, true);
+assert(!text.includes('（最新）'), text);
+assert(text.includes('读取失败'), text);
+assert.strictEqual(fmtVer('2.6.4', '2.6.4', false, true), '2.6.4（最新）');
+"""
+        result = subprocess.run([NODE, '-e', script[start:end] + checks], capture_output=True,
+                                text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]

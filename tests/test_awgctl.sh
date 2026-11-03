@@ -85,6 +85,10 @@ AWG_QUICK_BIN="${WORK}/bin/awg-quick"
 require_root() { :; }
 systemctl() { return 0; }
 detect_wan_iface() { echo "eth0"; }
+# 渲染失败场景的开关：置 1 时 meta_get port 返回空（渲染前提缺失）。
+AWG_TEST_DROP_PORT=0
+eval "$(declare -f meta_get | sed '1s/^meta_get/_awg_test_meta_get/')"
+meta_get() { [[ "$AWG_TEST_DROP_PORT" == 1 && "$1" == port ]] && return 0; _awg_test_meta_get "$@"; }
 
 # ==============================================================================
 section "1. 混淆参数生成：上游硬约束"
@@ -272,6 +276,8 @@ for line in 2 3; do
     check_eq "  隧道拒绝转发到云元数据(PostUp)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostUp = .*-d 169.254.0.0/16 -j DROP')" "1"
     check_eq "  隧道拒绝转发到内网(PostUp)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostUp = .*-d 10.0.0.0/8 -j DROP')" "1"
     check_eq "  拒绝规则停服时清理(PostDown)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostDown = .*-D FORWARD -i awg0 ! -o awg0 -d 169.254.0.0/16 -j DROP')" "1"
+    check_eq "  NAT 按隧道网段匹配、不绑出口网卡名(PostUp)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostUp = .*POSTROUTING -s 10.66.66.0/24 ! -o awg0 -j MASQUERADE')" "1"
+    check_eq "  PostUp 不再写死出口网卡" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostUp = .*POSTROUTING -o ')" "0"
     check_eq "  服务端含 NAT 清理(PostDown)" "$(printf '%s' "$SERVER_TEXT" | grep -c '^PostDown = .*MASQUERADE')" "1"
 
     # 客户端必备项
@@ -363,7 +369,7 @@ cp -p "$AWG_CONFIG" "${WORK}/config.before"
 : > "${WORK}/live-calls"
 peer_apply_live_add() { echo add >> "${WORK}/live-calls"; }
 peer_apply_live_del() { echo del >> "${WORK}/live-calls"; }
-detect_wan_iface() { return 1; }
+AWG_TEST_DROP_PORT=1  # 让渲染失败：meta 缺 port
 if (cmd_peer_add renderfail --endpoint vpn.example.com >/dev/null 2>&1); then
     bad "render_server_config 失败时 peer-add 应失败退出"
 else
@@ -377,7 +383,7 @@ fi
 if [[ ! -s "${WORK}/live-calls" ]]; then ok; else bad "peer-add 渲染失败后不应应用 live peer"; fi
 
 # 地址池满时 peer-add 失败，不能留下带全部私钥的备份文件（2026-11-03 修）。
-detect_wan_iface() { echo eth0; }
+AWG_TEST_DROP_PORT=0
 _saved_next_peer_address="$(declare -f next_peer_address)"
 next_peer_address() { return 1; }
 rm -f "${AWG_DIR}"/.peers-backup.* "${AWG_DIR}"/.conf-backup.*
@@ -394,16 +400,16 @@ else
     ok
 fi
 eval "$_saved_next_peer_address"
-detect_wan_iface() { return 1; }
+AWG_TEST_DROP_PORT=1  # 让渲染失败：meta 缺 port
 
 # 用一个有内容的列表验证删除失败也会完整回滚。
 jq '.peers += [{name:"deletefail",address:"10.66.66.9",private_key:"p",public_key:"pub-deletefail",preshared_key:"k",endpoint:"vpn.example.com",created_at:"t",enabled:true}]' \
     "$AWG_PEERS_FILE" > "${AWG_PEERS_FILE}.tmp" && mv "${AWG_PEERS_FILE}.tmp" "$AWG_PEERS_FILE"
 # 基线渲染必须成功；上面为 peer-add 失败场景桩掉了 detect_wan_iface，这里先恢复，
 # 拍完基线再重新桩成失败，只让 cmd_peer_del 内部的渲染失败。
-detect_wan_iface() { echo eth0; }
+AWG_TEST_DROP_PORT=0
 render_server_config
-detect_wan_iface() { return 1; }
+AWG_TEST_DROP_PORT=1  # 让渲染失败：meta 缺 port
 cp -p "$AWG_PEERS_FILE" "${WORK}/peers.before"
 cp -p "$AWG_CONFIG" "${WORK}/config.before"
 : > "${WORK}/live-calls"
@@ -418,7 +424,7 @@ else
     bad "peer-del 渲染失败后应恢复 peers 与服务端配置"
 fi
 if [[ ! -s "${WORK}/live-calls" ]]; then ok; else bad "peer-del 渲染失败后不应移除 live peer"; fi
-detect_wan_iface() { echo eth0; }
+AWG_TEST_DROP_PORT=0
 
 # ==============================================================================
 section "5. meta 读写"
