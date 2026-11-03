@@ -463,6 +463,25 @@ SCRIPT = r"""
   };
 })();
 
+// 会话过期后停掉后台轮询（2026-11-04 修）：旧实现每 2 秒 / 10 秒继续发未认证请求，
+// 页面上的网速停在旧数值像是实时的，这些请求还在消耗本来源的限流额度。
+// 任何一个本站请求回 401 就置位；轮询函数看到它直接跳过，并提示刷新。
+let portalSessionExpired = false;
+(function () {
+  if (typeof globalThis.fetch !== 'function') return;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async function (...args) {
+    const res = await realFetch.apply(this, args);
+    if (res && res.status === 401 && !portalSessionExpired) {
+      portalSessionExpired = true;
+      try {
+        if (typeof showToast === 'function') showToast('登录已过期，请刷新页面重新登录', 'error');
+      } catch (_) {}
+    }
+    return res;
+  };
+})();
+
 // 全局高颜值 Promise 确认框与 Toast 机制
 function showToast(msg, type = 'info') {
   const container = document.getElementById('toast-container');
@@ -898,7 +917,7 @@ if (btnResetWarpRules) {
 }
 
 checkWarpStatus();
-setInterval(() => { if (!document.hidden) checkWarpStatus(); }, 10000);
+setInterval(() => { if (!document.hidden && !portalSessionExpired) checkWarpStatus(); }, 10000);
 
 // ============================================================================
 // 自定义出站（Custom Outbounds）
@@ -2720,7 +2739,7 @@ function fmtSpeed(bytesPerSec) {
 
 let trafficPollPending = false;
 async function pollTrafficSpeed() {
-  if (document.hidden || trafficPollPending) return;
+  if (document.hidden || trafficPollPending || portalSessionExpired) return;
   trafficPollPending = true;
   try {
     const res = await fetch(location.pathname + 'traffic-speed', { credentials: 'same-origin' });
