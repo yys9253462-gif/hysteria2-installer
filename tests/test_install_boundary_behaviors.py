@@ -149,6 +149,8 @@ find(){
     command find "${args[@]}"
 }
 """ + fixture + "\n"
+            # 夹具是假 PEM，判定函数打桩；真实判定见 test_cert_pair_checks
+            + "_cert_key_usable(){ return 0; }\nis_valid_domain(){ return 0; }\n_cert_matches_domain(){ return 0; }\n"
             + extract_function("select_local_certificate")
             + f"expected_status={expected_status}\n"
             + f"expected_cert='{expected_cert}'\n"
@@ -189,7 +191,8 @@ find(){
     command find "${args[@]}"
 }
 SERVER_NAME=""
-""" + extract_function("select_local_certificate") + r"""
+""" + "\n".join(extract_function(n) for n in ("pem_cert_count", "_cert_key_usable", "is_valid_domain",
+                                             "_cert_matches_domain", "select_local_certificate")) + r"""
 select_local_certificate </dev/null
 [[ "$SERVER_NAME" == example.com ]] || { echo "SERVER_NAME=$SERVER_NAME" >&2; exit 1; }
 """)

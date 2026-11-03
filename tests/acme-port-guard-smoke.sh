@@ -49,7 +49,7 @@ extract_fn() {
 }
 
 for fn in port_owner detect_webserver_squatting find_cert_in_webserver \
-          pem_cert_count _accept_cert_pair _nginx_cert_candidates; do
+          pem_cert_count _cert_key_usable _accept_cert_pair _nginx_cert_candidates; do
     _f="$(extract_fn "$fn")"
     if [[ -z "$_f" ]]; then
         echo "❌ 未能从 install.sh 提取到函数 $fn（脚本结构变了？）" >&2
@@ -167,7 +167,7 @@ _probe="$(mktemp -d)"
 _chain="$_probe/acme-v02.example.org-dir/hy2.test.com"
 mkdir -p "$_chain"
 openssl req -x509 -newkey rsa:2048 -nodes -keyout "$_chain/hy2.test.com.key" \
-    -out "$_chain/hy2.test.com.crt" -days 1 -subj "/CN=hy2.test.com" >/dev/null 2>&1
+    -out "$_chain/hy2.test.com.crt" -days 30 -subj "/CN=hy2.test.com" >/dev/null 2>&1
 
 export CADDY_CERT_ROOT="$_probe"
 # 单张（叶证书）不应被采纳

@@ -1100,6 +1100,12 @@ setup_certificates() {
                     [[ "$force_leaf" =~ ^[Yy]$ ]] || chain_ok=0
                 fi
             fi
+            # 与迁移路径同样把关（2026-11-04 修）：过期证书或别次签发的私钥照单全收时，
+            # Hysteria / TLS 入站起不来或握手全失败，订阅却标成可信证书。
+            if [[ "$chain_ok" == "1" ]] && ! _cert_key_usable "$input_cert" "$input_key"; then
+                log_err "证书已过期 / 一天内过期，或与私钥不配对，将回退为自签名证书！"
+                chain_ok=0
+            fi
             if [[ "$chain_ok" == "1" ]]; then
                 CERT_TYPE="custom"
                 CERT_FILE="$input_cert"
@@ -1151,7 +1157,9 @@ select_local_certificate() {
             fullchain.cer) key="$(find "$dir" -maxdepth 1 -name '*.key' -type f 2>/dev/null | head -1)" ;;
             *) continue ;;
         esac
-        [[ -f "$key" ]] && certs+=("$cert|$key")
+        # 过期或私钥不配对的候选直接跳过（2026-11-04 修）：只有一个候选时会被
+        # 无人值守自动选中，废弃域名留下的旧证书因此成了节点的「可信证书」。
+        [[ -f "$key" ]] && _cert_key_usable "$cert" "$key" && certs+=("$cert|$key")
     done < <(find -L /etc/letsencrypt/live /root/.acme.sh /home -type f \( -name fullchain.pem -o -name fullchain.cer \) 2>/dev/null)
     if [[ ${#certs[@]} -eq 0 ]]; then
         log_err "未发现含完整证书链的证书 (fullchain.pem / fullchain.cer)。"
@@ -1182,6 +1190,13 @@ select_local_certificate() {
         read -rp "请输入证书绑定的域名 (SNI): " SERVER_NAME || true
     fi
     [[ -n "$SERVER_NAME" ]] || { log_err "域名不能为空。"; return 1; }
+    # SNI 必须是合法域名且在证书上（2026-11-04 修，与选项 2 同一判据）。
+    SERVER_NAME="$(printf '%s' "$SERVER_NAME" | tr 'A-Z' 'a-z')"
+    if ! is_valid_domain "$SERVER_NAME" || ! _cert_matches_domain "$cert" "$SERVER_NAME"; then
+        log_err "域名 ${SERVER_NAME} 不合法或不在所选证书上。"
+        CERT_TYPE=""; CERT_FILE=""; KEY_FILE=""; SERVER_NAME=""
+        return 1
+    fi
 }
 
 # 🔴 检查某个 TCP/UDP 端口是否已被占用，并报告占用者（供 ACME 前置检查用）
@@ -1310,9 +1325,16 @@ _accept_cert_pair() {
     # Go 系客户端（v2rayNG/Xray/hysteria）不会通过 AIA 补齐中间证书，
     # 会直接报 x509: certificate signed by unknown authority
     [[ "$(pem_cert_count "$c")" -ge 2 ]] || return 1
-    # 🔴 公私钥必须配对：不配对的证书装上去，握手 100% 失败。
-    # 与其等到用户连不上才发现，不如在这里就拒掉。
-    local pub prv
+    _cert_key_usable "$c" "$k"
+}
+
+# 证书未过期（至少还有 1 天）且与私钥配对。
+# 🔴 公私钥必须配对：不配对的证书装上去，握手 100% 失败。
+# 过期检查（2026-11-04 补）：复用扫描、导入、本机扫描都曾收下过期证书并标成可信，
+# 客户端校验全部失败，而面板显示一切正常。
+_cert_key_usable() {
+    local c="$1" k="$2" pub prv
+    openssl x509 -in "$c" -noout -checkend 86400 >/dev/null 2>&1 || return 1
     pub="$(openssl x509 -in "$c" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}')"
     prv="$(openssl pkey -in "$k" -pubout 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}')"
     [[ -n "$pub" && "$pub" == "$prv" ]] || return 1
@@ -1336,7 +1358,12 @@ _cert_matches_domain() {
     local c="$1" domain="$2" txt
     txt="$(openssl x509 -in "$c" -noout -subject -ext subjectAltName 2>/dev/null)"
     [[ -n "$txt" ]] || return 1
-    grep -qiE "(^|[^a-zA-Z0-9.-])${domain//./\\.}([^a-zA-Z0-9.-]|$)" <<<"$txt"
+    grep -qiE "(^|[^a-zA-Z0-9.-])${domain//./\\.}([^a-zA-Z0-9.-]|$)" <<<"$txt" && return 0
+    # 通配符只覆盖一级子域（2026-11-04 修）：hy2.example.com 匹配 *.example.com，
+    # 旧实现只认精确名字，可用的通配符证书被跳过、退回自签。
+    local parent="${domain#*.}"
+    [[ "$parent" != "$domain" && "$parent" == *.* ]] || return 1
+    grep -qiE "(^|[^a-zA-Z0-9.-])\*\.${parent//./\\.}([^a-zA-Z0-9.-]|$)" <<<"$txt"
 }
 
 # ------------------------------------------------------------------------------
