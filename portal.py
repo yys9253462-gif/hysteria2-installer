@@ -12728,8 +12728,15 @@ if __name__ == '__main__':
                 self.send_header('Location', prefix + '#users')
                 self.end_headers()
                 return
-            except Exception:
+            except (ValueError, TypeError, UnicodeDecodeError):
                 return self.reply(400, b'Bad request')
+            except Exception as exc:
+                # 保存 / 同步阶段的失败不是请求的错（2026-11-04 修）：旧实现一律回 400，
+                # 磁盘满时管理员看到「Bad request」，重试又撞「用户已存在」。
+                print('[portal] manage-user failed: %s: %s' % (type(exc).__name__, str(exc)[:160]),
+                      file=sys.stderr)
+                return self.reply(500, ('用户操作未能完成（%s），请检查服务器磁盘与日志后刷新页面确认'
+                                        % type(exc).__name__).encode('utf-8'))
 
         def _h_post_login(self, prefix):
             """POST /login 的处理逻辑（从 do_POST 机械搬移而来）。"""

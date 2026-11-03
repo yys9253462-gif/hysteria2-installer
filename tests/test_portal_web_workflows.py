@@ -195,6 +195,13 @@ class WebWorkflowTests(unittest.TestCase):
         status, _ = self.invoke('_h_post_manage_user', {'action': 'not-an-action', 'user_id': 'qa-user'})
         self.assertEqual(status, 400)
 
+    def test_save_failure_after_create_is_reported_as_server_error(self):
+        """建户后保存失败要回 500 并说明原因，不是 400「Bad request」（2026-11-04 修）。"""
+        self.ns['regenerate_page'] = Mock(side_effect=OSError('No space left on device'))
+        status, body = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user',
+                                                           'password': 'pw-new-user'})
+        self.assertEqual(status, 500, body)
+
     def test_invalid_user_duration_does_not_create_expired_record(self):
         status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user', 'duration_days': '-1'})
         self.assertEqual(status, 400)
