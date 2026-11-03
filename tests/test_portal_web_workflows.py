@@ -572,6 +572,34 @@ class WebWorkflowTests(unittest.TestCase):
         self.ns['_restore_systemd_service_state'].assert_called_once_with(
             'hy2-anytls', {'active': 'active', 'enabled': 'disabled'})
 
+    def test_anytls_disable_survives_a_corrupt_port(self):
+        """端口被改坏时停用 AnyTLS 不能 500（2026-11-03 修，与 VMess / TUIC 对齐）。
+
+        旧实现 int(acfg.get('port') or 0) 在 'abc' 上抛 ValueError：服务已经停了、
+        配置文件已删，配置段却没标 enabled=False，面板一直显示「运行中」。
+        """
+        config_path = self.hdir / portal.ANYTLS_CONFIG_NAME
+        config_path.write_bytes(b'{"inbounds":[{"type":"anytls"}]}')
+        self.data['anytls_config'] = {'enabled': True, 'port': 'abc', 'secret': 'fixture'}
+        self.ns.update({
+            'ANYTLS_CONFIG_NAME': portal.ANYTLS_CONFIG_NAME,
+            'ANYTLS_SERVICE': 'hy2-anytls',
+            'anytls_apply_lock': threading.RLock(),
+            '_active_anytls_config': lambda: self.data.get('anytls_config'),
+            '_systemd_state': lambda _: 'inactive',
+            '_systemd_service_snapshot': lambda _: {'active': 'active', 'enabled': 'enabled'},
+            '_restore_systemd_service_state': Mock(return_value=True),
+            '_service_stop_confirmed': lambda result, state: True,
+            'config_section': lambda data, key: data.get(key, {}),
+            '_valid_port': portal._valid_port,
+            'save_data': Mock(), 'regenerate_page': Mock(),
+            'close_protocol_port': Mock(return_value=True),
+        })
+        status, body = self.invoke('_h_post_manage_anytls', {'action': 'disable'})
+        self.assertEqual(status, 200, body)
+        self.assertIs(self.data['anytls_config'].get('enabled'), False)
+        self.ns['close_protocol_port'].assert_not_called()
+
     def test_anytls_enable_failure_restores_new_or_existing_unit(self):
         for old_unit in (None, b'custom previous unit'):
             with self.subTest(old_unit=old_unit):

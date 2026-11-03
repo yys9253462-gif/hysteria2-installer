@@ -147,7 +147,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.14'
+PORTAL_VERSION = '2.15'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -6968,14 +6968,17 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         r_sid = reality.get('short_id', '')
         if ruri and r_pbk and r_sid and r_port:
             rname = name + '-Reality'
+            # mihomo 的写法：tls 是布尔值，reality-opts 用连字符键（2026-11-03 修）。
+            # 旧写法 tls=dict(...) / reality_opts 让 mihomo v1.19.15 整份配置加载失败
+            # （"'tls' expected type 'bool'"），SE 上用真 mihomo 校验确认。
             reality_proxy = dict(name=rname, type='vless', server=public_ip,
                                  port=r_port, uuid=r_uuid, udp=True,
-                                 tls=dict(servername=r_sni),
+                                 tls=True,
                                  flow='xtls-rprx-vision',
                                  servername=r_sni,
-                                 reality_opts=dict(public_key=r_pbk,
-                                                   short_id=r_sid),
-                                 **{'client-fingerprint': 'chrome'})
+                                 **{'reality-opts': {'public-key': r_pbk,
+                                                     'short-id': r_sid},
+                                    'client-fingerprint': 'chrome'})
             reality_sing = dict(type='vless', tag=rname, server=public_ip,
                                server_port=r_port, uuid=r_uuid,
                                flow='xtls-rprx-vision',
@@ -7030,11 +7033,11 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                               tls=True, servername=e_sni, network='tcp',
                               encryption=e_enc,
                               **{'client-fingerprint': 'chrome'})
-        vlessenc_sing = dict(type='vless', tag=e_name, server=e_host,
-                             server_port=e_port, uuid=e_uuid,
-                             encryption=e_enc,
-                             tls=dict(enabled=True, server_name=e_sni,
-                                      utls=dict(enabled=True, fingerprint='chrome')))
+        # sing-box 的 VLESS 出站没有 encryption（那是 Xray 独有的）：带上它，
+        # sing-box 1.14.4 报 unknown field，整份 sing-box.json 加载失败，连 Hy2
+        # 节点一起用不了；去掉它又连不上 VLESS Encryption 入站。所以 sing-box
+        # 订阅里不下发这一条（2026-11-03 修，SE 上用真 sing-box check 确认）。
+        vlessenc_sing = None
 
     # ---- AnyTLS（可选，2026-10-28 加）----
     # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
@@ -7318,6 +7321,10 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
                     latest[key] = data[key]
             if _rebuilt:
                 latest['auth_hash'] = data['auth_hash']
+                # 凭据换了，旧密码登录的会话一并作废（同 adopt）。
+                epoch = latest.get('session_epoch', 0)
+                epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
+                latest['session_epoch'] = epoch + 1
             latest.pop('page', None)
             data = latest
     except (OSError, ValueError):
@@ -7428,9 +7435,16 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     # 两者如果漂移，用 master 密码算出来的 hash 会让真正的登录密码失效。
     _new_hash = hashlib.sha256(base64.b64encode(
         f"{access.get('username','')}:{access.get('password','')}".encode())).hexdigest()
-    if data.get('auth_hash') != _new_hash:
+    # ensure_portal_access 重建凭据时已把新 auth_hash 写进 data，下面的比较看不出
+    # 变化：旧实现下凭据重建后，用旧密码登录的会话在 30 天内照样有效（2026-11-03 修）。
+    # 改为推进会话纪元而不是换 session_secret —— 后者同时是分享链接 k 的密钥。
+    if data.get('auth_hash') != _new_hash or _rebuilt:
         data['auth_hash'] = _new_hash
-        data['session_secret'] = secrets.token_hex(32)
+        if not isinstance(data.get('session_secret'), str) or not data['session_secret']:
+            data['session_secret'] = secrets.token_hex(32)
+        epoch = data.get('session_epoch', 0)
+        epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
+        data['session_epoch'] = epoch + 1
     if node_api_key:
         data['api_key'] = node_api_key
         access['api_key'] = node_api_key
@@ -9217,6 +9231,16 @@ if __name__ == '__main__':
                         return False
                     self.server.api_requests.append(now)
                     return True
+                elif bucket == 'api_anon':
+                    # 没带有效 key 的 API 请求单独计数，打满也不影响控制台。
+                    anon = getattr(self.server, 'api_anon_requests', None)
+                    if anon is None:
+                        anon = self.server.api_anon_requests = []
+                    anon[:] = [t for t in anon if now - t < 1]
+                    if len(anon) >= 50:
+                        return False
+                    anon.append(now)
+                    return True
                 elif bucket == 'auth':
                     # 🔴 /auth 专用桶（真实漏洞，2026-10-09 修）：
                     # 原来 /auth 完全不限流，理由写的是「来自 127.0.0.1 豁免」——
@@ -9234,8 +9258,13 @@ if __name__ == '__main__':
                     return True
                 else:
                     self.server.requests[:] = [t for t in self.server.requests if now - t < 1]
-                    self.server.failures[:] = [t for t in self.server.failures if now - t < 60]
-                    if len(self.server.requests) >= 50 or len(self.server.failures) >= 60:
+                    if len(self.server.requests) >= 50:
+                        return False
+                    # 失败按来源计（2026-11-03 修）：旧实现是进程全局桶，拿到分享链接
+                    # 的人每分钟发 60 次不带凭据的 clash.yaml，管理页与所有人的订阅
+                    # 更新就全部 429。来源取 masquerade 写入的 X-Forwarded-For。
+                    limiter = self.server.web_failure_limiter
+                    if limiter.limited(self._web_source_key(), now):
                         return False
                     self.server.requests.append(now)
                     return True
@@ -9253,7 +9282,12 @@ if __name__ == '__main__':
             with data_lock:
                 self.server.login_failures[:] = [
                     t for t in self.server.login_failures if now - t < 600]
-                if len(self.server.login_failures) >= 10:
+                # 按来源计 10 次 / 10 分钟（2026-11-03 修）：旧实现全局 10 次，知道
+                # token 的人刷 10 次错误密码就把管理员锁在门外。全局保留 200 次作
+                # 兜底，换来源爆破的总尝试次数仍然有界。
+                per_source = self.server.login_source_failures.get(self._web_source_key(), [])
+                per_source[:] = [t for t in per_source if now - t < 600]
+                if len(per_source) >= 10 or len(self.server.login_failures) >= 200:
                     # 🔴 2026-10-31：锁定必须留痕。旧实现静默返回 True，
                     # 管理员只会看到「尝试次数过多，请 10 分钟后再试」，
                     # 而日志里查不到是谁、什么时候开始的 —— 分不清是自己
@@ -9269,6 +9303,12 @@ if __name__ == '__main__':
             now = time.monotonic()
             with data_lock:
                 self.server.login_failures.append(now)
+                table = self.server.login_source_failures
+                key = self._web_source_key()
+                table.setdefault(key, []).append(now)
+                table.move_to_end(key)
+                while len(table) > 4096:
+                    table.popitem(last=False)
 
         def clear_login_failures(self):
             """登录成功后清空失败桶。
@@ -9285,12 +9325,24 @@ if __name__ == '__main__':
             """
             with data_lock:
                 self.server.login_failures.clear()
+                self.server.login_source_failures.clear()
                 self.server._login_lock_logged = False
+
+        def _web_source_key(self):
+            """Web 失败计数的来源键：masquerade 代理进来的取 X-Forwarded-For 最后一跳。
+
+            门户只监听 127.0.0.1，公网请求都经 Hysteria masquerade 转入。SE 上用
+            hysteria v2.13.0 实测：xForwarded 会用真实来源**整体替换**客户端带的
+            X-Forwarded-For；取最后一项，在追加式代理下同样不吃伪造的前置项。
+            """
+            forwarded = self.headers.get('X-Forwarded-For') or ''
+            hop = forwarded.split(',')[-1].strip() if forwarded else ''
+            return auth_rate_key(hop or self.client_address[0])
 
         def record_failure(self):
             now = time.monotonic()
             with data_lock:
-                self.server.failures.append(now)
+                self.server.web_failure_limiter.record_failure(self._web_source_key(), now)
 
         def auth_rate_limited(self):
             """/auth 专用限流 + 失败累计。
@@ -9446,10 +9498,13 @@ if __name__ == '__main__':
 
             # 2. REST API 接口通道 (独立 API 速率桶)
             if self.path.startswith('/api/v1/'):
-                if not self.check_rate_limit(bucket='api'):
+                # 先验 key 再分桶（2026-11-03 修）：旧实现先扣共享的 api 桶，任何人
+                # 不带 key 每秒打 50 次，控制台的停用 / 删除就全部 429，撤销卡住。
+                api_authed = self.verify_api_key()
+                if not self.check_rate_limit(bucket='api' if api_authed else 'api_anon'):
                     return self.reply(429, b'Too many requests')
 
-                if not self.verify_api_key():
+                if not api_authed:
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized API key'})
 
                 try:
@@ -11936,7 +11991,7 @@ if __name__ == '__main__':
                 with data_lock:
                     acfg = dict(config_section(data, 'anytls_config'))
                     old_acfg = copy.deepcopy(acfg)
-                    closed_port = int(acfg.get('port') or 0)
+                    closed_port = _valid_port(acfg.get('port')) or 0
                     # secret 与端口保留：再次启用时沿用，已下发的订阅不失效。
                     acfg['enabled'] = False
                     data['anytls_config'] = acfg
@@ -12912,9 +12967,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if self.path.split('?', 1)[0] == '/api/health':
                 return self.reply_json(200, {'ok': True})
             if self.path.startswith('/api/v1/'):
-                if not self.check_rate_limit(bucket='api'):
+                api_authed = self.verify_api_key()
+                if not self.check_rate_limit(bucket='api' if api_authed else 'api_anon'):
                     return self.reply(429, b'Too many requests')
-                if not self.verify_api_key():
+                if not api_authed:
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized API key'})
                 sub = self.path[len('/api/v1/'):].split('?', 1)[0]
                 # 下方比较前 sub 已在上游剥掉 query（见 8160 行 split('?', 1)[0]），
@@ -14413,6 +14469,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
     server = ThreadingHTTPServer(('127.0.0.1', data['port']), Handler)
     server.requests, server.failures, server.api_requests = [], [], []
+    server.api_anon_requests = []
+    # 每来源 60 秒 60 次失败；全局速率由 requests 桶管，这里不再设兜底。
+    server.web_failure_limiter = AuthLimiter(per_ip_rate=10**6, per_ip_failures=60,
+                                             failure_window=60, global_rate=10**6)
     # /auth 专用限流桶（2026-10-09）：见 auth_rate_limited() 的说明 ——
     # /auth 经 masquerade 对公网可达，必须有独立的速率+失败计数。
     # auth_requests 仍供 check_rate_limit('auth') 使用；/auth 本身走按来源分桶的 auth_limiter（H4）。
@@ -14420,6 +14480,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     server.auth_limiter = AuthLimiter()
     # Web 登录专用失败桶（2026-10-25）：见 login_rate_limited() 的说明。
     server.login_failures = []
+    server.login_source_failures = collections.OrderedDict()
 
     # 启动时比较完整托管客户端列表；服务已停止但配置匹配时也尝试恢复。
     try:

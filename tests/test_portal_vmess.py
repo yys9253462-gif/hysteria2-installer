@@ -318,9 +318,10 @@ class VlessEncryptionTests(unittest.TestCase):
         vless = next(p for p in proxies if p['type'] == 'vless')
         self.assertEqual(vless['encryption'], self.CFG['encryption'])
         self.assertEqual(vless['network'], 'tcp')
+        # sing-box 不支持 VLESS Encryption：带 encryption 字段整份订阅加载失败
+        # （SE 上 sing-box 1.14.4 实测），所以 sing-box 订阅里不下发这一条。
         sing_doc = json.loads(sing)
-        out = next(o for o in sing_doc['outbounds'] if o.get('type') == 'vless')
-        self.assertEqual(out['encryption'], self.CFG['encryption'])
+        self.assertFalse(any(o.get('type') == 'vless' for o in sing_doc['outbounds']))
 
 
 class WarpToggleAclTests(unittest.TestCase):

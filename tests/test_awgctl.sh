@@ -344,6 +344,26 @@ else
 fi
 if [[ ! -s "${WORK}/live-calls" ]]; then ok; else bad "peer-add 渲染失败后不应应用 live peer"; fi
 
+# 地址池满时 peer-add 失败，不能留下带全部私钥的备份文件（2026-11-03 修）。
+detect_wan_iface() { echo eth0; }
+_saved_next_peer_address="$(declare -f next_peer_address)"
+next_peer_address() { return 1; }
+rm -f "${AWG_DIR}"/.peers-backup.* "${AWG_DIR}"/.conf-backup.*
+# 在子 shell 里桩掉安装检查与密钥生成：测试环境没有真二进制。
+if (is_installed() { return 0; }; genkey() { echo priv; }; pubkey_of() { echo pub; }; genpsk() { echo psk; }
+    cmd_peer_add poolfull vpn.example.com >/dev/null 2>&1); then
+    bad "地址池满时 peer-add 应失败退出"
+else
+    ok
+fi
+if compgen -G "${AWG_DIR}/.peers-backup.*" >/dev/null || compgen -G "${AWG_DIR}/.conf-backup.*" >/dev/null; then
+    bad "地址池满失败后留下了含私钥的备份文件"
+else
+    ok
+fi
+eval "$_saved_next_peer_address"
+detect_wan_iface() { return 1; }
+
 # 用一个有内容的列表验证删除失败也会完整回滚。
 jq '.peers += [{name:"deletefail",address:"10.66.66.9",private_key:"p",public_key:"pub-deletefail",preshared_key:"k",endpoint:"vpn.example.com",created_at:"t",enabled:true}]' \
     "$AWG_PEERS_FILE" > "${AWG_PEERS_FILE}.tmp" && mv "${AWG_PEERS_FILE}.tmp" "$AWG_PEERS_FILE"

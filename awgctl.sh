@@ -831,6 +831,12 @@ cmd_peer_add() {
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
     local priv pub psk addr tmp peers_backup config_backup had_config=0
+    # 先生成密钥、分配地址，再做备份（2026-11-03 修）：地址池满 / genkey 失败时
+    # 旧实现在备份之后 die，每次都留下一份带全部客户端私钥的备份文件。
+    priv="$(genkey)"
+    pub="$(pubkey_of "$priv")"
+    psk="$(genpsk)"
+    addr="$(next_peer_address)" || die "隧道地址池已满（10.66.66.0/24 上限 253 个客户端）"
     config_backup="${AWG_DIR}/.conf-backup.$$"
     peers_backup="${AWG_DIR}/.peers-backup.$$"
     (umask 077; cp -p "$AWG_PEERS_FILE" "$peers_backup") || { rm -f "$peers_backup"; die "无法备份客户端列表"; }
@@ -841,10 +847,6 @@ cmd_peer_add() {
         : > "$config_backup"
         chmod 600 "$config_backup"
     fi
-    priv="$(genkey)"
-    pub="$(pubkey_of "$priv")"
-    psk="$(genpsk)"
-    addr="$(next_peer_address)" || die "隧道地址池已满（10.66.66.0/24 上限 253 个客户端）"
 
     tmp="$(mktemp "${AWG_DIR}/.peers.XXXXXX")"
     jq --arg n "$name" --arg ip "$addr" --arg priv "$priv" \
@@ -1381,10 +1383,17 @@ cmd_resync() {
     require_root
     require_jq
     is_installed || die "AmneziaWG 尚未安装。"
+    # 与 update 同一套快照回滚（2026-11-03 修）：meta 被改坏时新配置起不来，
+    # 旧实现已经覆盖了 awg0.conf，所有客户端掉线直到有人手修 meta。
+    awg_transaction_snapshot || die "无法为 AWG 重新同步创建回滚快照"
+    trap awg_transaction_on_exit EXIT
     render_server_config
-    systemctl restart "$AWG_SERVICE_NAME"
+    systemctl restart "$AWG_SERVICE_NAME" || die "重载后服务异常，已恢复原配置"
     sleep 2
-    service_active && log_info "配置已重新同步，服务正常。" || die "重载后服务异常"
+    service_active || die "重载后服务异常，已恢复原配置"
+    awg_transaction_finish
+    trap - EXIT
+    log_info "配置已重新同步，服务正常。"
 }
 
 # ==============================================================================
