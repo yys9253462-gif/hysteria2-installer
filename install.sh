@@ -663,6 +663,13 @@ if [[ -n "${HY2_CERT_TYPE:-}" ]] && [[ ! "${HY2_CERT_TYPE}" =~ ^[1-4]$ ]]; then
     log_err "环境变量 HY2_CERT_TYPE='${HY2_CERT_TYPE}' 无效，只能是 1 / 2 / 3 / 4。"
     exit 1
 fi
+# HY2_PRESERVE_PORTAL 只认 0 / 1（2026-11-04 修）：后面一律判 == "1"，写成 true / yes /
+# 带空格时静默走「推倒重建」—— 门户凭据、API Key、订阅地址全部重生成，除机主外的
+# 用户全部清空，而用户本意是「保留」。
+if [[ -n "${HY2_PRESERVE_PORTAL:-}" ]] && [[ ! "${HY2_PRESERVE_PORTAL}" =~ ^[01]$ ]]; then
+    log_err "环境变量 HY2_PRESERVE_PORTAL='${HY2_PRESERVE_PORTAL}' 无效，只能是 1（沿用现有门户）或 0（重建）。"
+    exit 1
+fi
 # 本项目只提供商城版（Agent）节点，单机私密模式已移除。
 # 旧脚本里的 HY2_NODE_MODE=1 不再静默改成商城版 —— 那会让 Teyir 节点
 # 「看起来装好了但 API 没开」，所以直接报错并说明如何继续。
