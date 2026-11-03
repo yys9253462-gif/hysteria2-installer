@@ -644,6 +644,44 @@ class WebWorkflowTests(unittest.TestCase):
                 self.assertEqual(unit_path.read_bytes() if old_unit is not None else None, old_unit)
                 self.assertIn(['systemctl', 'daemon-reload'], commands)
 
+    def test_anytls_port_move_closes_the_old_firewall_port(self):
+        """协议换端口后收回旧端口的放行规则（2026-11-03 修，与 Reality 一致）。
+
+        旧实现只放行新端口，旧端口的入站规则一直留在 ufw / firewalld 里。
+        """
+        self.data['anytls_config'] = {'enabled': False, 'port': 2096, 'secret': 'fixture'}
+        fw, closed = [], []
+        self.ns.update({
+            'ANYTLS_SERVICE': 'hy2-anytls',
+            'ANYTLS_CONFIG_NAME': portal.ANYTLS_CONFIG_NAME,
+            'ANYTLS_UNIT_CONTENT': portal.ANYTLS_UNIT_CONTENT,
+            'anytls_apply_lock': threading.RLock(),
+            'read_meta_file': lambda _: {'server_name': 'node.example.com'},
+            '_is_dns_name': lambda _: True,
+            '_singbox_version': lambda: portal.ANYTLS_MIN_SINGBOX,
+            'managed_reserved_ports': lambda *a, **kw: set(),
+            '_pick_reality_port': lambda **kw: (2097, '原端口 2096 已被占用，自动改用 2097'),
+            '_systemd_state': lambda _: 'inactive',
+            'anytls_users': lambda _: [],
+            'build_anytls_config': lambda *a: {},
+            'apply_anytls_config': Mock(),
+            '_systemd_service_snapshot': lambda _: {'active': 'inactive', 'enabled': 'disabled'},
+            '_restore_systemd_service_state': Mock(return_value=True),
+            'save_data': Mock(), 'regenerate_page': Mock(),
+            'config_section': lambda data, key: data.get(key, {}),
+            '_valid_port': portal._valid_port,
+            'firewall_port': lambda port, proto, open_=True: fw.append((port, proto, open_)) or True,
+            'close_protocol_port': lambda port, proto, key: closed.append((port, proto, key)) or True,
+        })
+        self.handler._vmess_certificate = lambda *a: ('cert.pem', 'key.pem', 'node.example.com')
+        run = lambda args, **kw: SimpleNamespace(returncode=0, stdout='', stderr='')
+        self.ns['subprocess'].run = run
+        (self.root / 'etc/systemd/system').mkdir(parents=True, exist_ok=True)
+        with patch.object(portal.subprocess, 'run', side_effect=run):
+            extract_method('_apply_anytls_enable', self.ns)(self.handler)
+        self.assertIn((2097, 'tcp', True), fw)
+        self.assertEqual(closed, [(2096, 'tcp', 'anytls_config')])
+
     def test_tuic_enable_failure_restores_new_or_existing_unit(self):
         for old_unit in (None, b'custom previous unit'):
             with self.subTest(old_unit=old_unit):

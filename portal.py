@@ -11473,6 +11473,11 @@ if __name__ == '__main__':
             regenerate_page()
             if not firewall_port(listen_port, 'tcp', open_=True):
                 raise RuntimeError('VMess 配置已保存，但防火墙放行端口失败')
+            # 换了端口要收回旧端口的放行规则，与 Reality 一致（2026-11-03 修）：旧实现只放行
+            # 新端口，旧端口的入站规则一直留着，之后别的服务监听在那里就直接暴露在公网。
+            _old_port = _valid_port(old.get('port'))
+            if _old_port and _old_port != listen_port:
+                close_protocol_port(_old_port, 'tcp', 'vmess_config')
             return new_cfg
 
         def _apply_vlessenc_enable(self):
@@ -11581,6 +11586,11 @@ if __name__ == '__main__':
             regenerate_page()
             if not firewall_port(listen_port, 'tcp', open_=True):
                 raise RuntimeError('VLESS Encryption 配置已保存，但防火墙放行端口失败')
+            # 换了端口要收回旧端口的放行规则，与 Reality 一致（2026-11-03 修）：旧实现只放行
+            # 新端口，旧端口的入站规则一直留着，之后别的服务监听在那里就直接暴露在公网。
+            _old_port = _valid_port(old.get('port'))
+            if _old_port and _old_port != listen_port:
+                close_protocol_port(_old_port, 'tcp', 'vlessenc_config')
             return new_cfg
 
         def _h_post_manage_vmess(self, prefix):
@@ -11973,6 +11983,11 @@ if __name__ == '__main__':
             regenerate_page()
             if not firewall_port(listen_port, 'tcp', open_=True):
                 raise RuntimeError('AnyTLS 配置已保存，但防火墙放行端口失败')
+            # 换了端口要收回旧端口的放行规则，与 Reality 一致（2026-11-03 修）：旧实现只放行
+            # 新端口，旧端口的入站规则一直留着，之后别的服务监听在那里就直接暴露在公网。
+            _old_port = _valid_port(old.get('port'))
+            if _old_port and _old_port != listen_port:
+                close_protocol_port(_old_port, 'tcp', 'anytls_config')
             return new_cfg
 
         def _h_post_manage_anytls(self, prefix):
@@ -12166,6 +12181,11 @@ if __name__ == '__main__':
             regenerate_page()
             if not firewall_port(listen_port, 'udp', open_=True):
                 raise RuntimeError('TUIC 配置已保存，但防火墙放行端口失败')
+            # 换了端口要收回旧端口的放行规则，与 Reality 一致（2026-11-03 修）：旧实现只放行
+            # 新端口，旧端口的入站规则一直留着，之后别的服务监听在那里就直接暴露在公网。
+            _old_port = _valid_port(old.get('port'))
+            if _old_port and _old_port != listen_port:
+                close_protocol_port(_old_port, 'udp', 'tuic_config')
             return new_cfg
 
         def _h_post_manage_tuic(self, prefix):
