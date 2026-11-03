@@ -9065,8 +9065,12 @@ if __name__ == '__main__':
             with data_lock:
                 _data_now = dict(data)
             _avoid |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='reality_config')
+            # 已关闭的 Reality 保留下来的端口不算「自己的」（2026-11-04 修，与 VMess /
+            # VLESS-Enc / AnyTLS 一致）：停用期间 Caddy / Nginx 可能已占了它，再开启时
+            # 照旧沿用就绑不上、回 500，而不是换一个空闲端口。
             listen_port, port_reason = _pick_reality_port(
-                preferred=rcfg_old.get('port'), extra_blocked=_avoid)
+                preferred=rcfg_old.get('port'), extra_blocked=_avoid,
+                own_active=has_managed_inbound(_cfg_now or {}, REALITY_INBOUND_TAG))
             if not listen_port:
                 # 找不到空闲端口 ⇒ **明确失败**，不生成一份注定冲突的配置。
                 #

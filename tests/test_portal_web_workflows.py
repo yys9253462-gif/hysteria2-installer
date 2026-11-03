@@ -250,6 +250,23 @@ class WebWorkflowTests(unittest.TestCase):
         inbound = next(i for i in cfg['inbounds'] if i.get('tag') == portal.REALITY_INBOUND_TAG)
         self.assertNotIn('gone', [c.get('email') for c in inbound['settings']['clients']])
 
+    def test_reenabling_reality_rechecks_its_saved_port(self):
+        """Reality 已关闭时，保留的端口被别人占了要换一个（2026-11-04 修）。"""
+        self.data['reality_config'] = {'private_key': 'k' * 43, 'public_key': 'p' * 43,
+                                       'short_id': 'abcd1234', 'dest_sni': 'www.apple.com', 'port': 443}
+        picked = {}
+        def pick(**kw):
+            picked.update(kw)
+            raise RuntimeError('stop after picking')
+        self.ns.update(_pick_reality_port=pick, has_managed_inbound=portal.has_managed_inbound,
+                       REALITY_INBOUND_TAG=portal.REALITY_INBOUND_TAG)
+        (self.hdir / 'xray.json').write_text('{"inbounds": []}', encoding='utf-8')
+        generate = extract_method('_generate_and_apply_reality', self.ns)
+        with self.assertRaises(RuntimeError):
+            generate(self.handler, restart=False)
+        self.assertEqual(picked.get('preferred'), 443)
+        self.assertIs(picked.get('own_active'), False, picked)
+
     def test_reality_keygen_failure_never_uses_a_shared_static_key(self):
         self.run.return_value = SimpleNamespace(returncode=1, stdout='', stderr='keygen failed')
         generate = extract_method('_generate_and_apply_reality', self.ns)
