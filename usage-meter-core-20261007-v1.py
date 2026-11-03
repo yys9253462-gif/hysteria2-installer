@@ -138,6 +138,12 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
                 and uid in sampled_users and uid not in baseline_sampled
                 and uid not in reset_users and uid not in corrupt_users):
             deltas[uid] = (pair['tx'] - old['tx'], pair['rx'] - old['rx'])
+    # 上一轮还在、这一轮从计数里消失的用户（断开了）补一个 0 增量（2026-11-04 修）：
+    # 旧实现不发样本，速率端点在 15 秒窗口里继续显示他断开前的网速。同一 epoch 内才补，
+    # 换 epoch 时谁都没有可比的上一轮。
+    if not new_epoch and not first_sample:
+        for uid in sampled_users - set(clean) - ignored:
+            deltas.setdefault(uid, (0, 0))
     # 消失的用户保持旧游标：临时空响应不能让再次出现的累计值重复计数。
     sources[source] = {'epoch': epoch, 'counters': cursors, 'sampled_at': sampled_at,
                        'sampled_users': sorted(set(clean) | baseline_sampled)}
