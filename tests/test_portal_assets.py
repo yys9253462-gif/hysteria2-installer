@@ -209,6 +209,35 @@ globalThis.fetch = async () => reply;
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_reality_reset_shows_the_server_message(self):
+        """重置 Reality 密钥后显示服务端说明，不是写死的「UUID 已重新生成并生效」（2026-11-03 修）。"""
+        script = portal.SCRIPT
+        start = script.index('if (btnResetRealityKeys) {')
+        end = script.index('\n}\n', start) + 3
+        harness = r"""
+const assert = require('assert');
+const alerts = [];
+globalThis.alert = m => alerts.push(m);
+globalThis.confirm = () => true;
+const location = {pathname: '/fixture/'};
+let handler;
+const btnResetRealityKeys = {addEventListener: (k, fn) => { handler = fn; }};
+const checkRealityStatus = async () => {};
+globalThis.fetch = async () => ({json: async () => ({ok: true, message: '已重置密钥；节点当前已停用，新密钥将在控制台恢复节点时生效'})});
+"""
+        checks = r"""
+(async () => {
+  await handler();
+  assert.strictEqual(alerts.length, 1);
+  assert(alerts[0].includes('恢复节点时生效'), alerts[0]);
+  assert(!alerts[0].includes('UUID 已重新生成'), alerts[0]);
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + script[start:end] + checks], capture_output=True,
+                                text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]

@@ -1628,7 +1628,8 @@ if (btnResetRealityKeys) {
       });
       const json = await res.json();
       if (json.ok) {
-        alert('密钥与 UUID 已重新生成并生效！');
+        // 用服务端的说明（2026-11-03 修）：UUID 从不变；节点停用期间新密钥要等恢复后才生效。
+        alert(json.message || '密钥对已重新生成，请让客户端重新导入订阅');
         await checkRealityStatus();
       } else {
         alert(json.error || '重置失败');
