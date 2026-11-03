@@ -30,6 +30,25 @@ class PortProbeBoundaries(unittest.TestCase):
                     self.assertGreater(port, 0)
                     self.assertLessEqual(port, 65535)
 
+    def test_saved_port_of_a_stopped_protocol_is_rechecked(self):
+        """停用后保留的端口被别人占了，再启用时要换一个（2026-11-03 修）。
+
+        旧实现把 preferred 一律当成「自己的」端口、跳过监听检查：AnyTLS 停在 2096、
+        nginx 接着占了 2096，再启用时仍选 2096，sing-box 绑不上，回滚 500，
+        在别的服务让出端口之前永远启用不了。
+        """
+        with patch.object(portal, '_listening_ports', return_value={2096}):
+            port, reason = portal._pick_reality_port(preferred=2096, default=2096, own_active=False)
+            self.assertNotEqual(port, 2096, reason)
+            self.assertGreater(port, 0)
+            # 本协议正在 2096 上服务（例如重置密钥）：照旧沿用，不换端口。
+            port, _ = portal._pick_reality_port(preferred=2096, default=2096)
+            self.assertEqual(port, 2096)
+        with patch.object(portal, '_listening_ports', return_value=set()):
+            # 端口仍然空着：停用过也照样沿用，已发订阅不变。
+            port, _ = portal._pick_reality_port(preferred=2096, default=2096, own_active=False)
+            self.assertEqual(port, 2096)
+
     def test_invalid_subscription_port_uses_valid_default(self):
         meta = {'server_name': 'node.example.com', 'auth_password': 'test'}
         for bad in (True, 443.5, float('inf')):

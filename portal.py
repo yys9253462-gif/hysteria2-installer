@@ -6728,7 +6728,7 @@ _REALITY_RESERVED_PORTS = {
 _REALITY_PORT_CANDIDATES = [443, 8443, 2053, 2083, 2087, 2096, 9443, 5443, 8444]
 
 
-def _pick_reality_port(preferred=None, extra_blocked=None, default=None):
+def _pick_reality_port(preferred=None, extra_blocked=None, default=None, own_active=True):
     """挑一个**确实没被占用**的端口给 Reality 用。
 
     参数：
@@ -6737,6 +6737,9 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None):
         default      —— 协议的默认端口（VMess 2087 等）。排在候选表最前，但和
                         其它候选一样要查监听表；不能当作 preferred 传进来 ——
                         preferred 视为「自己的」端口，会跳过监听检查（2026-11-03）。
+        own_active   —— preferred 此刻是否真由本协议在监听。停用后保留的端口不算
+                        「自己的」：再启用前别的服务可能已占了它，要照常查监听表
+                        （2026-11-03 修）。默认 True，保持既有调用的行为。
 
     返回 (port, reason)：
         port 为 0 表示**没找到可用端口**，调用方应当报错而不是硬塞一个。
@@ -6815,9 +6818,9 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None):
         # 22 / 80 无论如何都不给（SSH 与 ACME 验证），沿用原端口也不行。
         if p in (22, 80):
             return False
-        if p == pref:
+        if p == pref and own_active:
             return True
-        if p in reserved:
+        if p in reserved and p != pref:
             return False
         # 以**实际监听表**为准。黑名单只是补充 ——
         # 因为「8443 归谁」在不同节点上完全不同，写死数字必然出错。
@@ -11395,7 +11398,8 @@ if __name__ == '__main__':
             blocked.add(reality_port)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2087,
-                extra_blocked=blocked)
+                extra_blocked=blocked,
+                own_active=has_managed_inbound(_cfg_now or {}, VMESS_INBOUND_TAG))
             if not listen_port:
                 raise RuntimeError(reason)
             ws_path = self._vmess_ws_path()
@@ -11500,7 +11504,8 @@ if __name__ == '__main__':
                 _data_now = dict(data)
             blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config')
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port'), default=2088, extra_blocked=blocked_ports)
+                preferred=old.get('port'), default=2088, extra_blocked=blocked_ports,
+                own_active=has_managed_inbound(_cfg_now or {}, VLESSENC_INBOUND_TAG))
             if not listen_port:
                 raise RuntimeError(reason)
             decryption = old.get('decryption', '')
@@ -11911,7 +11916,8 @@ if __name__ == '__main__':
                 _cfg_now = None
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config')
             listen_port, reason = _pick_reality_port(
-                preferred=old.get('port'), default=2096, extra_blocked=blocked)
+                preferred=old.get('port'), default=2096, extra_blocked=blocked,
+                own_active=_systemd_state(ANYTLS_SERVICE) == 'active')
             if not listen_port:
                 raise RuntimeError(reason)
             new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,

@@ -620,6 +620,7 @@ class WebWorkflowTests(unittest.TestCase):
                     '_singbox_version': lambda: portal.ANYTLS_MIN_SINGBOX,
                     'managed_reserved_ports': lambda *a, **kw: set(),
                     '_pick_reality_port': lambda **kw: (2096, ''),
+                    '_systemd_state': lambda _: 'inactive',
                     'anytls_users': lambda _: [],
                     'build_anytls_config': lambda *a: {},
                     'apply_anytls_config': Mock(),
