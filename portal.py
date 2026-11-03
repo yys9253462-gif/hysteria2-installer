@@ -140,6 +140,13 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
 
 
+def warp_backend_installed():
+    """本机是否装了 WARP 出口：wgcf + wireproxy，或旧节点的官方 warp-cli。"""
+    return (shutil.which('wireproxy') is not None
+            or shutil.which('warp-cli') is not None
+            or Path('/etc/systemd/system/wireproxy.service').exists())
+
+
 def user_id_shareable(user_id):
     """新开户的 user_id 能否放进分享链接 /u/<uid>/（2026-11-04 修）。
 
@@ -11198,6 +11205,7 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': '未知 WARP 操作'})
 
                 bad_domain = False
+                warp_not_installed = False
                 with data_lock:
                     previous_warp_state_exists = 'warp_enabled' in data
                     previous_warp_rules_exists = 'warp_rules' in data
@@ -11208,6 +11216,13 @@ if __name__ == '__main__':
                         data['warp_enabled'] = not bool(data.get('warp_enabled'))
                     elif action in ('enable', 'disable'):
                         data['warp_enabled'] = action == 'enable'
+                    # 没装 WARP 就不能开（2026-11-04 修）：旧实现照样置 True，渲染出指向
+                    # 127.0.0.1:19898 的 warp_socks 出站，AI 等默认分流域名全部发往一个没人
+                    # 监听的端口，用户只看到这些网站打不开。关闭始终允许。
+                    warp_not_installed = (data.get('warp_enabled') and not previous_warp_state
+                                          and not warp_backend_installed())
+                    if warp_not_installed:
+                        data['warp_enabled'] = previous_warp_state
                     elif action == 'add_rule':
                         raw = form.get('domain', [''])[0].strip().lower()
                         domain = re.sub(r'^[a-zA-Z]+://', '', raw).split('/')[0].split(':')[0].strip('.')
@@ -11230,6 +11245,15 @@ if __name__ == '__main__':
                 if bad_domain:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
+                if warp_not_installed:
+                    # 规则改动（如果有）与开关一起作废，不落盘。
+                    with data_lock:
+                        if previous_warp_rules_exists:
+                            data['warp_rules'] = previous_warp_rules
+                        else:
+                            data.pop('warp_rules', None)
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '本机尚未安装 WARP（wireproxy），请先在「出站分流」里安装 WARP 再开启'})
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
@@ -14441,9 +14465,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 overridden = state['outbound_mode'] == 'global' and bool(state['custom_outbounds'])
             # 统一到 wgcf + wireproxy(127.0.0.1:19898)；同时兼容尚未升级、
             # 仍跑官方 cloudflare-warp(127.0.0.1:40000) 的旧节点，避免误报「未安装」
-            is_installed = (shutil.which('wireproxy') is not None
-                            or shutil.which('warp-cli') is not None
-                            or Path('/etc/systemd/system/wireproxy.service').exists())
+            is_installed = warp_backend_installed()
             connected = False
             outbound_ip = ''
             if is_installed and enabled:

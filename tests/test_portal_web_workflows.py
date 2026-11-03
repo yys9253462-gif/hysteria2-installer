@@ -876,6 +876,7 @@ class WebWorkflowTests(unittest.TestCase):
                                                            'outbound': 'direct'}]}
         self.data.update(copy.deepcopy(original))
         self.ns['save_data'] = Mock(side_effect=OSError('disk full'))
+        self.ns['warp_backend_installed'] = lambda: True
         scheduled = []
         self.handler._reply_with_warp_apply = Mock(side_effect=lambda payload:
             scheduled.append(payload) or self.reply_json(200, payload))
@@ -883,6 +884,26 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 500, body)
         self.assertEqual({key: self.data[key] for key in original}, original)
         self.assertEqual(scheduled, [])
+
+    def test_warp_cannot_be_enabled_when_not_installed(self):
+        """没装 WARP 时开启回 409，不把流量导向没人监听的 19898（2026-11-04 修）。"""
+        self.data.update({'warp_enabled': False, 'warp_rules': []})
+        self.ns['warp_backend_installed'] = lambda: False
+        scheduled = []
+        self.handler._reply_with_warp_apply = Mock(side_effect=lambda payload:
+            scheduled.append(payload) or self.reply_json(200, payload))
+        for action in ('enable', 'toggle'):
+            with self.subTest(action=action):
+                status, body = self.invoke('_h_post_manage_warp', {'action': action})
+                self.assertEqual(status, 409, body)
+                self.assertFalse(self.data['warp_enabled'])
+                self.assertEqual(self.data['warp_rules'], [])
+        self.assertEqual(scheduled, [])
+        # 关闭不受影响。
+        self.data['warp_enabled'] = True
+        status, _ = self.invoke('_h_post_manage_warp', {'action': 'disable'})
+        self.assertEqual(status, 200)
+        self.assertFalse(self.data['warp_enabled'])
 
     def test_egress_schedule_save_failure_still_starts_apply_worker(self):
         self.ns['save_data'] = Mock(side_effect=[OSError('disk full')])
