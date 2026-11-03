@@ -350,6 +350,40 @@ class WebWorkflowTests(unittest.TestCase):
             self.assertEqual(self.data['bbr_target_version'], 'v1')
             self.assertEqual([p.read_text(encoding='utf-8') for p in paths], ['original', 'original'])
 
+    def test_bbr_applies_when_an_optional_tuning_key_is_missing(self):
+        """内核没有 tcp_notsent_lowat 时照样开 BBR，只是不写这一项（2026-11-04 修）。"""
+        applied = {}
+        def run(args, **kw):
+            if args == ['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control']:
+                return SimpleNamespace(returncode=0, stdout='reno cubic bbr', stderr='')
+            if args == ['sysctl', '-n', 'net.ipv4.tcp_notsent_lowat']:
+                return SimpleNamespace(returncode=255, stdout='', stderr='sysctl: cannot stat')
+            if args[:2] == ['sysctl', '-n']:
+                value = applied.get(args[2], {'net.ipv4.tcp_congestion_control': 'cubic',
+                                              'net.core.default_qdisc': 'fq_codel'}.get(args[2], '1'))
+                return SimpleNamespace(returncode=0, stdout=value, stderr='')
+            if args[:2] == ['sysctl', '-p']:
+                for line in Path(args[2]).read_text(encoding='utf-8').splitlines():
+                    if '=' in line and not line.startswith('#'):
+                        k, v = (x.strip() for x in line.split('=', 1))
+                        applied[k] = v
+                return SimpleNamespace(returncode=0, stdout='', stderr='')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        self.run.side_effect = run
+        self.ns['subprocess'].run = self.run
+        conf = self.root / 'etc/sysctl.d/99-bbr.conf'
+        mod = self.root / 'etc/modules-load.d/bbr.conf'
+        for path in (conf, mod):
+            path.parent.mkdir(parents=True, exist_ok=True)
+        original_path = self.ns['Path']
+        self.ns['Path'] = lambda value: (self.root / str(value).lstrip('/')
+            if str(value) in ('/etc/modules-load.d/bbr.conf', '/etc/sysctl.d/99-bbr.conf') else original_path(value))
+        status, body = self.invoke('_h_post_set_bbr', {'version': 'v1'})
+        self.assertEqual(status, 200, body)
+        text = conf.read_text(encoding='utf-8')
+        self.assertIn('net.ipv4.tcp_congestion_control = bbr', text)
+        self.assertNotIn('tcp_notsent_lowat', text)
+
     def test_failed_sysctl_is_not_reported_as_reboot_success(self):
         def run(args, **kw):
             return SimpleNamespace(returncode=1 if '-p' in args else 0,

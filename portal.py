@@ -12584,10 +12584,17 @@ if __name__ == '__main__':
                             'net.ipv4.tcp_notsent_lowat': '16384',
                             'net.ipv4.tcp_slow_start_after_idle': '0'}
                 runtime = {}
-                for key in settings:
+                # 两个调优项是锦上添花（2026-11-04 修）：容器或老内核没有 tcp_notsent_lowat 时，
+                # 旧实现整个拒绝开 BBR，而真正要的 qdisc / 拥塞算法两项完全可用。读不到的调优项
+                # 直接不写；必需的两项读不到才拒绝。
+                required = ('net.core.default_qdisc', 'net.ipv4.tcp_congestion_control')
+                for key in list(settings):
                     result = subprocess.run(['sysctl', '-n', key], capture_output=True, text=True, timeout=3)
                     if result.returncode != 0 or not result.stdout.strip():
-                        return self.reply_json(500, {'ok': False, 'error': '读取 sysctl 失败，未修改配置'})
+                        if key in required:
+                            return self.reply_json(500, {'ok': False, 'error': '读取 sysctl 失败，未修改配置'})
+                        settings.pop(key)
+                        continue
                     runtime[key] = result.stdout.strip()
                 paths = [Path('/etc/modules-load.d/bbr.conf'), Path('/etc/sysctl.d/99-bbr.conf')]
                 originals = {path: path.read_bytes() if path.exists() else None for path in paths}
