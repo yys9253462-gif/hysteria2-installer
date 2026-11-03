@@ -263,6 +263,44 @@ assert.strictEqual(obEls.list.innerHTML.match(/data-ob-addr="([^"]*)"/)[1], 'pro
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_copy_field_falls_back_when_clipboard_is_unavailable(self):
+        """代理详情里的单字段复制在剪贴板不可用时退回 execCommand（2026-11-03 修）。
+
+        旧写法 catch 为空：点了毫无反应。
+        """
+        script = portal.SCRIPT
+        helper_start = script.index('function copyWithFeedback(')
+        helper = script[helper_start:script.index('\n}\n', helper_start) + 3]
+        start = script.index("  document.querySelectorAll('[data-copy-field]').forEach(b => {")
+        end = script.index('  });\n', start) + len('  });\n')
+        harness = r"""
+const assert = require('assert');
+const copied = [];
+const button = {dataset: {copyField: 'f1'}, textContent: '复制'};
+const fieldEl = {textContent: 'socks5://u:p@host:1080'};
+globalThis.navigator = {};
+globalThis.alert = m => { throw new Error('alert: ' + m); };
+globalThis.setTimeout = () => {};
+globalThis.document = {
+  getElementById: id => id === 'f1' ? fieldEl : null,
+  querySelectorAll: sel => sel === '[data-copy-field]' ? [button] : [],
+  createElement: () => ({style: {}, select() {}, remove() {}, set value(v) { this._v = v; }, get value() { return this._v; }}),
+  body: {appendChild: el => { globalThis._last = el; }},
+  execCommand: cmd => { copied.push(globalThis._last.value); return cmd === 'copy'; },
+};
+"""
+        checks = r"""
+(async () => {
+  await button.onclick();
+  assert.deepStrictEqual(copied, ['socks5://u:p@host:1080']);
+  assert.strictEqual(button.textContent, '✓');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + helper + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_production_version_check_four_states(self):
         script = portal.SCRIPT
         code = script[script.index('// 版本检测与一键更新交互'):script.index('async function waitForCoreUpgrade')]

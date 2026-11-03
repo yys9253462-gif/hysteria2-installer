@@ -2820,14 +2820,9 @@ function showProxyResult(data) {
   document.querySelectorAll('[data-copy-field]').forEach(b => {
     b.onclick = async () => {
       const el = document.getElementById(b.dataset.copyField);
-      if (el) {
-        try {
-          await navigator.clipboard.writeText(el.textContent);
-          const orig = b.textContent;
-          b.textContent = '✓';
-          setTimeout(() => { b.textContent = orig; }, 1500);
-        } catch (_) {}
-      }
+      // 走统一的复制兜底（2026-11-03 修）：旧写法 catch 里什么都不做，剪贴板不可用时
+      // 点了毫无反应，看起来像按钮坏了。
+      if (el) copyWithFeedback(el.textContent, b, '✓');
     };
   });
 
