@@ -63,5 +63,27 @@ class AwgInstallFailurePathTests(unittest.TestCase):
             self.assertFalse(tx.exists())
 
 
+
+@unittest.skipUnless(BASH, 'requires bash')
+class AwgInstallLineSwitchTests(unittest.TestCase):
+    def _run(self, line, s4):
+        block = re.search(r'    local _s4\n.*?\n    else\n        log_info "沿用已有混淆参数"\n    fi\n',
+                          fn('cmd_install'), re.S).group(0)
+        script = '\n'.join([
+            'declare -A M=([S1]=20 [S4]=%s)' % s4,
+            'meta_get() { echo "${M[$1]:-}"; }', 'meta_set() { M[$1]="$2"; }',
+            'log_warn() { :; }', 'log_info() { :; }',
+            'gen_obfs_params() { AWG_S1=30; AWG_S2=31; AWG_S3=32; AWG_S4=40; }',
+            'line=%s' % line, block, 'echo "S4=${M[S4]}"'])
+        return run(script)
+
+    def test_switch_to_line3_regenerates_small_s4(self):
+        self.assertIn('S4=40', self._run(3, 5))
+
+    def test_same_params_kept_otherwise(self):
+        self.assertIn('S4=5', self._run(2, 5))
+        self.assertIn('S4=15', self._run(3, 15))
+
+
 if __name__ == '__main__':
     unittest.main()

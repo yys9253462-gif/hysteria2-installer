@@ -1117,7 +1117,15 @@ cmd_install() {
         meta_set server_name "$server_name"
     fi
 
-    # 混淆参数（已存在则保留 —— 否则所有客户端立刻失效）
+    # 混淆参数（已存在则保留 —— 否则所有客户端立刻失效）。
+    # 例外同 cmd_update：在 2.x 安装上 install --line 3 时，旧 S4<12 不满足 3.x 头部
+    # 保护，沿用会让服务起不来、事务回滚，换协议线永远装不上（2026-11-04 修）。
+    local _s4
+    _s4="$(meta_get S4)"
+    if [[ -n "$(meta_get S1)" && "$line" == "3" && "${_s4:-0}" -lt 12 ]]; then
+        log_warn "旧 S4=${_s4} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
+        meta_set S1 ""
+    fi
     if [[ -z "$(meta_get S1)" ]]; then
         gen_obfs_params "$line"
         meta_set Jc "$AWG_JC";     meta_set Jmin "$AWG_JMIN"; meta_set Jmax "$AWG_JMAX"
