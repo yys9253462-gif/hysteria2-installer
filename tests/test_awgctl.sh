@@ -173,6 +173,16 @@ for (( i = 0; i < PORT_ROUNDS; i++ )); do
 done
 check_eq "自动选端口避让跳跃区间与 Hysteria 端口" "$bad_auto" "0"
 
+# 自动选端口只读 ss 监听表，避开已在监听的端口；不再用 bind 探测（2026-11-03 修）。
+_saved_ss="$(declare -f ss || true)"
+ss() { printf 'UNCONN 0 0 0.0.0.0:%s 0.0.0.0:*
+' $(seq "$AWG_PORT_MIN" $((AWG_PORT_MAX - 1))); }
+check_eq "自动选端口避开 ss 里已监听的端口" "$(pick_port 1)" "$AWG_PORT_MAX"
+ss() { return 1; }
+if pick_port 1 >/dev/null 2>&1; then bad "ss 不可用时 pick_port 不应猜一个端口"; else ok; fi
+unset -f ss
+[[ -n "$_saved_ss" ]] && eval "$_saved_ss"
+
 # ==============================================================================
 section "3. 服务端 / 客户端配置：混淆参数必须逐字节一致"
 # ==============================================================================
