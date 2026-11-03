@@ -5372,9 +5372,16 @@ uninstall_all() {
         if [[ "$awg_confirm" =~ ^[Yy]$ ]]; then
             log_step "正在卸载 AmneziaWG..."
             awg_ensure_ctl 2>/dev/null || true
+            # 控制工具卸载失败时（停不下来 / 禁用失败）它会刻意保留全部资产并退出非零。
+            # 旧实现吞掉退出码、删掉控制工具、照报「已卸载」：AWG 实际还在跑，
+            # 却没了管理它的工具（2026-11-03 修）。
+            local awg_uninstall_failed=0 awg_uninstall_log=""
             if [[ -x "$AWG_CTL_BIN" ]]; then
-                "$AWG_CTL_BIN" uninstall >/dev/null 2>&1 || true
-                rm -f "$AWG_CTL_BIN"
+                if ! awg_uninstall_log="$("$AWG_CTL_BIN" uninstall 2>&1)"; then
+                    awg_uninstall_failed=1
+                else
+                    rm -f "$AWG_CTL_BIN"
+                fi
             else
                 # 控制工具不可用时的兜底清理，保证不留下半截状态
                 systemctl disable --now amneziawg-server 2>/dev/null || true
@@ -5382,7 +5389,12 @@ uninstall_all() {
                 rm -rf "$AWG_DIR"
                 systemctl daemon-reload 2>/dev/null || true
             fi
-            log_info "AmneziaWG 已卸载。"
+            if [[ "$awg_uninstall_failed" == 1 ]]; then
+                log_err "AmneziaWG 卸载失败，服务与客户端配置已保留，控制工具 ${AWG_CTL_BIN} 未删除："
+                printf '%s\n' "$awg_uninstall_log" | tail -n 5 >&2
+            else
+                log_info "AmneziaWG 已卸载。"
+            fi
         elif [[ -f "$AWG_CONFIG" ]]; then
             log_info "已保留 AmneziaWG（如需卸载：主菜单选 8，或执行 hy2-awgctl uninstall）。"
         fi
