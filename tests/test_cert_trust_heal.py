@@ -139,6 +139,28 @@ class TestPortalSyncCertTrust(unittest.TestCase):
         finally:
             sys.path.pop(0)
 
+    def test_missing_configured_cert_does_not_fall_back_to_old_self_signed(self):
+        """config.yaml 指向的证书不在时不改 meta（2026-11-04 修）。
+
+        旧实现退回 cert/server.crt（常是安装时留下的旧自签证书），把一个可信证书节点
+        改成 self_signed + insecure + 无关 pin，所有订阅随之变成跳过校验。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            _make_self_signed(td / "cert", cn="www.bing.com")
+            (td / "config.yaml").write_text(
+                "listen: :443\ntls:\n  cert: /nonexistent/moved/fullchain.pem\n"
+                "  key: /nonexistent/moved/privkey.pem\n")
+            meta = {"public_ip": "1.2.3.4", "server_name": "node.example.com",
+                    "cert_type": "custom", "is_insecure": False, "pin_sha256": ""}
+            (td / "client_meta.json").write_text(json.dumps(meta))
+            changed = self._call(td, dict(meta))
+            self.assertFalse(changed)
+            after = json.loads((td / "client_meta.json").read_text())
+            self.assertEqual(after["cert_type"], "custom")
+            self.assertIs(after["is_insecure"], False)
+            self.assertEqual(after["server_name"], "node.example.com")
+
     def test_self_signed_heals_all_four_fields(self):
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)

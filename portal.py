@@ -4391,6 +4391,19 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
 
     # 证书解析统一走 _resolve_live_cert —— 自愈与界面显示必须是同一张证书，
     # 否则会出现「卡片显示 A、自愈修 B」这种更隐蔽的不一致。
+    # config.yaml 写明了证书路径、文件却不在时不做任何改动（2026-11-04 修）：
+    # _resolve_live_cert 会退回 cert/server.crt —— 常常是安装时留下的旧自签证书。
+    # 旧实现据此把 meta 改成 self_signed + insecure + 一个无关证书的 pin，所有订阅
+    # 随之变成「跳过校验」，而 Hysteria 实际出示（或加载失败）的是配置里那条路径。
+    configured = _config_tls_cert_path(config_path)
+    if configured:
+        configured_path = Path(configured)
+        if not configured_path.is_absolute():
+            configured_path = Path(config_path).parent / configured_path
+        if not configured_path.exists():
+            print('[portal] 证书自愈跳过：config.yaml 指向的证书 %s 不存在' % configured_path,
+                  file=sys.stderr)
+            return False
     cert_file, cn, sans, self_signed = _resolve_live_cert(root, config_path)
     if not cert_file.exists():
         # 证书都读不到，不做任何猜测 —— 交给原来的行为。
