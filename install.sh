@@ -1159,8 +1159,10 @@ select_local_certificate() {
     CERT_TYPE="custom"; CERT_FILE="$cert"; KEY_FILE="$key"; IS_INSECURE="false"
     # SNI 能直接从证书 SAN/CN 推出来时不必再问（无人值守路径的关键）。
     if [[ -z "${SERVER_NAME:-}" ]]; then
-        SERVER_NAME="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[A-Za-z0-9*._-]+' | head -1 | sed 's/^DNS://')"
-        [[ -z "$SERVER_NAME" ]] && SERVER_NAME="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p')"
+        # 跳过通配符名字（2026-11-04 修）：*.example.com 不能当 SNI，写进订阅后客户端
+        # 发出非法主机名、TLS 校验失败。只有通配符时走下面的提问。
+        SERVER_NAME="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[A-Za-z0-9*._-]+' | sed 's/^DNS://' | grep -v '^\*' | head -1)"
+        [[ -z "$SERVER_NAME" ]] && SERVER_NAME="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p' | grep -v '^\*')"
     fi
     if [[ -z "${SERVER_NAME:-}" ]]; then
         read -rp "请输入证书绑定的域名 (SNI): " SERVER_NAME || true

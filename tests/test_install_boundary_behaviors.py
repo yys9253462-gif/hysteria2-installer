@@ -165,6 +165,36 @@ fi
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    @unittest.skipUnless(shutil.which("openssl"), "requires openssl")
+    def test_wildcard_first_san_is_not_used_as_sni(self):
+        """证书第一个 SAN 是通配符时，SNI 取第一个具体域名（2026-11-04 修）。
+
+        旧实现取第一个 DNS 名：*.example.com 被写进订阅，客户端发出非法 SNI。
+        """
+        result = run_shell(r"""
+mkdir -p live/example acme home
+openssl req -x509 -newkey rsa:2048 -nodes -keyout live/example/privkey.pem -out leaf.pem -days 2 \
+    -subj "/CN=*.example.com" -addext "subjectAltName=DNS:*.example.com,DNS:example.com" >/dev/null 2>&1
+cat leaf.pem leaf.pem > live/example/fullchain.pem
+find(){
+    local arg args=()
+    for arg in "$@"; do
+        case "$arg" in
+            /etc/letsencrypt/live) arg="$PWD/live" ;;
+            /root/.acme.sh) arg="$PWD/acme" ;;
+            /home) arg="$PWD/home" ;;
+        esac
+        args+=("$arg")
+    done
+    command find "${args[@]}"
+}
+SERVER_NAME=""
+""" + extract_function("select_local_certificate") + r"""
+select_local_certificate </dev/null
+[[ "$SERVER_NAME" == example.com ]] || { echo "SERVER_NAME=$SERVER_NAME" >&2; exit 1; }
+""")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_certbot_live_symlinks_are_selected_without_resolving_archive_paths(self):
         self.probe_certificate("""
 printf chain > archive/example/fullchain1.pem
