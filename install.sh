@@ -3316,7 +3316,13 @@ show_client_configs() {
     else
         echo -e "    ${YELLOW}私密信息页端口见上方 URL${PLAIN}"
     fi
-    if [[ "${CERT_TYPE:-}" == "acme" ]]; then
+    # 菜单 3 / `info` 在子 shell 里跑，CERT_TYPE 只在安装流程里赋值（2026-11-04 修）：
+    # 旧实现在这里永远读到空值，ACME 节点从不提示要放行 TCP 80，安全组一关续期就失败。
+    local _cert_type_display="${CERT_TYPE:-}"
+    if [[ -z "$_cert_type_display" && -f "$HY2_META_FILE" ]]; then
+        _cert_type_display="$(jq -r '.cert_type // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
+    if [[ "$_cert_type_display" == "acme" ]]; then
         echo -e "    ${GREEN}TCP 80${PLAIN}        申请 / 续期 Let's Encrypt 证书用"
     fi
 
