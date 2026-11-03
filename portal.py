@@ -10827,6 +10827,19 @@ if __name__ == '__main__':
                                 staged = Path('/usr/local/bin/gost.new')
                                 shutil.copyfile(str(src_bin), str(staged))
                                 os.chmod(str(staged), 0o755)
+                                # 先确认新文件能跑再替换（2026-11-04 修，与 Xray 安装一致）：
+                                # 摘要对得上不代表能执行（架构判错、noexec、依赖缺失），
+                                # 旧实现直接覆盖正在用的 gost，所有代理随下次重启全部失效。
+                                try:
+                                    probe = subprocess.run([str(staged), '-V'], capture_output=True,
+                                                           text=True, timeout=10)
+                                    runs = probe.returncode == 0 and 'gost' in (probe.stdout + probe.stderr).lower()
+                                except (OSError, subprocess.SubprocessError):
+                                    runs = False
+                                if not runs:
+                                    staged.unlink(missing_ok=True)
+                                    errors.append('%s: 下载的 gost 无法在本机运行，未替换现有版本' % host)
+                                    continue
                                 os.replace(str(staged), '/usr/local/bin/gost')
                                 assets_modified = True
                                 installed = True
