@@ -2041,6 +2041,11 @@ def _expiry_text(value):
         # 'Invalid user record' 并拒绝连接；面板却写「永久有效」，
         # 于是「显示永久、实际连不上」——最难排查的一类矛盾状态。
         return '到期时间无效'
+    # inf / nan 与鉴权同一口径（2026-11-03 修）：user_access_denial 对非有限值返回
+    # 'Invalid user record' 并拒绝连接，旧实现 inf 却落进下面的「永久有效」，nan 让
+    # localtime 抛错。
+    if not math.isfinite(ts):
+        return '到期时间无效'
     if ts <= 0:
         return '已过期'
     if ts > 253402300799:       # 9999-12-31，防御性上限
