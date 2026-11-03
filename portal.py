@@ -121,6 +121,8 @@ urllib.request.install_opener(urllib.request.build_opener(GitHubTokenHandler()))
 # 机主账号。它的 password 就是 Hysteria 的 auth_password —— /auth 是遍历
 # data['users'] 按密码匹配的，这条记录一旦被删，主密码立刻变成 "User not found"，
 # 机主本人都会被踢下线且再也连不上（只能重装）。因此全站禁止注销它。
+# 门户写的 BBR 配置文件首行；install.sh 卸载按它识别（必须与 install.sh 一致）。
+BBR_FILE_MARKER = '# 由 hysteria2-installer 门户生成（BBR）'
 MASTER_USER_ID = 'admin_master'
 # 保留名：三种协议的 clients 在「没有任何活跃用户」时都会写一条
 # email='placeholder' 的占位记录（Xray 的 clients 为空会拒绝所有连接）。
@@ -147,7 +149,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.17'
+PORTAL_VERSION = '2.18'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2041,6 +2043,11 @@ def _expiry_text(value):
         # 'Invalid user record' 并拒绝连接；面板却写「永久有效」，
         # 于是「显示永久、实际连不上」——最难排查的一类矛盾状态。
         return '到期时间无效'
+    # inf / nan 与鉴权同一口径（2026-11-03 修）：user_access_denial 对非有限值返回
+    # 'Invalid user record' 并拒绝连接，旧实现 inf 却落进下面的「永久有效」，nan 让
+    # localtime 抛错。
+    if not math.isfinite(ts):
+        return '到期时间无效'
     if ts <= 0:
         return '已过期'
     if ts > 253402300799:       # 9999-12-31，防御性上限
@@ -2325,7 +2332,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         expires_str = _expiry_text(u.get("expires_at"))
         # 设备上限与在线数可能是 `"5"`、None 或旧格式（在线 IP 存成数字）。
         # 直接比较 `> 0` / `len(...)` 会让整页 500 —— 与 created_at 同一类问题。
-        ip_limit = _safe_int(u.get("ip_limit") or 0)
+        # 与鉴权同一判据（user_ip_limit）：ip_limit=true 实际不限设备，旧写法 int(True)
+        # 显示成「1 IP」（2026-11-03 修）。
+        ip_limit = _display_ip_limit(u)
         ip_limit_str = f"{ip_limit} IP" if ip_limit > 0 else "不限"
         online_raw = u.get("online_ips")
         online_ips = len(online_raw) if isinstance(online_raw, (dict, list)) else _safe_int(online_raw or 0)
@@ -3659,7 +3668,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
 
     expires_str = _expiry_text(uinfo.get("expires_at"))
     # 与总览页同一处理：设备上限可能是 "5" / None（手工编辑或旧格式）。
-    ip_limit = _safe_int(uinfo.get("ip_limit") or 0)
+    ip_limit = _display_ip_limit(uinfo)
     # 按公网 IP 计：同一 Wi-Fi 下多台设备只占 1 个名额，文案不能写成「台设备」。
     ip_limit_str = f"{ip_limit} 个网络（同一网络下设备不限）" if ip_limit > 0 else "不限制"
 
@@ -5620,6 +5629,14 @@ def user_access_allowed(info, now=None):
 
 REALITY_IPLIMIT_RELEASE_SECONDS = 180
 REALITY_IPLIMIT_TAG_PREFIX = 'iplimit-'
+
+
+def _display_ip_limit(info):
+    """页面显示用的设备上限；记录损坏时按 0（不限）显示，不让渲染抛异常。"""
+    try:
+        return max(0, user_ip_limit(info)) if isinstance(info, dict) else 0
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def user_ip_limit(info):
@@ -8193,6 +8210,8 @@ def serve(path):
                 'measurement_started_at': None,
                 'measurement_scope': 'unavailable'}
 
+    gost_written_ports = []
+
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
         gost_cfg_path = portal_path.parent / 'gost.yml'
@@ -8229,11 +8248,19 @@ def serve(path):
                     'bypass': GOST_PRIVATE_BYPASS,
                 }
                 if ptype == 'https':
-                    cert_file, key_file = gost_tls_paths(portal_path.parent)
+                    # 证书不可用时只跳过这一条（2026-11-03 修）：旧实现在这里抛异常，
+                    # reload_gost 一律失败，增删任何代理（包括删掉这条坏的）都被回滚。
+                    try:
+                        cert_file, key_file = gost_tls_paths(portal_path.parent)
+                    except RuntimeError as exc:
+                        print('[portal] HTTPS 代理 :%d 已跳过：%s' % (port, exc), file=sys.stderr)
+                        continue
                     entry['listener'] = {'type': 'tls', 'tls': {
                         'certFile': cert_file, 'keyFile': key_file}}
                 services.append(entry)
 
+        # 记下真正写进配置的端口，gost_ports_ready 只等这些（2026-11-03 修）。
+        gost_written_ports[:] = [int(s['addr'].lstrip(':')) for s in services]
         cfg = {'services': services,
                'bypasses': [{'name': GOST_PRIVATE_BYPASS,
                              'matchers': list(PRIVATE_REJECT_RULES) + ['localhost', '*.localhost']}]}
@@ -8241,15 +8268,11 @@ def serve(path):
         atomic_write_private(gost_cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8'))
 
     def gost_ports_ready():
+        # 只等 write_gost_config 实际写进配置的端口（2026-11-03 修）：旧实现自己再解析
+        # 一遍 proxy_services，True 被当成端口 1、70000 照收，而这些条目根本没写进
+        # gost.yml —— gost 永远不会监听它们，于是每次增删代理都判「未生效」并回滚。
         with data_lock:
-            # 容错：数据里某条记录的 port 被改坏时，跳过它而不是让整个
-            # reload 因 ValueError 失败（2026-10-29 修）。
-            ports = []
-            for item in proxy_services(data):
-                try:
-                    ports.append(int(item['port']))
-                except (KeyError, TypeError, ValueError):
-                    continue
+            ports = list(gost_written_ports)
         if not ports:
             return True
         # 读监听表而不是逐个 create_connection（2026-10-29 改）：
@@ -10564,7 +10587,9 @@ if __name__ == '__main__':
                         except RuntimeError as exc:
                             return 400, {'ok': False, 'error': str(exc)}
                     existing = set()
-                    for item in previous:
+                    # 用已清洗的工作副本（2026-11-03 修）：previous 是原始值，容器是
+                    # null / 数字时 `for item in previous` 抛 TypeError，新增代理一律 500。
+                    for item in working:
                         try:
                             existing.add(int(item['port']))
                         except (KeyError, TypeError, ValueError):
@@ -12453,8 +12478,12 @@ if __name__ == '__main__':
                 paths = [Path('/etc/modules-load.d/bbr.conf'), Path('/etc/sysctl.d/99-bbr.conf')]
                 originals = {path: path.read_bytes() if path.exists() else None for path in paths}
                 try:
-                    paths[0].write_text('tcp_' + target + '\n', encoding='utf-8')
-                    paths[1].write_text('\n'.join('%s = %s' % item for item in settings.items()) + '\n', encoding='utf-8')
+                    # 带上归属标记，卸载时据此认出并删除（2026-11-03 修）：旧文件没有标记，
+                    # 卸载后重启仍加载 BBR 模块、套用这些 sysctl。
+                    paths[0].write_text(BBR_FILE_MARKER + '\ntcp_' + target + '\n', encoding='utf-8')
+                    paths[1].write_text(BBR_FILE_MARKER + '\n'
+                                        + '\n'.join('%s = %s' % item for item in settings.items()) + '\n',
+                                        encoding='utf-8')
                     applied = subprocess.run(['sysctl', '-p', str(paths[1])], capture_output=True, text=True, timeout=5)
                     if applied.returncode != 0:
                         raise RuntimeError('sysctl 应用失败')
@@ -14555,14 +14584,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
     # 启动时比较完整托管客户端列表；服务已停止但配置匹配时也尝试恢复。
     try:
-        if Path('/etc/hysteria/xray.json').exists():
+        # 与 apply_access 用同一个文件（portal_path.parent），检查与修复看的是同一份配置。
+        _startup_xray = portal_path.parent / 'xray.json'
+        if _startup_xray.exists():
             with data_lock:
                 _want = {REALITY_INBOUND_TAG: reality_clients(data),
                          VMESS_INBOUND_TAG: vmess_clients(data),
                          VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
             _got = {}
             try:
-                _cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                _cfg = json.loads(_startup_xray.read_text(encoding='utf-8'))
                 for _tag in MANAGED_INBOUND_TAGS:
                     _idx, _inb = managed_inbound_index(_cfg, _tag)
                     if _idx >= 0:
@@ -14571,12 +14602,24 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 _got = {}
             _mismatch = any(_want[tag] != (_got.get(tag) or []) for tag in _got)
             _stopped = bool(_got) and _systemd_state('xray') != 'active'
-            if (_mismatch or _stopped) and not unit_suspended('xray'):
+            if _mismatch and not unit_suspended('xray'):
+                # clients 与 portal.json 不一致时要按 data 重写 xray.json（2026-11-03 修）：
+                # 旧实现只 restart，Xray 重读的还是同一份旧文件。门户在 portal.json 已存、
+                # xray.json 未写时崩溃，新开 / 续费的用户就一直连不上 Reality / VMess。
+                # 先 reset-failed：停止状态的 xray 会被 apply 视为停用而不重启。
+                subprocess.run(['systemctl', 'reset-failed', 'xray'],
+                               capture_output=True, timeout=5)
+                # current != wanted 时 apply_access 自己就会改写并重启，不需要 force_ids。
+                if apply_access():
+                    print('[portal] 启动时按 portal.json 重写了 xray clients', file=sys.stderr)
+                else:
+                    print('[portal] 启动时补同步 clients 失败，交给撤销线程重试', file=sys.stderr)
+            elif _stopped and not unit_suspended('xray'):
                 subprocess.run(['systemctl', 'reset-failed', 'xray'],
                                capture_output=True, timeout=5)
                 subprocess.run(['systemctl', 'restart', 'xray'],
                                capture_output=True, timeout=10)
-                print('[portal] 启动时恢复了 xray 服务或补同步 clients', file=sys.stderr)
+                print('[portal] 启动时恢复了 xray 服务', file=sys.stderr)
     except Exception as e:
         print('[portal] 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
 

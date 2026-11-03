@@ -55,6 +55,27 @@ class RenderCorruptStateTests(unittest.TestCase):
                     'hysteria2://x@h:1/', 'clash', 'sing', '', 'tok', 'k', sub_port=8443)
                 self.assertIn('<!doctype html', page.lower())
 
+    def render_user(self, **fields):
+        base = {'status': 'active', 'expires_at': 2085974400, 'limit_bytes': 0, 'used_bytes': 0}
+        return portal.user_page_html('h.example.com', '1.2.3.4', 443, '', 'u', dict(base, **fields),
+                                     'hysteria2://x@h:1/', 'clash', 'sing', '', 'tok', 'k', sub_port=8443)
+
+    def test_user_page_shows_unlimited_for_boolean_ip_limit(self):
+        """ip_limit=true 实际不限设备（与鉴权同一判据），页面不能写「1 个网络」（2026-11-03 修）。"""
+        page = self.render_user(ip_limit=True)
+        self.assertNotIn('1 个网络', page)
+        self.assertIn('不限制', page)
+        self.assertIn('3 个网络', self.render_user(ip_limit=3))
+
+    def test_infinite_expiry_is_not_shown_as_permanent(self):
+        """expires_at=inf 时鉴权拒绝该用户，页面不能写「永久有效」（2026-11-03 修）。"""
+        for bad in (float('inf'), 'inf', '1e999', float('nan')):
+            with self.subTest(bad=bad):
+                self.assertEqual(portal._expiry_text(bad), '到期时间无效')
+                self.assertIsNotNone(portal.user_access_denial({'expires_at': bad}, 1))
+                page = self.render_user(expires_at=bad)
+                self.assertNotIn('永久有效', page)
+
     def test_page_html_tolerates_non_string_password(self):
         """旧版本会把数字密码原样落盘；单条坏密码不能让整个总览页渲染失败。"""
         meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com',

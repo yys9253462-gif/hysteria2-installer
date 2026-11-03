@@ -19,6 +19,8 @@ TREE = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
 def load_writer():
     fn = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef)
               and n.name == 'write_gost_config')
+    ready = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef)
+                 and n.name == 'gost_ports_ready')
     helper = next(n for n in TREE.body if isinstance(n, ast.FunctionDef)
                   and n.name == 'proxy_services')
     root = Path(__file__).resolve().parents[1] / 'tests' / '_gost_fixture'
@@ -27,7 +29,9 @@ def load_writer():
         if isinstance(n, ast.Assign) and any(getattr(t, 'id', '') in (
                 'PRIVATE_REJECT_RULES', 'GOST_PRIVATE_BYPASS') for t in n.targets):
             exec(compile(ast.Module(body=[copy.deepcopy(n)], type_ignores=[]), '<const>', 'exec'), env)
-    exec(compile(ast.Module(body=[copy.deepcopy(helper), copy.deepcopy(fn)], type_ignores=[]),
+    env['gost_written_ports'] = []
+    env['sys'] = __import__('sys')
+    exec(compile(ast.Module(body=[copy.deepcopy(helper), copy.deepcopy(fn), copy.deepcopy(ready)], type_ignores=[]),
                  '<gost>', 'exec'), env)
     return env
 
@@ -99,6 +103,41 @@ class GostConfigCorruptStateTests(unittest.TestCase):
                     self.assertTrue(any(addr in n for n in nets if n.version == addr.version), target)
                 self.assertIn('localhost', matchers)
 
+
+    def setup_env(self, services, tls=None):
+        import tempfile
+        written = {}
+        env = load_writer()
+        env.update({'data': {'proxy_services': services}, 'data_lock': threading.RLock(),
+                    'portal_path': Path(tempfile.mkdtemp()) / 'portal.json', 'json': json,
+                    'atomic_write_private': lambda p, b: written.update(payload=b),
+                    'gost_tls_paths': tls or (lambda root: ('/c.pem', '/k.pem'))})
+        return env, written
+
+    def test_readiness_only_waits_for_ports_actually_written(self):
+        """坏端口没写进 gost.yml，就不能拿它判定「未生效」（2026-11-03 修）。
+
+        旧实现 gost_ports_ready 自己解析：True 当成 1、70000 照收，gost 永远不会
+        监听这些端口，每次增删代理都被判失败并回滚。
+        """
+        env, _ = self.setup_env([{'type': 'socks5', 'port': 25001}, {'port': True}, {'port': 70000}])
+        env['write_gost_config']()
+        env['_listening_ports_detail'] = lambda: ({25001}, True)
+        self.assertTrue(env['gost_ports_ready']())
+        env['_listening_ports_detail'] = lambda: (set(), True)
+        self.assertFalse(env['gost_ports_ready']())
+
+    def test_https_proxy_without_certificate_does_not_block_others(self):
+        """一条 HTTPS 代理拿不到证书时只跳过它（2026-11-03 修）。"""
+        def no_cert(root):
+            raise RuntimeError('no usable certificate')
+        env, written = self.setup_env([{'type': 'https', 'port': 25003},
+                                       {'type': 'socks5', 'port': 25001}], tls=no_cert)
+        env['write_gost_config']()
+        cfg = json.loads(written['payload'])
+        self.assertEqual([s['addr'] for s in cfg['services']], [':25001'])
+        env['_listening_ports_detail'] = lambda: ({25001}, True)
+        self.assertTrue(env['gost_ports_ready']())
 
 if __name__ == '__main__':
     unittest.main()

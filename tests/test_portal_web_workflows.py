@@ -297,6 +297,15 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('qa%40user:a%40b%2F%23%3F@', body['url'])
 
+    def test_proxy_create_survives_a_null_container(self):
+        """proxy_services 是 null / 数字时新增代理不能 500（2026-11-03 修）。"""
+        for bad in (None, 7):
+            with self.subTest(bad=bad):
+                self.data['proxy_services'] = bad
+                status, body = self.invoke('_h_post_manage_proxy', {'action': 'create', 'type': 'http'})
+                self.assertEqual(status, 200, body)
+                self.assertEqual(len(self.data['proxy_services']), 1)
+
     def test_proxy_apply_failure_rolls_back_new_record(self):
         self.reload.return_value = False
         status, body = self.invoke('_h_post_manage_proxy', {'action': 'create', 'type': 'http'})

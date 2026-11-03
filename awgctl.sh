@@ -796,11 +796,16 @@ peer_apply_live_add() {
 peer_apply_live_del() {
     local pub="$1"
     service_active || return 0
-    if ! "$AWG_BIN" set "$AWG_LINK" peer "$pub" remove 2>/dev/null; then
-        log_err "客户端已从文件和服务端配置删除，但运行接口未能同步移除；请执行 hy2-awgctl resync。"
+    # 记录缺公钥（jq 输出 null / 空）或热移除失败时，按刚渲染好的配置重启接口
+    # （2026-11-03 修）：旧实现只打一句「请执行 resync」并照报删除成功，
+    # 被删的客户端一直连着，直到有人手动 resync。
+    if [[ -n "$pub" && "$pub" != null ]] && "$AWG_BIN" set "$AWG_LINK" peer "$pub" remove 2>/dev/null; then
         return 0
     fi
-    return 0
+    if ! systemctl restart "$AWG_SERVICE_NAME"; then
+        die "客户端已从配置删除，但无法移除运行中的连接（重启 ${AWG_SERVICE_NAME} 失败）"
+    fi
+    log_warn "无法热移除该客户端，已按新配置重启 AmneziaWG（其他客户端会短暂重连）。"
 }
 
 restore_peer_files() {
@@ -888,7 +893,7 @@ cmd_peer_del() {
     peer_exists "$name" || die "客户端不存在: ${name}"
 
     local pub tmp peers_backup config_backup had_config=0
-    pub="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .public_key' "$AWG_PEERS_FILE")"
+    pub="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .public_key // empty' "$AWG_PEERS_FILE")"
     peers_backup="${AWG_DIR}/.peers-backup.$$"
     config_backup="${AWG_DIR}/.conf-backup.$$"
     (umask 077; cp -p "$AWG_PEERS_FILE" "$peers_backup") || { rm -f "$peers_backup"; die "无法备份客户端列表"; }
