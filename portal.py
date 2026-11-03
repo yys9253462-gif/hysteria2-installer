@@ -3,6 +3,7 @@
 """
 import ast
 import collections
+import signal
 import copy
 import contextlib
 import datetime
@@ -14872,6 +14873,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         usage_meter.start()
     threading.Thread(target=expiry_access_worker,name="portal-expiry-enforcer",daemon=True).start()
     threading.Thread(target=reality_iplimit_worker,name="portal-reality-iplimit",daemon=True).start()
+
+    # systemd 停止 / 重启 / 关机时先把内存里的计量落盘（2026-11-04 修）：计量每 60 秒
+    # 才写一次，旧实现收到 SIGTERM 直接退出，最多丢一分钟流量；关机时 Hy2 / Xray
+    # 也一起重启换了 epoch，这段流量再也补算不回来，used_bytes 永久偏低。
+    def _flush_and_exit(signum, frame):
+        try:
+            save_data()
+        except Exception as exc:
+            print('[portal] 退出前保存失败: %s' % type(exc).__name__, file=sys.stderr)
+        raise SystemExit(0)
+    # 只有主线程能装信号处理器；测试里在线程中跑 serve() 时跳过，不能让门户因此起不来。
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _flush_and_exit)
     server.serve_forever()
 
 
