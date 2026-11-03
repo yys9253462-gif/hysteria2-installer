@@ -10570,7 +10570,9 @@ if __name__ == '__main__':
                         except RuntimeError as exc:
                             return 400, {'ok': False, 'error': str(exc)}
                     existing = set()
-                    for item in previous:
+                    # 用已清洗的工作副本（2026-11-03 修）：previous 是原始值，容器是
+                    # null / 数字时 `for item in previous` 抛 TypeError，新增代理一律 500。
+                    for item in working:
                         try:
                             existing.add(int(item['port']))
                         except (KeyError, TypeError, ValueError):
