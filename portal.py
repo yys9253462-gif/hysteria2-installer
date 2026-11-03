@@ -8212,6 +8212,7 @@ def serve(path):
 
     gost_written_ports = []
     speedtest_lock = threading.Lock()
+    unlock_check_lock = threading.Lock()
 
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
@@ -13983,8 +13984,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             以节点 IP 出口的任意 HTTP 代理。
             各项并发执行、单项 8 秒超时，整体约 10 秒内返回。
             """
-            self._extend_deadline(60)
-            results = run_unlock_checks()
+            # 与测速同理只跑一轮（2026-11-04 修）：每轮十几个并发外连，重叠请求只会
+            # 互相拖慢、占满 quick 槽，结果也不会更新。
+            if not unlock_check_lock.acquire(blocking=False):
+                return self.reply_json(429, {'ok': False, 'error': 'UNLOCK_CHECK_BUSY'})
+            try:
+                self._extend_deadline(60)
+                results = run_unlock_checks()
+            finally:
+                unlock_check_lock.release()
             return self.reply_json(200, {'ok': True, 'results': results, 'time': int(time.time())})
 
         def _h_api_speedtest(self):
