@@ -12858,6 +12858,10 @@ fi
 WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF")
 WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF")
 WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF")
+# 与 install.sh 一致：用 wgcf 下发的双栈地址，否则解析到 IPv6 的 WARP 域名连不上。
+WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+[ -n "$WG_ADDR" ] || WG_ADDR="172.16.0.2/32"
+case "$WG_ADDR" in *:*) WG_ALLOWED="0.0.0.0/0, ::/0" ;; *) WG_ALLOWED="0.0.0.0/0" ;; esac
 if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ]; then
     echo "WireGuard 配置解析失败 (PrivateKey/PublicKey/Endpoint 缺失)" >&2
     exit 1
@@ -12866,14 +12870,14 @@ fi
 cat > "$WP_CFG" <<WPEOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
-Address = 172.16.0.2/32
+Address = ${WG_ADDR}
 PrivateKey = ${WG_PRIV}
 DNS = 1.1.1.1
 
 [Peer]
 PublicKey = ${WG_PUB}
 Endpoint = ${WG_EP}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = ${WG_ALLOWED}
 PersistentKeepalive = 25
 
 [Socks5]

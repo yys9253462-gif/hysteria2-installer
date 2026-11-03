@@ -4198,17 +4198,23 @@ install_warp_local_proxy() {
 ')
     WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF" | tr -d '
 ')
+    # 用 wgcf 下发的地址（含 IPv6），AllowedIPs 同时放行 ::/0（2026-11-03 修）：
+    # 旧配置只写 IPv4，走 WARP 的域名一旦解析到 IPv6 就连不上（SE 上实测）。
+    WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+    [[ -n "$WG_ADDR" ]] || WG_ADDR="172.16.0.2/32"
+    WG_ALLOWED="0.0.0.0/0"
+    [[ "$WG_ADDR" == *:* ]] && WG_ALLOWED="0.0.0.0/0, ::/0"
     cat > "$WP_CFG" <<EOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
-Address = 172.16.0.2/32
+Address = ${WG_ADDR}
 PrivateKey = ${WG_PRIV}
 DNS = 1.1.1.1
 
 [Peer]
 PublicKey = ${WG_PUB}
 Endpoint = ${WG_EP}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = ${WG_ALLOWED}
 PersistentKeepalive = 25
 
 [Socks5]
