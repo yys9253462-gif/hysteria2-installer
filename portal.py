@@ -11131,8 +11131,11 @@ if __name__ == '__main__':
 
                 if action in ('start', 'stop', 'restart'):
                     label = {'start': '启动', 'stop': '停止', 'restart': '重启'}.get(action, action)
-                    proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
-                                          capture_output=True, text=True, timeout=30)
+                    # 与 peer 增删 / 更新串行（2026-11-04 修）：在它们中途停掉接口，热添加会
+                    # 落在正在关闭的接口上，更新自己的重启也会和这里打架。
+                    with awg_operation_lock:
+                        proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
+                                              capture_output=True, text=True, timeout=30)
                     if proc.returncode != 0:
                         return self.reply_json(500, {'ok': False, 'error': '服务' + label + '失败：' + (proc.stderr or '').strip()[-400:]})
                     return self.reply_json(200, {'ok': True, 'message': '服务已' + label})

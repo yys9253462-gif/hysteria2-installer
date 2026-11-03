@@ -2059,5 +2059,16 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         self.assertTrue(extended and max(extended) >= 90, extended)
 
+    def test_awg_service_actions_wait_for_other_awg_operations(self):
+        """启停 AWG 要与 peer 增删 / 更新串行（2026-11-04 修）。"""
+        self.awg_suspended_fixture(False)
+        held = []
+        lock = self.ns['awg_operation_lock']
+        self.run.side_effect = lambda args, **kw: held.append(lock.locked()) or SimpleNamespace(
+            returncode=0, stdout='', stderr='')
+        status, payload = self.invoke('_h_post_manage_amneziawg', {'action': 'stop'})
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(held, [True], '启停 AWG 时没有持有 AWG 操作锁')
+
 if __name__ == '__main__':
     unittest.main()
