@@ -182,6 +182,8 @@ if acquire_lock; then exit 1; fi
     def test_live_peer_apply_failures_are_reported(self):
         result = self.run_shell(r'''
 service_active() { return 0; }
+# 热移除失败时 peer_apply_live_del 会按新配置重启接口（2026-11-03）；这里记录而不真重启。
+systemctl() { echo "systemctl $*" >> "$ROOT/systemctl.log"; return 0; }
 cat > "$AWG_BIN" <<'STUB'
 #!/bin/sh
 exit 1
@@ -189,6 +191,7 @@ STUB
 chmod +x "$AWG_BIN"
 if ! peer_apply_live_add pub psk 10.66.66.2; then exit 1; fi
 if ! peer_apply_live_del pub; then exit 1; fi
+grep -qx 'systemctl restart amneziawg-server' "$ROOT/systemctl.log"
 ''')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 

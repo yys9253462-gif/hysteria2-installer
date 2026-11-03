@@ -335,6 +335,28 @@ render_server_config
 check_eq "服务端配置含 3 个 Peer 段" "$(grep -c '^\[Peer\]' "$AWG_CONFIG")" "3"
 check_eq "服务端配置含全部 3 个客户端注释" "$(grep -cE '^# (one|three|four)$' "$AWG_CONFIG")" "3"
 
+# 记录缺公钥时，peer-del 要重启接口把它断开，不能静默留着（2026-11-03 修）。
+_live_calls="${WORK}/live-del-calls"
+: > "$_live_calls"
+(
+    service_active() { return 0; }
+    systemctl() { echo "systemctl $*" >> "$_live_calls"; return 0; }
+    AWG_BIN_SAVE="$AWG_BIN"
+    awg_stub="${WORK}/awg-stub"
+    printf '#!/bin/sh
+echo "awg $*" >> "%s"
+[ "$4" = null ] && exit 1
+exit 0
+' "$_live_calls" > "$awg_stub"
+    chmod +x "$awg_stub"
+    AWG_BIN="$awg_stub"
+    peer_apply_live_del ""
+    peer_apply_live_del null
+    peer_apply_live_del pub-real
+) >/dev/null 2>&1
+check_eq "缺公钥的 peer-del 会重启接口（两次）" "$(grep -c '^systemctl restart' "$_live_calls")" "2"
+check_eq "有公钥时只做热移除" "$(grep -c '^awg set awg0 peer pub-real remove' "$_live_calls")" "1"
+
 # 渲染失败时 peer-add / peer-del 必须恢复 peers 和 server config，且不触碰运行态。
 cp -p "$AWG_PEERS_FILE" "${WORK}/peers.before"
 cp -p "$AWG_CONFIG" "${WORK}/config.before"
