@@ -9596,6 +9596,10 @@ if __name__ == '__main__':
                                 if params[key] < (1 if key == 'duration_days' else 0):
                                     raise ValueError()
                         if 'traffic_gb' in params:
+                            # 与上面的整数字段一样拒绝 bool（2026-11-04 修）：float(True) == 1.0，
+                            # {"traffic_gb": true} 被当成 1 GB 配额写进去。
+                            if isinstance(params['traffic_gb'], bool):
+                                raise ValueError()
                             params['traffic_gb'] = float(params['traffic_gb'])
                             if not math.isfinite(params['traffic_gb']) or params['traffic_gb'] < 0:
                                 raise ValueError()

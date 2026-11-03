@@ -926,6 +926,25 @@ class WebWorkflowTests(unittest.TestCase):
         extract_method('do_POST', self.ns)(self.handler)
         return self.response
 
+    def test_api_rejects_booleans_for_numeric_user_fields(self):
+        """布尔值不能被当成数字：ip_limit / expires_at 一直在入口拒绝，traffic_gb 曾漏掉（2026-11-04 修）。
+
+        float(True) == 1.0：{"traffic_gb": true} 会被当成 1 GB 配额。
+        """
+        self.data['users']['qa-user'] = {'password': 'old', 'status': 'active',
+            'expires_at': 2200000000, 'limit_bytes': 10, 'ip_limit': 0}
+        before = copy.deepcopy(self.data['users']['qa-user'])
+        for field in ('ip_limit', 'expires_at'):
+            with self.subTest(endpoint='update', field=field):
+                status, _ = self.invoke_api({'user_id': 'qa-user', field: True}, 'users/update')
+                self.assertEqual(status, 400)
+                self.assertEqual(self.data['users']['qa-user'], before)
+        for field in ('ip_limit', 'expires_at', 'duration_days', 'traffic_gb'):
+            with self.subTest(endpoint='create', field=field):
+                status, _ = self.invoke_api({'user_id': 'fresh-user', 'password': 'pw-x', field: True})
+                self.assertEqual(status, 400)
+                self.assertNotIn('fresh-user', self.data['users'])
+
     def test_api_update_and_renew_persist_user_changes(self):
         self.data['users']['qa-user'] = {'password': 'old', 'status': 'active',
             'expires_at': 2200000000, 'limit_bytes': 10, 'ip_limit': 0}
