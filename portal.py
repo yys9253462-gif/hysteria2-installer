@@ -2056,28 +2056,32 @@ def user_share_available(user, now=None):
     return user_access_allowed(user, now)
 
 
+_SHARE_DENIAL_TEXT = {
+    'User account inactive': '账号已被停用',
+    'User account expired': '服务已到期',
+    'Traffic quota exceeded': '流量已超额',
+}
+
+
 def share_unavailable_reason(user, now=None):
-    """Return a stable explanation for a denied share without trusting JSON types."""
-    now_ts = int(time.time() if now is None else now)
+    """分享页的拒绝说明，直接取自 user_access_denial（2026-11-04 改为同源）。
+
+    旧实现另写一份判据并把 now 取整：到期那一秒准入已拒绝、这里却还判「未到期」，
+    显示成笼统的「当前不可用」；损坏字段的分类也与准入不一致。
+    """
     if not isinstance(user, dict):
         return '账号资料无效'
-    if user.get('status', 'active') != 'active':
-        return '账号已被停用'
-    expires = user.get('expires_at')
-    if expires is not None:
-        try:
-            if float(expires) <= now_ts:
-                return '服务已到期'
-        except (TypeError, ValueError, OverflowError):
-            return '到期时间无效'
+    denial = user_access_denial(user, now)
+    if denial is None:
+        return '当前不可用'
+    if denial in _SHARE_DENIAL_TEXT:
+        return _SHARE_DENIAL_TEXT[denial]
     try:
-        limit_bytes = int(user.get('limit_bytes', 0) or 0)
-        used_bytes = int(user.get('used_bytes', 0) or 0)
+        if user.get('expires_at') is not None:
+            float(user.get('expires_at'))
     except (TypeError, ValueError, OverflowError):
-        return '流量数据无效'
-    if limit_bytes > 0 and used_bytes >= limit_bytes:
-        return '流量已超额'
-    return '当前不可用'
+        return '到期时间无效'
+    return '账号资料无效'
 
 
 def _expiry_text(value):
