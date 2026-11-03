@@ -9136,6 +9136,11 @@ if __name__ == '__main__':
             # 后拿到锁的那次会用**较早读到的旧快照**覆盖磁盘，把先写入的
             # 另一个协议静默丢掉（两个请求都返回成功，用户下次重启才发现）。
             with reality_apply_lock:
+                # clients 也要在锁内重新取（2026-11-04 修，与 VMess / VLESS-Enc 一致）：上面
+                # 那份是锁外拍的快照，等锁期间 apply_access 可能已撤掉某个刚删 / 到期的用户
+                # 并清掉待撤销记录，再写旧快照就把他加回 Reality，且不会再被撤销。
+                with data_lock:
+                    desired_inbound['settings']['clients'] = reality_clients(data)
                 previous_xray_bytes = xray_path.read_bytes() if xray_path.exists() else None
                 previous_xray = json.loads(previous_xray_bytes) if previous_xray_bytes is not None else None
                 previous_service_state = _systemd_service_snapshot('xray')

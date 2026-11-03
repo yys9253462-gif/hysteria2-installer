@@ -215,6 +215,41 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 500)
         self.assertFalse(body.get('ok'))
 
+    def test_reality_rebuild_takes_clients_under_the_apply_lock(self):
+        """重建 Reality 时，等锁期间被撤销的用户不能被写回（2026-11-04 修）。
+
+        旧实现在拿 reality_apply_lock 之前就拍好 clients：apply_access 此时撤掉某人并清掉
+        待撤销记录，重建拿到锁后写的仍是旧名单，这人又能连 Reality、且不会再被撤销。
+        这里让锁在进入时删掉用户，模拟「等锁期间完成了撤销」。
+        """
+        self.data['users']['gone'] = {'password': 'pw-gone', 'status': 'active', 'expires_at': 4102444800}
+        written = {}
+        data = self.data
+
+        class RevokingLock:
+            def __enter__(self_inner):
+                data['users'].pop('gone', None)
+            def __exit__(self_inner, *exc):
+                return False
+
+        def capture(cfg, *a, **kw):
+            written['cfg'] = copy.deepcopy(cfg)
+        self.ns.update(reality_apply_lock=RevokingLock(), reality_clients=portal.reality_clients,
+                       reality_registry=portal.reality_registry,
+                       apply_xray_config_transaction=Mock(side_effect=capture))
+        self.data['reality_config'] = {'private_key': 'k' * 43, 'public_key': 'p' * 43,
+                                       'short_id': 'abcd1234', 'dest_sni': 'www.apple.com', 'port': 8444}
+        portal.reality_registry(self.data)
+        generate = extract_method('_generate_and_apply_reality', self.ns)
+        try:
+            generate(self.handler, restart=False)
+        except Exception:
+            pass  # 写完配置之后的步骤（重启、防火墙）不在本用例关心范围内
+        cfg = written.get('cfg')
+        self.assertIsNotNone(cfg, '没有走到写配置那一步')
+        inbound = next(i for i in cfg['inbounds'] if i.get('tag') == portal.REALITY_INBOUND_TAG)
+        self.assertNotIn('gone', [c.get('email') for c in inbound['settings']['clients']])
+
     def test_reality_keygen_failure_never_uses_a_shared_static_key(self):
         self.run.return_value = SimpleNamespace(returncode=1, stdout='', stderr='keygen failed')
         generate = extract_method('_generate_and_apply_reality', self.ns)
