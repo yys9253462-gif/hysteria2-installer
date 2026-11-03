@@ -5298,7 +5298,16 @@ restart_service() {
 restart_portal() {
     require_installed || return 1
     log_step "重启门户（私密信息页 / Hy2 鉴权后端 / 控制台 API）..."
-    systemctl restart hysteria-portal
+    systemctl restart hysteria-portal || return 1
+    # 与 restart_service 同理确认还活着（2026-11-04 修）：Type=simple 下 restart 一 fork
+    # 就返回成功，门户包半更新导致 import 失败时照报「已重启」—— 而门户是 Hy2 的
+    # 鉴权后端，它起不来所有用户都连不上。
+    sleep 3
+    if ! systemctl is-active --quiet hysteria-portal; then
+        log_err "门户启动后立即退出（Hy2 用户此时无法鉴权），最近日志："
+        journalctl -u hysteria-portal -n 15 --no-pager >&2 || true
+        return 1
+    fi
     log_info "已重启。"
 }
 
