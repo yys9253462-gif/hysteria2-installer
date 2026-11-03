@@ -1981,6 +1981,17 @@ def rotate_user_view_key_on_change(previous, current):
         current['view_nonce'] = secrets.token_hex(16)
 
 
+def user_metered(user):
+    """计量是否给这个账户记账（2026-11-03 修）。
+
+    旧实现直接用 user_access_allowed：超额 / 到期的用户判为「不允许接入」，计量
+    随之把它当作停用户，只挪游标不记账。撤销有延迟或失败时，超额之后继续跑的
+    流量从不进 used_bytes；续费后第一次采样又被当成新基线，这段流量永久丢失。
+    现在只有**被停用**（status=disabled）或记录损坏的账户不记账。
+    """
+    return isinstance(user, dict) and user.get('status', 'active') != 'disabled'
+
+
 def user_share_available(user, now=None):
     """分享页是否可用 —— 判据必须与 user_access_allowed 完全同源。"""
     return user_access_allowed(user, now)
@@ -8011,7 +8022,7 @@ def serve(path):
         usage_meter = _usage_runtime.from_file(data, data_lock, save_meter_data,
                                               portal_path.parent / 'usage-meter-config.json',
                                               on_speed=_meter_speed_sample)
-        usage_meter.user_allowed = user_access_allowed
+        usage_meter.user_allowed = user_metered
     except Exception as _usage_exc:
         print('[portal] 真实计量未初始化: ' + type(_usage_exc).__name__, file=sys.stderr)
 
