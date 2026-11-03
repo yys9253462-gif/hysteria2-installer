@@ -406,6 +406,18 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('qa%40user:a%40b%2F%23%3F@', body['url'])
 
+    def test_proxy_list_host_is_bracketed_for_ipv6(self):
+        """代理列表给前端的 host 要带方括号，前端直接拼进 socks5:// 链接（2026-11-04 修）。"""
+        self.meta.write_text(json.dumps({'is_insecure': True, 'public_ip': '2001:db8::7',
+                                         'server_name': 'x'}), encoding='utf-8')
+        self.ns.update(read_meta_file=portal.read_meta_file, _host_for_url=portal._host_for_url,
+                       proxy_services=portal.proxy_services)
+        self.handler.reply_json = self.reply_json
+        extract_method('_h_get_proxy_services', self.ns)(self.handler, 'proxy-services')
+        status, body = self.response
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['host'], '[2001:db8::7]')
+
     def test_proxy_create_survives_a_null_container(self):
         """proxy_services 是 null / 数字时新增代理不能 500（2026-11-03 修）。"""
         for bad in (None, 7):

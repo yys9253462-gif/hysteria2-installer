@@ -207,7 +207,8 @@ awg_transaction_restore() {
         index=$((index + 1))
     done
     unit_dir="$(dirname "$AWG_SERVICE")"
-    if [[ -d "$unit_dir" && -f "$AWG_TRANSACTION_DIR/0.present" ]]; then
+    # 单元文件可能刚被删除或还原：一律重载，否则 systemd 留着过期单元
+    if [[ -d "$unit_dir" ]]; then
         systemctl daemon-reload || return 1
     fi
     state_file="$AWG_TRANSACTION_DIR/service-state"
@@ -217,7 +218,8 @@ awg_transaction_restore() {
         enabled) systemctl enable "$AWG_SERVICE_NAME" || return 1 ;;
         enabled-runtime) systemctl enable --runtime "$AWG_SERVICE_NAME" || return 1 ;;
         disabled) systemctl disable "$AWG_SERVICE_NAME" || return 1 ;;
-        static|indirect|not-found|'') systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null || return 1 ;;
+        static|indirect|'') systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null || return 1 ;;
+        not-found) systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null || true ;;
         masked) systemctl mask "$AWG_SERVICE_NAME" || return 1 ;;
         *) return 1 ;;
     esac
@@ -1115,7 +1117,15 @@ cmd_install() {
         meta_set server_name "$server_name"
     fi
 
-    # 混淆参数（已存在则保留 —— 否则所有客户端立刻失效）
+    # 混淆参数（已存在则保留 —— 否则所有客户端立刻失效）。
+    # 例外同 cmd_update：在 2.x 安装上 install --line 3 时，旧 S4<12 不满足 3.x 头部
+    # 保护，沿用会让服务起不来、事务回滚，换协议线永远装不上（2026-11-04 修）。
+    local _s4
+    _s4="$(meta_get S4)"
+    if [[ -n "$(meta_get S1)" && "$line" == "3" && "${_s4:-0}" -lt 12 ]]; then
+        log_warn "旧 S4=${_s4} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
+        meta_set S1 ""
+    fi
     if [[ -z "$(meta_get S1)" ]]; then
         gen_obfs_params "$line"
         meta_set Jc "$AWG_JC";     meta_set Jmin "$AWG_JMIN"; meta_set Jmax "$AWG_JMAX"
@@ -1184,7 +1194,8 @@ cmd_install() {
     if ! peer_exists "$client"; then
         if [[ -n "$ep" ]]; then
             log_step "创建首个客户端: ${client}"
-            if ! cmd_peer_add "$client" "$ep"; then
+            # die 会直接 exit：放进子 shell，首个客户端失败不让已提交的安装报错退出
+            if ! ( cmd_peer_add "$client" "$ep" ); then
                 log_warn "自动创建首个客户端失败，请手动执行:"
                 log_warn "  hy2-awgctl peer-add ${client} --endpoint ${ep}"
             fi

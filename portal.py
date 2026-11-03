@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.23'
+PORTAL_VERSION = '2.24'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2236,6 +2236,16 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
                     return port
     return None
 
+
+
+def meta_display_host(m):
+    """订阅 / 门户地址里的节点主机，与 artifacts() 同一条回落规则。
+
+    prepare / refresh 原先直接取 m['is_insecure'] / m['server_name']：老 meta 或手写
+    meta 缺键时 KeyError，刷新门户与证书自愈一起失败（2026-11-04 修）。
+    """
+    server_name = m.get('server_name') or m.get('public_ip', 'localhost')
+    return m.get('public_ip', server_name) if m.get('is_insecure', False) else server_name
 
 
 def read_meta_file(meta_path):
@@ -7297,7 +7307,7 @@ def prepare(meta_path, port, node_api_key=None):
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
-    host = m['public_ip'] if m['is_insecure'] else m['server_name']
+    host = meta_display_host(m)
     # 初始化时把订阅端口**解析并写回** client_meta.json（自愈）：
     # 历史机器上这个键可能缺失或是错的，写回真实值后，
     # 后续所有读取路径（含用户专属页）都不会再落到伪造的 8443 上。
@@ -7381,7 +7391,7 @@ def sync_download_artifacts(data, uri, clash, sing, qr=_QR_UNSET):
     return data
 
 
-def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
+def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', precomputed_qr=None):
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先修信任模型再对齐 pin。
@@ -7397,7 +7407,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
     # 「刷新页面」「证书自愈」这类日常操作直接抛异常（2026-10-30 修）。
     access, _rebuilt = ensure_portal_access(root, m, data)
     uri, clash, sing = artifacts(m)
-    host = m['public_ip'] if m['is_insecure'] else m['server_name']
+    host = meta_display_host(m)
     subscription = (f"https://{access['username']}:{access['password']}@"
                     f"{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml")
     
@@ -7439,7 +7449,11 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
     # 的旧节点。页面文本框显示的是新 sni、二维码却是旧的 —— 用户扫了码导入，
     # 立刻 CRYPTO_ERROR 0x150，而面板看起来一切正常。这正是 sync_cert_trust
     # 要消灭的失败模式，只是从下一层又冒了出来。
-    sync_download_artifacts(data, uri, clash, sing)
+    # 锁外预先算好的二维码只在 uri 没变时用（sync_cert_trust 可能刚改过 meta）。
+    if precomputed_qr is not None and precomputed_qr[0] == uri:
+        sync_download_artifacts(data, uri, clash, sing, precomputed_qr[1])
+    else:
+        sync_download_artifacts(data, uri, clash, sing)
     
     # 域名 / 订阅端口改过之后，交给控制台的门户地址也要跟上（token 与凭据不变）。
     access_url = f"https://{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/"
@@ -7461,6 +7475,12 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml'):
                 epoch = latest.get('session_epoch', 0)
                 epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
                 latest['session_epoch'] = epoch + 1
+            # 上面补出来的 users / proxy_services 也要带过去：只叠加派生键会把迁移丢掉，
+            # 缺 users 的老 portal.json 刷新后照旧缺，serve() 直接拒绝启动（2026-11-04 修）。
+            if not isinstance(latest.get('users'), dict):
+                latest['users'] = data['users']
+            if not isinstance(latest.get('proxy_services'), list):
+                latest['proxy_services'] = data['proxy_services']
             latest.pop('page', None)
             data = latest
     except (OSError, ValueError):
@@ -7484,11 +7504,19 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     root = Path(meta_path).parent
     portal_file = root / 'portal.json'
     access_file = root / 'portal-access.json'
+    # qrencode 最长 20 秒，先在状态锁外跑：运行中门户的 save_data 持 data_lock 等这把锁，
+    # 锁内跑子进程会让所有 /auth 跟着卡住（2026-11-04 修）。
+    precomputed_qr = None
+    try:
+        _uri = artifacts(json.loads(Path(meta_path).read_text(encoding='utf-8')))[0]
+        precomputed_qr = (_uri, qr_svg_for(_uri))
+    except Exception as exc:
+        _log_ignored('refresh_qr_precompute', exc)
     with portal_state_file_lock(root):
         old_portal = portal_file.read_bytes()
         old_access = access_file.read_bytes() if access_file.exists() else None
         try:
-            _refresh_portal_state(meta_path, config_path)
+            _refresh_portal_state(meta_path, config_path, precomputed_qr)
         except Exception:
             try:
                 atomic_write_private(portal_file, old_portal)
@@ -7500,6 +7528,31 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
                 print('[portal] refresh credential/state rollback failed: %s'
                       % rollback_error, file=sys.stderr)
             raise
+
+
+CLI_OWNED_PORTAL_KEYS = ('port', 'api_key', 'auth_hash', 'session_secret', 'session_epoch',
+                         'clash', 'sing', 'qr', 'page_digest')
+
+
+def merge_cli_owned_state(data, disk):
+    """把 adopt / refresh 写到磁盘的键并进运行中门户的内存 data（原地修改）。
+
+    只取 CLI 负责的键与机主的密码 / 到期时间；用户、用量、代理服务仍以内存为准。
+    """
+    for key in CLI_OWNED_PORTAL_KEYS:
+        if key in disk:
+            data[key] = disk[key]
+    disk_users = disk.get('users')
+    disk_master = disk_users.get(MASTER_USER_ID) if isinstance(disk_users, dict) else None
+    users = data.get('users')
+    if isinstance(disk_master, dict) and isinstance(users, dict):
+        master = users.get(MASTER_USER_ID)
+        if not isinstance(master, dict):
+            users[MASTER_USER_ID] = dict(disk_master)
+        else:
+            for key in ('password', 'expires_at'):
+                if key in disk_master:
+                    master[key] = disk_master[key]
 
 
 def ensure_portal_access(root, meta, data):
@@ -7554,9 +7607,15 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     access_path = root / 'portal-access.json'
     access, _rebuilt = ensure_portal_access(root, m, data)
     data['port'] = int(port)
-    master = data.setdefault('users', {}).setdefault(MASTER_USER_ID, {
-        'expires_at': MASTER_EXPIRES_AT, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
-        'status': 'active', 'created_at': int(time.time()), 'note': 'Master Admin'})
+    # users 为 null / 列表、机主条目不是 dict 时按空处理，与 user_table 一致；
+    # 旧实现直接 AttributeError / TypeError，保留门户的重装中途失败（2026-11-04 修）。
+    if not isinstance(data.get('users'), dict):
+        data['users'] = {}
+    if not isinstance(data['users'].get(MASTER_USER_ID), dict):
+        data['users'][MASTER_USER_ID] = {
+            'expires_at': MASTER_EXPIRES_AT, 'ip_limit': 0, 'limit_bytes': 0, 'used_bytes': 0,
+            'status': 'active', 'created_at': int(time.time()), 'note': 'Master Admin'}
+    master = data['users'][MASTER_USER_ID]
     # 老节点上的机主账号带着 2036 年的到期时间，adopt 时顺手改成新值。
     if isinstance(master, dict) and master.get('expires_at') == LEGACY_MASTER_EXPIRES_AT:
         master['expires_at'] = MASTER_EXPIRES_AT
@@ -7757,7 +7816,10 @@ def persist_interrupted_core_job(portal_path, data):
 
 def serve(path):
     portal_path = Path(path)
-    data = json.loads(portal_path.read_text(encoding='utf-8'))
+    _loaded_bytes = portal_path.read_bytes()
+    data = json.loads(_loaded_bytes.decode('utf-8'))
+    # 本进程最后一次读到 / 写出的 portal.json 摘要，save_data 用它识别 CLI 带外写入。
+    disk_state = {'digest': hashlib.sha256(_loaded_bytes).digest()}
     # 必需字段缺失时给出明确中文错误再退出。旧行为是在后面的 data['port']
     # 处抛 KeyError，日志里只有一段 traceback —— 而门户是 Hysteria 的鉴权后端，
     # 它起不来等于全部用户连不上（2026-10-29 加）。
@@ -7949,8 +8011,24 @@ def serve(path):
             # 直接 UnicodeEncodeError 把 HTTP handler 打死，客户端看到的是
             # "Remote end closed connection without response"，
             # 排查时完全看不出是编码问题。
+            # adopt / refresh 是另一个进程，写完就 restart 本服务：SIGTERM 时的
+            # save_data 会拿旧内存把它们刚写的 api_key / 凭据 / 机主密码盖回去，
+            # 控制台随即 401（2026-11-04 修）。磁盘自上次读写后变了，就先采纳这些
+            # CLI 管的键，再写本进程管的其余状态（用户、用量、代理服务）。
+            try:
+                current = portal_path.read_bytes()
+            except OSError:
+                current = None
+            if current is not None and hashlib.sha256(current).digest() != disk_state['digest']:
+                try:
+                    disk = json.loads(current.decode('utf-8'))
+                except ValueError:
+                    disk = None
+                if isinstance(disk, dict):
+                    merge_cli_owned_state(data, disk)
             payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
             atomic_write_private(portal_path, payload)
+            disk_state['digest'] = hashlib.sha256(payload).digest()
 
     # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
     #
@@ -14085,7 +14163,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 'ok': True,
                 'gost_installed': Path('/usr/local/bin/gost').exists(),
                 'gost_active': gost_status(),
-                'host': host,
+                # 前端把它直接拼进 socks5:// / http:// 链接：IPv6 要带方括号（2026-11-04 修），
+                # 与新增代理时返回的 url 同一写法。
+                'host': _host_for_url(host),
                 'services': services
             })
 

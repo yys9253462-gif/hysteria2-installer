@@ -5470,6 +5470,11 @@ uninstall_all() {
                 nginx_removed=1
             fi
         done
+        # 验证站点删了，它们共用的 webroot 也一并删掉（2026-11-04 修）；
+        # 还有别的配置引用它（机主留下的非本工具站点）就保留。
+        if [[ "$nginx_removed" == 1 ]]                 && ! grep -rqsF '/var/lib/hy2-acme-webroot' /etc/nginx 2>/dev/null; then
+            rm -rf /var/lib/hy2-acme-webroot
+        fi
         if [[ "$nginx_removed" == 1 ]] && command -v nginx >/dev/null 2>&1; then
             nginx -t >/dev/null 2>&1 && { systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1; } || true
         fi

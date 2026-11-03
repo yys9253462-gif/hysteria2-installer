@@ -95,7 +95,9 @@ class MeterRecoveryTests(unittest.TestCase):
         env = {'data': {'users': {}}, 'data_lock': threading.RLock(),
                'json': __import__('json'), 'portal_path': Path('/fixture/portal.json'),
                'atomic_write_private': write, 'Path': Mock(return_value=fallback),
-               'portal_state_file_lock': lambda *_: __import__('contextlib').nullcontext()}
+               'portal_state_file_lock': lambda *_: __import__('contextlib').nullcontext(),
+               'hashlib': __import__('hashlib'), 'disk_state': {'digest': b''},
+               'merge_cli_owned_state': lambda *_: None}
         exec(compile(ast.Module(body=[node], type_ignores=[]), '<portal-save>', 'exec'), env)
         with self.assertRaises(OSError):
             env['save_data']()

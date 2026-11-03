@@ -1,3 +1,16 @@
+## 2026-11-04 — 第十四批十项修复，门户 2.24
+
+- 重装沿用门户、刷新门户后重启服务时，旧进程退出前的保存不再把 adopt / refresh 刚写入的 API Key、登录凭据、机主密码盖回去（此前控制台重绑后立即 401）。
+- 刷新门户时二维码在状态锁外生成，运行中门户的保存不再因此卡住 /auth 最长 20 秒。
+- 缺少 `users` / `proxy_services` 的老 portal.json 刷新后补全的字段会真正落盘，门户不再因缺 users 拒绝启动。
+- adopt 遇到 `users` 为 null / 列表、机主条目损坏时不再崩溃。
+- client_meta.json 缺 `is_insecure` / `server_name` 时 prepare / refresh 不再 KeyError。
+- 代理服务列表里的 IPv6 节点地址加上方括号，复制的 socks5:// / http:// 链接可用。
+- AWG：首个客户端创建失败不再让已完成的安装报「安装失败」。
+- AWG：首次安装失败回滚时执行 daemon-reload，不再总报「原状态恢复不完整」并留下事务目录。
+- AWG：在 2.x 安装上 `install --line 3` 会重新生成不满足 3.x 的混淆参数，换协议线不再必然回滚。
+- 完整卸载删除本工具创建的 ACME webroot（仍被其他 Nginx 配置引用时保留）。
+
 ## 2026-11-04 — 第十三批十项修复，门户 2.23
 
 - AmneziaWG 客户端配置把 IPv6 也导进隧道（`AllowedIPs = 0.0.0.0/0, ::/0`），双栈网络上不再从本地出口泄露真实 IPv6。
