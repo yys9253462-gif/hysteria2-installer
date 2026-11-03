@@ -141,6 +141,16 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     # 消失的用户保持旧游标：临时空响应不能让再次出现的累计值重复计数。
     sources[source] = {'epoch': epoch, 'counters': cursors, 'sampled_at': sampled_at,
                        'sampled_users': sorted(set(clean) | baseline_sampled)}
+    # 已删用户只在还有数据源留着它的游标时才需要记住（2026-11-03 修）：旧实现
+    # retired_users 只增不减，按订单开号、到期删号的店铺里 portal.json 无界增长，
+    # 每轮采样都在 data_lock 内遍历。所有来源都没有它的游标（例如服务重启换了
+    # epoch）后，同名重建只会从新基线开始，不会把旧计数算进去。
+    if active_users is not None and retired:
+        held = set()
+        for item in sources.values():
+            if isinstance(item, dict) and isinstance(item.get('counters'), dict):
+                held.update(item['counters'])
+        new['retired_users'] = sorted(retired & held)
     if first_sample:
         sources[source]['baseline_at'] = sampled_at
     elif 'baseline_at' in previous:
