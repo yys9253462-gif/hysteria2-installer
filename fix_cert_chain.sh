@@ -25,7 +25,8 @@ DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=1; shift ;;
-        --config)  CONFIG="${2:-}"; shift 2 ;;
+        # 缺值时 shift 2 失败而 $1 不变，旧实现在这里死循环（2026-11-04 修）
+        --config)  [[ $# -ge 2 ]] || { echo "--config 需要取值"; exit 2; }; CONFIG="$2"; shift 2 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "未知参数: $1"; exit 2 ;;
     esac
