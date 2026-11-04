@@ -24,7 +24,8 @@ def bash_path(path):
 
 
 def block():
-    m = re.search(r'\n(    # ⚠️ 主监听端口占用检测.*?\n    fi\n)\n    # 端口跳跃', SRC, re.S)
+    # 结尾是 `fi`（旧）或 `done`（2026-11-04 改成就地重选的循环）
+    m = re.search(r'\n(    # ⚠️ 主监听端口占用检测.*?\n    (?:fi|done)\n)\n    # 端口跳跃', SRC, re.S)
     return m.group(1)
 
 

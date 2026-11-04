@@ -2085,21 +2085,26 @@ setup_ports_and_obfs() {
     if systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f "$HY2_META_FILE" ]]; then
         _running_port="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
     fi
-    if [[ -n "${LISTEN_PORT:-}" ]] && is_valid_port "$LISTEN_PORT" \
-       && [[ "$LISTEN_PORT" != "$_running_port" ]]; then
+    # 答 y 就地重选（2026-11-04 修）：旧实现问「换一个端口？」，答 y 也照样中止安装。
+    # 环境变量指定的端口不重问（无人值守），直接中止。
+    while [[ -n "${LISTEN_PORT:-}" ]] && is_valid_port "$LISTEN_PORT" \
+       && [[ "$LISTEN_PORT" != "$_running_port" ]]; do
         _port_user="$(port_owner udp "$LISTEN_PORT")"
-        if [[ -n "$_port_user" ]]; then
-            log_err "所选主监听 UDP 端口 ${LISTEN_PORT} 已被占用（占用进程: ${_port_user}）。"
-            log_err "Hysteria 将无法绑定该端口，服务会反复重启。"
-            read -rp "换一个端口？[y/N]: " _port_retry || true
-            if [[ ! "$_port_retry" =~ ^[Yy]$ ]]; then
-                log_err "已中止安装。请释放该端口或重跑本脚本换一个端口。"
-                return 1
-            fi
-            log_info "请重新运行本脚本并指定其他端口。"
+        [[ -n "$_port_user" ]] || break
+        log_err "所选主监听 UDP 端口 ${LISTEN_PORT} 已被占用（占用进程: ${_port_user}）。"
+        log_err "Hysteria 将无法绑定该端口，服务会反复重启。"
+        _port_retry=""
+        [[ -n "${HY2_PORT:-}" ]] || { read -rp "换一个端口？[y/N]: " _port_retry || true; }
+        if [[ ! "$_port_retry" =~ ^[Yy]$ ]]; then
+            log_err "已中止安装。请释放该端口或重跑本脚本换一个端口。"
             return 1
         fi
-    fi
+        read -rp "请输入新的主监听 UDP 端口 [1-65535]: " LISTEN_PORT || true
+        if ! is_valid_port "${LISTEN_PORT:-}"; then
+            log_err "端口必须是 1-65535 之间的整数，已中止安装。"
+            return 1
+        fi
+    done
 
     # 端口跳跃 (默认全自动开启，免询问)
     clear_all_hopping_rules
