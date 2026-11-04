@@ -160,9 +160,11 @@ def main():
         domain = m.group(1)
 
     # 对外可达端口 = masquerade.listenHTTPS
-    https_port = (masq.get("listenHTTPS") or "").lstrip(":")
-    if not https_port:
-        m2 = re.search(r"listenHTTPS:\s*:?(\d+)", cfg_text)
+    # 可能写成 `:8443` 或 `0.0.0.0:8443`：只取最后一个冒号后的数字（2026-11-04 修），
+    # 旧实现拼出 https://a.com:0.0.0.0:8443 还返回 0。
+    https_port = (masq.get("listenHTTPS") or "").rpartition(":")[2].strip()
+    if not https_port.isdigit():
+        m2 = re.search(r"listenHTTPS:\s*\S*?:?(\d+)\s*$", cfg_text, re.M)
         https_port = m2.group(1) if m2 else ""
 
     if not https_port:
