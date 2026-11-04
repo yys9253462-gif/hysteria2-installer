@@ -1,3 +1,16 @@
+## 2026-11-04 — 第十九批十项修复，门户 2.29
+
+- `fix_cert_chain.sh` 只改 `tls:` 段里的 `cert:` 行并按字面替换：此前全文 sed，同前缀的 `key:` 路径一起被改坏，hysteria 起不来；新配置下起不来时自动恢复原配置。
+- `fix_cert_chain.sh` 只接受叶证书与当前证书一致的 fullchain，多域名机器上不再换成别的域名的证书链。
+- `fix_cert_chain.sh` 非 root 时拒绝实际修改（`--dry-run` 照常）。
+- `fix_cert_chain.sh` `--config` 缺少取值时退出，不再死循环。
+- `panel-join.py --format curl` 输出的每个值都按 shell 规则引用，节点名里的引号不能再拼出额外命令；不再原样打印管理员 JWT，改用 `$PANEL_ADMIN_TOKEN`。`--panel` 必须是 https。
+- `panel-join.py` `listenHTTPS: 0.0.0.0:8443` 这类带主机的写法拼出正确的 api_url。
+- `users/ip-deny` 拒收保留账号与带 zone 的 IPv6，IPv4 映射地址还原成 IPv4。
+- adopt / refresh 不在门户状态锁内运行 qrencode：此前重装沿用门户时 /auth 最长卡 20 秒。
+- 出口应用 worker 保存结果失败时不再整份回滚 data（此前会把同期删掉的用户救活、界面卡在「应用中」）。
+- 核心更新 worker 结果落盘失败时不再让线程带着异常退出，结果照常显示。
+
 ## 2026-11-04 — 第十八批十二项修复，门户 2.28
 
 - `reinstall-debian13.sh` 在用户输入 yes 确认之后才清盘：此前确认前就 wipefs，回答 no 时分区表已经没了。

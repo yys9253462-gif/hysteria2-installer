@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.28'
+PORTAL_VERSION = '2.29'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
