@@ -248,6 +248,14 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertNotIn('victim', self.data['users'], '保存失败把别的线程删掉的用户回滚回来了')
         self.assertNotIn('egress_applying', self.data, '应用结果被撤回，界面会一直显示应用中')
 
+    def test_recreating_a_user_with_pending_revocation_is_refused(self):
+        """同名旧账号收回未完成时不能重建（2026-11-04 修），否则新账号每 5 秒被踢。"""
+        self.data['_pending_revocations'] = ['qa-user']
+        status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user',
+                                                        'password': 'pw-new-user'})
+        self.assertEqual(status, 409)
+        self.assertNotIn('qa-user', self.data['users'])
+
     def test_padded_password_is_rejected_not_trimmed(self):
         """Web 建户不静默去掉密码首尾空白（2026-11-04 修，与 API 同一规则）。"""
         status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user',
@@ -1160,6 +1168,13 @@ class WebWorkflowTests(unittest.TestCase):
         self.handler.rfile = io.BytesIO(body)
         extract_method('do_POST', self.ns)(self.handler)
         return self.response
+
+    def test_api_recreate_refused_while_revocation_pending(self):
+        """REST users/create 同样拒绝重建收回未完成的同名账号（2026-11-04 修）。"""
+        self.data['_pending_revocations'] = ['pend-a']
+        status, body = self.invoke_api({'user_id': 'pend-a', 'password': 'pw-pend-a'})
+        self.assertEqual(status, 409, body)
+        self.assertNotIn('pend-a', self.data['users'])
 
     def test_dot_only_user_ids_cannot_be_created(self):
         """'.' / '..' 开户会让分享链接被折叠成别的地址，开户时就拒绝（2026-11-04 修）。"""

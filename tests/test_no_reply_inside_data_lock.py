@@ -79,6 +79,7 @@ class ConflictBranchTests(unittest.TestCase):
                    MASTER_USER_ID='admin_master', RESERVED_USER_IDS=frozenset({'admin_master'}),
                    user_id_shareable=lambda uid: bool(uid) and uid.strip('.') != '',
                    password_taken=lambda u, p, o: password_taken_result,
+                   pending_revocations=lambda d: set(),
                    rotate_user_view_key_on_change=lambda a, b: None,
                    reality_registry=lambda d: {},
                    regenerate_page=lambda: None,

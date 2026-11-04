@@ -10082,6 +10082,10 @@ if __name__ == '__main__':
                         _create_only = str(params.get('create_only', '')).strip().lower() in ('1', 'true', 'yes', 'on')
                         if _create_only and existing is not None:
                             conflict = (409, 'User already exists')
+                        elif existing is None and user_id in pending_revocations(data):
+                            # 同名旧账号的收回还没完成（2026-11-04 修）：此时重建，worker 每 5 秒
+                            # 会把新账号当成待收回对象踢下线，故障不消失就一直踢。
+                            conflict = (409, 'Revocation of the previous account with this user_id is still pending; retry later')
                         elif params.get('password') and password_taken(data.get('users', {}), pwd, user_id):
                             conflict = (409, 'Password already in use by another user')
                         if conflict is None:
@@ -13104,6 +13108,8 @@ if __name__ == '__main__':
                             conflict = ('exists', tail, used_gb)
                         elif password_taken(data.get('users', {}), pwd, user_id):
                             conflict = ('password',)
+                        elif user_id in pending_revocations(data):
+                            conflict = ('pending',)
                         else:
                             data.setdefault('users', {})[user_id] = {
                                 'password': pwd,
@@ -13124,6 +13130,9 @@ if __name__ == '__main__':
                                 # 旧文案会把管理员指向不存在的功能（2026-10-25 修）。
                                 '如需改参数请调用 REST API 的 users/update，或先删除该用户再重建。'
                             ).encode('utf-8'))
+                        if conflict[0] == 'pending':
+                            return self.reply(409, ('同名旧账号 %s 的收回尚未完成，请稍后再建（或先排查节点服务）。'
+                                                    % user_id).encode('utf-8'))
                         return self.reply(409, '该密码已被其他用户使用，请换一个（留空则自动生成）。'.encode('utf-8'))
                 elif action == 'delete' and user_id:
                     # 🔴 admin_master 不能被注销：它的 password 就是 Hysteria 的
