@@ -70,6 +70,9 @@ set_tls_cert () {   # $1=config $2=new path
 }
 
 [[ -f "$CONFIG" ]] || { err "找不到配置文件：$CONFIG"; exit 1; }
+if [[ "$DRY_RUN" != "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+    err "需要 root 运行（要改 $CONFIG 并重启服务）；只检查请加 --dry-run。"; exit 1
+fi
 
 CERT_FILE="$(cert_of "$CONFIG")"
 
