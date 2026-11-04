@@ -763,6 +763,20 @@ allow_firewall() {
     return 0
 }
 
+revoke_firewall() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+        firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    log_info "已收回旧端口 ${port}/udp 的防火墙放行"
+    return 0
+}
+
 # ==============================================================================
 # Peer（客户端）管理
 # ==============================================================================
@@ -1108,6 +1122,8 @@ cmd_install() {
     fi
     pub="$(pubkey_of "$priv")"
 
+    local old_port
+    old_port="$(meta_get port)"
     meta_set line "$line"
     meta_set port "$port"
     meta_set server_private_key "$priv"
@@ -1180,6 +1196,10 @@ cmd_install() {
         || die "服务显示 active 但 ${AWG_LINK} 接口不存在，请检查 journalctl -u ${AWG_SERVICE_NAME}"
 
     allow_firewall "$port"
+    # 重装换了端口：收回旧端口的放行（2026-11-04 修），否则它永久开着，之后谁绑上去谁就暴露。
+    if [[ -n "${old_port:-}" && "$old_port" != "$port" ]]; then
+        revoke_firewall "$old_port"
+    fi
 
     # 服务与端口已确认就绪，事务提交后首个客户端输出失败不再回滚服务器安装。
     awg_transaction_finish
