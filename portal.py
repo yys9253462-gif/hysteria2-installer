@@ -14583,10 +14583,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
-                outs = list(data.get('custom_outbounds', []))
-                mode = data.get('outbound_mode', 'rules')
-                rules = list(data.get('warp_rules', []))
+                # 走 routing_state 的清洗（2026-11-04 修）：custom_outbounds / warp_rules 被写成
+                # null 或数字时 list() 抛 TypeError，连接被掐断，出口编辑器整块空白。
                 state = routing_state(data)
+                outs = state['custom_outbounds']
+                mode = data.get('outbound_mode', 'rules')
+                rules = [r for r in state['warp_rules'] if isinstance(r, (str, dict))]
                 applying = bool(data.get('egress_applying'))
                 error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
             try:

@@ -205,6 +205,18 @@ class WebWorkflowTests(unittest.TestCase):
                                                            'password': 'pw-new-user'})
         self.assertEqual(status, 500, body)
 
+    def test_outbound_list_survives_damaged_containers(self):
+        """custom_outbounds / warp_rules 损坏时出口列表照常返回（2026-11-04 修）。"""
+        self.handler.path = '/test-token/outbounds/list'
+        for outs, rules in ((None, None), (7, 7), ([], [5, 'x.com'])):
+            with self.subTest(outs=outs, rules=rules):
+                self.data['custom_outbounds'] = outs
+                self.data['warp_rules'] = rules
+                status, body = extract_method('_ob_list', self.ns)(self.handler)
+                self.assertEqual(status, 200, body)
+                self.assertIsInstance(body['outbounds'], list)
+                self.assertTrue(all(isinstance(r, dict) for r in body['rules']))
+
     def test_padded_password_is_rejected_not_trimmed(self):
         """Web 建户不静默去掉密码首尾空白（2026-11-04 修，与 API 同一规则）。"""
         status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user',
