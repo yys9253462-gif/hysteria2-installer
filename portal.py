@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.30'
+PORTAL_VERSION = '2.31'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -6528,9 +6528,20 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
             online=request_stats('/online')
             if any(int(online.get(uid, 0)) > 0 for uid in active):
                 # 标准核心只在下一次传输消费 kick；闲置/多实例需确保全部会话关闭。
-                subprocess.run(['systemctl','restart','hysteria-server'],capture_output=True,timeout=12,check=True)
+                # 走 _restart_hy2（2026-11-04 修）：直接 restart 不清失败计数，一阵连续收回就撞上
+                # StartLimitBurst，服务锁死、全员掉线。重启后统计接口要稍等才绑好端口：Type=simple
+                # 下 is-active 在 fork 后就报 active，紧接着请求 /online 会被拒绝连接。
+                _restart_hy2()
                 subprocess.run(['systemctl','is-active','--quiet','hysteria-server'],capture_output=True,timeout=4,check=True)
-                online=request_stats('/online')
+                online=None
+                for _ in range(25):
+                    try:
+                        online=request_stats('/online')
+                        break
+                    except OSError:
+                        time.sleep(0.2)
+                if online is None:
+                    raise RuntimeError('Hy2 stats API not reachable after restart; cannot confirm revocation')
                 if any(int(online.get(uid, 0)) > 0 for uid in active):
                     raise RuntimeError('Hy2 sessions still present after revocation')
     xj=root/'xray.json'
@@ -8758,6 +8769,16 @@ def serve(path):
         except OSError:
             pass
 
+    def gost_owned():
+        """gost 是本工具装的：有所有权标记，且单元指向本工具的配置（与一键安装同一判据）。"""
+        unit = Path('/etc/systemd/system/gost.service')
+        try:
+            return (Path('/etc/hysteria/.hy2-gost-owned').is_file() and unit.is_file()
+                    and 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
+                    in unit.read_text(encoding='utf-8'))
+        except OSError:
+            return False
+
     def ensure_gost_unit():
         """幂等地把 gost.service 补齐成当前标准内容（缺 ExecReload / -R / 自检就重写）.
 
@@ -8771,6 +8792,10 @@ def serve(path):
         只在确实缺失时才写盘 + daemon-reload，避免无谓重启。
         """
         unit_path = Path('/etc/systemd/system/gost.service')
+        # 不是本工具的 gost 一律不碰（2026-11-04 修）：旧实现在新增 / 删除代理时把机主自己
+        # 的 gost.service 整份改写成指向 /etc/hysteria/gost.yml，并重启，原有服务全部停掉。
+        if unit_path.exists() and not gost_owned():
+            return
         try:
             current = unit_path.read_text(encoding='utf-8') if unit_path.exists() else ''
         except OSError:
@@ -10082,6 +10107,10 @@ if __name__ == '__main__':
                         _create_only = str(params.get('create_only', '')).strip().lower() in ('1', 'true', 'yes', 'on')
                         if _create_only and existing is not None:
                             conflict = (409, 'User already exists')
+                        elif existing is None and user_id in pending_revocations(data):
+                            # 同名旧账号的收回还没完成（2026-11-04 修）：此时重建，worker 每 5 秒
+                            # 会把新账号当成待收回对象踢下线，故障不消失就一直踢。
+                            conflict = (409, 'Revocation of the previous account with this user_id is still pending; retry later')
                         elif params.get('password') and password_taken(data.get('users', {}), pwd, user_id):
                             conflict = (409, 'Password already in use by another user')
                         if conflict is None:
@@ -10983,6 +11012,9 @@ if __name__ == '__main__':
             with gost_operation_lock:
                 if not Path('/usr/local/bin/gost').exists():
                     return 409, {'ok': False, 'error': '请先安装 GOST，再创建代理服务'}
+                if not gost_owned():
+                    return 409, {'ok': False, 'error':
+                        '本机的 GOST 不是本工具安装的（无法确认归属），为避免覆盖宿主服务，不在这里管理代理'}
                 with data_lock:
                     # 保留原始值用于回滚；工作副本只取合法条目，
                     # 否则容器被改坏后追加/筛选都会抛异常。
@@ -12433,12 +12465,14 @@ if __name__ == '__main__':
                 raise RuntimeError(reason)
             new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
                        'secret': old.get('secret') or secrets.token_hex(32)}
-            with data_lock:
-                preview = dict(data)
-                preview['anytls_config'] = new_cfg
-                users = anytls_users(preview)
             unit_path = Path('/etc/systemd/system/%s.service' % ANYTLS_SERVICE)
             with anytls_apply_lock:
+                # 用户表在协议锁内取（2026-11-04 修）：旧实现在锁外取，期间撤销流程同步完
+                # anytls.json，本次再用旧名单覆盖，刚被停用 / 到期的用户又能连上直到下次同步。
+                with data_lock:
+                    preview = dict(data)
+                    preview['anytls_config'] = new_cfg
+                    users = anytls_users(preview)
                 previous_unit = unit_path.read_bytes() if unit_path.exists() else None
                 unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                 unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
@@ -13104,6 +13138,8 @@ if __name__ == '__main__':
                             conflict = ('exists', tail, used_gb)
                         elif password_taken(data.get('users', {}), pwd, user_id):
                             conflict = ('password',)
+                        elif user_id in pending_revocations(data):
+                            conflict = ('pending',)
                         else:
                             data.setdefault('users', {})[user_id] = {
                                 'password': pwd,
@@ -13124,6 +13160,9 @@ if __name__ == '__main__':
                                 # 旧文案会把管理员指向不存在的功能（2026-10-25 修）。
                                 '如需改参数请调用 REST API 的 users/update，或先删除该用户再重建。'
                             ).encode('utf-8'))
+                        if conflict[0] == 'pending':
+                            return self.reply(409, ('同名旧账号 %s 的收回尚未完成，请稍后再建（或先排查节点服务）。'
+                                                    % user_id).encode('utf-8'))
                         return self.reply(409, '该密码已被其他用户使用，请换一个（留空则自动生成）。'.encode('utf-8'))
                 elif action == 'delete' and user_id:
                     # 🔴 admin_master 不能被注销：它的 password 就是 Hysteria 的

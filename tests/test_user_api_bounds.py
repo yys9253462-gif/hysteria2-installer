@@ -42,5 +42,6 @@ class PasswordWhitespaceTest(PortalServer):
         self.assertEqual(self.api('users/update', {'user_id': 'pad1', 'password': ' abc'})[0], 400)
 
 
+
 if __name__ == '__main__':
     unittest.main()

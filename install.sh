@@ -432,7 +432,11 @@ hy2_acme_install_verified() {
     chmod +x "${work}/acme.sh" || { rm -rf "$work"; log_err "无法设置可执行位，已放弃安装。"; return 1; }
     had_home=0
     if [[ -d "$home" ]]; then had_home=1; fi
-    if ! ( cd "$work" && ./acme.sh --install --home "$home" ); then
+    # 没有 crontab 时上游安装器直接拒绝（要 --force），续期也就无人调用（2026-11-04 修）：
+    # 这种机器改用 --nocron，续期由 hy2_acme_ensure_renew_timer 装的 systemd timer 负责。
+    local _cron_flag=()
+    command -v crontab >/dev/null 2>&1 || command -v fcrontab >/dev/null 2>&1 || _cron_flag=(--nocron)
+    if ! ( cd "$work" && ./acme.sh --install --home "$home" "${_cron_flag[@]}" ); then
         log_err "acme.sh 安装器执行失败（文件已通过校验，失败发生在安装阶段）。"
         if [[ $had_home -eq 0 ]]; then
             rm -rf "$home"
@@ -1516,6 +1520,29 @@ hy2_acme_ensure() {
         fi
     fi
     [[ -x "$acct" ]] || { log_err "acme.sh 不可用。"; return 1; }
+    hy2_acme_ensure_renew_timer "$HOME/.acme.sh" \
+        || log_warn "未能安装 acme.sh 续期定时器，请自行安排每日执行 ${acct} --cron。"
+    return 0
+}
+
+# 没有 cron 的机器上用 systemd timer 跑 acme.sh --cron（2026-11-04 加）：
+# 续期与 reloadcmd 钩子只在 --cron 时触发，没人调用它证书 90 天后就过期。
+# 有 crontab 且上游已写入计划任务时不重复安装。
+hy2_acme_ensure_renew_timer() {
+    local home="$1" unit_dir="${HY2_SYSTEMD_DIR:-/etc/systemd/system}"
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF 'acme.sh --cron'; then
+        return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 || return 1
+    printf '%s\n' '[Unit]' 'Description=acme.sh certificate renewal (hysteria2-installer)' '' \
+        '[Service]' 'Type=oneshot' "ExecStart=${home}/acme.sh --cron --home ${home}" \
+        > "${unit_dir}/hy2-acme-renew.service" || return 1
+    printf '%s\n' '[Unit]' 'Description=Daily acme.sh renewal (hysteria2-installer)' '' \
+        '[Timer]' 'OnCalendar=daily' 'RandomizedDelaySec=3600' 'Persistent=true' '' \
+        '[Install]' 'WantedBy=timers.target' \
+        > "${unit_dir}/hy2-acme-renew.timer" || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now hy2-acme-renew.timer >/dev/null 2>&1
 }
 
 # 借本机 Nginx 完成 HTTP-01 签发（2026-10-29）。
@@ -1976,6 +2003,13 @@ generate_self_signed_cert() {
     KEY_FILE="${HY2_CERT_DIR}/server.key"
     IS_INSECURE="true"
 
+    # 已有一对可用的自签证书就沿用（2026-11-04 修）：「重新修改配置」默认走这里，旧实现每次
+    # 重新生成，pin 跟着变，已发放的自签链接（带 pinSHA256）全部握手失败。
+    # 要强制换新证书：HY2_REGEN_SELF_SIGNED=1。
+    if [[ "${HY2_REGEN_SELF_SIGNED:-0}" != "1" && -s "$CERT_FILE" && -s "$KEY_FILE" ]]             && _cert_key_usable "$CERT_FILE" "$KEY_FILE"             && openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -q "CN *= *${SERVER_NAME}"; then
+        log_info "沿用现有自签名证书（pin 不变，已发放的客户端无需重新导入）。"
+        return 0
+    fi
     log_step "正在生成高拟真自签名 ECC 证书 (伪装 SNI: ${SERVER_NAME})..."
     openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE"
     openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SERVER_NAME}" >/dev/null 2>&1
@@ -3379,9 +3413,20 @@ show_client_configs() {
     fi
 
     local url user pass
-    url=$(jq -r '.url' "$HY2_DIR/portal-access.json")
-    user=$(jq -r '.username' "$HY2_DIR/portal-access.json")
-    pass=$(jq -r '.password' "$HY2_DIR/portal-access.json")
+    # 凭据文件损坏时给出可操作的提示（2026-11-04 修）：旧实现 jq 在 set -e 下直接退出，
+    # 用户只看到一句 jq 解析错误；字段缺失时则把字面量 null 当成网址 / 密码打印出来。
+    if ! jq -e 'type == "object"' "$HY2_DIR/portal-access.json" >/dev/null 2>&1; then
+        log_err "门户凭据文件 ${HY2_DIR}/portal-access.json 已损坏。"
+        log_err "执行 bash install.sh refresh-page 可重建凭据（token / API Key / 用户保留，登录密码会换新）。"
+        return 1
+    fi
+    url=$(jq -r '.url // empty' "$HY2_DIR/portal-access.json")
+    user=$(jq -r '.username // empty' "$HY2_DIR/portal-access.json")
+    pass=$(jq -r '.password // empty' "$HY2_DIR/portal-access.json")
+    if [[ -z "$url" || -z "$user" || -z "$pass" ]]; then
+        log_err "门户凭据文件缺少 url / username / password，执行 bash install.sh refresh-page 重建。"
+        return 1
+    fi
 
     # 原来这里只吐一串凭据就结束了，新手装完完全不知道下一步该做什么。
     # 实际上「装完」只是完成了一半 —— 真正要用起来还需要：打开信息页 → 导入客户端
@@ -3532,25 +3577,25 @@ for p in sys.argv[1:]:
 #    两个函数复用同一个变量会互相覆盖，外层已累积的逐源原因会被内层清空，
 #    最终报错只剩最后一个源，正是本项目反复踩的"错误被覆盖"坑。
 portal_fetch_files() {
-    local dir="$1" base="$2" mode="$3" f _fetch_files_err=""
+    local dir="$1" base="$2" mode="$3" f
+    # 失败时要把是哪个文件带给调用方（2026-11-04 修）：旧实现只在成功分支写全局变量，
+    # 调用方在失败分支读到的永远是空串，报错只剩「下载失败」看不出缺的是谁。
+    PORTAL_FETCH_FILES_ERR=""
     # 计量文件与门户文件同源同生命周期，一起拉、一起失败
     for f in $PORTAL_FILES $METER_FILES; do
         if [[ "$mode" == "api" ]]; then
-            # 逐个文件报错，不要只留最后一个（错误被覆盖会把排查带偏）
             if ! curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" \
                  "${base}/${f}?ref=${PORTAL_FETCH_REF}" -o "${dir}/${f}" 2>/dev/null; then
-                _fetch_files_err="下载 ${f} 失败"
+                PORTAL_FETCH_FILES_ERR="下载 ${f} 失败"
                 return 1
             fi
         else
             if ! curl -fsSL --max-time 30 "${base}/${f}" -o "${dir}/${f}" 2>/dev/null; then
-                _fetch_files_err="下载 ${f} 失败"
+                PORTAL_FETCH_FILES_ERR="下载 ${f} 失败"
                 return 1
             fi
         fi
     done
-    # 成功时也要把细节带出去（调用方在失败分支里读它）
-    PORTAL_FETCH_FILES_ERR="${_fetch_files_err}"
     return 0
 }
 
@@ -5559,6 +5604,11 @@ uninstall_all() {
                 "$acme_bin" --remove -d "$acme_domain" --ecc >/dev/null 2>&1 || true
             done
         fi
+        # 本工具装的 acme.sh 续期定时器（无 cron 的机器）：描述行是归属标记。
+        if grep -qF '(hysteria2-installer)' /etc/systemd/system/hy2-acme-renew.timer 2>/dev/null; then
+            systemctl disable --now hy2-acme-renew.timer >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/hy2-acme-renew.timer /etc/systemd/system/hy2-acme-renew.service
+        fi
         # 仅删除首次安装时存在 marker 的安装器资产；旧版没有 marker 时保留，避免误删用户文件。
         if [[ -f "$HY2_DIR/.hy2-installer-owned" \
                 && -f /etc/sysctl.d/99-hysteria2.conf ]] \
@@ -5662,7 +5712,9 @@ run_action() {
 # 否则 Teyir 控制台保存的凭据全部失效、控制台开的用户与代理服务全部丢失。
 ask_preserve_portal() {
     PRESERVE_PORTAL=0
-    [[ -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]] || return 0
+    # 只看 portal.json（2026-11-04 修）：portal-access.json 缺失时 adopt 会重建它；旧条件
+    # 要求两个都在，凭据文件一丢就连问都不问、直接走 prepare，token / API Key 全换、子账号清空。
+    [[ -f "$HY2_DIR/portal.json" ]] || return 0
     echo
     echo -e "${YELLOW}是否沿用现有门户？${PLAIN}（登录凭据、API Key、订阅地址、全部用户与代理服务保持不变）"
     echo -e "  已接入 Teyir 控制台或已给客户发过订阅的节点，请务必选 Y。"

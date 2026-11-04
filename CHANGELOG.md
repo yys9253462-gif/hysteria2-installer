@@ -1,3 +1,16 @@
+## 2026-11-04 — 第二十一批十项修复，门户 2.31
+
+- 「重新修改配置」沿用现有自签证书：此前每次重新生成，pin 跟着变，已发放的自签链接全部握手失败（强制换新：`HY2_REGEN_SELF_SIGNED=1`）。
+- 只缺 `portal-access.json` 时「重新修改配置」照样询问并默认沿用门户：此前直接重建门户，token / API Key 全换、子账号清空。
+- 没有 cron 的机器上 acme.sh 以 `--nocron` 安装，并由 `hy2-acme-renew.timer` 每日续期：此前安装器直接拒绝，Nginx / DNS API 签发都失败，装上也不会续期。
+- 收回用户时的 Hy2 兜底重启改走清失败计数的重启，并等统计接口就绪：此前一阵连续收回就撞上启动次数上限，服务锁死、全员掉线。
+- 同名旧账号收回未完成时拒绝重建（Web 与 API），新账号不再每 5 秒被踢。
+- 新增 / 删除代理不再改写、重启不归本工具管理的 gost.service。
+- AnyTLS 启用在协议锁内读取用户表，与撤销流程不再互相覆盖。
+- `bash install.sh info` 遇到损坏或不完整的 `portal-access.json` 时提示用 `refresh-page` 重建，不再报 jq 错误或打印 `null`。
+- 门户文件包下载失败时报出具体是哪个文件。
+- 完整卸载一并移除本工具装的 acme.sh 续期定时器。
+
 ## 2026-11-04 — 第二十批十项修复，门户 2.30
 
 - DNS API 签发把凭据以环境变量交给 acme.sh：此前传 `--dns_cf_token` 等 acme.sh 不认识的参数，Cloudflare / 阿里云 / DuckDNS 签发从未成功过；DuckDNS 改用正确的 `dns_duckdns` 插件。
