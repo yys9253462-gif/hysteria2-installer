@@ -3089,7 +3089,8 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       const fmtBytes = v => {
         let n = Number(v || 0), i = 0;
         const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+        // 取整后到 1024 也要进位（2026-11-04 修，同后端 format_bytes）：否则显示「1024.00 KB」
+        while ((n >= 1024 || (i && Number(n.toFixed(2)) >= 1024)) && i < units.length - 1) { n /= 1024; i++; }
         return (i ? n.toFixed(2) : n.toFixed(0)) + ' ' + units[i];
       };
       let trafficText = (json.traffic_limit > 0)

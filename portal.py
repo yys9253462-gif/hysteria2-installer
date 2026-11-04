@@ -2211,15 +2211,13 @@ def format_bytes(b):
         b = 0
     if b < 1024:
         return f"{b} B"
-    elif b < 1024**2:
-        return f"{b/1024:.1f} KB"
-    elif b < 1024**3:
-        return f"{b/1024**2:.2f} MB"
-    elif b < 1024**4:
-        return f"{b/1024**3:.2f} GB"
-    else:
-        # 大流量套餐（几 TB）此前一律显示成「数千 GB」，读起来费劲。
-        return f"{b/1024**4:.2f} TB"
+    # 先按显示精度取整再定单位（2026-11-04 修）：1048575 B 旧实现显示成「1024.0 KB」。
+    # 大流量套餐（几 TB）此前一律显示成「数千 GB」，读起来费劲。
+    for unit, power, digits in (('KB', 1, 1), ('MB', 2, 2), ('GB', 3, 2)):
+        value = round(b / 1024 ** power, digits)
+        if value < 1024:
+            return f"{value:.{digits}f} {unit}"
+    return f"{b/1024**4:.2f} TB"
 
 
 def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
