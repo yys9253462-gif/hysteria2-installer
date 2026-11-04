@@ -153,17 +153,29 @@ class TestEncodingHardening(unittest.TestCase):
                          'Windows 上会因 GBK 打死 HTTP handler' % bad)
 
     def test_save_data_serializes_portal_json_as_utf8(self):
-        import ast
+        """save_data 写出的 portal.json 是 UTF-8（锁行为，不匹配源码字符串）。"""
+        import ast, contextlib, copy, hashlib, json, tempfile, threading
         src = Path(portal.__file__).read_text(encoding='utf-8')
         tree = ast.parse(src)
         serve = next(node for node in tree.body
                      if isinstance(node, ast.FunctionDef) and node.name == 'serve')
-        save = next(node for node in ast.walk(serve)
-                    if isinstance(node, ast.FunctionDef) and node.name == 'save_data')
-        body = ast.get_source_segment(src, save)
-        self.assertIn(".encode('utf-8')", body,
-                      'save_data 必须显式 UTF-8 —— 它写的是整个 portal.json')
-
+        nodes = [copy.deepcopy(n) for n in ast.walk(serve) if isinstance(n, ast.FunctionDef)
+                 and n.name in ('save_data', '_prepare_save_payload')]
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'portal.json'
+            path.write_bytes(b'{}')
+            data = {'note': 'H₂ 节点 ✓'}
+            env = {'data': data, 'data_lock': threading.RLock(), 'json': json, 'hashlib': hashlib,
+                   'contextlib': contextlib, 'portal_path': path,
+                   'atomic_write_private': lambda p, b: Path(p).write_bytes(b),
+                   'portal_state_file_lock': lambda *_: contextlib.nullcontext(),
+                   'disk_state': {'digest': hashlib.sha256(b'{}').digest()},
+                   'merge_cli_owned_state': lambda *_: None}
+            exec(compile(ast.Module(body=nodes, type_ignores=[]), '<save>', 'exec'), env)
+            env['save_data']()
+            raw = path.read_bytes()
+        self.assertEqual(json.loads(raw.decode('utf-8'))['note'], 'H₂ 节点 ✓')
+        self.assertIn('H₂'.encode('utf-8'), raw)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

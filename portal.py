@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.29'
+PORTAL_VERSION = '2.30'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2121,9 +2121,15 @@ def _expiry_text(value):
     if ts > 253402300799:       # 9999-12-31，防御性上限
         return '永久有效'
     try:
-        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        local = time.localtime(ts)
     except (OverflowError, OSError, ValueError):
         return '永久有效'
+    # 带上服务器时区的 UTC 偏移（2026-11-04 修）：节点跑在 UTC、客户在 UTC+8 时，
+    # 不带时区的「16:00」被当成本地时间，看起来早了 8 小时停服。
+    offset = local.tm_gmtoff if local.tm_gmtoff is not None else -time.timezone
+    sign = '+' if offset >= 0 else '-'
+    offset = abs(int(offset)) // 60
+    return '%s (UTC%s%02d:%02d)' % (time.strftime("%Y-%m-%d %H:%M", local), sign, offset // 60, offset % 60)
 
 def _utf8_encodable(value):
     """JSON 解析结果里的每个字符串（含键）都能编码成 UTF-8。
@@ -2187,6 +2193,16 @@ def password_hint(value):
     return value[:4] + '****' + value[-4:]
 
 
+def usage_percent(used_bytes, limit_bytes):
+    """用量百分比：向下取整，只有真正用满才是 100%（2026-11-04 修）。
+
+    旧实现四舍五入，用到 99.5% 就显示红色的 100%，而准入要到 used >= limit 才拒绝。
+    """
+    if used_bytes >= limit_bytes:
+        return 100
+    return min(int(used_bytes * 100 // limit_bytes), 99)
+
+
 def format_bytes(b):
     """把字节数渲染成人可读文本；任何非数值输入都按 0 处理。
 
@@ -2211,15 +2227,13 @@ def format_bytes(b):
         b = 0
     if b < 1024:
         return f"{b} B"
-    elif b < 1024**2:
-        return f"{b/1024:.1f} KB"
-    elif b < 1024**3:
-        return f"{b/1024**2:.2f} MB"
-    elif b < 1024**4:
-        return f"{b/1024**3:.2f} GB"
-    else:
-        # 大流量套餐（几 TB）此前一律显示成「数千 GB」，读起来费劲。
-        return f"{b/1024**4:.2f} TB"
+    # 先按显示精度取整再定单位（2026-11-04 修）：1048575 B 旧实现显示成「1024.0 KB」。
+    # 大流量套餐（几 TB）此前一律显示成「数千 GB」，读起来费劲。
+    for unit, power, digits in (('KB', 1, 1), ('MB', 2, 2), ('GB', 3, 2)):
+        value = round(b / 1024 ** power, digits)
+        if value < 1024:
+            return f"{value:.{digits}f} {unit}"
+    return f"{b/1024**4:.2f} TB"
 
 
 def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
@@ -2422,7 +2436,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         
         # 流量展示与进度条
         if limit_bytes > 0:
-            percent = min(round((used_bytes / limit_bytes) * 100), 100)
+            percent = usage_percent(used_bytes, limit_bytes)
             bar_class = "danger" if percent >= 90 else ""
             traffic_display = f"""<div><span data-user-usage="{html.escape(uid)}">{format_bytes(used_bytes)}</span> / {format_bytes(limit_bytes)} <span style="font-size:11px;color:var(--muted)">({percent}%)</span></div>
             <div class="traffic-bar"><div class="traffic-fill {bar_class}" style="width:{percent}%"></div></div>"""
@@ -3738,7 +3752,27 @@ def _safe_int(value, default=0):
     except (TypeError, ValueError, OverflowError):
         return default
 
-def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None):
+def _extra_link_boxes(extra_links):
+    """分享页里其它已启用协议的直链（2026-11-04 加）。
+
+    UDP 被封的网络要靠 Reality / VMess 等 TCP 协议兜底；旧分享页只有 Hy2 一条直链，
+    用 v2rayNG / Shadowrocket 按链接导入的用户永远拿不到备用节点。
+    """
+    parts = []
+    for i, (label, link) in enumerate(extra_links or ()):
+        if not isinstance(link, str) or not link:
+            continue
+        box_id = 'u-extra-uri-%d' % i
+        parts.append(
+            '<div style="margin-top:14px"><p class="note" style="margin-bottom:4px">%s 直链（UDP 不通时用）</p>'
+            '<textarea id="%s" class="link" readonly>%s</textarea>'
+            '<div class="actions"><button class="button" type="button" data-copy="%s">复制 %s 直链</button></div></div>'
+            % (html.escape(label), box_id, html.escape(link), box_id, html.escape(label)))
+    return ''.join(parts)
+
+
+def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None,
+                   extra_links=()):
     # 数据被改坏时（字符串用量、非法到期时间）不能让客户页面 500：
     # 这几个值直接来自 portal.json（2026-10-30 修）。
     used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
@@ -3753,7 +3787,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     ip_limit_str = f"{ip_limit} 个网络（同一网络下设备不限）" if ip_limit > 0 else "不限制"
 
     if limit_bytes > 0:
-        percent = min(round((used_bytes / limit_bytes) * 100), 100)
+        percent = usage_percent(used_bytes, limit_bytes)
         bar_class = "danger" if percent >= 90 else ""
         traffic_display = f"""<div>{format_bytes(used_bytes)} / {format_bytes(limit_bytes)} <span style="font-size:12px;color:var(--muted)">({percent}%)</span></div>
         <div class="traffic-bar" style="width:100%;height:8px"><div class="traffic-fill {bar_class}" style="width:{percent}%"></div></div>"""
@@ -3807,6 +3841,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
         <button class="button primary" type="button" data-copy="u-hy2-uri">复制直链</button>
       </div>
       <p class="note">{html.escape(host)} · UDP {_valid_port(listen_port) or 19984}</p>
+      {_extra_link_boxes(extra_links)}
     </section>
 
     <section class="card">
@@ -7651,6 +7686,39 @@ def ensure_portal_access(root, meta, data):
           '（token / API Key / 用户保留）', file=sys.stderr)
     return access, True
 
+def restore_egress_into_config(root, config_path=None):
+    """把门户里保存的 WARP 分流 / 自定义出站重新渲染进 config.yaml（2026-11-04 加）。
+
+    「重新修改配置」由 install.sh 从头重写 config.yaml，只带默认 ACL：网页上开着的 WARP
+    分流与自定义出站静默消失，面板却仍显示已开启。adopt 之后、安装脚本重启 Hysteria
+    之前调用；这里只写文件，不重启服务。
+    """
+    root = Path(root)
+    cfg = Path(config_path) if config_path else root / 'config.yaml'
+    try:
+        data = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
+        original = cfg.read_text(encoding='utf-8')
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    state = routing_state(data)
+    # 没保存过任何出口设置就不动：渲染总会顺带重排 ACL 头部，不该无故改写刚生成的配置。
+    if not (state['warp_enabled'] or state['custom_outbounds'] or state['warp_rules']
+            or state['outbound_mode'] == 'global'):
+        return False
+    rendered = render_egress_config(original, state)
+    if rendered == original:
+        return False
+    atomic_write_private(cfg, rendered.encode('utf-8'))
+    try:
+        os.chmod(cfg, 0o600)
+    except OSError:
+        pass
+    print('[portal] 已把保存的 WARP / 自定义出站规则写回 config.yaml', file=sys.stderr)
+    return True
+
+
 def adopt(meta_path, port, node_api_key=None):
     """「重新修改配置 / 重新安装」时沿用现有门户，而不是 prepare() 推倒重建。
 
@@ -7663,6 +7731,7 @@ def adopt(meta_path, port, node_api_key=None):
     root = Path(meta_path).parent
     with portal_state_file_lock(root):
         _adopt_locked(meta_path, port, node_api_key)
+    restore_egress_into_config(root)
     # refresh 自己拿状态锁，并在锁外先生成二维码（2026-11-04 修）：旧实现把它包在
     # 上面的锁里，qrencode 最长 20 秒期间运行中门户的 save_data 持着 data_lock 干等，
     # 所有新的 Hy2 鉴权跟着卡住。
@@ -8078,31 +8147,46 @@ def serve(path):
             time.sleep(5)
 
     def save_data():
-        with data_lock, portal_state_file_lock(portal_path.parent):
-            # ⚠️ 必须显式 encoding='utf-8'（2026-10-03 实测）。
-            # Path.write_text 不给 encoding 时跟随 locale：Linux 上是 UTF-8
-            # 没事，但 Windows 上是 GBK —— 页面里含 `₂` 之类字符时
-            # 直接 UnicodeEncodeError 把 HTTP handler 打死，客户端看到的是
-            # "Remote end closed connection without response"，
-            # 排查时完全看不出是编码问题。
-            # adopt / refresh 是另一个进程，写完就 restart 本服务：SIGTERM 时的
-            # save_data 会拿旧内存把它们刚写的 api_key / 凭据 / 机主密码盖回去，
-            # 控制台随即 401（2026-11-04 修）。磁盘自上次读写后变了，就先采纳这些
-            # CLI 管的键，再写本进程管的其余状态（用户、用量、代理服务）。
+        # 写盘与 fsync 不占 data_lock（2026-11-04 修）：慢盘上一次 fsync 可达数百毫秒，
+        # 期间所有 /auth 都在等 data_lock。锁序不变（先 data_lock 后文件锁），只是准备好
+        # payload 后先放掉 data_lock、仍持文件锁写盘；后到的保存者排在文件锁上，
+        # 落盘顺序与序列化顺序一致。调用方自己持着 data_lock 时（可重入）照旧全程持有。
+        file_lock = contextlib.ExitStack()
+        with data_lock:
+            file_lock.enter_context(portal_state_file_lock(portal_path.parent))
             try:
-                current = portal_path.read_bytes()
-            except OSError:
-                current = None
-            if current is not None and hashlib.sha256(current).digest() != disk_state['digest']:
-                try:
-                    disk = json.loads(current.decode('utf-8'))
-                except ValueError:
-                    disk = None
-                if isinstance(disk, dict):
-                    merge_cli_owned_state(data, disk)
-            payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
+                payload = _prepare_save_payload()
+            except BaseException:
+                file_lock.close()
+                raise
+        with file_lock:
             atomic_write_private(portal_path, payload)
             disk_state['digest'] = hashlib.sha256(payload).digest()
+
+    def _prepare_save_payload():
+        """在 data_lock 与文件锁内：合并 CLI 带外写入的键，序列化整份状态。"""
+        # ⚠️ 必须显式 encoding='utf-8'（2026-10-03 实测）。
+        # Path.write_text 不给 encoding 时跟随 locale：Linux 上是 UTF-8
+        # 没事，但 Windows 上是 GBK —— 页面里含 `₂` 之类字符时
+        # 直接 UnicodeEncodeError 把 HTTP handler 打死，客户端看到的是
+        # "Remote end closed connection without response"，
+        # 排查时完全看不出是编码问题。
+        # adopt / refresh 是另一个进程，写完就 restart 本服务：SIGTERM 时的
+        # save_data 会拿旧内存把它们刚写的 api_key / 凭据 / 机主密码盖回去，
+        # 控制台随即 401（2026-11-04 修）。磁盘自上次读写后变了，就先采纳这些
+        # CLI 管的键，再写本进程管的其余状态（用户、用量、代理服务）。
+        try:
+            current = portal_path.read_bytes()
+        except OSError:
+            current = None
+        if current is not None and hashlib.sha256(current).digest() != disk_state['digest']:
+            try:
+                disk = json.loads(current.decode('utf-8'))
+            except ValueError:
+                disk = None
+            if isinstance(disk, dict):
+                merge_cli_owned_state(data, disk)
+        return json.dumps(data, ensure_ascii=False).encode('utf-8')
 
     # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
     #
@@ -8372,13 +8456,28 @@ def serve(path):
                     # 开启路由接口要重启一次 Xray；失败后 10 分钟内不再尝试，免得反复重启。
                     if time.time() < enable_retry_at:
                         time.sleep(30); continue
-                    enable_retry_at = time.time() + 600
-                    spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
-                    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-                    # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
-                    # 否则两边同时改 xray.json，会有一方以「并发修改」失败一轮（jp 上线时踩过）。
-                    with access_apply_lock, reality_apply_lock:
-                        outcome = mod.enable_iplimit_routing(str(xray_path), binary, address)
+                    # 与其它 xray.json 写入者同一把核心锁（2026-11-04 修）：旧实现在核心安装 /
+                    # 升级 / 卸载（含另一个进程的 install.sh）替换二进制途中照样重启 Xray。
+                    # 拿不到就跳过本轮，且不消耗下面的 10 分钟退避。
+                    if not core_operation_lock.acquire(blocking=False):
+                        time.sleep(30); continue
+                    try:
+                        try:
+                            _core_fd = acquire_core_operation_lock()
+                        except RuntimeError:
+                            time.sleep(30); continue
+                        try:
+                            enable_retry_at = time.time() + 600
+                            spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
+                            mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+                            # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
+                            # 否则两边同时改 xray.json，会有一方以「并发修改」失败一轮（jp 上线时踩过）。
+                            with access_apply_lock, reality_apply_lock:
+                                outcome = mod.enable_iplimit_routing(str(xray_path), binary, address)
+                        finally:
+                            os.close(_core_fd)
+                    finally:
+                        core_operation_lock.release()
                     if outcome.get('changed'):
                         print('[iplimit] 已为 Reality 开启设备上限路由接口，备份: %s' % outcome.get('backup'),
                               file=sys.stderr)
@@ -13919,7 +14018,24 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     host = m.get('public_ip', server_name) if m.get('is_insecure') else server_name
                     listen_port = m.get('listen_port', 19984)
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
-                    page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0])
+                    # 其它已启用协议的直链，与 users/create 的回包同一组生成器（2026-11-04 加）
+                    _pub = m.get('public_ip', '127.0.0.1')
+                    _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
+                    _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
+                    _t = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
+                    extra = []
+                    for _label, _make in (
+                            ('Reality', lambda: reality_uri_for_user(_r, target_uid, _pub, label=f"Reality-{target_uid}") if _r else ''),
+                            ('VMess', lambda: vmess_uri_for_user(_v, target_uid, _pub, label=f"VMess-{target_uid}") if _v else ''),
+                            ('VLESS-Enc', lambda: vlessenc_uri_for_user(_e, target_uid, _pub, label=f"VLESS-Enc-{target_uid}") if _e else ''),
+                            ('AnyTLS', lambda: anytls_uri_for_user(_a, target_uid, label=f"AnyTLS-{target_uid}") if _a else ''),
+                            ('TUIC', lambda: tuic_uri_for_user(_t, target_uid, label=f"TUIC-{target_uid}") if _t else '')):
+                        try:
+                            extra.append((_label, _make()))
+                        except Exception as exc:
+                            _log_ignored('share_extra_uri', exc)
+                    page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0],
+                                          extra_links=extra)
                     return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
                 else:
                     return self.reply(404, b'Not found')
@@ -14019,6 +14135,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 前端弹窗按 `=== null` 判永久，于是永久用户显示成 1970-01-01 到期；
                     # 而 0 在本项目里恰恰表示「已过期」。
                     'expires_at': u_copy.get('expires_at'),
+                    'expires_text': _expiry_text(u_copy.get('expires_at')),
                     # 与用户表 / 分享页同一套显示规则（2026-11-04 修）：ip_limit=true 实际
                     # 不限却显示「true IP」；用量字段被改坏时弹窗显示 NaN B。
                     'traffic_used': _safe_int(u_copy.get('used_bytes', 0)),

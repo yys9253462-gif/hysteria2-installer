@@ -1260,11 +1260,12 @@ finally: s.close()
 # 两者完全可以共存：Hysteria 主监听是 **UDP** 端口，
 # 与反代的 TCP/UDP 443 通常不冲突。
 detect_webserver_squatting() {
-    local occupied=() who80 who443
+    # 只看 TCP 80（2026-11-04 修）：内置 ACME 写的是 `type: http`（HTTP-01），只要 80。
+    # 旧实现 443 被占也判「占用」，而本项目的 Reality 默认就在 443，于是 80 空着也
+    # 走不了内置签发，被推去 Caddy / DNS API / 自签。
+    local occupied=() who80
     who80="$(port_owner tcp 80)"
-    who443="$(port_owner tcp 443)"
     [[ -n "$who80" ]]  && occupied+=("TCP 80 (${who80})")
-    [[ -n "$who443" ]] && occupied+=("TCP 443 (${who443})")
     if [[ ${#occupied[@]} -eq 0 ]]; then
         ACRE_PORT_BLOCKER=""
         return 1   # 空闲：可以自己签
@@ -1677,7 +1678,7 @@ EOF
 # 代价：需要 DNS 服务商的 API 凭据。凭据从环境变量读，不落仓库：
 #   HY2_CF_TOKEN + HY2_CF_EMAIL   （Cloudflare）
 #   HY2_ALICLOUD_KEY              （阿里云）
-#   HY2_DP_TOKEN+ HY2_DP_ID       （DuckDNS）
+#   HY2_DP_TOKEN                  （DuckDNS，交给 acme.sh 的 DuckDNS_Token）
 # 拿不到凭据就明确告诉用户怎么办，而不是静默退回自签。
 setup_cert_via_dns_api() {
     local domain="$1"
@@ -1714,17 +1715,20 @@ setup_cert_via_dns_api() {
     export SKIP_ACME_SH_UPGRADE=1
     local ok=0
     case "$provider" in
+        # acme.sh 的 DNS 插件从环境变量读凭据（2026-11-04 修）：旧实现传 --dns_cf_token
+        # 之类的参数，acme.sh 不认识，直接报 Unknown parameter 退出，DNS API 签发从未成功过。
+        # DuckDNS 的插件是 dns_duckdns（旧实现写成了 DNSPod 的 dns_dp）。
         Cloudflare)
-            "$acct" --issue --dns dns_cf -d "$domain" \
-                --dns_cf_token "$HY2_CF_TOKEN" --dns_cf_email "$HY2_CF_EMAIL" || ok=1
+            CF_Token="$HY2_CF_TOKEN" CF_Email="$HY2_CF_EMAIL" \
+                "$acct" --issue --dns dns_cf -d "$domain" || ok=1
             ;;
         阿里云)
-            "$acct" --issue --dns dns_ali -d "$domain" \
-                --dns_ali_key "$HY2_ALICLOUD_KEY" --dns_ali_secret "${HY2_ALICLOUD_SECRET:-}" || ok=1
+            Ali_Key="$HY2_ALICLOUD_KEY" Ali_Secret="${HY2_ALICLOUD_SECRET:-}" \
+                "$acct" --issue --dns dns_ali -d "$domain" || ok=1
             ;;
         DuckDNS)
-            "$acct" --issue --dns dns_dp -d "$domain" \
-                --dns_dp_token "$HY2_DP_TOKEN" || ok=1
+            DuckDNS_Token="$HY2_DP_TOKEN" \
+                "$acct" --issue --dns dns_duckdns -d "$domain" || ok=1
             ;;
     esac
 
@@ -1796,8 +1800,7 @@ setup_acme_certificate() {
         log_warn "============================================================"
         log_warn " 检测到本机 ${ACRE_PORT_BLOCKER} 已被其他服务占用"
         log_warn "============================================================"
-        log_warn " Let's Encrypt 只有两种验证方式，都要求端口空闲："
-        log_warn "   HTTP-01 (TCP 80) / TLS-ALPN-01 (TCP 443)"
+        log_warn " 内置 ACME 用 HTTP-01 验证，要求 TCP 80 空闲。"
         log_warn " Hysteria 内置 ACME 无法在这种环境下自行签发，"
         log_warn " 强行尝试只会反复失败，然后退回自签证书（客户端必须开跳过校验）。"
         log_warn ""
@@ -5485,6 +5488,12 @@ uninstall_all() {
             systemctl disable --now wireproxy 2>/dev/null || true
             rm -f /etc/systemd/system/wireproxy.service /etc/wireguard/wp.conf
             rm -f /usr/local/bin/wireproxy /usr/local/bin/wgcf /usr/local/bin/hy2-warp-watchdog.sh
+        elif [[ -f "$HY2_DIR/.hy2-warp-owned" && ! -e /etc/systemd/system/wireproxy.service ]]; then
+            # WARP 安装中途失败（wgcf 注册被限流等）：所有权标记已写、服务单元还没写。
+            # 二进制是本工具下载的（标记只在装好可信 wireproxy 后才写），一并清掉，
+            # 否则卸载后永久残留（2026-11-04 修）。
+            rm -f /usr/local/bin/wireproxy /usr/local/bin/wgcf
+            managed_wireproxy=1
         fi
         if [[ "$managed_wireproxy" == 1 ]]; then
             systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true

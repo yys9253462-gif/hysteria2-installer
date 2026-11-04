@@ -92,6 +92,13 @@ class UserConfigExpiryTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(body['expires_at'], self.data['users']['dated']['expires_at'])
 
+    def test_expiry_text_matches_server_rendering(self):
+        """弹窗与用户表 / 分享页同一段文本，带服务器时区（2026-11-04 修）。"""
+        status, body = self.user_config('dated')
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['expires_text'], portal._expiry_text(self.data['users']['dated']['expires_at']))
+        self.assertIn('(UTC', body['expires_text'])
+
     def test_odd_fields_use_display_rules(self):
         """ip_limit=true 显示为不限、坏用量显示 0（2026-11-04 修，与用户表一致）。"""
         status, body = self.user_config('odd')
