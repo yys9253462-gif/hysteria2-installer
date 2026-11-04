@@ -2187,6 +2187,16 @@ def password_hint(value):
     return value[:4] + '****' + value[-4:]
 
 
+def usage_percent(used_bytes, limit_bytes):
+    """用量百分比：向下取整，只有真正用满才是 100%（2026-11-04 修）。
+
+    旧实现四舍五入，用到 99.5% 就显示红色的 100%，而准入要到 used >= limit 才拒绝。
+    """
+    if used_bytes >= limit_bytes:
+        return 100
+    return min(int(used_bytes * 100 // limit_bytes), 99)
+
+
 def format_bytes(b):
     """把字节数渲染成人可读文本；任何非数值输入都按 0 处理。
 
@@ -2420,7 +2430,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         
         # 流量展示与进度条
         if limit_bytes > 0:
-            percent = min(round((used_bytes / limit_bytes) * 100), 100)
+            percent = usage_percent(used_bytes, limit_bytes)
             bar_class = "danger" if percent >= 90 else ""
             traffic_display = f"""<div><span data-user-usage="{html.escape(uid)}">{format_bytes(used_bytes)}</span> / {format_bytes(limit_bytes)} <span style="font-size:11px;color:var(--muted)">({percent}%)</span></div>
             <div class="traffic-bar"><div class="traffic-fill {bar_class}" style="width:{percent}%"></div></div>"""
@@ -3751,7 +3761,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     ip_limit_str = f"{ip_limit} 个网络（同一网络下设备不限）" if ip_limit > 0 else "不限制"
 
     if limit_bytes > 0:
-        percent = min(round((used_bytes / limit_bytes) * 100), 100)
+        percent = usage_percent(used_bytes, limit_bytes)
         bar_class = "danger" if percent >= 90 else ""
         traffic_display = f"""<div>{format_bytes(used_bytes)} / {format_bytes(limit_bytes)} <span style="font-size:12px;color:var(--muted)">({percent}%)</span></div>
         <div class="traffic-bar" style="width:100%;height:8px"><div class="traffic-fill {bar_class}" style="width:{percent}%"></div></div>"""

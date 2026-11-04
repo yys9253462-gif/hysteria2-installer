@@ -28,5 +28,14 @@ class FormatBytesRoundingTests(unittest.TestCase):
         self.assertEqual(out[:3], ['1.00 MB', '1.00 GB', '1.00 TB'])
 
 
+
+class UsagePercentTests(unittest.TestCase):
+    def test_only_a_full_quota_reads_100(self):
+        self.assertEqual(portal.usage_percent(995, 1000), 99)
+        self.assertEqual(portal.usage_percent(1000, 1000), 100)
+        self.assertEqual(portal.usage_percent(1500, 1000), 100)
+        self.assertEqual(portal.usage_percent(0, 1000), 0)
+
+
 if __name__ == '__main__':
     unittest.main()
