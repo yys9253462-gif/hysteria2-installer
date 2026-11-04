@@ -2121,9 +2121,15 @@ def _expiry_text(value):
     if ts > 253402300799:       # 9999-12-31，防御性上限
         return '永久有效'
     try:
-        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        local = time.localtime(ts)
     except (OverflowError, OSError, ValueError):
         return '永久有效'
+    # 带上服务器时区的 UTC 偏移（2026-11-04 修）：节点跑在 UTC、客户在 UTC+8 时，
+    # 不带时区的「16:00」被当成本地时间，看起来早了 8 小时停服。
+    offset = local.tm_gmtoff if local.tm_gmtoff is not None else -time.timezone
+    sign = '+' if offset >= 0 else '-'
+    offset = abs(int(offset)) // 60
+    return '%s (UTC%s%02d:%02d)' % (time.strftime("%Y-%m-%d %H:%M", local), sign, offset // 60, offset % 60)
 
 def _utf8_encodable(value):
     """JSON 解析结果里的每个字符串（含键）都能编码成 UTF-8。
@@ -14057,6 +14063,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 前端弹窗按 `=== null` 判永久，于是永久用户显示成 1970-01-01 到期；
                     # 而 0 在本项目里恰恰表示「已过期」。
                     'expires_at': u_copy.get('expires_at'),
+                    'expires_text': _expiry_text(u_copy.get('expires_at')),
                     # 与用户表 / 分享页同一套显示规则（2026-11-04 修）：ip_limit=true 实际
                     # 不限却显示「true IP」；用量字段被改坏时弹窗显示 NaN B。
                     'traffic_used': _safe_int(u_copy.get('used_bytes', 0)),

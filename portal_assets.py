@@ -3098,9 +3098,10 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         : (fmtBytes(json.traffic_used) + ' (不限)');
       // 与后端 _expiry_text 同一条规则：只有「没有到期时间」才是永久。
       // 旧阈值 2e9（2033 年）会把十年有效的用户显示成永久有效（2026-10-30 修）。
-      let expireText = (json.expires_at === null || json.expires_at === undefined)
+      // 优先用服务端渲染的文本（带服务器时区），与用户表 / 分享页一字不差（2026-11-04 修）
+      let expireText = json.expires_text || ((json.expires_at === null || json.expires_at === undefined)
         ? '永久有效'
-        : new Date(json.expires_at * 1000).toLocaleString();
+        : new Date(json.expires_at * 1000).toLocaleString());
       let ipText = (json.ip_limit > 0) ? (json.ip_limit + ' IP') : '不限';
       
       uModalBody.innerHTML = `
