@@ -6631,6 +6631,13 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None):
             ports.add(int((data or {}).get(key, {}).get('port')))
         except (TypeError, ValueError, AttributeError):
             pass
+    # gost 代理服务的端口（2026-11-04 补）：gost 停着时这些端口不在监听表里，新启用的
+    # TCP 协议可能选中它，gost 一恢复就和那条代理抢端口。
+    for item in proxy_services(data):
+        try:
+            ports.add(int(item.get('port')))
+        except (TypeError, ValueError):
+            pass
     own_tags = {REALITY_INBOUND_TAG: 'reality_config',
                 VMESS_INBOUND_TAG: 'vmess_config',
                 VLESSENC_INBOUND_TAG: 'vlessenc_config'}
