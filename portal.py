@@ -12465,12 +12465,14 @@ if __name__ == '__main__':
                 raise RuntimeError(reason)
             new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
                        'secret': old.get('secret') or secrets.token_hex(32)}
-            with data_lock:
-                preview = dict(data)
-                preview['anytls_config'] = new_cfg
-                users = anytls_users(preview)
             unit_path = Path('/etc/systemd/system/%s.service' % ANYTLS_SERVICE)
             with anytls_apply_lock:
+                # 用户表在协议锁内取（2026-11-04 修）：旧实现在锁外取，期间撤销流程同步完
+                # anytls.json，本次再用旧名单覆盖，刚被停用 / 到期的用户又能连上直到下次同步。
+                with data_lock:
+                    preview = dict(data)
+                    preview['anytls_config'] = new_cfg
+                    users = anytls_users(preview)
                 previous_unit = unit_path.read_bytes() if unit_path.exists() else None
                 unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                 unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
