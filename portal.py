@@ -8372,13 +8372,28 @@ def serve(path):
                     # 开启路由接口要重启一次 Xray；失败后 10 分钟内不再尝试，免得反复重启。
                     if time.time() < enable_retry_at:
                         time.sleep(30); continue
-                    enable_retry_at = time.time() + 600
-                    spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
-                    mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
-                    # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
-                    # 否则两边同时改 xray.json，会有一方以「并发修改」失败一轮（jp 上线时踩过）。
-                    with access_apply_lock, reality_apply_lock:
-                        outcome = mod.enable_iplimit_routing(str(xray_path), binary, address)
+                    # 与其它 xray.json 写入者同一把核心锁（2026-11-04 修）：旧实现在核心安装 /
+                    # 升级 / 卸载（含另一个进程的 install.sh）替换二进制途中照样重启 Xray。
+                    # 拿不到就跳过本轮，且不消耗下面的 10 分钟退避。
+                    if not core_operation_lock.acquire(blocking=False):
+                        time.sleep(30); continue
+                    try:
+                        try:
+                            _core_fd = acquire_core_operation_lock()
+                        except RuntimeError:
+                            time.sleep(30); continue
+                        try:
+                            enable_retry_at = time.time() + 600
+                            spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
+                            mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
+                            # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
+                            # 否则两边同时改 xray.json，会有一方以「并发修改」失败一轮（jp 上线时踩过）。
+                            with access_apply_lock, reality_apply_lock:
+                                outcome = mod.enable_iplimit_routing(str(xray_path), binary, address)
+                        finally:
+                            os.close(_core_fd)
+                    finally:
+                        core_operation_lock.release()
                     if outcome.get('changed'):
                         print('[iplimit] 已为 Reality 开启设备上限路由接口，备份: %s' % outcome.get('backup'),
                               file=sys.stderr)
