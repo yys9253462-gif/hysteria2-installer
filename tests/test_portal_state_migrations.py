@@ -77,6 +77,44 @@ class RefreshQrOutsideLockTests(unittest.TestCase):
         self.assertEqual(seen, [False], '二维码在状态锁内生成')
         self.assertEqual(after['qr'], '<svg/>')
 
+    def _with_lock_probe(self, action, meta_change=None):
+        import contextlib
+        held, seen = [], []
+
+        @contextlib.contextmanager
+        def lock(_root):
+            held.append(1)
+            try:
+                yield
+            finally:
+                held.pop()
+
+        def qr(uri):
+            seen.append(bool(held))
+            return '<svg>%s</svg>' % uri[-6:]
+        with tempfile.TemporaryDirectory() as d:
+            root = PortalStateMigrationTests._root(None, d, {
+                'port': 1111, 'token': 'tok', 'api_key': 'k' * 32, 'auth_hash': 'a' * 64,
+                'session_secret': 's' * 64, 'users': {}, 'proxy_services': []})
+            trust = (lambda m, *a, **k: m.update(meta_change)) if meta_change else (lambda *a, **k: None)
+            with mock.patch.object(portal, 'portal_state_file_lock', lock),                     mock.patch.object(portal, 'qr_svg_for', qr),                     mock.patch.object(portal, 'sync_cert_trust', trust),                     mock.patch.object(portal, 'sync_pin', lambda *a, **k: None):
+                action(root)
+            after = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
+        return seen, after
+
+    def test_adopt_renders_qr_outside_state_lock(self):
+        """adopt 不再把 refresh 包在状态锁里（2026-11-04 修）。"""
+        seen, _ = self._with_lock_probe(lambda root: portal.adopt(root / 'client_meta.json', 2222))
+        self.assertTrue(seen)
+        self.assertNotIn(True, seen, 'adopt 时二维码在状态锁内生成')
+
+    def test_uri_changed_inside_lock_still_gets_a_fresh_qr_outside_it(self):
+        seen, after = self._with_lock_probe(lambda root: portal.refresh(root / 'client_meta.json'),
+                                            meta_change={'listen_port': 8443})
+        self.assertNotIn(True, seen, 'uri 在锁内变化时二维码仍在锁内生成')
+        self.assertEqual(len(seen), 2)
+        self.assertIn('qr', after)
+
 
 
 class RefreshSparseMetaTests(unittest.TestCase):
