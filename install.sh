@@ -5743,6 +5743,7 @@ flow_update_core() {
 flow_reconfigure() {
     check_root
     require_installed
+    refuse_if_suspended || return 1
     # 🔴 改配置前必须警告 + 备份（2026-10-09 修）：
     # 这条路径会整体重写 client_meta.json 并重建门户，原先一个字都没提示。
     echo
@@ -5770,8 +5771,10 @@ flow_reconfigure() {
     show_client_configs
 }
 
-flow_warp() { check_root; install_warp_local_proxy; }
-flow_gost() { check_root; install_gost; }
+# 流量超额停用期间不能走这些菜单（2026-11-04 修）：它们会 restart hysteria-server /
+# gost，与 9 / 11 号菜单一样绕过控制台的流量限额。
+flow_warp() { check_root; refuse_if_suspended || return 1; install_warp_local_proxy; }
+flow_gost() { check_root; refuse_if_suspended || return 1; install_gost; }
 flow_uninstall() { check_root; uninstall_all; }
 
 flow_refresh_portal() {
