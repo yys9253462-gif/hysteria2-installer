@@ -5420,6 +5420,27 @@ WantedBy=multi-user.target
 '''
 
 
+XRAY_UNIT_PATH = '/etc/systemd/system/xray.service'
+XRAY_OWNED_EXECSTART = 'ExecStart=/usr/local/bin/xray run -c /etc/hysteria/xray.json'
+XRAY_FOREIGN_ERROR = ('本机已有不归本工具管理的 xray.service（例如官方脚本安装的 Xray），'
+                      '为免覆盖其配置与二进制，已拒绝安装')
+
+
+def xray_unit_foreign(unit_path=XRAY_UNIT_PATH):
+    """xray.service 存在但不是本门户写的（2026-11-04 加）。
+
+    官方 XTLS 脚本用同名单元跑 /usr/local/etc/xray/config.json；覆盖它会让机主自己的
+    入站在下次重启时静默消失，二进制也被替换。判据与 install.sh 卸载时认领单元一致。
+    """
+    try:
+        text = Path(unit_path).read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return XRAY_OWNED_EXECSTART not in text
+
+
 def write_xray_unit():
     """写 xray.service 并 daemon-reload；不 enable —— 没有任何协议配置时
     开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
@@ -11494,6 +11515,8 @@ if __name__ == '__main__':
                             return self.reply_json(409, {'ok': False, 'error': str(exc)})
                         raise
                     try:
+                        if xray_unit_foreign():
+                            return self.reply_json(409, {'ok': False, 'error': XRAY_FOREIGN_ERROR})
                         ok, msg = install_xray_binary()
                         if not ok:
                             return self.reply_json(500, {'ok': False, 'error': msg})
@@ -12113,6 +12136,8 @@ if __name__ == '__main__':
                             return self.reply_json(409, {'ok': False, 'error': str(exc)})
                         raise
                     try:
+                        if name == 'xray' and xray_unit_foreign():
+                            return self.reply_json(409, {'ok': False, 'error': XRAY_FOREIGN_ERROR})
                         if name == 'xray':
                             ok, msg = install_xray_binary()
                             if ok:

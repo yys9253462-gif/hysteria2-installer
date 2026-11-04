@@ -1,6 +1,7 @@
 import ast
 import copy
 import io
+import os
 import json
 import subprocess
 import tempfile
@@ -57,6 +58,7 @@ class WebWorkflowTests(unittest.TestCase):
         self.save = Mock()
         self.reload = Mock(return_value=True)
         self.ns = dict(portal.__dict__, Path=fake_path, data=self.data, data_lock=threading.RLock(),
+                       xray_unit_foreign=lambda *a: False,
                        save_data=self.save, regenerate_page=self.save, meta_path=self.meta,
                        portal_path=self.hdir / 'portal.json', ip_tracker={}, speed_tracker={},
                        global_ip_deny={}, MASTER_USER_ID='admin_master',
@@ -490,6 +492,16 @@ class WebWorkflowTests(unittest.TestCase):
         self.ns['apply_access'] = lambda **kwargs: (applied.append(kwargs) or True)
         self.assertTrue(handler(self.handler, core_lock_fd=core_fd))
         self.assertEqual(applied, [{'core_lock_fd': core_fd}])
+
+    def test_core_install_refuses_foreign_xray_unit(self):
+        """官方脚本装的 xray.service 不被覆盖，二进制也不替换（2026-11-04 修）。"""
+        self.ns['acquire_core_operation_lock'] = Mock(return_value=os.open(os.devnull, os.O_RDONLY))
+        self.ns['xray_unit_foreign'] = Mock(return_value=True)
+        self.ns['XRAY_FOREIGN_ERROR'] = 'foreign'
+        install = self.ns['install_xray_binary'] = Mock(return_value=(True, ''))
+        status, body = self.invoke_core_install()
+        self.assertEqual(status, 409)
+        install.assert_not_called()
 
     def test_core_install_returns_conflict_when_cross_process_lock_is_held(self):
         self.ns['acquire_core_operation_lock'] = Mock(
