@@ -5488,6 +5488,12 @@ uninstall_all() {
             systemctl disable --now wireproxy 2>/dev/null || true
             rm -f /etc/systemd/system/wireproxy.service /etc/wireguard/wp.conf
             rm -f /usr/local/bin/wireproxy /usr/local/bin/wgcf /usr/local/bin/hy2-warp-watchdog.sh
+        elif [[ -f "$HY2_DIR/.hy2-warp-owned" && ! -e /etc/systemd/system/wireproxy.service ]]; then
+            # WARP 安装中途失败（wgcf 注册被限流等）：所有权标记已写、服务单元还没写。
+            # 二进制是本工具下载的（标记只在装好可信 wireproxy 后才写），一并清掉，
+            # 否则卸载后永久残留（2026-11-04 修）。
+            rm -f /usr/local/bin/wireproxy /usr/local/bin/wgcf
+            managed_wireproxy=1
         fi
         if [[ "$managed_wireproxy" == 1 ]]; then
             systemctl disable --now hy2-warp-watchdog.timer 2>/dev/null || true
