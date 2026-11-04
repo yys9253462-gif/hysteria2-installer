@@ -5701,7 +5701,9 @@ run_action() {
 # 否则 Teyir 控制台保存的凭据全部失效、控制台开的用户与代理服务全部丢失。
 ask_preserve_portal() {
     PRESERVE_PORTAL=0
-    [[ -f "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal-access.json" ]] || return 0
+    # 只看 portal.json（2026-11-04 修）：portal-access.json 缺失时 adopt 会重建它；旧条件
+    # 要求两个都在，凭据文件一丢就连问都不问、直接走 prepare，token / API Key 全换、子账号清空。
+    [[ -f "$HY2_DIR/portal.json" ]] || return 0
     echo
     echo -e "${YELLOW}是否沿用现有门户？${PLAIN}（登录凭据、API Key、订阅地址、全部用户与代理服务保持不变）"
     echo -e "  已接入 Teyir 控制台或已给客户发过订阅的节点，请务必选 Y。"
