@@ -144,7 +144,8 @@ if [ -z "$ROOT_PWD" ]; then
         die "非交互模式必须通过 ROOT_PWD 环境变量或 --pwd 提供 root 密码"
     fi
     printf '%s' "请设置新系统 root 密码（不能含特殊字符以免输入出错）: "
-    if [ -t 0 ]; then read -r ROOT_PWD; else read -r ROOT_PWD </dev/tty; fi
+    # set -eu 下 read 读到 EOF 返回 1，脚本会无声退出（2026-11-04 修）；交给下面的空值检查报错。
+    if [ -t 0 ]; then read -r ROOT_PWD || ROOT_PWD=""; else read -r ROOT_PWD </dev/tty || ROOT_PWD=""; fi
 fi
 [ -n "$ROOT_PWD" ] || die "root 密码不能为空"
 
@@ -221,7 +222,7 @@ warn "磁盘上所有数据都会丢失，且不可恢复"
 printf '\n'
 if [ "$ASSUME_YES" != "1" ] && [ "$DRY_RUN" != "1" ]; then
     printf '确认继续？输入 yes 回车：'
-    if [ -t 0 ]; then read -r _ans; else read -r _ans </dev/tty; fi
+    if [ -t 0 ]; then read -r _ans || _ans=""; else read -r _ans </dev/tty || _ans=""; fi
     [ "$_ans" = "yes" ] || die "已取消"
 fi
 
@@ -754,7 +755,7 @@ else
         run reboot
     else
         printf '现在重启吗？输入 reboot 回车立即重启，或直接按 Ctrl+C 稍后手动重启：'
-        if [ -t 0 ]; then read -r _rb; else read -r _rb </dev/tty; fi
+        if [ -t 0 ]; then read -r _rb || _rb=""; else read -r _rb </dev/tty || _rb=""; fi
         if [ "$_rb" = "reboot" ]; then
             info "重启中..."
             reboot
