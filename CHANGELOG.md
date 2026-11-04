@@ -1,3 +1,16 @@
+## 2026-11-04 — 第二十批十项修复，门户 2.30
+
+- DNS API 签发把凭据以环境变量交给 acme.sh：此前传 `--dns_cf_token` 等 acme.sh 不认识的参数，Cloudflare / 阿里云 / DuckDNS 签发从未成功过；DuckDNS 改用正确的 `dns_duckdns` 插件。
+- 内置 ACME 只要 TCP 80 空闲即可签发：此前 443 被占（本项目 Reality 默认就在 443）也判成端口冲突，被推去 Caddy / DNS API / 自签。
+- 「重新修改配置」沿用门户时，把网页上保存的 WARP 分流与自定义出站写回新生成的 config.yaml，不再静默消失。
+- WARP 安装中途失败（wgcf 注册被限流等）后，完整卸载也会清掉本工具下载的 wgcf / wireproxy。
+- 分享页给出所有已启用协议的直链（Reality / VMess / VLESS-Enc / AnyTLS / TUIC），UDP 不通时用 v2rayNG / Shadowrocket 也能导入备用节点。
+- 到期时间带上服务器的 UTC 偏移，用户弹窗与用户表 / 分享页显示同一段文本。
+- 流量显示先取整再定单位，不再出现「1024.0 KB」（后端与弹窗同一规则）。
+- 用量进度条只有真正用满才显示 100%。
+- 门户保存状态时写盘与 fsync 不再占着数据锁，慢盘上 /auth 不再跟着卡。
+- 设备上限 worker 先拿核心锁再改 xray.json，核心安装 / 升级 / 卸载途中不再重启 Xray。
+
 ## 2026-11-04 — 第十九批十项修复，门户 2.29
 
 - `fix_cert_chain.sh` 只改 `tls:` 段里的 `cert:` 行并按字面替换：此前全文 sed，同前缀的 `key:` 路径一起被改坏，hysteria 起不来；新配置下起不来时自动恢复原配置。
