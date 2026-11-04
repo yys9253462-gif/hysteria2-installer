@@ -3752,7 +3752,27 @@ def _safe_int(value, default=0):
     except (TypeError, ValueError, OverflowError):
         return default
 
-def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None):
+def _extra_link_boxes(extra_links):
+    """分享页里其它已启用协议的直链（2026-11-04 加）。
+
+    UDP 被封的网络要靠 Reality / VMess 等 TCP 协议兜底；旧分享页只有 Hy2 一条直链，
+    用 v2rayNG / Shadowrocket 按链接导入的用户永远拿不到备用节点。
+    """
+    parts = []
+    for i, (label, link) in enumerate(extra_links or ()):
+        if not isinstance(link, str) or not link:
+            continue
+        box_id = 'u-extra-uri-%d' % i
+        parts.append(
+            '<div style="margin-top:14px"><p class="note" style="margin-bottom:4px">%s 直链（UDP 不通时用）</p>'
+            '<textarea id="%s" class="link" readonly>%s</textarea>'
+            '<div class="actions"><button class="button" type="button" data-copy="%s">复制 %s 直链</button></div></div>'
+            % (html.escape(label), box_id, html.escape(link), box_id, html.escape(label)))
+    return ''.join(parts)
+
+
+def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None,
+                   extra_links=()):
     # 数据被改坏时（字符串用量、非法到期时间）不能让客户页面 500：
     # 这几个值直接来自 portal.json（2026-10-30 修）。
     used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
@@ -3821,6 +3841,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
         <button class="button primary" type="button" data-copy="u-hy2-uri">复制直链</button>
       </div>
       <p class="note">{html.escape(host)} · UDP {_valid_port(listen_port) or 19984}</p>
+      {_extra_link_boxes(extra_links)}
     </section>
 
     <section class="card">
@@ -13963,7 +13984,24 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     host = m.get('public_ip', server_name) if m.get('is_insecure') else server_name
                     listen_port = m.get('listen_port', 19984)
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
-                    page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0])
+                    # 其它已启用协议的直链，与 users/create 的回包同一组生成器（2026-11-04 加）
+                    _pub = m.get('public_ip', '127.0.0.1')
+                    _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
+                    _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
+                    _t = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
+                    extra = []
+                    for _label, _make in (
+                            ('Reality', lambda: reality_uri_for_user(_r, target_uid, _pub, label=f"Reality-{target_uid}") if _r else ''),
+                            ('VMess', lambda: vmess_uri_for_user(_v, target_uid, _pub, label=f"VMess-{target_uid}") if _v else ''),
+                            ('VLESS-Enc', lambda: vlessenc_uri_for_user(_e, target_uid, _pub, label=f"VLESS-Enc-{target_uid}") if _e else ''),
+                            ('AnyTLS', lambda: anytls_uri_for_user(_a, target_uid, label=f"AnyTLS-{target_uid}") if _a else ''),
+                            ('TUIC', lambda: tuic_uri_for_user(_t, target_uid, label=f"TUIC-{target_uid}") if _t else '')):
+                        try:
+                            extra.append((_label, _make()))
+                        except Exception as exc:
+                            _log_ignored('share_extra_uri', exc)
+                    page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0],
+                                          extra_links=extra)
                     return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
                 else:
                     return self.reply(404, b'Not found')
