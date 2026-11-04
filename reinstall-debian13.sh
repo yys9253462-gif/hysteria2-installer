@@ -602,9 +602,17 @@ set -- "$@" --cloudkernel 0 --bbr --motd
 
 printf '\n'
 info "开始执行重装（InstallNET 接管后会自行重启，全程 10~20 分钟）"
-info "执行命令：bash InstallNET.sh $*"
+# 屏显与日志里遮掉 root 密码（2026-11-04 修）：日志留在 /root/reinstall-debian13.log，
+# 旧实现把 -pwd 后的原文写进去，能读到它的人就拿到了 SSH root 密码。
+_shown="" _mask=0
+for _a in "$@"; do
+    if [ "$_mask" = "1" ]; then _a="******"; _mask=0; fi
+    [ "$_a" = "-pwd" ] && _mask=1
+    _shown="${_shown:+$_shown }$_a"
+done
+info "执行命令：bash InstallNET.sh $_shown"
 printf '\n'
-log_line "执行：bash InstallNET.sh $*"
+log_line "执行：bash InstallNET.sh $_shown"
 
 # 交给 InstallNET
 # ★ 兜底：明确检查 bash 存在，避免只留下一句 `sh: bash: not found`（退出码 127）

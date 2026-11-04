@@ -23,5 +23,23 @@ class ReinstallConfirmBeforeWipeTests(unittest.TestCase):
         self.assertGreater(guard, SRC.index("确认开始？输入 yes 回车"))
 
 
+
+class ReinstallLogMasksPasswordTests(unittest.TestCase):
+    def test_password_is_masked_in_shown_command(self):
+        """执行 reinstall-debian13.sh 里真实的遮罩循环（2026-11-04 修）。"""
+        import shutil, subprocess
+        sh = shutil.which('sh') or shutil.which('bash')
+        if not sh:
+            self.skipTest('requires sh')
+        start = SRC.index('_shown="" _mask=0')
+        end = SRC.index('done\n', start) + 5
+        script = ('set -- -debian 13 -port 22 -pwd "s3cr|t.*" -mirror m\n' + SRC[start:end]
+                  + 'printf "%s" "$_shown"')
+        out = subprocess.run([sh, '-c', script], capture_output=True, text=True, timeout=10).stdout
+        self.assertNotIn('s3cr', out)
+        self.assertIn('-pwd ******', out)
+        self.assertIn('-mirror m', out)
+
+
 if __name__ == '__main__':
     unittest.main()
