@@ -5010,10 +5010,10 @@ install_amneziawg() {
     echo -e "  ${GREEN}1.${PLAIN} AWG 3.x  (最新：头部保护 + 时序随机化，抗连接行为分析)"
     echo -e "  ${GREEN}2.${PLAIN} AWG 2.x  (生态验证更充分，参数体系稳定)"
     if [[ "$def_line" == "2" ]]; then
-        read -rp "请输入选项 [1-2, 默认 2]: " line_choice
+        read -rp "请输入选项 [1-2, 默认 2]: " line_choice || true
         line_choice="${line_choice:-2}"
     else
-        read -rp "请输入选项 [1-2, 默认 1]: " line_choice
+        read -rp "请输入选项 [1-2, 默认 1]: " line_choice || true
         line_choice="${line_choice:-1}"
     fi
     case "$line_choice" in
@@ -5027,7 +5027,7 @@ install_amneziawg() {
     echo ""
     echo -e "${YELLOW}端口说明：${PLAIN}必须避开 Hysteria2 的端口跳跃区间 20000-40000，"
     echo -e "          否则入站 UDP 会被 REDIRECT 到 Hysteria，AWG 收不到握手包。"
-    read -rp "请输入监听 UDP 端口 [回车自动选择 ${AWG_PORT_MIN}-${AWG_PORT_MAX} 内的空闲端口]: " port
+    read -rp "请输入监听 UDP 端口 [回车自动选择 ${AWG_PORT_MIN}-${AWG_PORT_MAX} 内的空闲端口]: " port || true
     port="${port// /}"
     if [[ -n "$port" ]]; then
         if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
@@ -5051,10 +5051,10 @@ install_amneziawg() {
     echo ""
     echo -e "${YELLOW}连接地址用于生成客户端的 Endpoint，填域名或公网 IP 均可。${PLAIN}"
     if [[ -n "$suggestion" ]]; then
-        read -rp "请输入客户端连接地址 [默认: ${suggestion}]: " endpoint
+        read -rp "请输入客户端连接地址 [默认: ${suggestion}]: " endpoint || true
         endpoint="${endpoint:-$suggestion}"
     else
-        read -rp "请输入客户端连接地址（域名或公网 IP）: " endpoint
+        read -rp "请输入客户端连接地址（域名或公网 IP）: " endpoint || true
     fi
     if [[ -z "$endpoint" ]]; then
         log_warn "未提供连接地址，将跳过首个客户端创建，之后可手动补。"
@@ -5069,7 +5069,7 @@ install_amneziawg() {
         fi
         if [[ "$has_peers" == "0" ]]; then
             echo ""
-            read -rp "请为首个客户端命名 [默认: client1]: " client
+            read -rp "请为首个客户端命名 [默认: client1]: " client || true
             client="${client:-client1}"
         fi
     fi
@@ -5109,7 +5109,7 @@ awg_menu_add_peer() {
     if ! awg_ensure_ctl; then return 1; fi
 
     local name endpoint suggestion
-    read -rp "请输入新客户端名称（字母/数字/._-）: " name
+    read -rp "请输入新客户端名称（字母/数字/._-）: " name || true
     name="${name// /}"
     if [[ -z "$name" ]]; then
         log_err "名称不能为空。"
@@ -5121,7 +5121,7 @@ awg_menu_add_peer() {
     fi
 
     suggestion="$(awg_suggest_endpoint)"
-    read -rp "客户端连接地址 [默认: ${suggestion:-需手动输入}]: " endpoint
+    read -rp "客户端连接地址 [默认: ${suggestion:-需手动输入}]: " endpoint || true
     endpoint="${endpoint:-$suggestion}"
     if [[ -z "$endpoint" ]]; then
         log_err "必须提供连接地址才能生成客户端配置。"
@@ -5152,14 +5152,14 @@ awg_menu_del_peer() {
     "$AWG_CTL_BIN" peer-list || true
     echo ""
     local name
-    read -rp "请输入要删除的客户端名称: " name
+    read -rp "请输入要删除的客户端名称: " name || true
     if [[ -z "$name" ]]; then
         log_err "名称不能为空。"
         return 1
     fi
 
     local confirm
-    read -rp "确认删除客户端 '${name}'？该客户端将立即断线 [y/N]: " confirm
+    read -rp "确认删除客户端 '${name}'？该客户端将立即断线 [y/N]: " confirm || true
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "已取消。"
         return 0
@@ -5189,7 +5189,7 @@ awg_menu_switch_line() {
     log_warn "所有已发放的客户端配置都会立刻失效，必须全部重新导出！"
     echo ""
     local confirm
-    read -rp "确认切换协议线？[y/N]: " confirm
+    read -rp "确认切换协议线？[y/N]: " confirm || true
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "已取消。"
         return 0
@@ -5211,7 +5211,7 @@ uninstall_amneziawg() {
     log_warn "即将彻底卸载 AmneziaWG：停止服务、删除网卡与 NAT 规则、"
     log_warn "删除全部密钥与客户端配置（不可恢复）。"
     local confirm
-    read -rp "确认卸载？[y/N]: " confirm
+    read -rp "确认卸载？[y/N]: " confirm || true
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "已取消。"
         return 0
@@ -5270,7 +5270,8 @@ menu_amneziawg() {
         echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
         echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
         echo -e "${CYAN}================================================================${PLAIN}"
-        read -rp "请输入选项 [0-8]: " sub
+        # EOF（无人值守 / 管道输入耗尽）时返回，而不是在循环里空转（2026-11-04 修）。
+        read -rp "请输入选项 [0-8]: " sub || return 0
 
         case "$sub" in
             1) install_amneziawg || true ;;
@@ -5304,7 +5305,7 @@ menu_amneziawg() {
         esac
 
         echo ""
-        read -rp "按回车返回 AmneziaWG 菜单..." _
+        read -rp "按回车返回 AmneziaWG 菜单..." _ || return 0
     done
 }
 
