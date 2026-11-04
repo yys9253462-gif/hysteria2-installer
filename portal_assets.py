@@ -3038,8 +3038,12 @@ if (uModal) {
   });
 }
 
+// 只认最后一次点击的回包（2026-11-04 修）：先点慢的 A、关掉再点 B，A 的回包晚到会把
+// B 标题下的内容换成 A 的链接与二维码，管理员复制出去就把 A 的凭据发给了 B 的客户。
+let userModalSeq = 0;
 document.querySelectorAll('.btn-user-connect').forEach(btn => {
   btn.addEventListener('click', async () => {
+    const mySeq = ++userModalSeq;
     const uid = btn.dataset.uid;
     const token = btn.dataset.token;
     const userKey = btn.dataset.key;
@@ -3059,6 +3063,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         throw new Error('网络请求异常 (HTTP ' + res.status + ')');
       }
       const json = await res.json();
+      if (mySeq !== userModalSeq) return;
       if (!json.ok) throw new Error(json.error || '加载失败');
       
       uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
@@ -3142,6 +3147,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       });
       
     } catch (err) {
+      if (mySeq !== userModalSeq) return;
       uModalBody.innerHTML = `<div style="text-align:center;padding:24px;color:var(--danger)">加载失败: ${obEsc(err.message)}</div>`;
     }
   });

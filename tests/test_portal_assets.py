@@ -357,6 +357,43 @@ globalThis.fetch = async () => reply;
         self.assertEqual(result.returncode, 0, result.stderr)
 
     @unittest.skipUnless(NODE, 'requires node')
+    def test_user_modal_ignores_a_late_reply_for_an_earlier_click(self):
+        """先点 A 再点 B，A 的回包晚到不能覆盖 B 的弹窗内容（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('let userModalSeq = 0;')
+        end = script.index('\n});\n', start) + 5
+        prelude = script[:script.index('// 全局高颜值 Promise 确认框与 Toast 机制')]
+        harness = r"""
+const assert = require('assert');
+const el = () => ({style: {}, textContent: '', innerHTML: '', dataset: {}, classList: {add(){}, remove(){}},
+                   querySelectorAll: () => [], addEventListener(){}});
+const uModal = el(), uModalTitle = el(), uModalSub = el(), uModalBody = el();
+const handlers = {};
+const mk = uid => ({dataset: {uid, token: 't', key: 'k'}, addEventListener: (k, fn) => { handlers[uid] = fn; }});
+globalThis.document = {querySelectorAll: sel => sel === '.btn-user-connect' ? [mk('A'), mk('B')] : [],
+                       getElementById: () => el()};
+globalThis.location = {origin: 'https://n', pathname: '/t/'};
+const resolvers = {};
+globalThis.fetch = async url => new Promise(r => { resolvers[url.includes('=A') ? 'A' : 'B'] = r; });
+const obEsc = v => String(v);
+const reply = uid => new Response(JSON.stringify({ok: true, uri: 'hy2://' + uid + '-SECRET', note: '',
+  clash: '', sing_box: '', qr_svg: '', expires_at: null, traffic_used: 0, traffic_limit: 0, ip_limit: 0}));
+"""
+        checks = r"""
+(async () => {
+  const a = handlers.A(); await new Promise(r => setTimeout(r, 0));
+  const b = handlers.B(); await new Promise(r => setTimeout(r, 0));
+  resolvers.B(reply('B')); await b;
+  resolvers.A(reply('A')); await a;
+  assert(uModalBody.innerHTML.includes('B-SECRET'), '弹窗不是 B 的内容');
+  assert(!uModalBody.innerHTML.includes('A-SECRET'), 'A 的晚到回包覆盖了 B');
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + prelude + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
     def test_reality_qr_is_cleared_when_the_server_sends_none(self):
         """重置密钥后没有新二维码时清掉旧的，不让用户扫旧 pbk（2026-11-04 修）。"""
         script = portal.SCRIPT
