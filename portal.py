@@ -757,6 +757,11 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
 
     if not isinstance(rules, (list, tuple)):
         rules = ()
+    # Hysteria ACL 首条命中即停：更具体的域名必须排在前面（2026-11-04 修）。按添加顺序
+    # 写时，先加的 google.com → warp 会吞掉后加的 mail.google.com → direct，后者永不生效。
+    # sorted 是稳定排序，同层级的规则仍保持添加顺序。
+    rules = sorted((r for r in rules if isinstance(r, dict)),
+                   key=lambda r: -str(r.get('domain') or '').strip('.').count('.'))
     for r in rules:
         if not isinstance(r, dict):
             continue
@@ -823,7 +828,9 @@ def build_warp_acl_config(original, enabled, rules):
         text = text.rstrip('\n') + '\n\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443\n  udpPorts: 443\n'
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
     lines = _acl_head()
-    for rule in rows if enabled else custom_rules:
+    _ordered = sorted(rows if enabled else custom_rules,
+                      key=lambda r: -str(r.get('domain', '') if isinstance(r, dict) else r).strip('.').count('.'))
+    for rule in _ordered:  # 同 build_acl_block：具体域名在前
         domain = rule.get('domain', '') if isinstance(rule, dict) else rule
         target = rule.get('outbound') or warp_name if isinstance(rule, dict) else warp_name
         if target not in set(existing) | {'direct', 'reject'}:
