@@ -37,6 +37,16 @@ class ParseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 portal.parse_ip_deny(params, 0)
 
+    def test_rejects_reserved_and_scoped_and_unmaps_v4(self):
+        """保留名、带 zone 的 IPv6 拒收；IPv4 映射地址还原（2026-11-04 修）。"""
+        for params in ({'user_id': 'admin_master', 'ips': ['1.2.3.4']},
+                       {'user_id': 'placeholder', 'ips': ['1.2.3.4']},
+                       {'user_id': 'sub_a', 'ips': ['fe80::1%eth0']}):
+            with self.subTest(params=params), self.assertRaises(ValueError):
+                portal.parse_ip_deny(params, 0)
+        _, entries = portal.parse_ip_deny({'user_id': 'sub_a', 'ips': ['::ffff:198.51.100.7']}, 0)
+        self.assertEqual(list(entries), ['198.51.100.7'])
+
     def test_expired_entries_drop_out(self):
         table = {'u': {'1.1.1.1': 100, '2.2.2.2': 300}}
         self.assertEqual(portal.active_ip_deny(table, 'u', 200), {'2.2.2.2'})

@@ -5808,6 +5808,10 @@ def parse_ip_deny(params, now):
     user_id = str(params.get('user_id', '')).strip()
     if not USER_ID_RE.match(user_id):
         raise ValueError('Invalid user_id format')
+    # 与其它 users/ 写接口一致（2026-11-04 修）：保留名不能被拉黑，否则 API Key 就能
+    # 让机主账号在 /auth 里按 IP 被拒。
+    if user_id in RESERVED_USER_IDS:
+        raise ValueError('Reserved user accounts cannot be targeted')
     raw = params.get('ips', [])
     if not isinstance(raw, list) or len(raw) > IP_DENY_MAX_IPS:
         raise ValueError('ips must be a list of at most %d addresses' % IP_DENY_MAX_IPS)
@@ -5825,10 +5829,16 @@ def parse_ip_deny(params, now):
     entries = {}
     for item in raw:
         try:
-            ip = str(ipaddress.ip_address(str(item).strip()))
+            addr = ipaddress.ip_address(str(item).strip())
         except ValueError:
             raise ValueError('Invalid IP address: %s' % str(item)[:64])
-        entries[ip] = now + ttl
+        # 带 zone 的 IPv6（fe80::1%eth0）永远匹配不上 /auth 的客户端地址，写进 Xray
+        # 规则还会让整批 adrules 失败；IPv4 映射地址还原成 IPv4，与 /auth 同一写法（2026-11-04 修）。
+        if getattr(addr, 'scope_id', None):
+            raise ValueError('Scoped IPv6 addresses are not allowed: %s' % str(item)[:64])
+        if addr.version == 6 and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        entries[str(addr)] = now + ttl
     return user_id, entries
 
 
