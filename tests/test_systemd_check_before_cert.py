@@ -28,6 +28,7 @@ class SystemdCheckBeforeCertTests(unittest.TestCase):
             'generate_server_config', 'setup_system_firewall', 'setup_systemd', 'show_client_configs'))
         script = '\n'.join([
             'log_err() { echo "ERR $*"; }', 'log_warn() { :; }', 'log_info() { :; }',
+            'refuse_if_suspended() { return 0; }',
             'HY2_CONFIG=/nonexistent/config.yaml',
             'systemctl() { [[ "$1" == --version ]] && echo "systemd 245 (245.4)"; }',
             stubs, fn('require_systemd_247'), fn('flow_install'),

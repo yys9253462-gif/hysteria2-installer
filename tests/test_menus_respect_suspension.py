@@ -29,22 +29,22 @@ class MenusRespectSuspensionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / 'portal.json').write_text(json.dumps({'traffic_suspend': {'suspended': suspended}}))
             script = '\n'.join([
-                'HY2_DIR=%s' % td, 'log_warn() { :; }', 'check_root() { :; }', 'require_installed() { :; }',
-                'install_warp_local_proxy() { echo RAN; }', 'install_gost() { echo RAN; }',
+                'HY2_DIR=%s' % td, 'HY2_CONFIG=%s/portal.json' % td, 'log_warn() { :; }', 'check_root() { :; }', 'require_installed() { :; }',
+                'install_warp_local_proxy() { echo RAN; }', 'install_gost() { echo RAN; }', 'check_arch() { :; }',
                 'read() { echo RAN; return 1; }',
                 fn('traffic_suspended'), fn('refuse_if_suspended'), fn(flow),
                 '%s; echo "RC=$?"' % flow])
             return subprocess.run([BASH, '-c', script], capture_output=True, text=True, timeout=20).stdout
 
     def test_suspended_node_refuses(self):
-        for flow in ('flow_warp', 'flow_gost', 'flow_reconfigure'):
+        for flow in ('flow_warp', 'flow_gost', 'flow_reconfigure', 'flow_install'):
             with self.subTest(flow=flow):
                 out = self.run_flow(flow, True)
                 self.assertNotIn('RAN', out)
                 self.assertIn('RC=1', out)
 
     def test_active_node_proceeds(self):
-        for flow in ('flow_warp', 'flow_gost', 'flow_reconfigure'):
+        for flow in ('flow_warp', 'flow_gost', 'flow_reconfigure', 'flow_install'):
             with self.subTest(flow=flow):
                 self.assertIn('RAN', self.run_flow(flow, False))
 

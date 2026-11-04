@@ -5674,6 +5674,8 @@ acquire_installer_core_lock() {
 flow_install() {
     check_root
     check_arch
+    # 与 4 / 5 / 6 号菜单同理（2026-11-04 修）：重装会 restart hysteria-server，超额停用期间拒绝。
+    refuse_if_suspended || return 1
     # 已装机再按「1」会重生成配置、可能换掉端口/密码/证书，
     # 已发放的客户端配置随之失效 —— 必须让用户确认一次。
     if [[ -f "$HY2_CONFIG" ]]; then
@@ -5989,6 +5991,7 @@ if [[ $# -gt 0 ]]; then
     esac
     case "$1" in
         install)
+            refuse_if_suspended || exit 1
             acquire_installer_core_lock || exit 1
             # 免交互重装也要先留出与菜单安装相同的恢复快照。
             if [[ -f "$HY2_DIR/config.yaml" || -f "$HY2_META_FILE" ]]; then
