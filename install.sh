@@ -1976,6 +1976,13 @@ generate_self_signed_cert() {
     KEY_FILE="${HY2_CERT_DIR}/server.key"
     IS_INSECURE="true"
 
+    # 已有一对可用的自签证书就沿用（2026-11-04 修）：「重新修改配置」默认走这里，旧实现每次
+    # 重新生成，pin 跟着变，已发放的自签链接（带 pinSHA256）全部握手失败。
+    # 要强制换新证书：HY2_REGEN_SELF_SIGNED=1。
+    if [[ "${HY2_REGEN_SELF_SIGNED:-0}" != "1" && -s "$CERT_FILE" && -s "$KEY_FILE" ]]             && _cert_key_usable "$CERT_FILE" "$KEY_FILE"             && openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -q "CN *= *${SERVER_NAME}"; then
+        log_info "沿用现有自签名证书（pin 不变，已发放的客户端无需重新导入）。"
+        return 0
+    fi
     log_step "正在生成高拟真自签名 ECC 证书 (伪装 SNI: ${SERVER_NAME})..."
     openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE"
     openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SERVER_NAME}" >/dev/null 2>&1
