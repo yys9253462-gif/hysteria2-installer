@@ -7686,6 +7686,39 @@ def ensure_portal_access(root, meta, data):
           '（token / API Key / 用户保留）', file=sys.stderr)
     return access, True
 
+def restore_egress_into_config(root, config_path=None):
+    """把门户里保存的 WARP 分流 / 自定义出站重新渲染进 config.yaml（2026-11-04 加）。
+
+    「重新修改配置」由 install.sh 从头重写 config.yaml，只带默认 ACL：网页上开着的 WARP
+    分流与自定义出站静默消失，面板却仍显示已开启。adopt 之后、安装脚本重启 Hysteria
+    之前调用；这里只写文件，不重启服务。
+    """
+    root = Path(root)
+    cfg = Path(config_path) if config_path else root / 'config.yaml'
+    try:
+        data = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
+        original = cfg.read_text(encoding='utf-8')
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    state = routing_state(data)
+    # 没保存过任何出口设置就不动：渲染总会顺带重排 ACL 头部，不该无故改写刚生成的配置。
+    if not (state['warp_enabled'] or state['custom_outbounds'] or state['warp_rules']
+            or state['outbound_mode'] == 'global'):
+        return False
+    rendered = render_egress_config(original, state)
+    if rendered == original:
+        return False
+    atomic_write_private(cfg, rendered.encode('utf-8'))
+    try:
+        os.chmod(cfg, 0o600)
+    except OSError:
+        pass
+    print('[portal] 已把保存的 WARP / 自定义出站规则写回 config.yaml', file=sys.stderr)
+    return True
+
+
 def adopt(meta_path, port, node_api_key=None):
     """「重新修改配置 / 重新安装」时沿用现有门户，而不是 prepare() 推倒重建。
 
@@ -7698,6 +7731,7 @@ def adopt(meta_path, port, node_api_key=None):
     root = Path(meta_path).parent
     with portal_state_file_lock(root):
         _adopt_locked(meta_path, port, node_api_key)
+    restore_egress_into_config(root)
     # refresh 自己拿状态锁，并在锁外先生成二维码（2026-11-04 修）：旧实现把它包在
     # 上面的锁里，qrencode 最长 20 秒期间运行中门户的 save_data 持着 data_lock 干等，
     # 所有新的 Hy2 鉴权跟着卡住。
