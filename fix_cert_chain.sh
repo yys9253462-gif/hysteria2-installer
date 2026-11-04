@@ -50,7 +50,24 @@ cert_of () {   # 从 config.yaml 取出 tls.cert 路径
              print; exit
          }' "$1"
 }
-n_certs () { grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null || echo 0; }
+n_certs () { local n; n="$(grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
+# 证书文件第一张证书（叶证书）的公钥指纹
+leaf_pub () { openssl x509 -in "$1" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}'; }
+# 只改 tls: 段里的 cert: 行，按字面替换（2026-11-04 修）：旧实现 sed 全文替换且把路径当
+# 正则，key: "/x/a.cer.key" 这种同前缀路径会一起被改坏，hysteria 随即起不来。
+set_tls_cert () {   # $1=config $2=new path
+    local tmp; tmp="$(mktemp "${1}.XXXXXX")" || return 1
+    NEW_CERT="$2" awk '
+        /^tls:[[:space:]]*$/ {f=1; print; next}
+        /^[^[:space:]]/ {f=0}
+        f && !done && /^[[:space:]]+cert:/ {
+            match($0, /^[[:space:]]+cert:/); print substr($0, 1, RLENGTH) " \"" ENVIRON["NEW_CERT"] "\""
+            done=1; next
+        }
+        {print}' "$1" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod --reference="$1" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$1"
+}
 
 [[ -f "$CONFIG" ]] || { err "找不到配置文件：$CONFIG"; exit 1; }
 
@@ -81,8 +98,11 @@ else
     DIR="$(dirname "$CERT_FILE")"
     FULL=""
     for cand in "$DIR/fullchain.cer" "$DIR/fullchain.pem" "$DIR/../fullchain.cer" "$DIR/../fullchain.pem"; do
-        if [[ -f "$cand" ]] && [[ "$(n_certs "$cand")" -ge 2 ]]; then
+        if [[ -f "$cand" ]] && [[ "$(n_certs "$cand")" -ge 2 ]]                 && [[ -n "$_want" && "$(leaf_pub "$cand")" == "$_want" ]]; then
             FULL="$cand"; break
+    # 候选链的叶证书必须就是当前这张（2026-11-04 修）：多域名机器上上级目录的
+    # fullchain 可能属于别的域名，旧实现照单全收，服务端随即出示错的证书。
+    _want="$(leaf_pub "$CERT_FILE")"
         fi
     done
 
