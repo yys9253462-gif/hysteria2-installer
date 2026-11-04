@@ -2375,7 +2375,10 @@ if (btnRebootServer) {
         }
       }, 1000);
     } catch (e) {
-      alert("重启请求已发出: " + e.message);
+      // 网络错误：请求可能根本没到服务器，按钮必须恢复，否则只能刷新页面才能重试。
+      alert('未能发起重启：' + e.message);
+      btnRebootServer.disabled = false;
+      btnRebootServer.textContent = '🔄 立即重启服务器生效';
     }
   });
 }

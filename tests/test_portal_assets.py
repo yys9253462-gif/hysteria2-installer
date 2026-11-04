@@ -341,6 +341,12 @@ globalThis.fetch = async () => reply;
   assert.strictEqual(intervals.length, 0, '被拒绝时仍开始了倒计时');
   assert(alerts[0].includes('已有重型任务在运行'), alerts[0]);
   assert.strictEqual(btnRebootServer.disabled, false);
+  // 网络错误（fetch 本身抛出）：按钮要恢复，否则只能刷新页面重试（2026-11-04 修）
+  reply = Promise.reject(new TypeError('Failed to fetch'));
+  reply.catch(() => {});
+  await handler();
+  assert.strictEqual(intervals.length, 0, '网络错误后开始了倒计时');
+  assert.strictEqual(btnRebootServer.disabled, false, '网络错误后按钮仍禁用');
   reply = new Response(JSON.stringify({ok: true}), {status: 200});
   await handler();
   assert.strictEqual(intervals.length, 1);
