@@ -8078,31 +8078,46 @@ def serve(path):
             time.sleep(5)
 
     def save_data():
-        with data_lock, portal_state_file_lock(portal_path.parent):
-            # ⚠️ 必须显式 encoding='utf-8'（2026-10-03 实测）。
-            # Path.write_text 不给 encoding 时跟随 locale：Linux 上是 UTF-8
-            # 没事，但 Windows 上是 GBK —— 页面里含 `₂` 之类字符时
-            # 直接 UnicodeEncodeError 把 HTTP handler 打死，客户端看到的是
-            # "Remote end closed connection without response"，
-            # 排查时完全看不出是编码问题。
-            # adopt / refresh 是另一个进程，写完就 restart 本服务：SIGTERM 时的
-            # save_data 会拿旧内存把它们刚写的 api_key / 凭据 / 机主密码盖回去，
-            # 控制台随即 401（2026-11-04 修）。磁盘自上次读写后变了，就先采纳这些
-            # CLI 管的键，再写本进程管的其余状态（用户、用量、代理服务）。
+        # 写盘与 fsync 不占 data_lock（2026-11-04 修）：慢盘上一次 fsync 可达数百毫秒，
+        # 期间所有 /auth 都在等 data_lock。锁序不变（先 data_lock 后文件锁），只是准备好
+        # payload 后先放掉 data_lock、仍持文件锁写盘；后到的保存者排在文件锁上，
+        # 落盘顺序与序列化顺序一致。调用方自己持着 data_lock 时（可重入）照旧全程持有。
+        file_lock = contextlib.ExitStack()
+        with data_lock:
+            file_lock.enter_context(portal_state_file_lock(portal_path.parent))
             try:
-                current = portal_path.read_bytes()
-            except OSError:
-                current = None
-            if current is not None and hashlib.sha256(current).digest() != disk_state['digest']:
-                try:
-                    disk = json.loads(current.decode('utf-8'))
-                except ValueError:
-                    disk = None
-                if isinstance(disk, dict):
-                    merge_cli_owned_state(data, disk)
-            payload = json.dumps(data, ensure_ascii=False).encode('utf-8')
+                payload = _prepare_save_payload()
+            except BaseException:
+                file_lock.close()
+                raise
+        with file_lock:
             atomic_write_private(portal_path, payload)
             disk_state['digest'] = hashlib.sha256(payload).digest()
+
+    def _prepare_save_payload():
+        """在 data_lock 与文件锁内：合并 CLI 带外写入的键，序列化整份状态。"""
+        # ⚠️ 必须显式 encoding='utf-8'（2026-10-03 实测）。
+        # Path.write_text 不给 encoding 时跟随 locale：Linux 上是 UTF-8
+        # 没事，但 Windows 上是 GBK —— 页面里含 `₂` 之类字符时
+        # 直接 UnicodeEncodeError 把 HTTP handler 打死，客户端看到的是
+        # "Remote end closed connection without response"，
+        # 排查时完全看不出是编码问题。
+        # adopt / refresh 是另一个进程，写完就 restart 本服务：SIGTERM 时的
+        # save_data 会拿旧内存把它们刚写的 api_key / 凭据 / 机主密码盖回去，
+        # 控制台随即 401（2026-11-04 修）。磁盘自上次读写后变了，就先采纳这些
+        # CLI 管的键，再写本进程管的其余状态（用户、用量、代理服务）。
+        try:
+            current = portal_path.read_bytes()
+        except OSError:
+            current = None
+        if current is not None and hashlib.sha256(current).digest() != disk_state['digest']:
+            try:
+                disk = json.loads(current.decode('utf-8'))
+            except ValueError:
+                disk = None
+            if isinstance(disk, dict):
+                merge_cli_owned_state(data, disk)
+        return json.dumps(data, ensure_ascii=False).encode('utf-8')
 
     # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
     #

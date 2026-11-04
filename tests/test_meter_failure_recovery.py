@@ -87,18 +87,18 @@ class MeterRecoveryTests(unittest.TestCase):
 
     def test_portal_save_propagates_write_error_without_fallback(self):
         tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
-        node = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-                    and n.name == 'save_data')
+        nodes = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+                    and n.name in ('save_data', '_prepare_save_payload')]
         write = Mock(side_effect=OSError('disk full'))
         fallback = Mock()
         fallback.exists.return_value = False
         env = {'data': {'users': {}}, 'data_lock': threading.RLock(),
                'json': __import__('json'), 'portal_path': Path('/fixture/portal.json'),
                'atomic_write_private': write, 'Path': Mock(return_value=fallback),
-               'portal_state_file_lock': lambda *_: __import__('contextlib').nullcontext(),
+               'portal_state_file_lock': lambda *_: __import__('contextlib').nullcontext(), 'contextlib': __import__('contextlib'),
                'hashlib': __import__('hashlib'), 'disk_state': {'digest': b''},
                'merge_cli_owned_state': lambda *_: None}
-        exec(compile(ast.Module(body=[node], type_ignores=[]), '<portal-save>', 'exec'), env)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<portal-save>', 'exec'), env)
         with self.assertRaises(OSError):
             env['save_data']()
         write.assert_called_once()
