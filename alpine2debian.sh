@@ -101,10 +101,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --yes|-y)     ASSUME_YES=1; shift ;;
         --dry-run)    DRY_RUN=1; shift ;;
-        --disk)       DISK="${2:-}"; shift 2 ;;
-        --mirror)     MIRROR="${2:-}"; shift 2 ;;
-        --suite)      DEBIAN_SUITE="${2:-}"; shift 2 ;;
-        --pwd)        ROOT_PWD="${2:-}"; shift 2 ;;
+        --disk)       [ $# -ge 2 ] || die "--disk 缺少取值"; DISK="$2"; shift 2 ;;
+        --mirror)     [ $# -ge 2 ] || die "--mirror 缺少取值"; MIRROR="$2"; shift 2 ;;
+        --suite)      [ $# -ge 2 ] || die "--suite 缺少取值"; DEBIAN_SUITE="$2"; shift 2 ;;
+        --pwd)        [ $# -ge 2 ] || die "--pwd 缺少取值"; ROOT_PWD="$2"; shift 2 ;;
         -h|--help)    usage ;;
         *) die "未知参数: $1（用 --help 看用法）" ;;
     esac
