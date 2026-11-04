@@ -3577,25 +3577,25 @@ for p in sys.argv[1:]:
 #    两个函数复用同一个变量会互相覆盖，外层已累积的逐源原因会被内层清空，
 #    最终报错只剩最后一个源，正是本项目反复踩的"错误被覆盖"坑。
 portal_fetch_files() {
-    local dir="$1" base="$2" mode="$3" f _fetch_files_err=""
+    local dir="$1" base="$2" mode="$3" f
+    # 失败时要把是哪个文件带给调用方（2026-11-04 修）：旧实现只在成功分支写全局变量，
+    # 调用方在失败分支读到的永远是空串，报错只剩「下载失败」看不出缺的是谁。
+    PORTAL_FETCH_FILES_ERR=""
     # 计量文件与门户文件同源同生命周期，一起拉、一起失败
     for f in $PORTAL_FILES $METER_FILES; do
         if [[ "$mode" == "api" ]]; then
-            # 逐个文件报错，不要只留最后一个（错误被覆盖会把排查带偏）
             if ! curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" \
                  "${base}/${f}?ref=${PORTAL_FETCH_REF}" -o "${dir}/${f}" 2>/dev/null; then
-                _fetch_files_err="下载 ${f} 失败"
+                PORTAL_FETCH_FILES_ERR="下载 ${f} 失败"
                 return 1
             fi
         else
             if ! curl -fsSL --max-time 30 "${base}/${f}" -o "${dir}/${f}" 2>/dev/null; then
-                _fetch_files_err="下载 ${f} 失败"
+                PORTAL_FETCH_FILES_ERR="下载 ${f} 失败"
                 return 1
             fi
         fi
     done
-    # 成功时也要把细节带出去（调用方在失败分支里读它）
-    PORTAL_FETCH_FILES_ERR="${_fetch_files_err}"
     return 0
 }
 
