@@ -131,5 +131,21 @@ class AwgPeerDelCorruptListTests(unittest.TestCase):
             self.assertEqual(peers.read_text(), original)
 
 
+
+@unittest.skipUnless(BASH, 'requires bash')
+class AwgObfsPaddedSizesTests(unittest.TestCase):
+    def test_padded_sizes_are_distinct(self):
+        """S3 撞上 S1/S2 时重抽（2026-11-04 修）。awg_rand 打桩成先给出撞车值。"""
+        script = '\n'.join([
+            # S4=0；S1=20、S2=30（S1+56!=S2）；S3 先给 104（64+104 == 148+20），再给 50
+            # $(awg_rand) 在子 shell 里跑，计数器放文件里
+            'declare -a Q=(0 20 30 104 50)', 'C=$(mktemp); echo 0 > "$C"',
+            'awg_rand() { local i; i=$(<"$C"); echo $((i+1)) > "$C"; echo "${Q[$i]}"; }',
+            fn('gen_obfs_params'),
+            'gen_obfs_params 2 >/dev/null; echo "S=$AWG_S1,$AWG_S2,$AWG_S3,$AWG_S4"'])
+        out = run(script)
+        self.assertIn('S=20,30,50,0', out)
+
+
 if __name__ == '__main__':
     unittest.main()
