@@ -58,7 +58,7 @@ class WebWorkflowTests(unittest.TestCase):
         self.save = Mock()
         self.reload = Mock(return_value=True)
         self.ns = dict(portal.__dict__, Path=fake_path, data=self.data, data_lock=threading.RLock(),
-                       xray_unit_foreign=lambda *a: False,
+                       xray_unit_foreign=lambda *a: False, gost_owned=lambda: True,
                        save_data=self.save, regenerate_page=self.save, meta_path=self.meta,
                        portal_path=self.hdir / 'portal.json', ip_tracker={}, speed_tracker={},
                        global_ip_deny={}, MASTER_USER_ID='admin_master',
@@ -255,6 +255,15 @@ class WebWorkflowTests(unittest.TestCase):
                                                         'password': 'pw-new-user'})
         self.assertEqual(status, 409)
         self.assertNotIn('qa-user', self.data['users'])
+
+    def test_proxy_create_refuses_foreign_gost(self):
+        """不是本工具装的 gost 不在这里管理，也不改写它的单元（2026-11-04 修）。"""
+        self.ns['gost_owned'] = lambda: False
+        reload_gost = self.ns['reload_gost'] = Mock(return_value=True)
+        status, body = extract_method('_manage_proxy_operation', self.ns)(
+            self.handler, 'create', {'type': 'socks5', 'port': '31080'})
+        self.assertEqual(status, 409, body)
+        reload_gost.assert_not_called()
 
     def test_padded_password_is_rejected_not_trimmed(self):
         """Web 建户不静默去掉密码首尾空白（2026-11-04 修，与 API 同一规则）。"""

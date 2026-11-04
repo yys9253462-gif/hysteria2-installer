@@ -8769,6 +8769,16 @@ def serve(path):
         except OSError:
             pass
 
+    def gost_owned():
+        """gost 是本工具装的：有所有权标记，且单元指向本工具的配置（与一键安装同一判据）。"""
+        unit = Path('/etc/systemd/system/gost.service')
+        try:
+            return (Path('/etc/hysteria/.hy2-gost-owned').is_file() and unit.is_file()
+                    and 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
+                    in unit.read_text(encoding='utf-8'))
+        except OSError:
+            return False
+
     def ensure_gost_unit():
         """幂等地把 gost.service 补齐成当前标准内容（缺 ExecReload / -R / 自检就重写）.
 
@@ -8782,6 +8792,10 @@ def serve(path):
         只在确实缺失时才写盘 + daemon-reload，避免无谓重启。
         """
         unit_path = Path('/etc/systemd/system/gost.service')
+        # 不是本工具的 gost 一律不碰（2026-11-04 修）：旧实现在新增 / 删除代理时把机主自己
+        # 的 gost.service 整份改写成指向 /etc/hysteria/gost.yml，并重启，原有服务全部停掉。
+        if unit_path.exists() and not gost_owned():
+            return
         try:
             current = unit_path.read_text(encoding='utf-8') if unit_path.exists() else ''
         except OSError:
@@ -10998,6 +11012,9 @@ if __name__ == '__main__':
             with gost_operation_lock:
                 if not Path('/usr/local/bin/gost').exists():
                     return 409, {'ok': False, 'error': '请先安装 GOST，再创建代理服务'}
+                if not gost_owned():
+                    return 409, {'ok': False, 'error':
+                        '本机的 GOST 不是本工具安装的（无法确认归属），为避免覆盖宿主服务，不在这里管理代理'}
                 with data_lock:
                     # 保留原始值用于回滚；工作副本只取合法条目，
                     # 否则容器被改坏后追加/筛选都会抛异常。
