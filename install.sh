@@ -432,7 +432,11 @@ hy2_acme_install_verified() {
     chmod +x "${work}/acme.sh" || { rm -rf "$work"; log_err "无法设置可执行位，已放弃安装。"; return 1; }
     had_home=0
     if [[ -d "$home" ]]; then had_home=1; fi
-    if ! ( cd "$work" && ./acme.sh --install --home "$home" ); then
+    # 没有 crontab 时上游安装器直接拒绝（要 --force），续期也就无人调用（2026-11-04 修）：
+    # 这种机器改用 --nocron，续期由 hy2_acme_ensure_renew_timer 装的 systemd timer 负责。
+    local _cron_flag=()
+    command -v crontab >/dev/null 2>&1 || command -v fcrontab >/dev/null 2>&1 || _cron_flag=(--nocron)
+    if ! ( cd "$work" && ./acme.sh --install --home "$home" "${_cron_flag[@]}" ); then
         log_err "acme.sh 安装器执行失败（文件已通过校验，失败发生在安装阶段）。"
         if [[ $had_home -eq 0 ]]; then
             rm -rf "$home"
@@ -1516,6 +1520,29 @@ hy2_acme_ensure() {
         fi
     fi
     [[ -x "$acct" ]] || { log_err "acme.sh 不可用。"; return 1; }
+    hy2_acme_ensure_renew_timer "$HOME/.acme.sh" \
+        || log_warn "未能安装 acme.sh 续期定时器，请自行安排每日执行 ${acct} --cron。"
+    return 0
+}
+
+# 没有 cron 的机器上用 systemd timer 跑 acme.sh --cron（2026-11-04 加）：
+# 续期与 reloadcmd 钩子只在 --cron 时触发，没人调用它证书 90 天后就过期。
+# 有 crontab 且上游已写入计划任务时不重复安装。
+hy2_acme_ensure_renew_timer() {
+    local home="$1" unit_dir="${HY2_SYSTEMD_DIR:-/etc/systemd/system}"
+    if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF 'acme.sh --cron'; then
+        return 0
+    fi
+    command -v systemctl >/dev/null 2>&1 || return 1
+    printf '%s\n' '[Unit]' 'Description=acme.sh certificate renewal (hysteria2-installer)' '' \
+        '[Service]' 'Type=oneshot' "ExecStart=${home}/acme.sh --cron --home ${home}" \
+        > "${unit_dir}/hy2-acme-renew.service" || return 1
+    printf '%s\n' '[Unit]' 'Description=Daily acme.sh renewal (hysteria2-installer)' '' \
+        '[Timer]' 'OnCalendar=daily' 'RandomizedDelaySec=3600' 'Persistent=true' '' \
+        '[Install]' 'WantedBy=timers.target' \
+        > "${unit_dir}/hy2-acme-renew.timer" || return 1
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now hy2-acme-renew.timer >/dev/null 2>&1
 }
 
 # 借本机 Nginx 完成 HTTP-01 签发（2026-10-29）。
@@ -5565,6 +5592,11 @@ uninstall_all() {
                 is_valid_domain "$acme_domain" || continue
                 "$acme_bin" --remove -d "$acme_domain" --ecc >/dev/null 2>&1 || true
             done
+        fi
+        # 本工具装的 acme.sh 续期定时器（无 cron 的机器）：描述行是归属标记。
+        if grep -qF '(hysteria2-installer)' /etc/systemd/system/hy2-acme-renew.timer 2>/dev/null; then
+            systemctl disable --now hy2-acme-renew.timer >/dev/null 2>&1 || true
+            rm -f /etc/systemd/system/hy2-acme-renew.timer /etc/systemd/system/hy2-acme-renew.service
         fi
         # 仅删除首次安装时存在 marker 的安装器资产；旧版没有 marker 时保留，避免误删用户文件。
         if [[ -f "$HY2_DIR/.hy2-installer-owned" \
