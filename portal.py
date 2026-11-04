@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.28'
+PORTAL_VERSION = '2.29'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -5808,6 +5808,10 @@ def parse_ip_deny(params, now):
     user_id = str(params.get('user_id', '')).strip()
     if not USER_ID_RE.match(user_id):
         raise ValueError('Invalid user_id format')
+    # 与其它 users/ 写接口一致（2026-11-04 修）：保留名不能被拉黑，否则 API Key 就能
+    # 让机主账号在 /auth 里按 IP 被拒。
+    if user_id in RESERVED_USER_IDS:
+        raise ValueError('Reserved user accounts cannot be targeted')
     raw = params.get('ips', [])
     if not isinstance(raw, list) or len(raw) > IP_DENY_MAX_IPS:
         raise ValueError('ips must be a list of at most %d addresses' % IP_DENY_MAX_IPS)
@@ -5825,10 +5829,16 @@ def parse_ip_deny(params, now):
     entries = {}
     for item in raw:
         try:
-            ip = str(ipaddress.ip_address(str(item).strip()))
+            addr = ipaddress.ip_address(str(item).strip())
         except ValueError:
             raise ValueError('Invalid IP address: %s' % str(item)[:64])
-        entries[ip] = now + ttl
+        # 带 zone 的 IPv6（fe80::1%eth0）永远匹配不上 /auth 的客户端地址，写进 Xray
+        # 规则还会让整批 adrules 失败；IPv4 映射地址还原成 IPv4，与 /auth 同一写法（2026-11-04 修）。
+        if getattr(addr, 'scope_id', None):
+            raise ValueError('Scoped IPv6 addresses are not allowed: %s' % str(item)[:64])
+        if addr.version == 6 and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        entries[str(addr)] = now + ttl
     return user_id, entries
 
 
@@ -7489,10 +7499,14 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     # 立刻 CRYPTO_ERROR 0x150，而面板看起来一切正常。这正是 sync_cert_trust
     # 要消灭的失败模式，只是从下一层又冒了出来。
     # 锁外预先算好的二维码只在 uri 没变时用（sync_cert_trust 可能刚改过 meta）。
+    stale_qr_uri = None
     if precomputed_qr is not None and precomputed_qr[0] == uri:
         sync_download_artifacts(data, uri, clash, sing, precomputed_qr[1])
     else:
-        sync_download_artifacts(data, uri, clash, sing)
+        # uri 在锁内才变（sync_cert_trust 刚改了 meta）：不在锁内跑 qrencode，先保留旧图，
+        # 由 refresh 在释放锁后补一次（2026-11-04 修）。
+        sync_download_artifacts(data, uri, clash, sing, None)
+        stale_qr_uri = uri
     
     # 域名 / 订阅端口改过之后，交给控制台的门户地址也要跟上（token 与凭据不变）。
     access_url = f"https://{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/"
@@ -7536,6 +7550,8 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
         access['url'] = access_url
         atomic_write_private(_access_file, json.dumps(access, ensure_ascii=False).encode('utf-8'))
     atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+    # 需要在锁外补生成二维码的 uri（锁内 uri 才变化时）；None 表示已是最新。
+    return stale_qr_uri
 
 
 def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
@@ -7551,11 +7567,12 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
         precomputed_qr = (_uri, qr_svg_for(_uri))
     except Exception as exc:
         _log_ignored('refresh_qr_precompute', exc)
+    stale_uri = None
     with portal_state_file_lock(root):
         old_portal = portal_file.read_bytes()
         old_access = access_file.read_bytes() if access_file.exists() else None
         try:
-            _refresh_portal_state(meta_path, config_path, precomputed_qr)
+            stale_uri = _refresh_portal_state(meta_path, config_path, precomputed_qr)
         except Exception:
             try:
                 atomic_write_private(portal_file, old_portal)
@@ -7567,6 +7584,17 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
                 print('[portal] refresh credential/state rollback failed: %s'
                       % rollback_error, file=sys.stderr)
             raise
+    if stale_uri:
+        qr = qr_svg_for(stale_uri)   # 锁外生成，再短暂持锁写回
+        if isinstance(qr, str) and qr:
+            with portal_state_file_lock(root):
+                try:
+                    latest = json.loads(portal_file.read_text(encoding='utf-8'))
+                    if isinstance(latest, dict):
+                        latest['qr'] = qr
+                        atomic_write_private(portal_file, json.dumps(latest, ensure_ascii=False).encode('utf-8'))
+                except (OSError, ValueError) as exc:
+                    _log_ignored('refresh_qr_late', exc)
 
 
 CLI_OWNED_PORTAL_KEYS = ('port', 'api_key', 'auth_hash', 'session_secret', 'session_epoch',
@@ -7635,7 +7663,10 @@ def adopt(meta_path, port, node_api_key=None):
     root = Path(meta_path).parent
     with portal_state_file_lock(root):
         _adopt_locked(meta_path, port, node_api_key)
-        refresh(meta_path)
+    # refresh 自己拿状态锁，并在锁外先生成二维码（2026-11-04 修）：旧实现把它包在
+    # 上面的锁里，qrencode 最长 20 秒期间运行中门户的 save_data 持着 data_lock 干等，
+    # 所有新的 Hy2 鉴权跟着卡住。
+    refresh(meta_path)
 
 
 def _adopt_locked(meta_path, port, node_api_key=None):
@@ -10828,7 +10859,13 @@ if __name__ == '__main__':
                     with data_lock:
                         data['core_upgrade'] = dict(job, finished_at=int(time.time()))
                         _core_ver_cache['t'] = 0.0
-                    save_data()
+                    # 结果已在内存，界面能读到；落盘失败只记日志（2026-11-04 修）：旧实现让
+                    # 线程带着 traceback 死掉，磁盘上的任务一直是 running，重启后被当成中断任务。
+                    try:
+                        save_data()
+                    except (OSError, AtomicWriteDurabilityError) as exc:
+                        print('[portal] core upgrade result not saved: %s' % type(exc).__name__,
+                              file=sys.stderr, flush=True)
                 try:
                     self.reply_json(200, {'ok': True, 'target': 'core', 'applying': True,
                         'message': '核心更新任务已接受，下载、应用和回滚结果将单独核验'})
@@ -11395,7 +11432,9 @@ if __name__ == '__main__':
                     except Exception as exc:
                         applied, error = False, '应用出站失败: %s' % type(exc).__name__
                     with data_lock:
-                        previous = copy.deepcopy(data)
+                        # 不再整份快照、保存失败时整份回滚（2026-11-04 修）：旧实现
+                        # data.clear(); data.update(旧快照)，把这期间别的线程的改动
+                        # （删用户、待撤销名单）一起抹掉，应用结果也被撤回、界面卡在「应用中」。
                         pending = max(0, _egress_pending_count(data.get('_egress_pending')) - 1)
                         if pending:
                             data['_egress_pending'] = pending
@@ -11412,13 +11451,13 @@ if __name__ == '__main__':
                             data.pop('egress_apply_error', None)
                     try:
                         save_data()
-                    except AtomicWriteDurabilityError:
-                        raise
-                    except OSError:
-                        with data_lock:
-                            data.clear()
-                            data.update(previous)
-                        raise
+                    except AtomicWriteDurabilityError as exc:
+                        print('[portal] egress result durability uncertain: %s' % exc,
+                              file=sys.stderr, flush=True)
+                    except OSError as exc:
+                        # 内存里保留应用结果：配置已经生效，界面不该一直停在「应用中」。
+                        # 只记日志、不 re-raise，worker 线程不必带着 traceback 死掉。
+                        print('[portal] egress result not saved: %s' % exc, file=sys.stderr, flush=True)
                     if not applied:
                         print('[portal] egress apply failed: %s' % error, file=sys.stderr, flush=True)
             try:

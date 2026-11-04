@@ -217,6 +217,37 @@ class WebWorkflowTests(unittest.TestCase):
                 self.assertIsInstance(body['outbounds'], list)
                 self.assertTrue(all(isinstance(r, dict) for r in body['rules']))
 
+    def test_egress_worker_save_failure_keeps_other_threads_changes(self):
+        """出口应用结果保存失败时不能整份回滚 data（2026-11-04 修）。
+
+        worker 运行期间另一个线程删掉了用户；旧实现 data.clear(); data.update(旧快照)
+        把用户救活，并让 worker 带着 OSError 死掉。
+        """
+        self.data['users']['victim'] = {'password': 'pw-victim', 'status': 'active'}
+        calls = {'n': 0}
+
+        def save():
+            calls['n'] += 1
+            if calls['n'] >= 2:   # 第一次是排队标记，第二次是 worker 写结果
+                raise OSError('disk full')
+
+        def apply(data, lock):
+            with lock:
+                data['users'].pop('victim', None)   # 另一线程在 worker 运行期间删掉了用户
+            return True, ''
+
+        class SyncThread:
+            def __init__(self, target, daemon=None): self.target = target
+            def start(self): self.target()
+
+        self.ns.update(save_data=save, apply_egress_config=apply, warp_apply_lock=threading.Lock(),
+                       threading=SimpleNamespace(Thread=SyncThread, Lock=threading.Lock,
+                                                 RLock=threading.RLock))
+        method = extract_method('_reply_with_egress_apply', self.ns)
+        method(self.handler, {'ok': True})
+        self.assertNotIn('victim', self.data['users'], '保存失败把别的线程删掉的用户回滚回来了')
+        self.assertNotIn('egress_applying', self.data, '应用结果被撤回，界面会一直显示应用中')
+
     def test_padded_password_is_rejected_not_trimmed(self):
         """Web 建户不静默去掉密码首尾空白（2026-11-04 修，与 API 同一规则）。"""
         status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user',

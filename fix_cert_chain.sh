@@ -25,7 +25,8 @@ DRY_RUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run) DRY_RUN=1; shift ;;
-        --config)  CONFIG="${2:-}"; shift 2 ;;
+        # 缺值时 shift 2 失败而 $1 不变，旧实现在这里死循环（2026-11-04 修）
+        --config)  [[ $# -ge 2 ]] || { echo "--config 需要取值"; exit 2; }; CONFIG="$2"; shift 2 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "未知参数: $1"; exit 2 ;;
     esac
@@ -49,9 +50,29 @@ cert_of () {   # 从 config.yaml 取出 tls.cert 路径
              print; exit
          }' "$1"
 }
-n_certs () { grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null || echo 0; }
+n_certs () { local n; n="$(grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
+# 证书文件第一张证书（叶证书）的公钥指纹
+leaf_pub () { openssl x509 -in "$1" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}'; }
+# 只改 tls: 段里的 cert: 行，按字面替换（2026-11-04 修）：旧实现 sed 全文替换且把路径当
+# 正则，key: "/x/a.cer.key" 这种同前缀路径会一起被改坏，hysteria 随即起不来。
+set_tls_cert () {   # $1=config $2=new path
+    local tmp; tmp="$(mktemp "${1}.XXXXXX")" || return 1
+    NEW_CERT="$2" awk '
+        /^tls:[[:space:]]*$/ {f=1; print; next}
+        /^[^[:space:]]/ {f=0}
+        f && !done && /^[[:space:]]+cert:/ {
+            match($0, /^[[:space:]]+cert:/); print substr($0, 1, RLENGTH) " \"" ENVIRON["NEW_CERT"] "\""
+            done=1; next
+        }
+        {print}' "$1" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod --reference="$1" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$1"
+}
 
 [[ -f "$CONFIG" ]] || { err "找不到配置文件：$CONFIG"; exit 1; }
+if [[ "$DRY_RUN" != "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
+    err "需要 root 运行（要改 $CONFIG 并重启服务）；只检查请加 --dry-run。"; exit 1
+fi
 
 CERT_FILE="$(cert_of "$CONFIG")"
 
@@ -79,8 +100,12 @@ else
 
     DIR="$(dirname "$CERT_FILE")"
     FULL=""
+    # 候选链的叶证书必须就是当前这张（2026-11-04 修）：多域名机器上上级目录的
+    # fullchain 可能属于别的域名，旧实现照单全收，服务端随即出示错的证书。
+    _want="$(leaf_pub "$CERT_FILE")"
     for cand in "$DIR/fullchain.cer" "$DIR/fullchain.pem" "$DIR/../fullchain.cer" "$DIR/../fullchain.pem"; do
-        if [[ -f "$cand" ]] && [[ "$(n_certs "$cand")" -ge 2 ]]; then
+        if [[ -f "$cand" ]] && [[ "$(n_certs "$cand")" -ge 2 ]] \
+                && [[ -n "$_want" && "$(leaf_pub "$cand")" == "$_want" ]]; then
             FULL="$cand"; break
         fi
     done
@@ -100,10 +125,10 @@ else
     fi
 
     BK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-    cp -a "$CONFIG" "$BK"
+    cp -a "$CONFIG" "$BK" || { err "备份配置失败，未做任何修改。"; exit 1; }
     info "已备份原配置：$BK"
 
-    sed -i "s|${CERT_FILE}|${FULL}|g" "$CONFIG"        # 用 | 作分隔符，避开路径里的 /
+    set_tls_cert "$CONFIG" "$FULL" || { cp -a "$BK" "$CONFIG"; err "写入配置失败，已恢复备份。"; exit 1; }
     NEW="$(cert_of "$CONFIG")"
     ok "tls.cert 已更新为：$NEW"
     FINAL_CERT="$FULL"
@@ -117,8 +142,15 @@ fi
 
 if [[ "$CHANGED" == "1" ]]; then
     info "重启 hysteria-server ..."
-    systemctl restart hysteria-server 2>/dev/null || { err "重启失败，请确认 systemd 单元名。"; exit 1; }
+    systemctl restart hysteria-server 2>/dev/null || true
     sleep 3
+    # 起不来就恢复原配置（2026-11-04 修）：旧实现留着改坏的配置，节点直接掉线。
+    if ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
+        err "新配置下 hysteria-server 未能启动，已恢复原配置：$BK"
+        cp -a "$BK" "$CONFIG"
+        systemctl restart hysteria-server 2>/dev/null || true
+        exit 1
+    fi
 fi
 systemctl is-active --quiet hysteria-server 2>/dev/null || { warn "hysteria-server 当前不是 active，请人工确认。"; }
 
