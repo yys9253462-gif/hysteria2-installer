@@ -19,7 +19,10 @@ class ExpiryTests(unittest.TestCase):
    p=pathlib.Path(d);(p/'usage-meter-config.json').write_text(json.dumps({'hysteria':{'url':'http://127.0.0.1:19996','secret':'fixture'}}))
    with patch.object(portal.urllib.request,'urlopen',side_effect=[Resp({'expired':2}),Resp({}),Resp({'expired':1}),Resp({})]),patch.object(portal.subprocess,'run') as run,patch.object(portal.time,'sleep'):
     self.assertTrue(portal.enforce_node_access(p,{'users':{'expired':{'expires_at':1}}}))
-   self.assertTrue(any(x.args[0]==['systemctl','restart','hysteria-server'] for x in run.call_args_list))
+   # 兜底重启走 _restart_hy2：stop → reset-failed → start（2026-11-04 起不再裸 restart）
+   cmds=[x.args[0] for x in run.call_args_list]
+   self.assertIn(['systemctl','reset-failed','hysteria-server'],cmds)
+   self.assertIn(['systemctl','start','hysteria-server'],cmds)
  def test_failed_kick_never_acknowledges(self):
   with tempfile.TemporaryDirectory() as d:
    p=pathlib.Path(d);(p/'usage-meter-config.json').write_text(json.dumps({'hysteria':{'url':'http://127.0.0.1:19996','secret':'fixture'}}))

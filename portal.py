@@ -6528,9 +6528,20 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
             online=request_stats('/online')
             if any(int(online.get(uid, 0)) > 0 for uid in active):
                 # 标准核心只在下一次传输消费 kick；闲置/多实例需确保全部会话关闭。
-                subprocess.run(['systemctl','restart','hysteria-server'],capture_output=True,timeout=12,check=True)
+                # 走 _restart_hy2（2026-11-04 修）：直接 restart 不清失败计数，一阵连续收回就撞上
+                # StartLimitBurst，服务锁死、全员掉线。重启后统计接口要稍等才绑好端口：Type=simple
+                # 下 is-active 在 fork 后就报 active，紧接着请求 /online 会被拒绝连接。
+                _restart_hy2()
                 subprocess.run(['systemctl','is-active','--quiet','hysteria-server'],capture_output=True,timeout=4,check=True)
-                online=request_stats('/online')
+                online=None
+                for _ in range(25):
+                    try:
+                        online=request_stats('/online')
+                        break
+                    except OSError:
+                        time.sleep(0.2)
+                if online is None:
+                    raise RuntimeError('Hy2 stats API not reachable after restart; cannot confirm revocation')
                 if any(int(online.get(uid, 0)) > 0 for uid in active):
                     raise RuntimeError('Hy2 sessions still present after revocation')
     xj=root/'xray.json'
