@@ -45,7 +45,9 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
+import urllib.parse
 import urllib.request
 import urllib.error
 
@@ -201,22 +203,30 @@ def main():
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
 
-    if args.format == "curl":
+    if args.format == "curl" or args.register:
         if not args.panel:
-            print("--format curl 需要 --panel", file=sys.stderr)
+            print("--format curl / --register 需要 --panel", file=sys.stderr)
             return 2
+        # 只接受 https（2026-11-04 修）：http 会把管理员 JWT 与节点 api_key 明文发出去；
+        # 去掉结尾的 /，免得拼成 //api/nodes。
+        _p = urllib.parse.urlsplit(args.panel.strip())
+        if _p.scheme != "https" or not _p.hostname:
+            print("--panel 必须是 https:// 开头的面板地址", file=sys.stderr)
+            return 2
+        panel = args.panel.strip().rstrip("/")
+
+    if args.format == "curl":
         body = json.dumps({
             "name": args.name or result["suggested_name"],
             "api_url": result["api_url"],
             "api_key": result["api_key"],
         }, ensure_ascii=False)
-        print(f"curl -X POST '{args.panel}/api/nodes' \\")
-        if args.admin_token:
-            print(f"  -H 'Authorization: Bearer {args.admin_token}' \\")
-        else:
-            print("  -H 'Authorization: Bearer <管理员JWT>' \\")
+        # 每个值都按 shell 规则引用（2026-11-04 修）：旧实现原样放进单引号，--name 里一个 '
+        # 就能拼出任意命令，用户粘贴即执行。JWT 不原样打印，用环境变量引用，免得留在终端/历史里。
+        print("curl -X POST %s \\" % shlex.quote(panel + "/api/nodes"))
+        print('  -H "Authorization: Bearer ${PANEL_ADMIN_TOKEN:?请先 export PANEL_ADMIN_TOKEN=<管理员JWT>}" \\')
         print("  -H 'Content-Type: application/json' \\")
-        print(f"  -d '{body}'")
+        print("  -d %s" % shlex.quote(body))
         return 0
 
     if args.register:
@@ -231,7 +241,7 @@ def main():
             "api_url": result["api_url"],
             "api_key": result["api_key"],
         }, ensure_ascii=False).encode()
-        req = urllib.request.Request(args.panel + "/api/nodes", data=body, method="POST")
+        req = urllib.request.Request(panel + "/api/nodes", data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + args.admin_token)
         try:
