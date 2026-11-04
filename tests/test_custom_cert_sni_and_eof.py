@@ -42,6 +42,7 @@ class CustomCertSniTests(unittest.TestCase):
                 'log_err() { echo "ERR $*"; }', 'log_warn() { :; }', 'log_info() { :; }', 'log_step() { :; }',
                 'generate_self_signed_cert() { echo SELF_SIGNED; CERT_TYPE=self_signed; }',
                 'reuse_existing_cert_config() { return 1; }',
+                '_cert_key_usable() { return 0; }',  # 夹具是假 PEM；真实判定见 test_cert_pair_checks
                 'PUBLIC_IP=203.0.113.7', 'HY2_CERT_DIR="%s"' % bash_path(td / 'c'),
                 fn('pem_cert_count'), fn('is_valid_domain'), fn('setup_certificates'),
                 'setup_certificates', 'echo "TYPE=${CERT_TYPE} SNI=${SERVER_NAME:-} RC=$?"'])

@@ -48,7 +48,7 @@ extract_fn() {
 }
 
 for fn in port_owner detect_webserver_squatting find_cert_in_webserver \
-          pem_cert_count _accept_cert_pair _cert_matches_domain _nginx_cert_candidates \
+          pem_cert_count _cert_key_usable _accept_cert_pair _cert_matches_domain _nginx_cert_candidates \
           is_valid_domain is_valid_email \
           setup_cert_via_dns_api generate_self_signed_cert setup_acme_certificate; do
     _f="$(extract_fn "$fn")"

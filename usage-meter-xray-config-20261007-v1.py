@@ -62,9 +62,13 @@ def add_iplimit_routing(cfg):
     outbounds=cfg.setdefault('outbounds',[])
     if not outbounds:outbounds.append({'protocol':'freedom','tag':'direct'})
     if outbounds[0].get('tag')==IPLIMIT_OUTBOUND_TAG:
-        # 保留原默认出口的行为，托管 tag 留给后面的黑洞。
-        default=copy.deepcopy(outbounds[0])
-        default.pop('tag')
+        # 保留原默认出口的行为，托管 tag 留给后面的黑洞。首个出站本身就是托管黑洞时
+        # 不能照抄：无 tag 的黑洞成了默认出站，全部流量被丢弃（2026-11-04 修）。
+        if outbounds[0].get('protocol')=='blackhole':
+            default={'protocol':'freedom','tag':'direct'}
+        else:
+            default=copy.deepcopy(outbounds[0])
+            default.pop('tag')
         outbounds.insert(0,default)
     for index,outbound in enumerate(outbounds):
         if outbound.get('tag')==IPLIMIT_OUTBOUND_TAG and outbound.get('protocol')!='blackhole':

@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.24'
+PORTAL_VERSION = '2.25'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2056,28 +2056,32 @@ def user_share_available(user, now=None):
     return user_access_allowed(user, now)
 
 
+_SHARE_DENIAL_TEXT = {
+    'User account inactive': '账号已被停用',
+    'User account expired': '服务已到期',
+    'Traffic quota exceeded': '流量已超额',
+}
+
+
 def share_unavailable_reason(user, now=None):
-    """Return a stable explanation for a denied share without trusting JSON types."""
-    now_ts = int(time.time() if now is None else now)
+    """分享页的拒绝说明，直接取自 user_access_denial（2026-11-04 改为同源）。
+
+    旧实现另写一份判据并把 now 取整：到期那一秒准入已拒绝、这里却还判「未到期」，
+    显示成笼统的「当前不可用」；损坏字段的分类也与准入不一致。
+    """
     if not isinstance(user, dict):
         return '账号资料无效'
-    if user.get('status', 'active') != 'active':
-        return '账号已被停用'
-    expires = user.get('expires_at')
-    if expires is not None:
-        try:
-            if float(expires) <= now_ts:
-                return '服务已到期'
-        except (TypeError, ValueError, OverflowError):
-            return '到期时间无效'
+    denial = user_access_denial(user, now)
+    if denial is None:
+        return '当前不可用'
+    if denial in _SHARE_DENIAL_TEXT:
+        return _SHARE_DENIAL_TEXT[denial]
     try:
-        limit_bytes = int(user.get('limit_bytes', 0) or 0)
-        used_bytes = int(user.get('used_bytes', 0) or 0)
+        if user.get('expires_at') is not None:
+            float(user.get('expires_at'))
     except (TypeError, ValueError, OverflowError):
-        return '流量数据无效'
-    if limit_bytes > 0 and used_bytes >= limit_bytes:
-        return '流量已超额'
-    return '当前不可用'
+        return '到期时间无效'
+    return '账号资料无效'
 
 
 def _expiry_text(value):
@@ -9871,6 +9875,11 @@ if __name__ == '__main__':
                     if 'limit_bytes' in params:
                         limit_bytes = int(params['limit_bytes'])
                     initial_used = int(params.get('used_bytes', 0))
+                    # 与 users/renew 同一上界：超过 int64 的额度能开户，之后却永远续不了期
+                    # （renew 拒绝 new_limit > 2**63-1），用量计数也会溢出 Hysteria 侧（2026-11-04 修）。
+                    if not 0 <= limit_bytes <= 2**63 - 1 or not 0 <= initial_used <= 2**63 - 1:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: limit_bytes / used_bytes out of range'})
                     # active 同理：旧实现校验了却始终写 status=active，
                     # 控制台传 {"active": false} 开户会拿到 200 但用户照样能连。
                     want_active = params.get('active', True)
@@ -10071,7 +10080,8 @@ if __name__ == '__main__':
                     try:
                         changes = {}
                         if 'password' in params:
-                            if not isinstance(params['password'], str) or not params['password']:
+                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修）。
+                            if not isinstance(params['password'], str) or not params['password'].strip():
                                 raise ValueError()
                             changes['password'] = params['password']
                         if 'expires_at' in params:
@@ -10160,7 +10170,10 @@ if __name__ == '__main__':
                             try:
                                 base_time = max(int(u.get('expires_at') or 0), now_ts)
                                 new_expiry = int(base_time) + days * 86400
-                                new_limit = int(u.get('limit_bytes', 0)) + added_bytes
+                                # limit_bytes=0 表示不限量：加流量不能把它变成「只有本次加的量」，
+                                # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
+                                old_limit = int(u.get('limit_bytes', 0))
+                                new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
                                 if not 0 <= new_expiry <= 253402300799 or not 0 <= new_limit <= 2**63 - 1:
                                     raise ValueError()
                             except (ValueError, TypeError, OverflowError):
