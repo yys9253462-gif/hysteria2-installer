@@ -13966,9 +13966,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 前端弹窗按 `=== null` 判永久，于是永久用户显示成 1970-01-01 到期；
                     # 而 0 在本项目里恰恰表示「已过期」。
                     'expires_at': u_copy.get('expires_at'),
-                    'traffic_used': u_copy.get('used_bytes', 0),
-                    'traffic_limit': u_copy.get('limit_bytes', 0),
-                    'ip_limit': u_copy.get('ip_limit', 0),
+                    # 与用户表 / 分享页同一套显示规则（2026-11-04 修）：ip_limit=true 实际
+                    # 不限却显示「true IP」；用量字段被改坏时弹窗显示 NaN B。
+                    'traffic_used': _safe_int(u_copy.get('used_bytes', 0)),
+                    'traffic_limit': _safe_int(u_copy.get('limit_bytes', 0)),
+                    'ip_limit': _display_ip_limit(u_copy),
                 })
 
             # ---------------- AmneziaWG (AWG) ----------------
