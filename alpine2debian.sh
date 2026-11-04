@@ -667,6 +667,17 @@ fi
 # ── 第 8 步：网络配置 + swap ─────────────────────────────────────────────
 info "第 8/9 步：写网络配置"
 
+# 当前地址不是 DHCP 拿到的（救援系统里手工 ip addr add），新系统写 DHCP 必然失联
+# （2026-11-04 修）。ip addr 对 DHCP 地址标 dynamic；没有这个标记就照当前值写静态。
+if ip -4 addr show "$MAIN_IFACE" 2>/dev/null | grep 'inet ' | grep -q dynamic; then
+    NET_STANZA="iface ${MAIN_IFACE} inet dhcp"
+else
+    NET_STANZA="iface ${MAIN_IFACE} inet static
+    address ${MAIN_IP}/${MAIN_CIDR}
+    gateway ${MAIN_GATE}"
+    warn "当前 IPv4 不是 DHCP 获得的，新系统写入静态地址 ${MAIN_IP}/${MAIN_CIDR} 网关 ${MAIN_GATE}"
+fi
+
 NET_CFG=$(cat <<NET_EOF
 # 由 alpine2debian.sh 生成
 # 与阿里云官方 Debian 12 镜像保持一致的开头，方便以后往里加接口
@@ -676,7 +687,7 @@ auto lo
 iface lo inet loopback
 
 auto ${MAIN_IFACE}
-iface ${MAIN_IFACE} inet dhcp
+${NET_STANZA}
 NET_EOF
 )
 
@@ -684,7 +695,7 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s /etc/network/interfaces：\n%s\n' "$c_ylw" "$c_rst" "$NET_CFG"
 else
     printf '%s\n' "$NET_CFG" > "$MOUNT_DIR/etc/network/interfaces"
-    ok "网络配置已写入（网卡 $MAIN_IFACE 走 DHCP）"
+    ok "网络配置已写入：$(printf '%s' "$NET_STANZA" | head -n1)"
 fi
 
 if [ "$SWAP_MB" -gt 0 ]; then
