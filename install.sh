@@ -2317,9 +2317,20 @@ select_subscription_port() {
             return 0
         fi
     fi
-    HY2_SUB_PORT=$(python3 - <<'PYPORT'
-import socket, secrets
+    HY2_SUB_PORT=$(python3 - "$HY2_DIR/portal.json" <<'PYPORT'
+import json, socket, secrets, sys
 RESERVED = {8443, 19898, 22, 80, 443, 40000, 56195}
+# 门户托管协议记下的端口也要避开（2026-11-04 修）：协议此刻停着时 bind 能成功，
+# 订阅端口占了它的位置，之后再启用该协议就撞车。
+try:
+    _data = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError):
+    _data = {}
+if isinstance(_data, dict):
+    for _key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
+        _sec = _data.get(_key)
+        if isinstance(_sec, dict) and isinstance(_sec.get('port'), int) and not isinstance(_sec.get('port'), bool):
+            RESERVED.add(_sec['port'])
 for _ in range(100):
     port = 10000 + secrets.randbelow(50000)
     if port in RESERVED or 20000 <= port <= 40000:

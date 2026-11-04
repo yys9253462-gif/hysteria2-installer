@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import portal
@@ -59,7 +60,7 @@ class PortalTest(unittest.TestCase):
         它按 Linux 路径解析，看不到 `C:/...` 的临时脚本，测试会莫名其妙地 127 退出。
         """
         script = (Path(portal.__file__).parent/'install.sh').read_text(encoding="utf-8")
-        found = re.search(r"HY2_SUB_PORT=\$\(python3 - <<'PYPORT'\n(.*?)\nPYPORT",
+        found = re.search(r"HY2_SUB_PORT=\$\(python3 - [^\n]*<<'PYPORT'\n(.*?)\nPYPORT",
                           script, re.S)
         self.assertIsNotNone(found, 'install.sh 里找不到 HY2_SUB_PORT 的端口探测代码')
         code = found.group(1)
@@ -97,7 +98,8 @@ class PortalTest(unittest.TestCase):
                                 '替换失败：busy 端口没有被注入候选序列')
 
             buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
+            # 片段从 argv[1] 读 portal.json 以避开托管协议端口；这里给一个不存在的路径。
+            with contextlib.redirect_stdout(buf), mock.patch.object(sys, 'argv', ['-', '/nonexistent/portal.json']):
                 exec(patched, {})
             selected = int(buf.getvalue().strip())
         finally:
