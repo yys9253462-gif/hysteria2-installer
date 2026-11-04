@@ -521,7 +521,7 @@ if [ "$DRY_RUN" != "1" ]; then
         done
     fi
     [ -b "$ROOT_PART" ] || die "分区设备 $ROOT_PART 未就绪，无法继续格式化。
-       请手动执行 `partx -a -n 1:1 $DISK` 后重跑本脚本。"
+       请手动执行 partx -a -n 1:1 $DISK 后重跑本脚本。"
     ok "分区设备已就绪：$ROOT_PART"
 fi
 
