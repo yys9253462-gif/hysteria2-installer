@@ -100,12 +100,13 @@ else
 
     DIR="$(dirname "$CERT_FILE")"
     FULL=""
-    for cand in "$DIR/fullchain.cer" "$DIR/fullchain.pem" "$DIR/../fullchain.cer" "$DIR/../fullchain.pem"; do
-        if [[ -f "$cand" ]] && [[ "$(n_certs "$cand")" -ge 2 ]]                 && [[ -n "$_want" && "$(leaf_pub "$cand")" == "$_want" ]]; then
-            FULL="$cand"; break
     # 候选链的叶证书必须就是当前这张（2026-11-04 修）：多域名机器上上级目录的
     # fullchain 可能属于别的域名，旧实现照单全收，服务端随即出示错的证书。
     _want="$(leaf_pub "$CERT_FILE")"
+    for cand in "$DIR/fullchain.cer" "$DIR/fullchain.pem" "$DIR/../fullchain.cer" "$DIR/../fullchain.pem"; do
+        if [[ -f "$cand" ]] && [[ "$(n_certs "$cand")" -ge 2 ]] \
+                && [[ -n "$_want" && "$(leaf_pub "$cand")" == "$_want" ]]; then
+            FULL="$cand"; break
         fi
     done
 
@@ -124,10 +125,10 @@ else
     fi
 
     BK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-    cp -a "$CONFIG" "$BK"
+    cp -a "$CONFIG" "$BK" || { err "备份配置失败，未做任何修改。"; exit 1; }
     info "已备份原配置：$BK"
 
-    sed -i "s|${CERT_FILE}|${FULL}|g" "$CONFIG"        # 用 | 作分隔符，避开路径里的 /
+    set_tls_cert "$CONFIG" "$FULL" || { cp -a "$BK" "$CONFIG"; err "写入配置失败，已恢复备份。"; exit 1; }
     NEW="$(cert_of "$CONFIG")"
     ok "tls.cert 已更新为：$NEW"
     FINAL_CERT="$FULL"
@@ -141,8 +142,15 @@ fi
 
 if [[ "$CHANGED" == "1" ]]; then
     info "重启 hysteria-server ..."
-    systemctl restart hysteria-server 2>/dev/null || { err "重启失败，请确认 systemd 单元名。"; exit 1; }
+    systemctl restart hysteria-server 2>/dev/null || true
     sleep 3
+    # 起不来就恢复原配置（2026-11-04 修）：旧实现留着改坏的配置，节点直接掉线。
+    if ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
+        err "新配置下 hysteria-server 未能启动，已恢复原配置：$BK"
+        cp -a "$BK" "$CONFIG"
+        systemctl restart hysteria-server 2>/dev/null || true
+        exit 1
+    fi
 fi
 systemctl is-active --quiet hysteria-server 2>/dev/null || { warn "hysteria-server 当前不是 active，请人工确认。"; }
 

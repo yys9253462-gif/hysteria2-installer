@@ -35,9 +35,7 @@ class FixCertChainRepairTests(unittest.TestCase):
         (d / 'bin').mkdir()
         (d / 'bin' / 'systemctl').write_text('#!/bin/sh\necho "$@" >> %s/systemctl.log\n'
                                               '[ "$1" = is-active ] && exit ${ACTIVE_RC:-0}\nexit 0\n' % d)
-        (d / 'bin' / 'id').write_text('#!/bin/sh\n[ "$1" = -u ] && { echo 0; exit 0; }\nexec /usr/bin/id "$@"\n')
-        for f in ('systemctl', 'id'):
-            (d / 'bin' / f).chmod(0o755)
+        (d / 'bin' / 'systemctl').chmod(0o755)
         self.cfg = d / 'config.yaml'
         self.cfg.write_text('listen: :443\ntls:\n  cert: "%s/certs/a.cer"\n  key: "%s/certs/a.cer.key"\n'
                             'masquerade:\n  listenHTTPS: :1\n' % (d, d))
