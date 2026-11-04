@@ -3282,9 +3282,13 @@ function renderAwgPeers(peers) {
     b.addEventListener('click', async () => {
       const n = decodeURIComponent(b.getAttribute('data-awg-del'));
       if (!confirm('确认删除客户端「' + n + '」？该客户端会立即断开连接。')) return;
-      const json = await awgPost('manage-amneziawg', { action: 'peer_del', name: n });
-      if (json.ok) { showToast('已删除客户端 ' + n, 'success'); loadAwgState(); }
-      else { alert(json.error || '删除失败'); }
+      // 请求期间禁用按钮（2026-11-04 修）：连点两次第二次必然报「不存在」。
+      b.disabled = true;
+      try {
+        const json = await awgPost('manage-amneziawg', { action: 'peer_del', name: n });
+        if (json.ok) { showToast('已删除客户端 ' + n, 'success'); loadAwgState(); }
+        else { alert(json.error || '删除失败'); }
+      } finally { b.disabled = false; }
     });
   });
 }
@@ -3356,18 +3360,25 @@ if (btnSwitchAwgLine) {
     if (target !== '2' && target !== '3') return;
     if (target === awgCurrentLine) { alert('已经是 AWG ' + awgCurrentLine + '.x，无需切换。'); return; }
     if (!confirm('确认切换到 AWG ' + target + '.x？所有已发放的客户端配置都会失效。')) return;
-    const json = await awgPost('manage-amneziawg', { action: 'set_line', line: target });
-    if (json.ok) { showToast(json.message || '已切换协议线', 'success'); loadAwgState(); }
-    else { alert(json.error || '切换失败'); }
+    // 请求期间禁用（2026-11-04 修）：第二次提交会再生成一遍混淆参数，中间导出的配置随即失效。
+    btnSwitchAwgLine.disabled = true;
+    try {
+      const json = await awgPost('manage-amneziawg', { action: 'set_line', line: target });
+      if (json.ok) { showToast(json.message || '已切换协议线', 'success'); loadAwgState(); }
+      else { alert(json.error || '切换失败'); }
+    } finally { btnSwitchAwgLine.disabled = false; }
   });
 }
 
 if (btnUpdateAwg) {
   btnUpdateAwg.addEventListener('click', async () => {
     if (!confirm('确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。')) return;
-    const json = await awgPost('manage-amneziawg', { action: 'update' });
-    if (json.ok) { showToast(json.message || '更新完成', 'success'); loadAwgState(); }
-    else { alert(json.error || '更新失败'); }
+    btnUpdateAwg.disabled = true;
+    try {
+      const json = await awgPost('manage-amneziawg', { action: 'update' });
+      if (json.ok) { showToast(json.message || '更新完成', 'success'); loadAwgState(); }
+      else { alert(json.error || '更新失败'); }
+    } finally { btnUpdateAwg.disabled = false; }
   });
 }
 
