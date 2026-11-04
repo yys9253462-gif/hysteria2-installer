@@ -1260,11 +1260,12 @@ finally: s.close()
 # 两者完全可以共存：Hysteria 主监听是 **UDP** 端口，
 # 与反代的 TCP/UDP 443 通常不冲突。
 detect_webserver_squatting() {
-    local occupied=() who80 who443
+    # 只看 TCP 80（2026-11-04 修）：内置 ACME 写的是 `type: http`（HTTP-01），只要 80。
+    # 旧实现 443 被占也判「占用」，而本项目的 Reality 默认就在 443，于是 80 空着也
+    # 走不了内置签发，被推去 Caddy / DNS API / 自签。
+    local occupied=() who80
     who80="$(port_owner tcp 80)"
-    who443="$(port_owner tcp 443)"
     [[ -n "$who80" ]]  && occupied+=("TCP 80 (${who80})")
-    [[ -n "$who443" ]] && occupied+=("TCP 443 (${who443})")
     if [[ ${#occupied[@]} -eq 0 ]]; then
         ACRE_PORT_BLOCKER=""
         return 1   # 空闲：可以自己签
@@ -1799,8 +1800,7 @@ setup_acme_certificate() {
         log_warn "============================================================"
         log_warn " 检测到本机 ${ACRE_PORT_BLOCKER} 已被其他服务占用"
         log_warn "============================================================"
-        log_warn " Let's Encrypt 只有两种验证方式，都要求端口空闲："
-        log_warn "   HTTP-01 (TCP 80) / TLS-ALPN-01 (TCP 443)"
+        log_warn " 内置 ACME 用 HTTP-01 验证，要求 TCP 80 空闲。"
         log_warn " Hysteria 内置 ACME 无法在这种环境下自行签发，"
         log_warn " 强行尝试只会反复失败，然后退回自签证书（客户端必须开跳过校验）。"
         log_warn ""
