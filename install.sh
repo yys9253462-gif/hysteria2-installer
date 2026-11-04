@@ -856,14 +856,25 @@ verify_domain_resolves_to_this_host() {
 
 install_dependencies() {
     log_step "检查并安装基础依赖 (curl, wget, jq, openssl, iptables, tar)..."
+    # 关键包与可选包分两批装，可选包逐个装（2026-11-04 修）：dnf 默认 strict，一个包名
+    # 不存在（RHEL / Alma / Rocky 没开 EPEL 时的 qrencode）整批一个都不装，jq 也跟着缺，
+    # 安装随即中止；apt 遇到缺包同样整批拒绝。
+    local _pm=() _pkg
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq && apt-get install -y -qq curl wget jq openssl iptables tar ca-certificates qrencode python3 || true
+        apt-get update -qq || true
+        _pm=(apt-get install -y -qq)
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl wget jq openssl iptables tar ca-certificates qrencode python3 || true
+        _pm=(dnf install -y)
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl wget jq openssl iptables tar ca-certificates qrencode python3 || true
+        _pm=(yum install -y)
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl wget jq openssl iptables tar ca-certificates bash qrencode python3 || true
+        _pm=(apk add --no-cache)
+    fi
+    if (( ${#_pm[@]} > 0 )); then
+        "${_pm[@]}" curl jq openssl ca-certificates python3 tar             || for _pkg in curl jq openssl ca-certificates python3 tar; do "${_pm[@]}" "$_pkg" || true; done
+        for _pkg in wget iptables qrencode $([[ "${_pm[0]}" == apk ]] && echo bash); do
+            "${_pm[@]}" "$_pkg" >/dev/null 2>&1 || true
+        done
     else
         log_warn "未识别的包管理器，请确认已安装 curl, wget, jq, openssl, iptables"
     fi
