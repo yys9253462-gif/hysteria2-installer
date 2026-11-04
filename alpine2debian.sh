@@ -101,10 +101,10 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --yes|-y)     ASSUME_YES=1; shift ;;
         --dry-run)    DRY_RUN=1; shift ;;
-        --disk)       DISK="${2:-}"; shift 2 ;;
-        --mirror)     MIRROR="${2:-}"; shift 2 ;;
-        --suite)      DEBIAN_SUITE="${2:-}"; shift 2 ;;
-        --pwd)        ROOT_PWD="${2:-}"; shift 2 ;;
+        --disk)       [ $# -ge 2 ] || die "--disk 缺少取值"; DISK="$2"; shift 2 ;;
+        --mirror)     [ $# -ge 2 ] || die "--mirror 缺少取值"; MIRROR="$2"; shift 2 ;;
+        --suite)      [ $# -ge 2 ] || die "--suite 缺少取值"; DEBIAN_SUITE="$2"; shift 2 ;;
+        --pwd)        [ $# -ge 2 ] || die "--pwd 缺少取值"; ROOT_PWD="$2"; shift 2 ;;
         -h|--help)    usage ;;
         *) die "未知参数: $1（用 --help 看用法）" ;;
     esac
@@ -144,7 +144,8 @@ if [ -z "$ROOT_PWD" ]; then
         die "非交互模式必须通过 ROOT_PWD 环境变量或 --pwd 提供 root 密码"
     fi
     printf '%s' "请设置新系统 root 密码（不能含特殊字符以免输入出错）: "
-    if [ -t 0 ]; then read -r ROOT_PWD; else read -r ROOT_PWD </dev/tty; fi
+    # set -eu 下 read 读到 EOF 返回 1，脚本会无声退出（2026-11-04 修）；交给下面的空值检查报错。
+    if [ -t 0 ]; then read -r ROOT_PWD || ROOT_PWD=""; else read -r ROOT_PWD </dev/tty || ROOT_PWD=""; fi
 fi
 [ -n "$ROOT_PWD" ] || die "root 密码不能为空"
 
@@ -170,11 +171,12 @@ if ! ip route show default >/dev/null 2>&1 || [ -z "$(ip route show default 2>/d
             ip link set "$ifc" up 2>/dev/null || true
             udhcpc -i "$ifc" -q -n -t 10 2>/dev/null || true
         fi
-        ip route show default >/dev/null 2>&1 && break
+        # ip route 没有默认路由时也返回 0，必须看输出（2026-11-04 修）
+        [ -n "$(ip route show default 2>/dev/null)" ] && break
     done
 fi
 
-if ! ip route show default >/dev/null 2>&1; then
+if [ -z "$(ip route show default 2>/dev/null)" ]; then
     die "仍然没有默认路由。请先在 VNC 里手动联网：
        ip link                    # 看网卡名，确认状态是 DOWN 还是 UP
        ip link set <网卡> up      # ★ DOWN 的话先启用
@@ -221,7 +223,7 @@ warn "磁盘上所有数据都会丢失，且不可恢复"
 printf '\n'
 if [ "$ASSUME_YES" != "1" ] && [ "$DRY_RUN" != "1" ]; then
     printf '确认继续？输入 yes 回车：'
-    if [ -t 0 ]; then read -r _ans; else read -r _ans </dev/tty; fi
+    if [ -t 0 ]; then read -r _ans || _ans=""; else read -r _ans </dev/tty || _ans=""; fi
     [ "$_ans" = "yes" ] || die "已取消"
 fi
 
@@ -519,7 +521,7 @@ if [ "$DRY_RUN" != "1" ]; then
         done
     fi
     [ -b "$ROOT_PART" ] || die "分区设备 $ROOT_PART 未就绪，无法继续格式化。
-       请手动执行 `partx -a -n 1:1 $DISK` 后重跑本脚本。"
+       请手动执行 partx -a -n 1:1 $DISK 后重跑本脚本。"
     ok "分区设备已就绪：$ROOT_PART"
 fi
 
@@ -667,6 +669,17 @@ fi
 # ── 第 8 步：网络配置 + swap ─────────────────────────────────────────────
 info "第 8/9 步：写网络配置"
 
+# 当前地址不是 DHCP 拿到的（救援系统里手工 ip addr add），新系统写 DHCP 必然失联
+# （2026-11-04 修）。ip addr 对 DHCP 地址标 dynamic；没有这个标记就照当前值写静态。
+if ip -4 addr show "$MAIN_IFACE" 2>/dev/null | grep 'inet ' | grep -q dynamic; then
+    NET_STANZA="iface ${MAIN_IFACE} inet dhcp"
+else
+    NET_STANZA="iface ${MAIN_IFACE} inet static
+    address ${MAIN_IP}/${MAIN_CIDR}
+    gateway ${MAIN_GATE}"
+    warn "当前 IPv4 不是 DHCP 获得的，新系统写入静态地址 ${MAIN_IP}/${MAIN_CIDR} 网关 ${MAIN_GATE}"
+fi
+
 NET_CFG=$(cat <<NET_EOF
 # 由 alpine2debian.sh 生成
 # 与阿里云官方 Debian 12 镜像保持一致的开头，方便以后往里加接口
@@ -676,7 +689,7 @@ auto lo
 iface lo inet loopback
 
 auto ${MAIN_IFACE}
-iface ${MAIN_IFACE} inet dhcp
+${NET_STANZA}
 NET_EOF
 )
 
@@ -684,7 +697,7 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s /etc/network/interfaces：\n%s\n' "$c_ylw" "$c_rst" "$NET_CFG"
 else
     printf '%s\n' "$NET_CFG" > "$MOUNT_DIR/etc/network/interfaces"
-    ok "网络配置已写入（网卡 $MAIN_IFACE 走 DHCP）"
+    ok "网络配置已写入：$(printf '%s' "$NET_STANZA" | head -n1)"
 fi
 
 if [ "$SWAP_MB" -gt 0 ]; then
@@ -743,7 +756,7 @@ else
         run reboot
     else
         printf '现在重启吗？输入 reboot 回车立即重启，或直接按 Ctrl+C 稍后手动重启：'
-        if [ -t 0 ]; then read -r _rb; else read -r _rb </dev/tty; fi
+        if [ -t 0 ]; then read -r _rb || _rb=""; else read -r _rb </dev/tty || _rb=""; fi
         if [ "$_rb" = "reboot" ]; then
             info "重启中..."
             reboot

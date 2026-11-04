@@ -443,35 +443,6 @@ wipe_disk() {
     return 1
 }
 
-# 只有要动这块盘时才清理（CHECK_ONLY 模式只看不动）
-if [ "$CHECK_ONLY" != "1" ] && [ "$DRY_RUN" != "1" ]; then
-    if [ "$_mounted_suspicious" = "1" ] || [ -n "$_sig" ]; then
-        _round=0
-        _clean_ok=0
-        while [ "$_round" -lt 3 ]; do
-            _round=$((_round + 1))
-            info "释放磁盘占用 / 清除残留签名（第 $_round 轮）"
-            release_disk "$DISK"
-            wipe_disk "$DISK" || true
-            _left=""
-            if [ -r /proc/mounts ]; then
-                _left="$(awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts 2>/dev/null)"
-            fi
-            if [ -z "$_left" ]; then _clean_ok=1; break; fi
-            warn "仍被挂载：$(printf '%s' "$_left" | tr '\n' ' ') —— 延迟卸载后重试"
-            printf '%s\n' "$_left" | sort -r | while IFS= read -r _mp; do
-                umount -l "$_mp" >/dev/null 2>&1 || true
-            done
-            sleep 2
-        done
-        if [ "$_clean_ok" = "1" ]; then
-            ok "磁盘已释放并清除残留签名"
-        else
-            warn "磁盘仍被占用 —— mkfs 可能失败，届时请手动检查"
-        fi
-    fi
-fi
-
 # ── 第 5 步：确认参数 ────────────────────────────────────────────────────
 info "第 5/6 步：确认重装参数"
 
@@ -515,6 +486,38 @@ if [ "$ASSUME_YES" != "1" ]; then
     _c="$(ask '确认开始？输入 yes 回车：' 'no')"
     [ "$_c" = "yes" ] || die "已取消"
 fi
+
+# 清盘必须在用户确认之后（2026-11-04 修）：旧实现在第 5 步确认前就 wipefs，
+# 用户看到参数摘要（比如盘选错了）回答 no 时，分区表和文件系统签名已经没了。
+# 只有要动这块盘时才清理（CHECK_ONLY 模式只看不动）
+if [ "$CHECK_ONLY" != "1" ] && [ "$DRY_RUN" != "1" ]; then
+    if [ "$_mounted_suspicious" = "1" ] || [ -n "$_sig" ]; then
+        _round=0
+        _clean_ok=0
+        while [ "$_round" -lt 3 ]; do
+            _round=$((_round + 1))
+            info "释放磁盘占用 / 清除残留签名（第 $_round 轮）"
+            release_disk "$DISK"
+            wipe_disk "$DISK" || true
+            _left=""
+            if [ -r /proc/mounts ]; then
+                _left="$(awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts 2>/dev/null)"
+            fi
+            if [ -z "$_left" ]; then _clean_ok=1; break; fi
+            warn "仍被挂载：$(printf '%s' "$_left" | tr '\n' ' ') —— 延迟卸载后重试"
+            printf '%s\n' "$_left" | sort -r | while IFS= read -r _mp; do
+                umount -l "$_mp" >/dev/null 2>&1 || true
+            done
+            sleep 2
+        done
+        if [ "$_clean_ok" = "1" ]; then
+            ok "磁盘已释放并清除残留签名"
+        else
+            warn "磁盘仍被占用 —— mkfs 可能失败，届时请手动检查"
+        fi
+    fi
+fi
+
 
 # ── 第 6 步：下载并执行 InstallNET ───────────────────────────────────────
 info "第 6/6 步：下载并执行重装程序"
@@ -599,9 +602,17 @@ set -- "$@" --cloudkernel 0 --bbr --motd
 
 printf '\n'
 info "开始执行重装（InstallNET 接管后会自行重启，全程 10~20 分钟）"
-info "执行命令：bash InstallNET.sh $*"
+# 屏显与日志里遮掉 root 密码（2026-11-04 修）：日志留在 /root/reinstall-debian13.log，
+# 旧实现把 -pwd 后的原文写进去，能读到它的人就拿到了 SSH root 密码。
+_shown="" _mask=0
+for _a in "$@"; do
+    if [ "$_mask" = "1" ]; then _a="******"; _mask=0; fi
+    [ "$_a" = "-pwd" ] && _mask=1
+    _shown="${_shown:+$_shown }$_a"
+done
+info "执行命令：bash InstallNET.sh $_shown"
 printf '\n'
-log_line "执行：bash InstallNET.sh $*"
+log_line "执行：bash InstallNET.sh $_shown"
 
 # 交给 InstallNET
 # ★ 兜底：明确检查 bash 存在，避免只留下一句 `sh: bash: not found`（退出码 127）

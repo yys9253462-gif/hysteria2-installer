@@ -2085,21 +2085,26 @@ setup_ports_and_obfs() {
     if systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f "$HY2_META_FILE" ]]; then
         _running_port="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
     fi
-    if [[ -n "${LISTEN_PORT:-}" ]] && is_valid_port "$LISTEN_PORT" \
-       && [[ "$LISTEN_PORT" != "$_running_port" ]]; then
+    # 答 y 就地重选（2026-11-04 修）：旧实现问「换一个端口？」，答 y 也照样中止安装。
+    # 环境变量指定的端口不重问（无人值守），直接中止。
+    while [[ -n "${LISTEN_PORT:-}" ]] && is_valid_port "$LISTEN_PORT" \
+       && [[ "$LISTEN_PORT" != "$_running_port" ]]; do
         _port_user="$(port_owner udp "$LISTEN_PORT")"
-        if [[ -n "$_port_user" ]]; then
-            log_err "所选主监听 UDP 端口 ${LISTEN_PORT} 已被占用（占用进程: ${_port_user}）。"
-            log_err "Hysteria 将无法绑定该端口，服务会反复重启。"
-            read -rp "换一个端口？[y/N]: " _port_retry || true
-            if [[ ! "$_port_retry" =~ ^[Yy]$ ]]; then
-                log_err "已中止安装。请释放该端口或重跑本脚本换一个端口。"
-                return 1
-            fi
-            log_info "请重新运行本脚本并指定其他端口。"
+        [[ -n "$_port_user" ]] || break
+        log_err "所选主监听 UDP 端口 ${LISTEN_PORT} 已被占用（占用进程: ${_port_user}）。"
+        log_err "Hysteria 将无法绑定该端口，服务会反复重启。"
+        _port_retry=""
+        [[ -n "${HY2_PORT:-}" ]] || { read -rp "换一个端口？[y/N]: " _port_retry || true; }
+        if [[ ! "$_port_retry" =~ ^[Yy]$ ]]; then
+            log_err "已中止安装。请释放该端口或重跑本脚本换一个端口。"
             return 1
         fi
-    fi
+        read -rp "请输入新的主监听 UDP 端口 [1-65535]: " LISTEN_PORT || true
+        if ! is_valid_port "${LISTEN_PORT:-}"; then
+            log_err "端口必须是 1-65535 之间的整数，已中止安装。"
+            return 1
+        fi
+    done
 
     # 端口跳跃 (默认全自动开启，免询问)
     clear_all_hopping_rules
@@ -5005,10 +5010,10 @@ install_amneziawg() {
     echo -e "  ${GREEN}1.${PLAIN} AWG 3.x  (最新：头部保护 + 时序随机化，抗连接行为分析)"
     echo -e "  ${GREEN}2.${PLAIN} AWG 2.x  (生态验证更充分，参数体系稳定)"
     if [[ "$def_line" == "2" ]]; then
-        read -rp "请输入选项 [1-2, 默认 2]: " line_choice
+        read -rp "请输入选项 [1-2, 默认 2]: " line_choice || true
         line_choice="${line_choice:-2}"
     else
-        read -rp "请输入选项 [1-2, 默认 1]: " line_choice
+        read -rp "请输入选项 [1-2, 默认 1]: " line_choice || true
         line_choice="${line_choice:-1}"
     fi
     case "$line_choice" in
@@ -5022,7 +5027,7 @@ install_amneziawg() {
     echo ""
     echo -e "${YELLOW}端口说明：${PLAIN}必须避开 Hysteria2 的端口跳跃区间 20000-40000，"
     echo -e "          否则入站 UDP 会被 REDIRECT 到 Hysteria，AWG 收不到握手包。"
-    read -rp "请输入监听 UDP 端口 [回车自动选择 ${AWG_PORT_MIN}-${AWG_PORT_MAX} 内的空闲端口]: " port
+    read -rp "请输入监听 UDP 端口 [回车自动选择 ${AWG_PORT_MIN}-${AWG_PORT_MAX} 内的空闲端口]: " port || true
     port="${port// /}"
     if [[ -n "$port" ]]; then
         if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
@@ -5046,10 +5051,10 @@ install_amneziawg() {
     echo ""
     echo -e "${YELLOW}连接地址用于生成客户端的 Endpoint，填域名或公网 IP 均可。${PLAIN}"
     if [[ -n "$suggestion" ]]; then
-        read -rp "请输入客户端连接地址 [默认: ${suggestion}]: " endpoint
+        read -rp "请输入客户端连接地址 [默认: ${suggestion}]: " endpoint || true
         endpoint="${endpoint:-$suggestion}"
     else
-        read -rp "请输入客户端连接地址（域名或公网 IP）: " endpoint
+        read -rp "请输入客户端连接地址（域名或公网 IP）: " endpoint || true
     fi
     if [[ -z "$endpoint" ]]; then
         log_warn "未提供连接地址，将跳过首个客户端创建，之后可手动补。"
@@ -5064,7 +5069,7 @@ install_amneziawg() {
         fi
         if [[ "$has_peers" == "0" ]]; then
             echo ""
-            read -rp "请为首个客户端命名 [默认: client1]: " client
+            read -rp "请为首个客户端命名 [默认: client1]: " client || true
             client="${client:-client1}"
         fi
     fi
@@ -5104,7 +5109,7 @@ awg_menu_add_peer() {
     if ! awg_ensure_ctl; then return 1; fi
 
     local name endpoint suggestion
-    read -rp "请输入新客户端名称（字母/数字/._-）: " name
+    read -rp "请输入新客户端名称（字母/数字/._-）: " name || true
     name="${name// /}"
     if [[ -z "$name" ]]; then
         log_err "名称不能为空。"
@@ -5116,7 +5121,7 @@ awg_menu_add_peer() {
     fi
 
     suggestion="$(awg_suggest_endpoint)"
-    read -rp "客户端连接地址 [默认: ${suggestion:-需手动输入}]: " endpoint
+    read -rp "客户端连接地址 [默认: ${suggestion:-需手动输入}]: " endpoint || true
     endpoint="${endpoint:-$suggestion}"
     if [[ -z "$endpoint" ]]; then
         log_err "必须提供连接地址才能生成客户端配置。"
@@ -5147,14 +5152,14 @@ awg_menu_del_peer() {
     "$AWG_CTL_BIN" peer-list || true
     echo ""
     local name
-    read -rp "请输入要删除的客户端名称: " name
+    read -rp "请输入要删除的客户端名称: " name || true
     if [[ -z "$name" ]]; then
         log_err "名称不能为空。"
         return 1
     fi
 
     local confirm
-    read -rp "确认删除客户端 '${name}'？该客户端将立即断线 [y/N]: " confirm
+    read -rp "确认删除客户端 '${name}'？该客户端将立即断线 [y/N]: " confirm || true
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "已取消。"
         return 0
@@ -5184,7 +5189,7 @@ awg_menu_switch_line() {
     log_warn "所有已发放的客户端配置都会立刻失效，必须全部重新导出！"
     echo ""
     local confirm
-    read -rp "确认切换协议线？[y/N]: " confirm
+    read -rp "确认切换协议线？[y/N]: " confirm || true
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "已取消。"
         return 0
@@ -5206,7 +5211,7 @@ uninstall_amneziawg() {
     log_warn "即将彻底卸载 AmneziaWG：停止服务、删除网卡与 NAT 规则、"
     log_warn "删除全部密钥与客户端配置（不可恢复）。"
     local confirm
-    read -rp "确认卸载？[y/N]: " confirm
+    read -rp "确认卸载？[y/N]: " confirm || true
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         log_info "已取消。"
         return 0
@@ -5265,7 +5270,8 @@ menu_amneziawg() {
         echo -e "${CYAN}----------------------------------------------------------------${PLAIN}"
         echo -e "  ${GREEN}0.${PLAIN} 返回主菜单"
         echo -e "${CYAN}================================================================${PLAIN}"
-        read -rp "请输入选项 [0-8]: " sub
+        # EOF（无人值守 / 管道输入耗尽）时返回，而不是在循环里空转（2026-11-04 修）。
+        read -rp "请输入选项 [0-8]: " sub || return 0
 
         case "$sub" in
             1) install_amneziawg || true ;;
@@ -5299,7 +5305,7 @@ menu_amneziawg() {
         esac
 
         echo ""
-        read -rp "按回车返回 AmneziaWG 菜单..." _
+        read -rp "按回车返回 AmneziaWG 菜单..." _ || return 0
     done
 }
 
@@ -5674,6 +5680,8 @@ acquire_installer_core_lock() {
 flow_install() {
     check_root
     check_arch
+    # 与 4 / 5 / 6 号菜单同理（2026-11-04 修）：重装会 restart hysteria-server，超额停用期间拒绝。
+    refuse_if_suspended || return 1
     # 已装机再按「1」会重生成配置、可能换掉端口/密码/证书，
     # 已发放的客户端配置随之失效 —— 必须让用户确认一次。
     if [[ -f "$HY2_CONFIG" ]]; then
@@ -5989,6 +5997,7 @@ if [[ $# -gt 0 ]]; then
     esac
     case "$1" in
         install)
+            refuse_if_suspended || exit 1
             acquire_installer_core_lock || exit 1
             # 免交互重装也要先留出与菜单安装相同的恢复快照。
             if [[ -f "$HY2_DIR/config.yaml" || -f "$HY2_META_FILE" ]]; then
