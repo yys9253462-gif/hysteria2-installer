@@ -34,5 +34,13 @@ class RenewUnlimitedTest(PortalServer):
         self.assertEqual(users['unl']['limit_bytes'], 0)
 
 
+
+class PasswordWhitespaceTest(PortalServer):
+    def test_api_rejects_padded_password(self):
+        self.assertEqual(self.api('users/create', {'user_id': 'pad1', 'password': 'abc '})[0], 400)
+        self.assertEqual(self.api('users/create', {'user_id': 'pad1', 'password': 'abc-pw'})[0], 200)
+        self.assertEqual(self.api('users/update', {'user_id': 'pad1', 'password': ' abc'})[0], 400)
+
+
 if __name__ == '__main__':
     unittest.main()

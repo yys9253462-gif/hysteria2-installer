@@ -9840,6 +9840,9 @@ if __name__ == '__main__':
                     # str() 后的形态不一致，用户拿到的连接参数就对不上。
                     if not isinstance(pwd, str) or not pwd.strip():
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user parameter: password must be a non-empty string'})
+                    if pwd != pwd.strip():
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: password must not start or end with whitespace'})
                     # 🔴 2026-10-25 修：这些值直接来自请求体，`int('abc')` 会抛
                     # ValueError。该分支不在任何 try 里，异常会穿透 do_POST →
                     # 连接被掐断，客户端只看到 "Remote end closed connection"，
@@ -10081,7 +10084,8 @@ if __name__ == '__main__':
                         changes = {}
                         if 'password' in params:
                             # 与 users/create 同一判据：纯空白也算空（2026-11-04 修）。
-                            if not isinstance(params['password'], str) or not params['password'].strip():
+                            if (not isinstance(params['password'], str) or not params['password'].strip()
+                                    or params['password'] != params['password'].strip()):
                                 raise ValueError()
                             changes['password'] = params['password']
                         if 'expires_at' in params:
@@ -12865,7 +12869,12 @@ if __name__ == '__main__':
                     return self.reply(400, 'user_id 不能只由点组成'.encode('utf-8'))
 
                 if action == 'create' and user_id:
-                    pwd = form.get('password', [''])[0].strip() or secrets.token_hex(16)
+                    # 不再静默去掉首尾空白（2026-11-04 修）：「abc 」被存成「abc」，客户端按输入的
+                    # 原样填就鉴权失败。与 API 同一规则：首尾带空白直接拒，全空则随机生成。
+                    pwd = form.get('password', [''])[0]
+                    if pwd != pwd.strip() and pwd.strip():
+                        return self.reply(400, '密码首尾不能有空白字符'.encode('utf-8'))
+                    pwd = pwd.strip() or secrets.token_hex(16)
                     # 同 REST 通道：非数字输入必须回 400，而不是让异常掐断连接。
                     try:
                         days = int(form.get('duration_days', ['30'])[0] or 30)

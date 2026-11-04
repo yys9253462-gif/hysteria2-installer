@@ -203,6 +203,13 @@ class WebWorkflowTests(unittest.TestCase):
                                                            'password': 'pw-new-user'})
         self.assertEqual(status, 500, body)
 
+    def test_padded_password_is_rejected_not_trimmed(self):
+        """Web 建户不静默去掉密码首尾空白（2026-11-04 修，与 API 同一规则）。"""
+        status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user',
+                                                        'password': 'abc '})
+        self.assertEqual(status, 400)
+        self.assertNotIn('qa-user', self.data['users'])
+
     def test_invalid_user_duration_does_not_create_expired_record(self):
         status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user', 'duration_days': '-1'})
         self.assertEqual(status, 400)
