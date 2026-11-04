@@ -7730,7 +7730,11 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
             has_runtime_fingerprint = bool(_runtime_data.get('loaded_cert_sha256'))
         except (OSError, ValueError, AttributeError):
             pass
-    runtime_reloaded = sync_cert_runtime(root, live_cert) if cert_changed or not has_runtime_fingerprint else False
+    # 每轮都交给 sync_cert_runtime 比对（2026-11-04 修）：它拿磁盘证书与上次重载时记下的
+    # 指纹比，相同就直接返回，不会每 30 分钟重启一次。旧的门槛只看「本轮前后」两次快照，
+    # 而本轮里根本不写证书：Caddy / 手工换证后服务一直握着旧证书，到期时 TLS 全挂。
+    del cert_changed, has_runtime_fingerprint
+    runtime_reloaded = sync_cert_runtime(root, live_cert)
 
     if changed or runtime_reloaded:
         # 留痕：让「刚刚自动对齐过一次」在门户卡片上可见，而不是悄无声息。

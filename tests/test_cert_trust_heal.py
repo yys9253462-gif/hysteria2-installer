@@ -567,6 +567,30 @@ class TestCertRuntimeReload(unittest.TestCase):
                              __import__('hashlib').sha256(cert.read_bytes()).hexdigest())
             self.assertEqual(saved['heal_count'], 1)
 
+    def test_out_of_band_renewal_between_runs_reloads_services(self):
+        """Caddy / 手工换证后下一轮 selfheal 要重载服务（2026-11-04 修）。
+
+        旧实现只比较本轮内的前后快照，第二轮起永远看不到证书变化。
+        """
+        import portal
+        from types import SimpleNamespace
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cert = root / 'fullchain.pem'
+            cert.write_bytes(b'old certificate')
+            meta_path = root / 'client_meta.json'
+            meta_path.write_text('{}', encoding='utf-8')
+            calls = []
+            with mock.patch.object(portal, '_resolve_live_cert', return_value=(cert, '', [], False)),                  mock.patch.object(portal, 'sync_cert_trust', return_value=False),                  mock.patch.object(portal, 'sync_pin', side_effect=lambda *_: None),                  mock.patch.object(portal, '_systemd_state',
+                                   side_effect=lambda service: 'active' if service == 'xray' else 'inactive'),                  mock.patch.object(portal.subprocess, 'run', side_effect=lambda args, **kwargs:
+                     (calls.append(args) or SimpleNamespace(returncode=0))):
+                portal.selfheal(str(meta_path), config_path=str(root / 'config.yaml'))
+                cert.write_bytes(b'renewed certificate')
+                portal.selfheal(str(meta_path), config_path=str(root / 'config.yaml'))
+                portal.selfheal(str(meta_path), config_path=str(root / 'config.yaml'))
+            self.assertEqual(calls, [['systemctl', 'try-restart', 'xray']] * 2)
+
     def test_record_cert_heal_keeps_runtime_fingerprint(self):
         import portal
         with tempfile.TemporaryDirectory() as td:
