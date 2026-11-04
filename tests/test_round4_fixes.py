@@ -173,5 +173,21 @@ class ViewKeyHttpTest(PortalServer):
         self.assertNotIn('view_nonce', body)
 
 
+
+class SessionCookieAmongForeignCookiesTest(PortalServer):
+    """同域其它不合 RFC 的 cookie 不能让管理员掉线（2026-11-04 修）。"""
+    def _cookie(self):
+        token, secret, iat = self.data['token'], self.data['session_secret'], str(int(time.time()))
+        sig = hmac.new(secret.encode(), f'sess:{token}:{iat}'.encode(), hashlib.sha256).hexdigest()
+        return f'hy2_session={token}.{iat}.{sig}'
+
+    def test_session_survives_malformed_neighbour_cookies(self):
+        for header in ('x=a b; %s', '%s; x=a b', 'a={"x":1}; %s'):
+            with self.subTest(header=header):
+                _, body = self.request(self.prefix, headers={'Cookie': header % self._cookie()})
+                self.assertIn('/logout', body)
+                self.assertNotIn('class="login-form"', body)
+
+
 if __name__ == '__main__':
     unittest.main()

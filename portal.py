@@ -9097,14 +9097,17 @@ if __name__ == '__main__':
     def verify_session(cookie_header):
         if not cookie_header:
             return False
-        cookies = SimpleCookie()
-        try:
-            cookies.load(cookie_header)
-        except Exception:
+        # 不用 SimpleCookie（2026-11-04 修）：同一 Cookie 头里只要有一个不合 RFC 的值
+        # （同域其它应用 / 统计脚本写的带空格或裸 JSON 的 cookie），load() 会把**全部**
+        # cookie 丢掉且不抛异常，管理员登录后刷新就回到登录页，日志里什么也没有。
+        value = None
+        for part in str(cookie_header).split(';'):
+            name, sep, val = part.strip().partition('=')
+            if sep and name == 'hy2_session':
+                value = val.strip().strip('"')
+        if value is None:
             return False
-        if 'hy2_session' not in cookies:
-            return False
-        parts = cookies['hy2_session'].value.split('.')
+        parts = value.split('.')
         if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
             return False
         t, issued_at, sig = parts
