@@ -85,5 +85,51 @@ class AwgInstallLineSwitchTests(unittest.TestCase):
         self.assertIn('S4=15', self._run(3, 15))
 
 
+
+@unittest.skipUnless(BASH, 'requires bash')
+class AwgReinstallPortChangeTests(unittest.TestCase):
+    def _run(self, old, new):
+        block = re.search(r'    allow_firewall "\$port"\n.*?\n    fi\n', fn('cmd_install'), re.S).group(0)
+        with tempfile.TemporaryDirectory() as td:
+            script = '\n'.join([
+                'log_info() { :; }',
+                'command() { if [[ "$1" == -v ]]; then [[ "$2" == ufw ]]; return; fi; builtin command "$@"; }',
+                'ufw() { [[ "$1" == status ]] && { echo "Status: active"; return; }; echo "UFW $*" >> %s/calls; }' % td,
+                'systemctl() { return 1; }',
+                fn('allow_firewall'), fn('revoke_firewall'),
+                'old_port=%s; port=%s' % (old, new), block])
+            subprocess.run([BASH, '-c', script], timeout=20)
+            calls = Path(td) / 'calls'
+            return calls.read_text() if calls.exists() else ''
+
+    def test_old_port_revoked_on_change(self):
+        out = self._run(51234, 52345)
+        self.assertIn('UFW allow 52345/udp', out)
+        self.assertIn('UFW delete allow 51234/udp', out)
+
+    def test_same_port_not_revoked(self):
+        self.assertNotIn('delete', self._run(51234, 51234))
+        self.assertNotIn('delete', self._run('', 51234))
+
+
+
+@unittest.skipUnless(BASH and shutil.which('jq'), 'requires bash and jq')
+class AwgPeerDelCorruptListTests(unittest.TestCase):
+    def test_unparseable_peer_list_is_left_intact(self):
+        with tempfile.TemporaryDirectory() as td:
+            peers = Path(td) / 'peers.json'
+            original = '{"peers": "corrupt", "keep": 1}'
+            peers.write_text(original)
+            script = '\n'.join([
+                'AWG_DIR=%s; AWG_PEERS_FILE=%s; AWG_CONFIG=%s/none' % (td, peers, td),
+                'die() { echo "DIE $*"; exit 1; }', 'log_info() { :; }',
+                'require_root() { :; }', 'require_jq() { :; }', 'peers_init() { :; }',
+                'peer_exists() { return 0; }', 'render_server_config() { :; }', 'peer_apply_live_del() { :; }',
+                fn('cmd_peer_del'), 'cmd_peer_del alice'])
+            out = subprocess.run([BASH, '-c', script], capture_output=True, text=True, timeout=20).stdout
+            self.assertIn('DIE', out)
+            self.assertEqual(peers.read_text(), original)
+
+
 if __name__ == '__main__':
     unittest.main()

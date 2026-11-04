@@ -67,5 +67,46 @@ class TrafficSuspendStateTests(unittest.TestCase):
         self.assertFalse(env['unit_suspended']('x'))
 
 
+
+class ResumeSkipsRetiredProtocolsTests(unittest.TestCase):
+    """停用期间关掉的 AnyTLS / TUIC 不能让恢复永远失败（2026-11-04 修）。"""
+    def run_resume(self, data):
+        import subprocess as sp
+        from unittest import mock
+        node = next(n for n in ast.walk(TREE) if isinstance(n, ast.FunctionDef)
+                    and n.name == '_set_traffic_suspension')
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            ok = not (cmd[1] == 'start' and cmd[2] == 'hy2-anytls')  # 配置已删，起不来
+            return sp.CompletedProcess(cmd, 0 if ok else 1)
+        env = load()
+        env.update(data=data, data_lock=threading.RLock(), copy=copy, time=__import__('time'),
+                   subprocess=mock.Mock(run=fake_run), save_data=lambda: None,
+                   AtomicWriteDurabilityError=type('E', (Exception,), {}),
+                   ANYTLS_SERVICE='hy2-anytls', TUIC_SERVICE='hy2-tuic',
+                   TRAFFIC_SUSPEND_UNITS=('hysteria-server', 'hy2-anytls', 'hy2-tuic'),
+                   _unit_active=lambda u: False)
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[copy.deepcopy(node)], type_ignores=[])),
+                     '<resume>', 'exec'), env)
+        env['_set_traffic_suspension'](False)
+        return data, calls
+
+    def test_disabled_anytls_is_not_restarted_and_resume_completes(self):
+        data = {'traffic_suspend': {'suspended': True, 'units': ['hysteria-server', 'hy2-anytls']},
+                'anytls_config': {'enabled': False}}
+        data, calls = self.run_resume(data)
+        self.assertEqual(data['traffic_suspend'], {'suspended': False})
+        self.assertNotIn(['systemctl', 'start', 'hy2-anytls'], calls)
+        self.assertIn(['systemctl', 'start', 'hysteria-server'], calls)
+
+    def test_enabled_anytls_that_fails_stays_suspended(self):
+        data = {'traffic_suspend': {'suspended': True, 'units': ['hysteria-server', 'hy2-anytls']},
+                'anytls_config': {'enabled': True}}
+        data, _ = self.run_resume(data)
+        self.assertEqual(data['traffic_suspend']['units'], ['hy2-anytls'])
+
+
 if __name__ == '__main__':
     unittest.main()

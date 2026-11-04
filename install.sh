@@ -2317,9 +2317,20 @@ select_subscription_port() {
             return 0
         fi
     fi
-    HY2_SUB_PORT=$(python3 - <<'PYPORT'
-import socket, secrets
+    HY2_SUB_PORT=$(python3 - "$HY2_DIR/portal.json" <<'PYPORT'
+import json, socket, secrets, sys
 RESERVED = {8443, 19898, 22, 80, 443, 40000, 56195}
+# 门户托管协议记下的端口也要避开（2026-11-04 修）：协议此刻停着时 bind 能成功，
+# 订阅端口占了它的位置，之后再启用该协议就撞车。
+try:
+    _data = json.load(open(sys.argv[1], encoding='utf-8'))
+except (OSError, ValueError):
+    _data = {}
+if isinstance(_data, dict):
+    for _key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
+        _sec = _data.get(_key)
+        if isinstance(_sec, dict) and isinstance(_sec.get('port'), int) and not isinstance(_sec.get('port'), bool):
+            RESERVED.add(_sec['port'])
 for _ in range(100):
     port = 10000 + secrets.randbelow(50000)
     if port in RESERVED or 20000 <= port <= 40000:
@@ -5743,6 +5754,7 @@ flow_update_core() {
 flow_reconfigure() {
     check_root
     require_installed
+    refuse_if_suspended || return 1
     # 🔴 改配置前必须警告 + 备份（2026-10-09 修）：
     # 这条路径会整体重写 client_meta.json 并重建门户，原先一个字都没提示。
     echo
@@ -5759,6 +5771,10 @@ flow_reconfigure() {
     ask_preserve_portal
     acquire_installer_core_lock || return 1
     backup_state_before_reconfigure || return 1
+    # 先记下旧端口：setup_ports_and_obfs 会重写 meta，之后就拿不到了。
+    local _old_listen _old_sub
+    _old_listen="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    _old_sub="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
     require_systemd_247 || return 1
     install_dependencies
     get_public_ip
@@ -5766,12 +5782,39 @@ flow_reconfigure() {
     setup_ports_and_obfs
     generate_server_config
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
+    close_replaced_ports "$_old_listen" "$_old_sub"
     setup_systemd
     show_client_configs
 }
 
-flow_warp() { check_root; install_warp_local_proxy; }
-flow_gost() { check_root; install_gost; }
+# 改端口后收回旧端口的放行（2026-11-04 修）：setup_system_firewall 只加不删，
+# 旧的 UDP 主端口 / TCP 订阅端口永久留在 ufw / firewalld 里，之后谁绑上去谁就暴露。
+# 只收回本次确实被换掉、且没有托管协议仍在用的端口；nft 规则不动（无法证明归属）。
+close_replaced_ports() {
+    local old_udp="$1" old_tcp="$2" in_use
+    in_use="$(jq -r '[.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
+        | map(select(type == "object") | .port | numbers) | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    _close_one() {   # $1=port $2=proto
+        is_valid_port "$1" || return 0
+        grep -qx "$1" <<<"$in_use" && return 0
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+            ufw delete allow "$1/$2" >/dev/null 2>&1 || true
+        fi
+        if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
+            firewall-cmd --remove-port="$1/$2" --permanent >/dev/null 2>&1                 && firewall-cmd --reload >/dev/null 2>&1 || true
+        fi
+        log_info "已收回旧端口 $1/$2 的防火墙放行。"
+    }
+    [[ -n "$old_udp" && "$old_udp" != "$LISTEN_PORT" ]] && _close_one "$old_udp" udp
+    [[ -n "$old_tcp" && "$old_tcp" != "$HY2_SUB_PORT" ]] && _close_one "$old_tcp" tcp
+    unset -f _close_one
+    return 0
+}
+
+# 流量超额停用期间不能走这些菜单（2026-11-04 修）：它们会 restart hysteria-server /
+# gost，与 9 / 11 号菜单一样绕过控制台的流量限额。
+flow_warp() { check_root; refuse_if_suspended || return 1; install_warp_local_proxy; }
+flow_gost() { check_root; refuse_if_suspended || return 1; install_gost; }
 flow_uninstall() { check_root; uninstall_all; }
 
 flow_refresh_portal() {

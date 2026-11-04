@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.25'
+PORTAL_VERSION = '2.26'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -5420,6 +5420,27 @@ WantedBy=multi-user.target
 '''
 
 
+XRAY_UNIT_PATH = '/etc/systemd/system/xray.service'
+XRAY_OWNED_EXECSTART = 'ExecStart=/usr/local/bin/xray run -c /etc/hysteria/xray.json'
+XRAY_FOREIGN_ERROR = ('本机已有不归本工具管理的 xray.service（例如官方脚本安装的 Xray），'
+                      '为免覆盖其配置与二进制，已拒绝安装')
+
+
+def xray_unit_foreign(unit_path=XRAY_UNIT_PATH):
+    """xray.service 存在但不是本门户写的（2026-11-04 加）。
+
+    官方 XTLS 脚本用同名单元跑 /usr/local/etc/xray/config.json；覆盖它会让机主自己的
+    入站在下次重启时静默消失，二进制也被替换。判据与 install.sh 卸载时认领单元一致。
+    """
+    try:
+        text = Path(unit_path).read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return XRAY_OWNED_EXECSTART not in text
+
+
 def write_xray_unit():
     """写 xray.service 并 daemon-reload；不 enable —— 没有任何协议配置时
     开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
@@ -7709,7 +7730,11 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
             has_runtime_fingerprint = bool(_runtime_data.get('loaded_cert_sha256'))
         except (OSError, ValueError, AttributeError):
             pass
-    runtime_reloaded = sync_cert_runtime(root, live_cert) if cert_changed or not has_runtime_fingerprint else False
+    # 每轮都交给 sync_cert_runtime 比对（2026-11-04 修）：它拿磁盘证书与上次重载时记下的
+    # 指纹比，相同就直接返回，不会每 30 分钟重启一次。旧的门槛只看「本轮前后」两次快照，
+    # 而本轮里根本不写证书：Caddy / 手工换证后服务一直握着旧证书，到期时 TLS 全挂。
+    del cert_changed, has_runtime_fingerprint
+    runtime_reloaded = sync_cert_runtime(root, live_cert)
 
     if changed or runtime_reloaded:
         # 留痕：让「刚刚自动对齐过一次」在门户卡片上可见，而不是悄无声息。
@@ -8147,7 +8172,17 @@ def serve(path):
             new_state = {'suspended': True, 'units': list(units),
                          'since': state.get('since') or int(time.time())}
         else:
+            # 停用期间被管理员关掉的协议不再拉起（2026-11-04 修）：AnyTLS / TUIC 停用会删掉
+            # 配置文件，start 必然失败、留在 remaining 里，suspended 永远是 True，控制台
+            # 每轮恢复都 500，而停用状态下又不许重新启用 —— Web 端无路可退。
+            with data_lock:
+                _retired = {name for name, key in ((ANYTLS_SERVICE, 'anytls_config'),
+                                                   (TUIC_SERVICE, 'tuic_config'))
+                            if not (isinstance(data.get(key), dict) and data[key].get('enabled') is True)}
             for u in state.get('units') or []:
+                if u in _retired:
+                    results[u] = True
+                    continue
                 try:
                     subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
                     r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
@@ -9097,14 +9132,17 @@ if __name__ == '__main__':
     def verify_session(cookie_header):
         if not cookie_header:
             return False
-        cookies = SimpleCookie()
-        try:
-            cookies.load(cookie_header)
-        except Exception:
+        # 不用 SimpleCookie（2026-11-04 修）：同一 Cookie 头里只要有一个不合 RFC 的值
+        # （同域其它应用 / 统计脚本写的带空格或裸 JSON 的 cookie），load() 会把**全部**
+        # cookie 丢掉且不抛异常，管理员登录后刷新就回到登录页，日志里什么也没有。
+        value = None
+        for part in str(cookie_header).split(';'):
+            name, sep, val = part.strip().partition('=')
+            if sep and name == 'hy2_session':
+                value = val.strip().strip('"')
+        if value is None:
             return False
-        if 'hy2_session' not in cookies:
-            return False
-        parts = cookies['hy2_session'].value.split('.')
+        parts = value.split('.')
         if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
             return False
         t, issued_at, sig = parts
@@ -9840,6 +9878,9 @@ if __name__ == '__main__':
                     # str() 后的形态不一致，用户拿到的连接参数就对不上。
                     if not isinstance(pwd, str) or not pwd.strip():
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user parameter: password must be a non-empty string'})
+                    if pwd != pwd.strip():
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: password must not start or end with whitespace'})
                     # 🔴 2026-10-25 修：这些值直接来自请求体，`int('abc')` 会抛
                     # ValueError。该分支不在任何 try 里，异常会穿透 do_POST →
                     # 连接被掐断，客户端只看到 "Remote end closed connection"，
@@ -10081,7 +10122,8 @@ if __name__ == '__main__':
                         changes = {}
                         if 'password' in params:
                             # 与 users/create 同一判据：纯空白也算空（2026-11-04 修）。
-                            if not isinstance(params['password'], str) or not params['password'].strip():
+                            if (not isinstance(params['password'], str) or not params['password'].strip()
+                                    or params['password'] != params['password'].strip()):
                                 raise ValueError()
                             changes['password'] = params['password']
                         if 'expires_at' in params:
@@ -11477,6 +11519,8 @@ if __name__ == '__main__':
                             return self.reply_json(409, {'ok': False, 'error': str(exc)})
                         raise
                     try:
+                        if xray_unit_foreign():
+                            return self.reply_json(409, {'ok': False, 'error': XRAY_FOREIGN_ERROR})
                         ok, msg = install_xray_binary()
                         if not ok:
                             return self.reply_json(500, {'ok': False, 'error': msg})
@@ -12096,6 +12140,8 @@ if __name__ == '__main__':
                             return self.reply_json(409, {'ok': False, 'error': str(exc)})
                         raise
                     try:
+                        if name == 'xray' and xray_unit_foreign():
+                            return self.reply_json(409, {'ok': False, 'error': XRAY_FOREIGN_ERROR})
                         if name == 'xray':
                             ok, msg = install_xray_binary()
                             if ok:
@@ -12865,7 +12911,12 @@ if __name__ == '__main__':
                     return self.reply(400, 'user_id 不能只由点组成'.encode('utf-8'))
 
                 if action == 'create' and user_id:
-                    pwd = form.get('password', [''])[0].strip() or secrets.token_hex(16)
+                    # 不再静默去掉首尾空白（2026-11-04 修）：「abc 」被存成「abc」，客户端按输入的
+                    # 原样填就鉴权失败。与 API 同一规则：首尾带空白直接拒，全空则随机生成。
+                    pwd = form.get('password', [''])[0]
+                    if pwd != pwd.strip() and pwd.strip():
+                        return self.reply(400, '密码首尾不能有空白字符'.encode('utf-8'))
+                    pwd = pwd.strip() or secrets.token_hex(16)
                     # 同 REST 通道：非数字输入必须回 400，而不是让异常掐断连接。
                     try:
                         days = int(form.get('duration_days', ['30'])[0] or 30)
