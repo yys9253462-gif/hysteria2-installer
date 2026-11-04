@@ -171,11 +171,12 @@ if ! ip route show default >/dev/null 2>&1 || [ -z "$(ip route show default 2>/d
             ip link set "$ifc" up 2>/dev/null || true
             udhcpc -i "$ifc" -q -n -t 10 2>/dev/null || true
         fi
-        ip route show default >/dev/null 2>&1 && break
+        # ip route 没有默认路由时也返回 0，必须看输出（2026-11-04 修）
+        [ -n "$(ip route show default 2>/dev/null)" ] && break
     done
 fi
 
-if ! ip route show default >/dev/null 2>&1; then
+if [ -z "$(ip route show default 2>/dev/null)" ]; then
     die "仍然没有默认路由。请先在 VNC 里手动联网：
        ip link                    # 看网卡名，确认状态是 DOWN 还是 UP
        ip link set <网卡> up      # ★ DOWN 的话先启用
