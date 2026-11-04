@@ -45,6 +45,11 @@ jobs:
           bash -n tests/portal-buttons-smoke.sh
           bash -n tests/portal-update-cycle.sh
           bash -n fix_cert_chain.sh
+          # 两个重装脚本是 POSIX sh（Alpine 救援环境），两种解析器都要过（2026-11-04 补）。
+          for f in alpine2debian.sh reinstall-debian13.sh tests/test-reinstall-debian13.sh; do
+            sh -n "$f"
+            bash -n "$f"
+          done
 
       - name: 交互逻辑行为测试
         # 这些不是语法检查，而是真的把脚本跑起来验行为 ——
