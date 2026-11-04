@@ -11426,7 +11426,9 @@ if __name__ == '__main__':
                     except Exception as exc:
                         applied, error = False, '应用出站失败: %s' % type(exc).__name__
                     with data_lock:
-                        previous = copy.deepcopy(data)
+                        # 不再整份快照、保存失败时整份回滚（2026-11-04 修）：旧实现
+                        # data.clear(); data.update(旧快照)，把这期间别的线程的改动
+                        # （删用户、待撤销名单）一起抹掉，应用结果也被撤回、界面卡在「应用中」。
                         pending = max(0, _egress_pending_count(data.get('_egress_pending')) - 1)
                         if pending:
                             data['_egress_pending'] = pending
@@ -11443,13 +11445,13 @@ if __name__ == '__main__':
                             data.pop('egress_apply_error', None)
                     try:
                         save_data()
-                    except AtomicWriteDurabilityError:
-                        raise
-                    except OSError:
-                        with data_lock:
-                            data.clear()
-                            data.update(previous)
-                        raise
+                    except AtomicWriteDurabilityError as exc:
+                        print('[portal] egress result durability uncertain: %s' % exc,
+                              file=sys.stderr, flush=True)
+                    except OSError as exc:
+                        # 内存里保留应用结果：配置已经生效，界面不该一直停在「应用中」。
+                        # 只记日志、不 re-raise，worker 线程不必带着 traceback 死掉。
+                        print('[portal] egress result not saved: %s' % exc, file=sys.stderr, flush=True)
                     if not applied:
                         print('[portal] egress apply failed: %s' % error, file=sys.stderr, flush=True)
             try:
