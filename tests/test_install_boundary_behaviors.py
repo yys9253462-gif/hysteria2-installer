@@ -322,9 +322,9 @@ HY2_SUB_PORT=18080
 printf '{}' > portal-access.json
 jq(){
     case "$2" in
-        .url) printf 'https://example.com:18080/fixture/' ;;
-        .username) printf fixture-user ;;
-        .password) printf fixture-password ;;
+        .url|'.url // empty') printf 'https://example.com:18080/fixture/' ;;
+        .username|'.username // empty') printf fixture-user ;;
+        .password|'.password // empty') printf fixture-password ;;
         '.hop_port_range // empty') printf '%s' "$SAVED_RANGE" ;;
         *) return 0 ;;
     esac

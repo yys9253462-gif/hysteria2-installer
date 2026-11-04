@@ -3413,9 +3413,20 @@ show_client_configs() {
     fi
 
     local url user pass
-    url=$(jq -r '.url' "$HY2_DIR/portal-access.json")
-    user=$(jq -r '.username' "$HY2_DIR/portal-access.json")
-    pass=$(jq -r '.password' "$HY2_DIR/portal-access.json")
+    # 凭据文件损坏时给出可操作的提示（2026-11-04 修）：旧实现 jq 在 set -e 下直接退出，
+    # 用户只看到一句 jq 解析错误；字段缺失时则把字面量 null 当成网址 / 密码打印出来。
+    if ! jq -e 'type == "object"' "$HY2_DIR/portal-access.json" >/dev/null 2>&1; then
+        log_err "门户凭据文件 ${HY2_DIR}/portal-access.json 已损坏。"
+        log_err "执行 bash install.sh refresh-page 可重建凭据（token / API Key / 用户保留，登录密码会换新）。"
+        return 1
+    fi
+    url=$(jq -r '.url // empty' "$HY2_DIR/portal-access.json")
+    user=$(jq -r '.username // empty' "$HY2_DIR/portal-access.json")
+    pass=$(jq -r '.password // empty' "$HY2_DIR/portal-access.json")
+    if [[ -z "$url" || -z "$user" || -z "$pass" ]]; then
+        log_err "门户凭据文件缺少 url / username / password，执行 bash install.sh refresh-page 重建。"
+        return 1
+    fi
 
     # 原来这里只吐一串凭据就结束了，新手装完完全不知道下一步该做什么。
     # 实际上「装完」只是完成了一半 —— 真正要用起来还需要：打开信息页 → 导入客户端
