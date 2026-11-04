@@ -893,12 +893,16 @@ cmd_peer_add() {
     fi
 
     tmp="$(mktemp "${AWG_DIR}/.peers.XXXXXX")"
-    jq --arg n "$name" --arg ip "$addr" --arg priv "$priv" \
+    # 同 peer-del：jq 失败时空输出不能盖掉原有客户端（2026-11-04 修）。
+    if ! jq --arg n "$name" --arg ip "$addr" --arg priv "$priv" \
        --arg pub "$pub" --arg psk "$psk" --arg ep "$endpoint" \
        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        '.peers += [{name:$n, address:$ip, private_key:$priv, public_key:$pub,
                     preshared_key:$psk, endpoint:$ep, created_at:$ts, enabled:true}]' \
-       "$AWG_PEERS_FILE" > "$tmp"
+       "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp" "$peers_backup" "$config_backup"
+        die "客户端列表无法解析，未做任何修改：${AWG_PEERS_FILE}"
+    fi
     chmod 600 "$tmp"
     mv -f "$tmp" "$AWG_PEERS_FILE"
 
@@ -943,7 +947,12 @@ cmd_peer_del() {
     fi
 
     tmp="$(mktemp "${AWG_DIR}/.peers.XXXXXX")"
-    jq --arg n "$name" '.peers |= map(select(.name != $n))' "$AWG_PEERS_FILE" > "$tmp"
+    # jq 失败（peers.json 结构被改坏）时不能拿空输出覆盖原文件（2026-11-04 修）：
+    # 那会一次删光全部客户端。
+    if ! jq --arg n "$name" '.peers |= map(select(.name != $n))' "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp" "$peers_backup" "$config_backup"
+        die "客户端列表无法解析，未做任何修改：${AWG_PEERS_FILE}"
+    fi
     chmod 600 "$tmp"
     mv -f "$tmp" "$AWG_PEERS_FILE"
 

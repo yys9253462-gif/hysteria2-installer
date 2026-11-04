@@ -112,5 +112,24 @@ class AwgReinstallPortChangeTests(unittest.TestCase):
         self.assertNotIn('delete', self._run('', 51234))
 
 
+
+@unittest.skipUnless(BASH and shutil.which('jq'), 'requires bash and jq')
+class AwgPeerDelCorruptListTests(unittest.TestCase):
+    def test_unparseable_peer_list_is_left_intact(self):
+        with tempfile.TemporaryDirectory() as td:
+            peers = Path(td) / 'peers.json'
+            original = '{"peers": "corrupt", "keep": 1}'
+            peers.write_text(original)
+            script = '\n'.join([
+                'AWG_DIR=%s; AWG_PEERS_FILE=%s; AWG_CONFIG=%s/none' % (td, peers, td),
+                'die() { echo "DIE $*"; exit 1; }', 'log_info() { :; }',
+                'require_root() { :; }', 'require_jq() { :; }', 'peers_init() { :; }',
+                'peer_exists() { return 0; }', 'render_server_config() { :; }', 'peer_apply_live_del() { :; }',
+                fn('cmd_peer_del'), 'cmd_peer_del alice'])
+            out = subprocess.run([BASH, '-c', script], capture_output=True, text=True, timeout=20).stdout
+            self.assertIn('DIE', out)
+            self.assertEqual(peers.read_text(), original)
+
+
 if __name__ == '__main__':
     unittest.main()
