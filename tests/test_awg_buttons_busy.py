@@ -57,6 +57,19 @@ class AwgButtonsBusyTests(unittest.TestCase):
         r = self.run_button('btnUpdateAwg')
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_reality_reset_button(self):
+        """Reality 重置密钥同样在请求期间禁用（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('if (btnResetRealityKeys) {')
+        end = script.index('\n}\n', start) + 3
+        harness = HARNESS.replace('BTN', 'btnResetRealityKeys') + (
+            "const checkRealityStatus = async () => {};\n"
+            "const location = {pathname: '/t/'};\n"
+            "globalThis.fetch = () => new Promise(r => { release = j => r(new Response(JSON.stringify(j))); });\n")
+        js = harness + script[start:end] + CHECKS.replace('BTN', 'btnResetRealityKeys')
+        r = subprocess.run([NODE, '-e', js], capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -1654,6 +1654,8 @@ if (btnToggleReality) {
 if (btnResetRealityKeys) {
   btnResetRealityKeys.addEventListener('click', async () => {
     if (!confirm("确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。")) return;
+    // 请求期间禁用（2026-11-04 修）：连点会连续重置两次，第一次导出的订阅随即失效。
+    btnResetRealityKeys.disabled = true;
     try {
       const res = await fetch(location.pathname + 'manage-reality', {
         method: 'POST',
@@ -1671,6 +1673,8 @@ if (btnResetRealityKeys) {
       }
     } catch (e) {
       alert('请求异常: ' + e.message);
+    } finally {
+      btnResetRealityKeys.disabled = false;
     }
   });
 }
