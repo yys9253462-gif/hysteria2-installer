@@ -1677,7 +1677,7 @@ EOF
 # 代价：需要 DNS 服务商的 API 凭据。凭据从环境变量读，不落仓库：
 #   HY2_CF_TOKEN + HY2_CF_EMAIL   （Cloudflare）
 #   HY2_ALICLOUD_KEY              （阿里云）
-#   HY2_DP_TOKEN+ HY2_DP_ID       （DuckDNS）
+#   HY2_DP_TOKEN                  （DuckDNS，交给 acme.sh 的 DuckDNS_Token）
 # 拿不到凭据就明确告诉用户怎么办，而不是静默退回自签。
 setup_cert_via_dns_api() {
     local domain="$1"
@@ -1714,17 +1714,20 @@ setup_cert_via_dns_api() {
     export SKIP_ACME_SH_UPGRADE=1
     local ok=0
     case "$provider" in
+        # acme.sh 的 DNS 插件从环境变量读凭据（2026-11-04 修）：旧实现传 --dns_cf_token
+        # 之类的参数，acme.sh 不认识，直接报 Unknown parameter 退出，DNS API 签发从未成功过。
+        # DuckDNS 的插件是 dns_duckdns（旧实现写成了 DNSPod 的 dns_dp）。
         Cloudflare)
-            "$acct" --issue --dns dns_cf -d "$domain" \
-                --dns_cf_token "$HY2_CF_TOKEN" --dns_cf_email "$HY2_CF_EMAIL" || ok=1
+            CF_Token="$HY2_CF_TOKEN" CF_Email="$HY2_CF_EMAIL" \
+                "$acct" --issue --dns dns_cf -d "$domain" || ok=1
             ;;
         阿里云)
-            "$acct" --issue --dns dns_ali -d "$domain" \
-                --dns_ali_key "$HY2_ALICLOUD_KEY" --dns_ali_secret "${HY2_ALICLOUD_SECRET:-}" || ok=1
+            Ali_Key="$HY2_ALICLOUD_KEY" Ali_Secret="${HY2_ALICLOUD_SECRET:-}" \
+                "$acct" --issue --dns dns_ali -d "$domain" || ok=1
             ;;
         DuckDNS)
-            "$acct" --issue --dns dns_dp -d "$domain" \
-                --dns_dp_token "$HY2_DP_TOKEN" || ok=1
+            DuckDNS_Token="$HY2_DP_TOKEN" \
+                "$acct" --issue --dns dns_duckdns -d "$domain" || ok=1
             ;;
     esac
 
