@@ -771,12 +771,17 @@ async function delWarpRule(domain) {
   }
 }
 
+// 只认最新一次请求（2026-11-04 修，与 VMess 卡片同一做法）：轮询回包比开关后的状态查询
+// 晚到时会把卡片刷回切换之前的状态，管理员再点一次就切反了。
+let warpStatusSeq = 0;
 async function checkWarpStatus() {
   if (!warpBadge) return;
+  const seq = ++warpStatusSeq;
   try {
     const res = await fetch(location.pathname + 'warp-status', { credentials: 'same-origin' });
     if (!res.ok) return;
     const json = await res.json();
+    if (seq !== warpStatusSeq) return;
     if (!json.ok) return;
 
     if (btnInstallWarp) {
@@ -1565,12 +1570,17 @@ const realityFlowVal = document.getElementById('reality-flow-val');
 const btnCopyRealityUri = document.getElementById('btn-copy-reality-uri');
 const btnResetRealityKeys = document.getElementById('btn-reset-reality-keys');
 
+// 只认最新一次请求（2026-11-04 修，与 VMess 卡片同一做法）：轮询回包比开关后的状态查询
+// 晚到时会把卡片刷回切换之前的状态，管理员再点一次就切反了。
+let realityStatusSeq = 0;
 async function checkRealityStatus() {
   if (!realityBadge) return;
+  const seq = ++realityStatusSeq;
   try {
     const res = await fetch(location.pathname + 'reality-status', { credentials: 'same-origin' });
     if (!res.ok) return;
     const json = await res.json();
+    if (seq !== realityStatusSeq) return;
     if (!json.ok) return;
     const portTag = document.getElementById('reality-port-tag');
     if (portTag) portTag.textContent = 'TCP ' + (json.config?.port || '--');

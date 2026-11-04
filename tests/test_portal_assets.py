@@ -408,6 +408,7 @@ const location = {pathname: '/fixture/'};
 const realityBadge = el(), realityQrBox = el(), realityUriVal = el(), realitySniVal = el(), realityUuidVal = el();
 const realityContentBox = el(), btnToggleReality = el(), btnResetRealityKeys = el();
 realityQrBox.innerHTML = '<svg>OLD-PBK</svg>';
+let realityStatusSeq = 0;
 const btnInstallXray = el();
 globalThis.fetch = async () => ({ok: true, json: async () => ({ok: true, installed: true, active: true,
   config: {uri: 'vless://new', qr_svg: '', port: 8444, sni: 'www.apple.com', uuid: 'u'}})});
