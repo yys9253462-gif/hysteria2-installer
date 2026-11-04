@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.26'
+PORTAL_VERSION = '2.27'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -757,6 +757,11 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
 
     if not isinstance(rules, (list, tuple)):
         rules = ()
+    # Hysteria ACL 首条命中即停：更具体的域名必须排在前面（2026-11-04 修）。按添加顺序
+    # 写时，先加的 google.com → warp 会吞掉后加的 mail.google.com → direct，后者永不生效。
+    # sorted 是稳定排序，同层级的规则仍保持添加顺序。
+    rules = sorted((r for r in rules if isinstance(r, dict)),
+                   key=lambda r: -str(r.get('domain') or '').strip('.').count('.'))
     for r in rules:
         if not isinstance(r, dict):
             continue
@@ -823,7 +828,9 @@ def build_warp_acl_config(original, enabled, rules):
         text = text.rstrip('\n') + '\n\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443\n  udpPorts: 443\n'
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
     lines = _acl_head()
-    for rule in rows if enabled else custom_rules:
+    _ordered = sorted(rows if enabled else custom_rules,
+                      key=lambda r: -str(r.get('domain', '') if isinstance(r, dict) else r).strip('.').count('.'))
+    for rule in _ordered:  # 同 build_acl_block：具体域名在前
         domain = rule.get('domain', '') if isinstance(rule, dict) else rule
         target = rule.get('outbound') or warp_name if isinstance(rule, dict) else warp_name
         if target not in set(existing) | {'direct', 'reject'}:
@@ -6623,6 +6630,13 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None):
         try:
             ports.add(int((data or {}).get(key, {}).get('port')))
         except (TypeError, ValueError, AttributeError):
+            pass
+    # gost 代理服务的端口（2026-11-04 补）：gost 停着时这些端口不在监听表里，新启用的
+    # TCP 协议可能选中它，gost 一恢复就和那条代理抢端口。
+    for item in proxy_services(data):
+        try:
+            ports.add(int(item.get('port')))
+        except (TypeError, ValueError):
             pass
     own_tags = {REALITY_INBOUND_TAG: 'reality_config',
                 VMESS_INBOUND_TAG: 'vmess_config',
@@ -13966,9 +13980,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 前端弹窗按 `=== null` 判永久，于是永久用户显示成 1970-01-01 到期；
                     # 而 0 在本项目里恰恰表示「已过期」。
                     'expires_at': u_copy.get('expires_at'),
-                    'traffic_used': u_copy.get('used_bytes', 0),
-                    'traffic_limit': u_copy.get('limit_bytes', 0),
-                    'ip_limit': u_copy.get('ip_limit', 0),
+                    # 与用户表 / 分享页同一套显示规则（2026-11-04 修）：ip_limit=true 实际
+                    # 不限却显示「true IP」；用量字段被改坏时弹窗显示 NaN B。
+                    'traffic_used': _safe_int(u_copy.get('used_bytes', 0)),
+                    'traffic_limit': _safe_int(u_copy.get('limit_bytes', 0)),
+                    'ip_limit': _display_ip_limit(u_copy),
                 })
 
             # ---------------- AmneziaWG (AWG) ----------------
@@ -14574,10 +14590,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
-                outs = list(data.get('custom_outbounds', []))
-                mode = data.get('outbound_mode', 'rules')
-                rules = list(data.get('warp_rules', []))
+                # 走 routing_state 的清洗（2026-11-04 修）：custom_outbounds / warp_rules 被写成
+                # null 或数字时 list() 抛 TypeError，连接被掐断，出口编辑器整块空白。
                 state = routing_state(data)
+                outs = state['custom_outbounds']
+                mode = data.get('outbound_mode', 'rules')
+                rules = [r for r in state['warp_rules'] if isinstance(r, (str, dict))]
                 applying = bool(data.get('egress_applying'))
                 error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
             try:

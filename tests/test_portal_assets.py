@@ -341,9 +341,52 @@ globalThis.fetch = async () => reply;
   assert.strictEqual(intervals.length, 0, '被拒绝时仍开始了倒计时');
   assert(alerts[0].includes('已有重型任务在运行'), alerts[0]);
   assert.strictEqual(btnRebootServer.disabled, false);
+  // 网络错误（fetch 本身抛出）：按钮要恢复，否则只能刷新页面重试（2026-11-04 修）
+  reply = Promise.reject(new TypeError('Failed to fetch'));
+  reply.catch(() => {});
+  await handler();
+  assert.strictEqual(intervals.length, 0, '网络错误后开始了倒计时');
+  assert.strictEqual(btnRebootServer.disabled, false, '网络错误后按钮仍禁用');
   reply = new Response(JSON.stringify({ok: true}), {status: 200});
   await handler();
   assert.strictEqual(intervals.length, 1);
+})().catch(e => {console.error(e); process.exitCode = 1;});
+"""
+        result = subprocess.run([NODE, '-e', harness + prelude + script[start:end] + checks],
+                                capture_output=True, text=True, encoding='utf-8')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    @unittest.skipUnless(NODE, 'requires node')
+    def test_user_modal_ignores_a_late_reply_for_an_earlier_click(self):
+        """先点 A 再点 B，A 的回包晚到不能覆盖 B 的弹窗内容（2026-11-04 修）。"""
+        script = portal.SCRIPT
+        start = script.index('let userModalSeq = 0;')
+        end = script.index('\n});\n', start) + 5
+        prelude = script[:script.index('// 全局高颜值 Promise 确认框与 Toast 机制')]
+        harness = r"""
+const assert = require('assert');
+const el = () => ({style: {}, textContent: '', innerHTML: '', dataset: {}, classList: {add(){}, remove(){}},
+                   querySelectorAll: () => [], addEventListener(){}});
+const uModal = el(), uModalTitle = el(), uModalSub = el(), uModalBody = el();
+const handlers = {};
+const mk = uid => ({dataset: {uid, token: 't', key: 'k'}, addEventListener: (k, fn) => { handlers[uid] = fn; }});
+globalThis.document = {querySelectorAll: sel => sel === '.btn-user-connect' ? [mk('A'), mk('B')] : [],
+                       getElementById: () => el()};
+globalThis.location = {origin: 'https://n', pathname: '/t/'};
+const resolvers = {};
+globalThis.fetch = async url => new Promise(r => { resolvers[url.includes('=A') ? 'A' : 'B'] = r; });
+const obEsc = v => String(v);
+const reply = uid => new Response(JSON.stringify({ok: true, uri: 'hy2://' + uid + '-SECRET', note: '',
+  clash: '', sing_box: '', qr_svg: '', expires_at: null, traffic_used: 0, traffic_limit: 0, ip_limit: 0}));
+"""
+        checks = r"""
+(async () => {
+  const a = handlers.A(); await new Promise(r => setTimeout(r, 0));
+  const b = handlers.B(); await new Promise(r => setTimeout(r, 0));
+  resolvers.B(reply('B')); await b;
+  resolvers.A(reply('A')); await a;
+  assert(uModalBody.innerHTML.includes('B-SECRET'), '弹窗不是 B 的内容');
+  assert(!uModalBody.innerHTML.includes('A-SECRET'), 'A 的晚到回包覆盖了 B');
 })().catch(e => {console.error(e); process.exitCode = 1;});
 """
         result = subprocess.run([NODE, '-e', harness + prelude + script[start:end] + checks],
@@ -365,6 +408,7 @@ const location = {pathname: '/fixture/'};
 const realityBadge = el(), realityQrBox = el(), realityUriVal = el(), realitySniVal = el(), realityUuidVal = el();
 const realityContentBox = el(), btnToggleReality = el(), btnResetRealityKeys = el();
 realityQrBox.innerHTML = '<svg>OLD-PBK</svg>';
+let realityStatusSeq = 0;
 const btnInstallXray = el();
 globalThis.fetch = async () => ({ok: true, json: async () => ({ok: true, installed: true, active: true,
   config: {uri: 'vless://new', qr_svg: '', port: 8444, sni: 'www.apple.com', uuid: 'u'}})});

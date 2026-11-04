@@ -771,12 +771,17 @@ async function delWarpRule(domain) {
   }
 }
 
+// 只认最新一次请求（2026-11-04 修，与 VMess 卡片同一做法）：轮询回包比开关后的状态查询
+// 晚到时会把卡片刷回切换之前的状态，管理员再点一次就切反了。
+let warpStatusSeq = 0;
 async function checkWarpStatus() {
   if (!warpBadge) return;
+  const seq = ++warpStatusSeq;
   try {
     const res = await fetch(location.pathname + 'warp-status', { credentials: 'same-origin' });
     if (!res.ok) return;
     const json = await res.json();
+    if (seq !== warpStatusSeq) return;
     if (!json.ok) return;
 
     if (btnInstallWarp) {
@@ -1565,12 +1570,17 @@ const realityFlowVal = document.getElementById('reality-flow-val');
 const btnCopyRealityUri = document.getElementById('btn-copy-reality-uri');
 const btnResetRealityKeys = document.getElementById('btn-reset-reality-keys');
 
+// 只认最新一次请求（2026-11-04 修，与 VMess 卡片同一做法）：轮询回包比开关后的状态查询
+// 晚到时会把卡片刷回切换之前的状态，管理员再点一次就切反了。
+let realityStatusSeq = 0;
 async function checkRealityStatus() {
   if (!realityBadge) return;
+  const seq = ++realityStatusSeq;
   try {
     const res = await fetch(location.pathname + 'reality-status', { credentials: 'same-origin' });
     if (!res.ok) return;
     const json = await res.json();
+    if (seq !== realityStatusSeq) return;
     if (!json.ok) return;
     const portTag = document.getElementById('reality-port-tag');
     if (portTag) portTag.textContent = 'TCP ' + (json.config?.port || '--');
@@ -1644,6 +1654,8 @@ if (btnToggleReality) {
 if (btnResetRealityKeys) {
   btnResetRealityKeys.addEventListener('click', async () => {
     if (!confirm("确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。")) return;
+    // 请求期间禁用（2026-11-04 修）：连点会连续重置两次，第一次导出的订阅随即失效。
+    btnResetRealityKeys.disabled = true;
     try {
       const res = await fetch(location.pathname + 'manage-reality', {
         method: 'POST',
@@ -1661,6 +1673,8 @@ if (btnResetRealityKeys) {
       }
     } catch (e) {
       alert('请求异常: ' + e.message);
+    } finally {
+      btnResetRealityKeys.disabled = false;
     }
   });
 }
@@ -2375,7 +2389,10 @@ if (btnRebootServer) {
         }
       }, 1000);
     } catch (e) {
-      alert("重启请求已发出: " + e.message);
+      // 网络错误：请求可能根本没到服务器，按钮必须恢复，否则只能刷新页面才能重试。
+      alert('未能发起重启：' + e.message);
+      btnRebootServer.disabled = false;
+      btnRebootServer.textContent = '🔄 立即重启服务器生效';
     }
   });
 }
@@ -3035,8 +3052,12 @@ if (uModal) {
   });
 }
 
+// 只认最后一次点击的回包（2026-11-04 修）：先点慢的 A、关掉再点 B，A 的回包晚到会把
+// B 标题下的内容换成 A 的链接与二维码，管理员复制出去就把 A 的凭据发给了 B 的客户。
+let userModalSeq = 0;
 document.querySelectorAll('.btn-user-connect').forEach(btn => {
   btn.addEventListener('click', async () => {
+    const mySeq = ++userModalSeq;
     const uid = btn.dataset.uid;
     const token = btn.dataset.token;
     const userKey = btn.dataset.key;
@@ -3056,6 +3077,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         throw new Error('网络请求异常 (HTTP ' + res.status + ')');
       }
       const json = await res.json();
+      if (mySeq !== userModalSeq) return;
       if (!json.ok) throw new Error(json.error || '加载失败');
       
       uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
@@ -3139,6 +3161,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       });
       
     } catch (err) {
+      if (mySeq !== userModalSeq) return;
       uModalBody.innerHTML = `<div style="text-align:center;padding:24px;color:var(--danger)">加载失败: ${obEsc(err.message)}</div>`;
     }
   });
@@ -3263,9 +3286,13 @@ function renderAwgPeers(peers) {
     b.addEventListener('click', async () => {
       const n = decodeURIComponent(b.getAttribute('data-awg-del'));
       if (!confirm('确认删除客户端「' + n + '」？该客户端会立即断开连接。')) return;
-      const json = await awgPost('manage-amneziawg', { action: 'peer_del', name: n });
-      if (json.ok) { showToast('已删除客户端 ' + n, 'success'); loadAwgState(); }
-      else { alert(json.error || '删除失败'); }
+      // 请求期间禁用按钮（2026-11-04 修）：连点两次第二次必然报「不存在」。
+      b.disabled = true;
+      try {
+        const json = await awgPost('manage-amneziawg', { action: 'peer_del', name: n });
+        if (json.ok) { showToast('已删除客户端 ' + n, 'success'); loadAwgState(); }
+        else { alert(json.error || '删除失败'); }
+      } finally { b.disabled = false; }
     });
   });
 }
@@ -3337,18 +3364,25 @@ if (btnSwitchAwgLine) {
     if (target !== '2' && target !== '3') return;
     if (target === awgCurrentLine) { alert('已经是 AWG ' + awgCurrentLine + '.x，无需切换。'); return; }
     if (!confirm('确认切换到 AWG ' + target + '.x？所有已发放的客户端配置都会失效。')) return;
-    const json = await awgPost('manage-amneziawg', { action: 'set_line', line: target });
-    if (json.ok) { showToast(json.message || '已切换协议线', 'success'); loadAwgState(); }
-    else { alert(json.error || '切换失败'); }
+    // 请求期间禁用（2026-11-04 修）：第二次提交会再生成一遍混淆参数，中间导出的配置随即失效。
+    btnSwitchAwgLine.disabled = true;
+    try {
+      const json = await awgPost('manage-amneziawg', { action: 'set_line', line: target });
+      if (json.ok) { showToast(json.message || '已切换协议线', 'success'); loadAwgState(); }
+      else { alert(json.error || '切换失败'); }
+    } finally { btnSwitchAwgLine.disabled = false; }
   });
 }
 
 if (btnUpdateAwg) {
   btnUpdateAwg.addEventListener('click', async () => {
     if (!confirm('确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。')) return;
-    const json = await awgPost('manage-amneziawg', { action: 'update' });
-    if (json.ok) { showToast(json.message || '更新完成', 'success'); loadAwgState(); }
-    else { alert(json.error || '更新失败'); }
+    btnUpdateAwg.disabled = true;
+    try {
+      const json = await awgPost('manage-amneziawg', { action: 'update' });
+      if (json.ok) { showToast(json.message || '更新完成', 'success'); loadAwgState(); }
+      else { alert(json.error || '更新失败'); }
+    } finally { btnUpdateAwg.disabled = false; }
   });
 }
 
