@@ -10859,7 +10859,13 @@ if __name__ == '__main__':
                     with data_lock:
                         data['core_upgrade'] = dict(job, finished_at=int(time.time()))
                         _core_ver_cache['t'] = 0.0
-                    save_data()
+                    # 结果已在内存，界面能读到；落盘失败只记日志（2026-11-04 修）：旧实现让
+                    # 线程带着 traceback 死掉，磁盘上的任务一直是 running，重启后被当成中断任务。
+                    try:
+                        save_data()
+                    except (OSError, AtomicWriteDurabilityError) as exc:
+                        print('[portal] core upgrade result not saved: %s' % type(exc).__name__,
+                              file=sys.stderr, flush=True)
                 try:
                     self.reply_json(200, {'ok': True, 'target': 'core', 'applying': True,
                         'message': '核心更新任务已接受，下载、应用和回滚结果将单独核验'})
