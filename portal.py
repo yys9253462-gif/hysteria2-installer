@@ -8147,7 +8147,17 @@ def serve(path):
             new_state = {'suspended': True, 'units': list(units),
                          'since': state.get('since') or int(time.time())}
         else:
+            # 停用期间被管理员关掉的协议不再拉起（2026-11-04 修）：AnyTLS / TUIC 停用会删掉
+            # 配置文件，start 必然失败、留在 remaining 里，suspended 永远是 True，控制台
+            # 每轮恢复都 500，而停用状态下又不许重新启用 —— Web 端无路可退。
+            with data_lock:
+                _retired = {name for name, key in ((ANYTLS_SERVICE, 'anytls_config'),
+                                                   (TUIC_SERVICE, 'tuic_config'))
+                            if not (isinstance(data.get(key), dict) and data[key].get('enabled') is True)}
             for u in state.get('units') or []:
+                if u in _retired:
+                    results[u] = True
+                    continue
                 try:
                     subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
                     r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)

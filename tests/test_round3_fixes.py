@@ -64,7 +64,8 @@ class SuspensionResumeTest(unittest.TestCase):
                're': re, 'subprocess': SimpleNamespace(run=run), 'time': time,
                'copy': copy, 'AtomicWriteDurabilityError': portal.AtomicWriteDurabilityError,
                'TRAFFIC_SUSPEND_UNITS': ('hysteria-server', 'xray', 'gost', 'amneziawg-server'),
-               '_unit_active': lambda unit: True}
+               '_unit_active': lambda unit: True,
+               'ANYTLS_SERVICE': portal.ANYTLS_SERVICE, 'TUIC_SERVICE': portal.TUIC_SERVICE}
         # 生产代码现在用模块级 suspend_state + 服务名正则清洗状态，
         # 提取闭包时要把这两个名字一并带进命名空间。
         for node in TREE.body:
