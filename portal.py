@@ -2372,9 +2372,16 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     def copy(identifier):
         return f'<button class="button primary" type="button" data-copy="{identifier}" data-orig="复制">复制</button>'
     
-    is_insecure = m.get("is_insecure", False)
-    server_name = m.get("server_name") or m.get("public_ip", "localhost")
-    public_ip = m.get("public_ip", server_name)
+    # meta 字段先清洗再用（2026-11-06 修）：server_name / public_ip 为数字、列表或 null 时
+    # 下面的 html.escape 抛 AttributeError，整个管理页 500；is_insecure 写成字符串 "false"
+    # 时被当成真，标题换成公网 IP 并显示伪装 SNI 提示。
+    _flag = m.get("is_insecure", False)
+    is_insecure = _flag is True or (isinstance(_flag, str) and _flag.strip().lower() == "true")
+    _sn, _ip = m.get("server_name"), m.get("public_ip")
+    _sn = _sn.strip() if isinstance(_sn, str) else ""
+    _ip = _ip.strip() if isinstance(_ip, str) else ""
+    server_name = _sn or _ip or "localhost"
+    public_ip = _ip or server_name
     host = public_ip if is_insecure else server_name
     # 自签模式下 server_name 是**伪装 SNI**（如 www.bing.com），机主既不拥有它、
     # 它也不指向本机。此前 <h1> 直接显示 server_name，于是每个自签节点的门户

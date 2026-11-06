@@ -26,6 +26,38 @@ class RenderCorruptStateTests(unittest.TestCase):
         self.assertIn('good', page)
         self.assertNotIn('>oops<', page)
 
+    def test_page_html_tolerates_corrupt_meta_strings(self):
+        """server_name / public_ip / pin_sha256 不是字符串时管理页照常渲染（2026-11-06 修）。"""
+        base = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com', 'subscription_port': 8443,
+                'listen_port': 1, 'hop_port_range': '', 'auth_password': 'p', 'obfs_password': '',
+                'cert_type': 'self_signed', 'is_insecure': True, 'pin_sha256': ''}
+        for extra in ({'server_name': 123}, {'server_name': ['a']}, {'public_ip': None},
+                      {'pin_sha256': 5}, {'pin_sha256': None}):
+            with self.subTest(extra=extra):
+                page = portal.page_html(dict(base, **extra), 'hysteria2://x@h:1/', '#s', 'c', '{}',
+                                        users={}, token='t', session_secret='s')
+                self.assertIn('<!doctype html', page.lower())
+
+    def test_api_base_url_brackets_ipv6_and_escapes_host(self):
+        base = {'subscription_port': 8443, 'listen_port': 1, 'hop_port_range': '', 'auth_password': 'p',
+                'obfs_password': '', 'pin_sha256': ''}
+        page = portal.page_html(dict(base, public_ip='2001:db8::1', server_name='www.bing.com',
+                                     cert_type='self_signed', is_insecure=True),
+                                'hysteria2://x@h:1/', '#s', 'c', '{}', users={}, token='t', session_secret='s')
+        self.assertIn('id="api-base-val">https://[2001:db8::1]:8443<', page)
+        page = portal.page_html(dict(base, public_ip='1.2.3.4', server_name='<img src=x onerror=alert(1)>',
+                                     cert_type='acme', is_insecure=False),
+                                'hysteria2://x@h:1/', '#s', 'c', '{}', users={}, token='t', session_secret='s')
+        self.assertNotIn('<img src=x onerror', page)
+
+    def test_string_false_is_not_insecure(self):
+        meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com', 'subscription_port': 8443,
+                'listen_port': 1, 'hop_port_range': '', 'auth_password': 'p', 'obfs_password': '',
+                'cert_type': 'acme', 'is_insecure': 'false', 'pin_sha256': ''}
+        page = portal.page_html(meta, 'hysteria2://x@h:1/', '#s', 'c', '{}', users={}, token='t',
+                                session_secret='s')
+        self.assertNotIn('伪装 SNI', page)
+
     def test_page_html_tolerates_odd_numeric_fields(self):
         meta = {'public_ip': '1.2.3.4', 'server_name': 'h.example.com',
                 'subscription_port': 8443, 'listen_port': 1, 'hop_port_range': '',
