@@ -147,5 +147,29 @@ class AwgObfsPaddedSizesTests(unittest.TestCase):
         self.assertIn('S=20,30,50,0', out)
 
 
+
+@unittest.skipUnless(BASH, 'requires bash')
+class AwgUninstallFirewallTests(unittest.TestCase):
+    def test_uninstall_revokes_the_listening_port(self):
+        """卸载在删 meta 之前收回 ufw 里的 UDP 放行（2026-11-06 修）。"""
+        with tempfile.TemporaryDirectory() as td:
+            t = Path(td)
+            awg_dir = t / 'awg'
+            awg_dir.mkdir()
+            script = '\n'.join([
+                'AWG_DIR=%s; AWG_META_FILE=%s/meta.json; AWG_SERVICE=%s/awg.service' % (awg_dir, awg_dir, t),
+                'AWG_SERVICE_NAME=awg; AWG_LINK=awg0; AWG_GO_BIN=%s/g; AWG_BIN=%s/b; AWG_QUICK_BIN=%s/q' % (t, t, t),
+                'log_step() { :; }', 'log_info() { :; }', 'log_warn() { :; }', 'die() { echo "DIE $*"; exit 1; }',
+                'require_root() { :; }',
+                'meta_get() { [[ "$1" == port ]] && echo 53127; }',
+                'systemctl() { [[ "$1" == is-active && "$2" != --quiet ]] && { echo inactive; return 3; }; return 0; }',
+                'command() { if [[ "$1" == -v ]]; then case "$2" in ufw) return 0;; ip) return 1;; *) return 1;; esac; fi; builtin command "$@"; }',
+                'ufw() { [[ "$1" == status ]] && { echo "Status: active"; return; }; echo "UFW $*" >> %s/calls; }' % t,
+                fn('revoke_firewall'), fn('cmd_uninstall'), 'cmd_uninstall'])
+            subprocess.run([BASH, '-c', script], capture_output=True, text=True, timeout=20)
+            calls = (t / 'calls').read_text() if (t / 'calls').exists() else ''
+        self.assertIn('UFW delete allow 53127/udp', calls)
+
+
 if __name__ == '__main__':
     unittest.main()

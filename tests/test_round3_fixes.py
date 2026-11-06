@@ -302,6 +302,8 @@ systemctl(){
     *) return 0 ;;
   esac
 }
+meta_get() { :; }
+revoke_firewall() { :; }
 """ + extract_shell_function('cmd_uninstall') + "\ncmd_uninstall --keep-binaries\n"
             runner = root / 'run.sh'
             runner.write_text(script, encoding='utf-8')
