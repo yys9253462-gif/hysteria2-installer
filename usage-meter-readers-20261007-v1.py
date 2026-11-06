@@ -89,6 +89,13 @@ def read_hysteria_online(url, secret):
 """只读采集：连接事件 + Hy2核心在线计数校验；不使用鉴权超时作在线判据。"""
 import re,ipaddress,time,pathlib,urllib.error
 
+def _norm_ip(value):
+    """规范化单个 IP：IPv4 映射地址还原成 IPv4（与 /auth、拦截名单同一写法）。"""
+    ip=ipaddress.ip_address(str(value).strip())
+    if ip.version==6 and ip.ipv4_mapped:
+        ip=ip.ipv4_mapped
+    return str(ip)
+
 def _addr_ip(addr):
     """从 hysteria 日志的 addr 取 IP：[v6]:port、v4:port、裸 v4、裸 v6 都要认（2026-11-03 修）。
 
@@ -97,11 +104,17 @@ def _addr_ip(addr):
     """
     text=addr.strip()
     if text.startswith('['):
-        return str(ipaddress.ip_address(text[1:text.index(']')]))
-    try:
-        return str(ipaddress.ip_address(text))
-    except ValueError:
-        return str(ipaddress.ip_address(text.rsplit(':',1)[0]))
+        ip=ipaddress.ip_address(text[1:text.index(']')])
+    else:
+        try:
+            ip=ipaddress.ip_address(text)
+        except ValueError:
+            ip=ipaddress.ip_address(text.rsplit(':',1)[0])
+    # 双栈监听时 IPv4 客户端报成 ::ffff:a.b.c.d：还原成 IPv4（2026-11-06 修），否则控制台的
+    # 跨节点在线 IP 与拦截名单（纯 IPv4）对不上，同一设备在不同节点上像是两个。
+    if ip.version==6 and ip.ipv4_mapped:
+        ip=ip.ipv4_mapped
+    return str(ip)
 
 def parse_events(rows):
     """按「用户 + 客户端 IP」重放连接事件，返回 {(uid, ip): 仍在线的连接数}。
@@ -181,7 +194,7 @@ def read_live_connections():
             for uid,out in output['users'].items():
                 row=live['users'].get(uid,{'connections':0,'ips':[]})
                 if type(row.get('connections'))!=int or row['connections']<0 or not isinstance(row.get('ips'),list):raise ValueError('invalid_core_live_user')
-                ips=[{'ip':str(ipaddress.ip_address(ip)),'protocol':'Hy2','last_seen':output['sampled_at']} for ip in row['ips']]
+                ips=[{'ip':_norm_ip(ip),'protocol':'Hy2','last_seen':output['sampled_at']} for ip in row['ips']]
                 out.update(ok=True,hysteria_ok=True,error='',hysteria_count=row['connections'],ips=ips)
         else:
             online=read_hysteria_online(h['url'],h['secret'])
