@@ -2375,14 +2375,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     # meta 字段先清洗再用（2026-11-06 修）：server_name / public_ip 为数字、列表或 null 时
     # 下面的 html.escape 抛 AttributeError，整个管理页 500；is_insecure 写成字符串 "false"
     # 时被当成真，标题换成公网 IP 并显示伪装 SNI 提示。
-    _flag = m.get("is_insecure", False)
-    is_insecure = _flag is True or (isinstance(_flag, str) and _flag.strip().lower() == "true")
-    _sn, _ip = m.get("server_name"), m.get("public_ip")
-    _sn = _sn.strip() if isinstance(_sn, str) else ""
-    _ip = _ip.strip() if isinstance(_ip, str) else ""
-    server_name = _sn or _ip or "localhost"
-    public_ip = _ip or server_name
-    host = public_ip if is_insecure else server_name
+    is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 自签模式下 server_name 是**伪装 SNI**（如 www.bing.com），机主既不拥有它、
     # 它也不指向本机。此前 <h1> 直接显示 server_name，于是每个自签节点的门户
     # 标题都是 www.bing.com —— 全页最大字号的那一行偏偏是错的，新手第一眼以为
@@ -7127,6 +7120,35 @@ def _host_for_url(host):
     return host
 
 
+def clean_node_identity(m):
+    """从 client_meta.json 取 (is_insecure, server_name, public_ip, host)，先清洗类型（2026-11-06 加）。
+
+    这些字段可能被手工改坏：server_name / public_ip 为数字、列表或 null，is_insecure 写成
+    字符串 "false"。页面渲染与订阅生成共用这一份规则，否则一边修好另一边仍会输出
+    `server: 123`、`skip-cert-verify: 'false'` 这种客户端拒收的订阅。
+    """
+    m = m if isinstance(m, dict) else {}
+    flag = m.get('is_insecure', False)
+    is_insecure = flag is True or (isinstance(flag, str) and flag.strip().lower() == 'true')
+    sn, ip = m.get('server_name'), m.get('public_ip')
+    sn = sn.strip() if isinstance(sn, str) else ''
+    ip = ip.strip() if isinstance(ip, str) else ''
+    server_name = sn or ip or 'localhost'
+    public_ip = ip or server_name
+    return is_insecure, server_name, public_ip, (public_ip if is_insecure else server_name)
+
+
+def clean_hop_range(value):
+    """端口跳跃区间规范成 (起, 止)；格式不对或越界返回 None（按未开启处理）。"""
+    if not isinstance(value, str):
+        return None
+    hit = re.fullmatch(r'\s*(\d{1,5})\s*[-:]\s*(\d{1,5})\s*', value)
+    if not hit:
+        return None
+    lo, hi = int(hit.group(1)), int(hit.group(2))
+    return (lo, hi) if 1 <= lo <= hi <= 65535 else None
+
+
 def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
               vmess=None, vlessenc=None, anytls=None, tuic=None):
     """生成 hy2:// 直链 + Clash / Sing-box 配置。
@@ -7140,10 +7162,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     改返回结构会让任何漏改的一处静默错位。VMess 的 vmess:// 直链由
     vmess_uri_for_user() 单独生成，在需要的端点里作为额外字段下发。
     """
-    is_insecure = m.get('is_insecure', False)
-    server_name = m.get('server_name') or m.get('public_ip', 'localhost')
-    public_ip = m.get('public_ip', server_name)
-    host = public_ip if is_insecure else server_name
+    is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 标签会进 quote() 与客户端配置；非字符串（调用方传错或数据被改坏）
     # 会抛 TypeError，把整页渲染和订阅下载一起打断。
     name = name_override if isinstance(name_override, str) and name_override else ('Hy2-' + str(host))
@@ -7176,8 +7195,10 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     pin_sha256 = raw_pin if len(raw_pin) == 64 and all(c in '0123456789abcdef' for c in raw_pin) else ''
     if not isinstance(obfs_password, str):
         obfs_password = ''
-    if not isinstance(hop_port_range, str):
-        hop_port_range = ''
+    # 只认 起-止 / 起:止 且 1<=起<=止<=65535（2026-11-06 修）：'garbage'、'40000-20000' 原样
+    # 写进 mport / ports / server_ports，sing-box 报 bad port range、整份配置加载失败。
+    _hop = clean_hop_range(hop_port_range)
+    hop_port_range = '%d-%d' % _hop if _hop else ''
     params = {'sni': server_name}
     if is_insecure:
         params['insecure'] = '1'
