@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.33'
+PORTAL_VERSION = '2.34'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2269,8 +2269,7 @@ def meta_display_host(m):
     prepare / refresh 原先直接取 m['is_insecure'] / m['server_name']：老 meta 或手写
     meta 缺键时 KeyError，刷新门户与证书自愈一起失败（2026-11-04 修）。
     """
-    server_name = m.get('server_name') or m.get('public_ip', 'localhost')
-    return m.get('public_ip', server_name) if m.get('is_insecure', False) else server_name
+    return clean_node_identity(m)[3]
 
 
 def read_meta_file(meta_path):
@@ -2372,10 +2371,10 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     def copy(identifier):
         return f'<button class="button primary" type="button" data-copy="{identifier}" data-orig="复制">复制</button>'
     
-    is_insecure = m.get("is_insecure", False)
-    server_name = m.get("server_name") or m.get("public_ip", "localhost")
-    public_ip = m.get("public_ip", server_name)
-    host = public_ip if is_insecure else server_name
+    # meta 字段先清洗再用（2026-11-06 修）：server_name / public_ip 为数字、列表或 null 时
+    # 下面的 html.escape 抛 AttributeError，整个管理页 500；is_insecure 写成字符串 "false"
+    # 时被当成真，标题换成公网 IP 并显示伪装 SNI 提示。
+    is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 自签模式下 server_name 是**伪装 SNI**（如 www.bing.com），机主既不拥有它、
     # 它也不指向本机。此前 <h1> 直接显示 server_name，于是每个自签节点的门户
     # 标题都是 www.bing.com —— 全页最大字号的那一行偏偏是错的，新手第一眼以为
@@ -2383,7 +2382,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     fake_sni_hint = (f' · <span style="opacity:.75">伪装 SNI: {html.escape(server_name)}'
                      f'（自签模式，非真实域名）</span>') if is_insecure else ""
     sub_port = resolve_subscription_port(m)[0]
-    _raw_pin = (m.get("pin_sha256") or "").strip().lower()
+    _raw_pin = m.get("pin_sha256")
+    _raw_pin = _raw_pin.strip().lower() if isinstance(_raw_pin, str) else ""
     pin_sha256 = _raw_pin if (is_insecure and len(_raw_pin) == 64
                               and all(c in "0123456789abcdef" for c in _raw_pin)) else ""
     pin_block = (f'<div class="api-box"><div><div style="font-size:11px;color:var(--muted);font-weight:700">'
@@ -3472,7 +3472,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <div class="api-box">
       <div>
         <div style="font-size:11px;color:var(--muted);font-weight:700">API 基础地址 (Base URL)</div>
-        <div class="api-key-code" id="api-base-val">https://{host}:{sub_port}</div>
+        <div class="api-key-code" id="api-base-val">https://{html.escape(_host_for_url(host))}:{sub_port}</div>
       </div>
       <button class="button" type="button" data-copy="api-base-val" data-orig="复制地址">复制地址</button>
     </div>
@@ -4969,6 +4969,21 @@ def vmess_clients(data):
     return clients
 
 
+def protocol_host_sni(cfg, fallback=''):
+    """托管 TLS 协议直链用的 (host, sni)：只认非空字符串，改坏的值退回 fallback（2026-11-06 加）。
+
+    domain / sni 被改成数字、列表或 null 时，旧实现把 123、['d'] 原样拼进 vmess:// /
+    vless:// / anytls:// / tuic://，客户端导入后连一个不存在的地址。
+    """
+    def clean(v):
+        return v.strip() if isinstance(v, str) and v.strip() else ''
+    fb = clean(fallback)
+    host = clean(cfg.get('domain')) if isinstance(cfg, dict) else ''
+    host = host or fb
+    sni = (clean(cfg.get('sni')) if isinstance(cfg, dict) else '') or host
+    return host, sni
+
+
 def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     """拼一条标准 vmess:// 直链（Base64 JSON，v2rayN / NekoBox / Shadowrocket 通用）。
 
@@ -4980,7 +4995,7 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     # 而调用点在用户订阅生成路径上 —— 一条坏配置让整份订阅 500。
     if not isinstance(vcfg, dict):
         return ''
-    host = vcfg.get('domain') or public_ip
+    host, _sni = protocol_host_sni(vcfg, public_ip)
     # 与 VLESS-Reality 同一套端口校验：`"abc"` / True / 70000 会生成一条
     # 客户端无法解析的链接（admin 面板仍显示成功）。
     port = _valid_port(vcfg.get('port'))
@@ -4992,7 +5007,7 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
         'v': '2', 'ps': tag, 'add': str(host), 'port': str(port),
         'id': vmess_uuid_for_user(user_id), 'aid': '0', 'scy': 'auto',
         'net': 'ws', 'type': 'none', 'host': str(host), 'path': path,
-        'tls': 'tls', 'sni': str(vcfg.get('sni') or host), 'alpn': '',
+        'tls': 'tls', 'sni': _sni, 'alpn': '',
         'fp': 'chrome',
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
@@ -5138,12 +5153,12 @@ def anytls_uri_for_user(acfg, user_id, label=None):
     secret = acfg.get('secret')
     if not isinstance(secret, str) or not secret:
         return ''
-    host = acfg.get('domain')
+    host, _sni = protocol_host_sni(acfg)
     port = _valid_port(acfg.get('port'))
     if not (host and port):
         return ''
     pwd = anytls_password_for_user(secret, user_id)
-    params = urlencode({'sni': acfg.get('sni') or host})
+    params = urlencode({'sni': _sni})
     return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
 
 
@@ -5352,12 +5367,12 @@ def tuic_uri_for_user(tcfg, user_id, label=None):
     secret = tcfg.get('secret')
     if not isinstance(secret, str) or not secret:
         return ''
-    host = tcfg.get('domain')
+    host, _sni = protocol_host_sni(tcfg)
     port = _valid_port(tcfg.get('port'))
     if not (host and port):
         return ''
     u, pwd = tuic_credentials_for_user(secret, user_id)
-    params = urlencode({'sni': tcfg.get('sni') or host, 'alpn': 'h3',
+    params = urlencode({'sni': _sni, 'alpn': 'h3',
                         'congestion_control': 'bbr', 'udp_relay_mode': 'native'})
     return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(label or ('TUIC-' + str(user_id)))}"
 
@@ -5732,14 +5747,14 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     """
     if not isinstance(vcfg, dict):
         return ''
-    host = vcfg.get('domain') or public_ip
+    host, _sni = protocol_host_sni(vcfg, public_ip)
     # 同 Reality / VMess：非整数端口会让客户端解析失败。
     port = _valid_port(vcfg.get('port'))
     enc = vcfg.get('encryption', '')
     if not (host and port and enc):
         return ''
     tag = label or ('VLESS-Enc-' + str(user_id))
-    params = {'encryption': enc, 'security': 'tls', 'sni': str(vcfg.get('sni') or host),
+    params = {'encryption': enc, 'security': 'tls', 'sni': _sni,
               'type': 'tcp', 'headerType': 'none', 'fp': 'chrome'}
     return (f"vless://{reality_uuid_for_user(user_id)}@{_host_for_url(host)}:{port}"
             f"?{urlencode(params, safe='')}#{quote(tag)}")
@@ -6656,7 +6671,7 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
 
 
 
-def managed_reserved_ports(meta, data, config=None, exclude_key=None):
+def managed_reserved_ports(meta, data, config=None, exclude_key=None, keep_disabled=False):
     """汇总「本机其它协议正在用 / 配置里已占」的端口，供 _pick_reality_port 避让。
 
     2026-10-24 修：三个启用流程各自只避开 hy2 与订阅端口，彼此之间不避让 ——
@@ -6679,7 +6694,11 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None):
         section = data.get(key)
         if key == 'anytls_config' and not (isinstance(section, dict) and section.get('enabled')):
             continue
-        if isinstance(section, dict) and section.get('enabled') is False:
+        # Reality / VMess / VLESS Encryption 停用后保留端口、再启用要沿用它：别的协议选端口时
+        # 也要避开（2026-11-06 修）。旧实现跳过停用段，VMess / Reality 可能占走 VLESS
+        # Encryption 停用期间保留的端口，后者再启用只能换端口，已发的订阅全部指错。
+        # 选新端口的调用方传 keep_disabled=True；只问「此刻谁占着」的调用方停用段不算。
+        if isinstance(section, dict) and section.get('enabled') is False and not keep_disabled:
             continue
         if key == exclude_key:
             # 协议**自己**的端口不是冲突：重新启用时应当沿用它。
@@ -7055,6 +7074,32 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None, own_act
                '当前监听 %s）' % (_REALITY_PORT_CANDIDATES, sorted(listening)[:12]))
 
 
+_REALITY_SID_RE = re.compile(r'^[0-9A-Za-z]{1,16}$')
+_REALITY_SNI_RE = re.compile(r'^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$')
+# 只拦会破坏直链 / 配置的值（数字、含 & # 空白），不卡长度：密钥由 xray x25519 生成。
+_REALITY_KEY_RE = re.compile(r'^[A-Za-z0-9_=+/-]{1,128}$')
+
+
+def reality_client_params(rcfg):
+    """客户端连接 Reality 要用的 (port, sni, public_key, short_id)；任一项改坏返回 None（2026-11-06 加）。
+
+    这些值进 vless:// 直链与 Clash / sing-box 配置：dest_sni / short_id 被改成数字时
+    订阅里出现 `servername: 123`、丢掉前导零的 short-id，客户端拒收或握手失败；
+    含 & / # 的值还会把直链截断。
+    """
+    if not isinstance(rcfg, dict):
+        return None
+    port = _valid_port(rcfg.get('port', 443))
+    sni = rcfg.get('dest_sni', 'www.apple.com')
+    pbk = rcfg.get('public_key', '')
+    sid = rcfg.get('short_id', '')
+    if not (port and isinstance(sni, str) and _REALITY_SNI_RE.match(sni.strip())
+            and isinstance(pbk, str) and _REALITY_KEY_RE.match(pbk)
+            and isinstance(sid, str) and _REALITY_SID_RE.match(sid)):
+        return None
+    return port, sni.strip(), pbk, sid
+
+
 def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     """给某个用户拼他自己的 VLESS-Reality 直链。
 
@@ -7064,17 +7109,10 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     """
     # 同 VMess / VLESS-Encryption：非 dict 配置在订阅路径上直接抛
     # AttributeError，用户拿不到任何节点。
-    if not isinstance(rcfg, dict):
+    params = reality_client_params(rcfg)
+    if params is None:
         return ''
-    short_id = rcfg.get('short_id', '')
-    dest_sni = rcfg.get('dest_sni', 'www.apple.com')
-    pub_key = rcfg.get('public_key', '')
-    # 端口必须是合法整数：被改成 "abc" / None / 70000 时链路会拼出
-    # `vless://...#:abc` 这种所有客户端都拒绝的地址，而页面照样显示成功
-    # （与 VMess 分支同一套 _valid_port 校验，2026-10-30 修）。
-    port = _valid_port(rcfg.get('port', 443))
-    if not (short_id and dest_sni and pub_key and port):
-        return ''
+    port, dest_sni, pub_key, short_id = params
     uid_uuid = reality_uuid_for_user(user_id)
     tag = label or ('VLESS-Reality-' + str(user_id))
     return (f"vless://{uid_uuid}@{_host_for_url(public_ip)}:{port}"
@@ -7115,6 +7153,35 @@ def _host_for_url(host):
     return host
 
 
+def clean_node_identity(m):
+    """从 client_meta.json 取 (is_insecure, server_name, public_ip, host)，先清洗类型（2026-11-06 加）。
+
+    这些字段可能被手工改坏：server_name / public_ip 为数字、列表或 null，is_insecure 写成
+    字符串 "false"。页面渲染与订阅生成共用这一份规则，否则一边修好另一边仍会输出
+    `server: 123`、`skip-cert-verify: 'false'` 这种客户端拒收的订阅。
+    """
+    m = m if isinstance(m, dict) else {}
+    flag = m.get('is_insecure', False)
+    is_insecure = flag is True or (isinstance(flag, str) and flag.strip().lower() == 'true')
+    sn, ip = m.get('server_name'), m.get('public_ip')
+    sn = sn.strip() if isinstance(sn, str) else ''
+    ip = ip.strip() if isinstance(ip, str) else ''
+    server_name = sn or ip or 'localhost'
+    public_ip = ip or server_name
+    return is_insecure, server_name, public_ip, (public_ip if is_insecure else server_name)
+
+
+def clean_hop_range(value):
+    """端口跳跃区间规范成 (起, 止)；格式不对或越界返回 None（按未开启处理）。"""
+    if not isinstance(value, str):
+        return None
+    hit = re.fullmatch(r'\s*(\d{1,5})\s*[-:]\s*(\d{1,5})\s*', value)
+    if not hit:
+        return None
+    lo, hi = int(hit.group(1)), int(hit.group(2))
+    return (lo, hi) if 1 <= lo <= hi <= 65535 else None
+
+
 def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=None,
               vmess=None, vlessenc=None, anytls=None, tuic=None):
     """生成 hy2:// 直链 + Clash / Sing-box 配置。
@@ -7128,10 +7195,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     改返回结构会让任何漏改的一处静默错位。VMess 的 vmess:// 直链由
     vmess_uri_for_user() 单独生成，在需要的端点里作为额外字段下发。
     """
-    is_insecure = m.get('is_insecure', False)
-    server_name = m.get('server_name') or m.get('public_ip', 'localhost')
-    public_ip = m.get('public_ip', server_name)
-    host = public_ip if is_insecure else server_name
+    is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 标签会进 quote() 与客户端配置；非字符串（调用方传错或数据被改坏）
     # 会抛 TypeError，把整页渲染和订阅下载一起打断。
     name = name_override if isinstance(name_override, str) and name_override else ('Hy2-' + str(host))
@@ -7164,8 +7228,10 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     pin_sha256 = raw_pin if len(raw_pin) == 64 and all(c in '0123456789abcdef' for c in raw_pin) else ''
     if not isinstance(obfs_password, str):
         obfs_password = ''
-    if not isinstance(hop_port_range, str):
-        hop_port_range = ''
+    # 只认 起-止 / 起:止 且 1<=起<=止<=65535（2026-11-06 修）：'garbage'、'40000-20000' 原样
+    # 写进 mport / ports / server_ports，sing-box 报 bad port range、整份配置加载失败。
+    _hop = clean_hop_range(hop_port_range)
+    hop_port_range = '%d-%d' % _hop if _hop else ''
     params = {'sni': server_name}
     if is_insecure:
         params['insecure'] = '1'
@@ -7203,11 +7269,9 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         ruri = reality_uri_for_user(reality, user_id, public_ip,
                                     label=(name + '-Reality'))
         r_uuid = reality_uuid_for_user(user_id)
-        r_port = _valid_port(reality.get('port', 443))
-        r_sni = reality.get('dest_sni', 'www.apple.com')
-        r_pbk = reality.get('public_key', '')
-        r_sid = reality.get('short_id', '')
-        if ruri and r_pbk and r_sid and r_port:
+        _rp = reality_client_params(reality)
+        r_port, r_sni, r_pbk, r_sid = _rp if _rp else (0, '', '', '')
+        if ruri and _rp:
             rname = name + '-Reality'
             # mihomo 的写法：tls 是布尔值，reality-opts 用连字符键（2026-11-03 修）。
             # 旧写法 tls=dict(...) / reality_opts 让 mihomo v1.19.15 整份配置加载失败
@@ -7369,8 +7433,10 @@ def sync_pin(m, root, meta_path):
     Self-signed   -> a valid lowercase HEX64 pin, recomputed from cert/server.crt
                      whenever it is missing or malformed.
     """
-    if m.get('is_insecure'):
-        cur = (m.get('pin_sha256') or '').strip().lower()
+    # is_insecure 写成字符串 "false" 时不能当成自签（2026-11-06 修），否则会给可信证书节点写 pin。
+    if clean_node_identity(m)[0]:
+        cur = m.get('pin_sha256')
+        cur = cur.strip().lower() if isinstance(cur, str) else ''
         if len(cur) != 64 or any(c not in '0123456789abcdef' for c in cur):
             # 按实际在用的证书算 pin（2026-11-04 修），与 sync_cert_trust 同一来源：
             # 旧实现固定读 cert/server.crt，自签证书放在别处时写进一张无关证书的 pin，
@@ -9481,7 +9547,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            _avoid |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='reality_config')
+            _avoid |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='reality_config', keep_disabled=True)
             # 已关闭的 Reality 保留下来的端口不算「自己的」（2026-11-04 修，与 VMess /
             # VLESS-Enc / AnyTLS 一致）：停用期间 Caddy / Nginx 可能已占了它，再开启时
             # 照旧沿用就绑不上、回 500，而不是换一个空闲端口。
@@ -11071,7 +11137,7 @@ if __name__ == '__main__':
                         _cfg_now = None
                     with data_lock:
                         _data_now = dict(data)
-                    _avoid = managed_reserved_ports(_meta_now, _data_now, _cfg_now)
+                    _avoid = managed_reserved_ports(_meta_now, _data_now, _cfg_now, keep_disabled=True)
                     _avoid |= _listening_ports()
                     if port and port in _avoid:
                         # 显式端口也要检查：否则 gost 起不来 → 回滚 →
@@ -11939,7 +12005,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config')
+            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config', keep_disabled=True)
             blocked.add(reality_port)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2087,
@@ -12052,7 +12118,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config')
+            blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config', keep_disabled=True)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2088, extra_blocked=blocked_ports,
                 own_active=has_managed_inbound(_cfg_now or {}, VLESSENC_INBOUND_TAG))
@@ -12471,7 +12537,7 @@ if __name__ == '__main__':
                             if Path('/etc/hysteria/xray.json').exists() else None)
             except (OSError, ValueError):
                 _cfg_now = None
-            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config')
+            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config', keep_disabled=True)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2096, extra_blocked=blocked,
                 own_active=_systemd_state(ANYTLS_SERVICE) == 'active')
@@ -14077,12 +14143,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
                     except Exception:
                         qr_svg = ''
-                    server_name = m.get('server_name') or m.get('public_ip', 'localhost')
-                    host = m.get('public_ip', server_name) if m.get('is_insecure') else server_name
+                    # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
+                    # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
+                    _insecure, server_name, _pub_clean, host = clean_node_identity(m)
                     listen_port = m.get('listen_port', 19984)
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
                     # 其它已启用协议的直链，与 users/create 的回包同一组生成器（2026-11-04 加）
-                    _pub = m.get('public_ip', '127.0.0.1')
+                    _pub = _pub_clean
                     _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
                     _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
                     _t = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)

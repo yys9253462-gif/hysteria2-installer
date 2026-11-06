@@ -1,3 +1,16 @@
+## 2026-11-06 — 第二十四批十项修复，门户 2.34
+
+- nftables 放行覆盖所有会拦截的 input 链：此前只处理第一条 policy drop 链，双栈主机的 IPv6 链没放行；「policy accept + 末尾 drop」写法的链被完全跳过。
+- 安装结束的安全组提示列出 Hysteria 2 主监听 UDP 端口：直连走它，不走跳跃区间，此前照着提示放行的用户直连全部超时。
+- 订阅生成先清洗 client_meta.json：server_name / public_ip 为数字或 null、is_insecure 写成字符串、hop_port_range 为乱码或倒序时，不再输出 `server: 123`、`skip-cert-verify: 'false'`、`server_ports: ["garbage"]` 这种客户端拒收的配置。
+- Reality 的 sni / 公钥 / short_id 被改坏时不再写进订阅（此前会出现 `servername: 123`、丢掉前导零的 short-id、被 & 截断的直链）。
+- VMess / VLESS Encryption / AnyTLS / TUIC 的 domain / sni 被改坏时，直链退回公网 IP 或不生成，不再拼出 `@['d']:41000` 这类假地址。
+- 分享页与 sync_pin 使用同一套 meta 清洗：server_name 为数字时分享页不再 500；is_insecure 为 "false" 时不再给可信证书节点写 pin。
+- 管理页：server_name / public_ip / is_insecure 被改坏时不再 500 或显示错误的标题与提示。
+- 管理页：pin_sha256 为非字符串时不再 500。
+- 管理页的 API 基础地址给 IPv6 加方括号并转义主机名。
+- 选新协议端口时避开停用协议保留的端口：再启用时不必换端口，已发的订阅继续可用。
+
 ## 2026-11-06 — 第二十三批十项修复，门户 2.33
 
 - 机主手工加的、带自己 tag 的 Reality 入站不再被门户认领：此前一次开关就会被删掉或改写，门户用户还会被写进它的 clients。

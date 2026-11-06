@@ -2222,13 +2222,20 @@ setup_system_firewall() {
         # 用 list ruleset 的层级结构解析（格式在所有 nft 版本间稳定）：
         # 先记下当前所在的 table（"table <family> <name>"）/ chain，
         # 遇到 "hook input ... policy drop" 就输出 "<family> <table> <chain>"。
-        local nft_input
-        nft_input=$(nft list ruleset 2>/dev/null | awk '
-            /^table /            { tbl=$2" "$3; chain="" }
-            /^[[:space:]]*chain /{ chain=$2; sub(/\{.*/,"",chain); sub(/:$/,"",chain) }
-            /hook input/ && /policy drop/ && chain != "" { print tbl " " chain; exit }
+        # 收集**所有**会拦截的 input 链（2026-11-06 修）：旧实现只取第一条 policy drop 链就 exit，
+        # 双栈主机上 ip6 的 INPUT 链没放行，IPv6 客户端连不上；以「policy accept + 末尾 drop」
+        # 方式写的链（nftables.conf 常见写法）则完全被跳过，一个端口都没放。
+        local nft_inputs nft_input
+        nft_inputs=$(nft list ruleset 2>/dev/null | awk '
+            function flush() { if (cur != "" && (pdrop || tdrop)) print cur; cur=""; pdrop=0; tdrop=0 }
+            /^table /                 { flush(); tbl=$2" "$3 }
+            /^[[:space:]]*chain /     { flush(); chain=$2; sub(/\{.*/,"",chain); sub(/:$/,"",chain); inchain=1; hooked=0 }
+            inchain && /hook input/   { hooked=1; cur=tbl " " chain; if (/policy drop/) pdrop=1 }
+            inchain && hooked && /^[[:space:]]*(drop|reject)([[:space:]]|$)/ { tdrop=1 }
+            END { flush() }
         ')
-        if [[ -n "$nft_input" ]]; then
+        while IFS= read -r nft_input; do
+            [[ -n "$nft_input" ]] || continue
             # nft_input = "<family> <table> <chain>"，正好是 nft 命令需要的三个参数。
             # 用 read 拆分而不是 set --，避免覆盖函数自身的位置参数（$1/$2/$3）。
             local nft_fam nft_tbl nft_chain
@@ -2265,7 +2272,7 @@ setup_system_firewall() {
                 log_info "nftables 规则已齐备（udp ${port} / tcp ${HY2_SUB_PORT}），跳过。"
             fi
             unset -f _nft_has _nft_ensure
-        fi
+        done <<<"$nft_inputs"
     fi
     # 裸 iptables 兜底（既无 ufw/firewalld，也无 nft 的情况）。
     # 注意：这里处理的是 filter/INPUT 的放行，与端口跳跃的 nat/REDIRECT 无关。
@@ -3460,6 +3467,16 @@ show_client_configs() {
     # info 子命令没有经过端口配置，从落盘元数据读取实际启用的范围。
     if [[ ! -v HOP_PORT_RANGE ]]; then
         _hop_range_display="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
+    # 主监听端口必须单独列出（2026-11-06 修）：订阅里的 `port:` 直连它、不走跳跃区间，
+    # 而它通常在 20000-40000 之外。旧提示只列跳跃区间，照着放行的用户直连全部超时；
+    # 没有 iptables（跳跃关闭）时更是一个 UDP 端口都没列。
+    local _listen_display="${LISTEN_PORT:-}"
+    if [[ -z "$_listen_display" && -f "$HY2_META_FILE" ]]; then
+        _listen_display="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_listen_display" ]]; then
+        echo -e "    ${GREEN}UDP ${_listen_display}${PLAIN}        Hysteria 2 主监听端口（客户端直连它）"
     fi
     if [[ -n "$_hop_range_display" ]]; then
         echo -e "    ${GREEN}UDP ${_hop_range_display}${PLAIN}   节点连接用的端口跳跃区间（要放行整个区间，不是单个端口）"
