@@ -8708,7 +8708,10 @@ def serve(path):
 
     def _remote_root_shas():
         now = time.time()
-        if _ver_cache['data'] is not None and now - _ver_cache['t'] < 300:
+        # 失败也缓存 60 秒（2026-11-06 修）：旧实现失败不记缓存，每次打开页面都再请求两次
+        # GitHub（各 8 秒超时）；限流后一直被限流，GitHub 不通时页面多等 16 秒。
+        ttl = 300 if _ver_cache['data'] is not None else 60
+        if _ver_cache['t'] and now - _ver_cache['t'] < ttl:
             return _ver_cache['data']
         try:
             req = urllib.request.Request(
@@ -8729,6 +8732,8 @@ def serve(path):
                 return shas
         except Exception as exc:
             _log_ignored('version_check', exc)
+        _ver_cache['t'] = now
+        _ver_cache['data'] = None
         return None
 
     def _version_triple(local_path, remote_name):
