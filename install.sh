@@ -1378,15 +1378,26 @@ _nginx_cert_candidates() {
 
 # 证书的 CN 或 SAN 是否命中目标域名
 _cert_matches_domain() {
-    local c="$1" domain="$2" txt
-    txt="$(openssl x509 -in "$c" -noout -subject -ext subjectAltName 2>/dev/null)"
-    [[ -n "$txt" ]] || return 1
-    grep -qiE "(^|[^a-zA-Z0-9.-])${domain//./\\.}([^a-zA-Z0-9.-]|$)" <<<"$txt" && return 0
-    # 通配符只覆盖一级子域（2026-11-04 修）：hy2.example.com 匹配 *.example.com，
-    # 旧实现只认精确名字，可用的通配符证书被跳过、退回自签。
-    local parent="${domain#*.}"
-    [[ "$parent" != "$domain" && "$parent" == *.* ]] || return 1
-    grep -qiE "(^|[^a-zA-Z0-9.-])\*\.${parent//./\\.}([^a-zA-Z0-9.-]|$)" <<<"$txt"
+    local c="$1" domain="$2" names n parent
+    # 只比对证书真正的名字（2026-11-06 修）：旧实现在 -subject 整行里 grep，O= / OU= / L=
+    # 里出现目标域名也算命中，于是复用 / 导入了一张不覆盖该域名的证书，客户端校验失败。
+    # 有 SAN 就只看 SAN 的 DNS 项（与客户端行为一致），没有 SAN 才看 CN。
+    names="$(openssl x509 -in "$c" -noout -ext subjectAltName 2>/dev/null \
+        | tr ',' '\n' | sed -n 's/^[[:space:]]*DNS:[[:space:]]*//p')"
+    if [[ -z "$names" ]]; then
+        names="$(openssl x509 -in "$c" -noout -subject -nameopt multiline 2>/dev/null \
+            | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p')"
+    fi
+    [[ -n "$names" ]] || return 1
+    domain="${domain,,}"
+    parent="${domain#*.}"
+    while IFS= read -r n; do
+        n="${n,,}"; n="${n%"${n##*[![:space:]]}"}"
+        [[ "$n" == "$domain" ]] && return 0
+        # 通配符只覆盖一级子域：hy2.example.com 匹配 *.example.com（2026-11-04 修）
+        [[ "$parent" != "$domain" && "$parent" == *.* && "$n" == "*.${parent}" ]] && return 0
+    done <<<"$names"
+    return 1
 }
 
 # ------------------------------------------------------------------------------

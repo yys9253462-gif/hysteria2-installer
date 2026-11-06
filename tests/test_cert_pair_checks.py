@@ -41,6 +41,12 @@ class CertPairCheckTests(unittest.TestCase):
            'openssl x509 -req -in old.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile old.ext -out old.leaf 2>/dev/null && '
            'cat old.leaf ca.crt > old.full', d)
 
+        # 目标域名只出现在 O= 里、真正的名字是别的（2026-11-06 修：旧实现把它当成匹配）
+        sh('openssl req -x509 -newkey rsa:2048 -nodes -keyout org.key -out org.full -days 30 '
+           '-subj "/O=hy2.example.com/CN=other.net" -addext "subjectAltName=DNS:other.net" 2>/dev/null', d)
+        sh('openssl req -x509 -newkey rsa:2048 -nodes -keyout cn.key -out cn.full -days 30 '
+           '-subj "/CN=HY2.Example.com" 2>/dev/null', d)
+
     @classmethod
     def tearDownClass(cls):
         cls._td.cleanup()
@@ -59,6 +65,13 @@ class CertPairCheckTests(unittest.TestCase):
 
     def test_mismatched_key_rejected(self):
         self.assertEqual(self.check('_cert_key_usable good.full wild.key'), 'NO')
+
+    def test_subject_organization_is_not_a_name(self):
+        self.assertEqual(self.check('_cert_matches_domain org.full hy2.example.com'), 'NO')
+        self.assertEqual(self.check('_cert_matches_domain org.full other.net'), 'YES')
+
+    def test_cn_used_only_without_san_and_case_insensitive(self):
+        self.assertEqual(self.check('_cert_matches_domain cn.full hy2.example.com'), 'YES')
 
     def test_wildcard_matches_one_label(self):
         self.assertEqual(self.check('_cert_matches_domain wild.full hy2.example.com'), 'YES')
