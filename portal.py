@@ -4887,7 +4887,10 @@ def managed_inbound_index(config, tag):
     # 撤销也覆盖不到它。判据必须按协议各自独立。
     if tag == REALITY_INBOUND_TAG:
         for i, item in enumerate(inbounds):
-            if (isinstance(item, dict) and item.get('protocol') == 'vless'
+            # 只认领**没有 tag** 的旧入站（2026-11-06 修）：机主自己加的、带别的 tag 的
+            # Reality 入站旧实现也认成托管的，一次开关就被删掉或改写，用户表还会被写进去。
+            if (isinstance(item, dict) and not item.get('tag')
+                    and item.get('protocol') == 'vless'
                     and (item.get('streamSettings') or {}).get('security') == 'reality'):
                 return i, item
     return -1, None
