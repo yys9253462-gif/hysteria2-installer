@@ -1215,6 +1215,30 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 409, body)
         self.assertNotIn('pend-a', self.data['users'])
 
+    def test_corrupt_user_entry_never_500s_any_user_endpoint(self):
+        """条目被改成非对象时各用户接口按「不存在 / 覆盖」处理，不 500（2026-11-06 修）。"""
+        cases = [({'user_id': 'brokenx', 'extend_days': 30}, 'users/renew', 404),
+                 ({'user_id': 'brokenx', 'status': 'disabled'}, 'users/status', 404),
+                 ({'user_id': 'brokenx'}, 'users/get/brokenx', 404)]
+        for payload, endpoint, want in cases:
+            with self.subTest(endpoint=endpoint):
+                self.data['users']['brokenx'] = 7
+                status, body = self.invoke_api(payload, endpoint=endpoint)
+                self.assertEqual(status, want, body)
+        for bad in (7, 'x', [1]):
+            with self.subTest(api_create=bad):
+                self.data['users']['brokenx'] = bad
+                status, body = self.invoke_api({'user_id': 'brokenx', 'password': 'pw-fix-entry'})
+                self.assertEqual(status, 200, body)
+                self.assertIsInstance(self.data['users']['brokenx'], dict)
+            with self.subTest(web_create=bad):
+                self.data['users']['brokenx'] = bad
+                status, body = self.invoke('_h_post_manage_user',
+                                           {'action': 'create', 'user_id': 'brokenx',
+                                            'password': 'pw-fix-web'})
+                self.assertIn(status, (200, 302), body)   # Web 表单成功走 302 回跳
+                self.assertIsInstance(self.data['users']['brokenx'], dict)
+
     def test_api_update_of_a_corrupt_user_entry_is_404(self):
         """用户条目被改成非对象时 users/update 回 404 而不是 500（2026-11-06 修）。"""
         self.data['users']['brokenx'] = 7

@@ -10189,6 +10189,11 @@ if __name__ == '__main__':
                     password_changed = False
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
+                        # 条目被改坏时按「不存在」覆盖掉（2026-11-06 修）：否则
+                        # `'view_nonce' in existing` / existing.get 抛 TypeError/AttributeError，
+                        # 坏条目也没法通过重建修复。
+                        if not isinstance(existing, dict):
+                            existing = None
                         # 只认明确的真值：字符串 "0"/"false" 不该被当成 true。
                         _create_only = str(params.get('create_only', '')).strip().lower() in ('1', 'true', 'yes', 'on')
                         if _create_only and existing is not None:
@@ -10462,7 +10467,9 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        if not u:
+                        # 条目被改成数字 / 字符串时按不存在处理（2026-11-06 修）：`not u` 放行后
+                        # u.get 抛 AttributeError，续费在锁内 500。
+                        if not isinstance(u, dict):
                             conflict = (404, 'User not found')
                         else:
                             # expires_at 可能是 None（「永久」的表示方式之一）：
@@ -10627,7 +10634,9 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        missing = not u
+                        # 同上：`not u` 对 7 / "x" 为假，随后 u.get / u['status'] 抛异常，
+                        # 滥用用户根本停不掉（2026-11-06 修）。
+                        missing = not isinstance(u, dict)
                         if not missing:
                             previous = copy.deepcopy(u)
                             before = u.get('status', 'active')
@@ -13223,6 +13232,8 @@ if __name__ == '__main__':
                     conflict = None
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
+                        if not isinstance(existing, dict):   # 条目改坏＝不存在（2026-11-06 修）
+                            existing = None
                         if existing is not None:
                             _pw = existing.get('password')
                             tail = _pw[-4:] if isinstance(_pw, str) else ''
@@ -13988,9 +13999,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        missing_user = u is None
+                        # 条目不是对象时按不存在返回 404（2026-11-06 修），旧实现 u.items() 抛异常
+                        missing_user = not isinstance(u, dict)
                         result = None
-                        if u is not None:
+                        if not missing_user:
                             result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
                             # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
                             result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
