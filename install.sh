@@ -5401,7 +5401,15 @@ start_service() {
     require_installed || return 1
     refuse_if_suspended || return 1
     log_step "启动 Hysteria 2 服务..."
-    systemctl start hysteria-server
+    systemctl start hysteria-server || return 1
+    # 与 restart_service 同理（2026-11-06 修）：Type=simple 下 start 一 fork 就返回 0，
+    # 配置坏 / 端口被占时核心 0.1 秒后就退出，旧实现照报「已启动」。
+    sleep 3
+    if ! systemctl is-active --quiet hysteria-server; then
+        log_err "Hysteria 2 启动后立即退出，最近日志："
+        journalctl -u hysteria-server -n 15 --no-pager >&2 || true
+        return 1
+    fi
     log_info "已启动。"
 }
 
