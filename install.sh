@@ -2762,15 +2762,6 @@ acl:
     - warp_socks(suffix:generativelanguage.googleapis.com)
     - warp_socks(suffix:alkalimakersuite-pa.clients6.google.com)
     - direct_ipv4(all)
-    - warp_socks(chatgpt.com)
-    - warp_socks(oaistatic.com)
-    - warp_socks(oaiusercontent.com)
-    - warp_socks(ai.com)
-    - warp_socks(gemini.google.com)
-    - warp_socks(aistudio.google.com)
-    - warp_socks(generativelanguage.googleapis.com)
-    - warp_socks(anthropic.com)
-    - warp_socks(claude.ai)
 EOF
 fi
 
@@ -2795,7 +2786,13 @@ fi
 
 # acl 段无实际变化时不重启，避免无谓掐断所有在线用户
 if [[ "${BEFORE_ACL:-}" != "$(sed -n '/^acl:/,$p' "$CONFIG")" ]]; then
-    systemctl restart hysteria-server 2>/dev/null || true
+    # 流量超额停用期间只改配置不拉起服务（2026-11-04 修），否则手动跑一次本脚本就绕过限额；
+    # 重启前清失败计数，连续切换几次不会撞上 StartLimitBurst 把服务锁死。
+    if [[ "$(jq -r '.traffic_suspend.suspended // false' /etc/hysteria/portal.json 2>/dev/null)" != "true" ]]; then
+        systemctl stop hysteria-server 2>/dev/null || true
+        systemctl reset-failed hysteria-server 2>/dev/null || true
+        systemctl start hysteria-server 2>/dev/null || true
+    fi
 fi
 EOTW
     chmod +x "$HY2_DIR/toggle_warp.sh"
