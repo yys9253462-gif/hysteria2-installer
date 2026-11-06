@@ -63,5 +63,21 @@ class ArtifactsCleanMetaTests(unittest.TestCase):
             self.assertEqual(proxy['ports'], '443,20000-40000')
 
 
+class SharePageHostTests(unittest.TestCase):
+    """分享页与订阅同一套 meta 清洗（2026-11-06 修）：server_name 为数字时分享页曾 500。"""
+    def test_display_host_is_always_a_string(self):
+        for meta in ({'server_name': 123, 'public_ip': '1.2.3.4'},
+                     {'server_name': 'www.bing.com', 'public_ip': None, 'is_insecure': True},
+                     {'server_name': 'ex.com', 'public_ip': '1.2.3.4', 'is_insecure': 'false'}):
+            with self.subTest(meta=meta):
+                host = portal.meta_display_host(meta)
+                self.assertIsInstance(host, str)
+        self.assertEqual(portal.meta_display_host({'server_name': 'ex.com', 'public_ip': '1.2.3.4',
+                                                   'is_insecure': 'false'}), 'ex.com')
+        page = portal.user_page_html('x', portal.meta_display_host({'server_name': 123}), 443, '', 'u',
+                                     {'used_bytes': 0}, 'hysteria2://a@b:1', 'c', '{}', '', 't', 'k', 8443)
+        self.assertIn('<!doctype html', page.lower())
+
+
 if __name__ == '__main__':
     unittest.main()

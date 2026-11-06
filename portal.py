@@ -2269,8 +2269,7 @@ def meta_display_host(m):
     prepare / refresh 原先直接取 m['is_insecure'] / m['server_name']：老 meta 或手写
     meta 缺键时 KeyError，刷新门户与证书自愈一起失败（2026-11-04 修）。
     """
-    server_name = m.get('server_name') or m.get('public_ip', 'localhost')
-    return m.get('public_ip', server_name) if m.get('is_insecure', False) else server_name
+    return clean_node_identity(m)[3]
 
 
 def read_meta_file(meta_path):
@@ -7402,8 +7401,10 @@ def sync_pin(m, root, meta_path):
     Self-signed   -> a valid lowercase HEX64 pin, recomputed from cert/server.crt
                      whenever it is missing or malformed.
     """
-    if m.get('is_insecure'):
-        cur = (m.get('pin_sha256') or '').strip().lower()
+    # is_insecure 写成字符串 "false" 时不能当成自签（2026-11-06 修），否则会给可信证书节点写 pin。
+    if clean_node_identity(m)[0]:
+        cur = m.get('pin_sha256')
+        cur = cur.strip().lower() if isinstance(cur, str) else ''
         if len(cur) != 64 or any(c not in '0123456789abcdef' for c in cur):
             # 按实际在用的证书算 pin（2026-11-04 修），与 sync_cert_trust 同一来源：
             # 旧实现固定读 cert/server.crt，自签证书放在别处时写进一张无关证书的 pin，
@@ -14110,12 +14111,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
                     except Exception:
                         qr_svg = ''
-                    server_name = m.get('server_name') or m.get('public_ip', 'localhost')
-                    host = m.get('public_ip', server_name) if m.get('is_insecure') else server_name
+                    # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
+                    # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
+                    _insecure, server_name, _pub_clean, host = clean_node_identity(m)
                     listen_port = m.get('listen_port', 19984)
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
                     # 其它已启用协议的直链，与 users/create 的回包同一组生成器（2026-11-04 加）
-                    _pub = m.get('public_ip', '127.0.0.1')
+                    _pub = _pub_clean
                     _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
                     _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
                     _t = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
