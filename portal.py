@@ -11826,7 +11826,7 @@ if __name__ == '__main__':
                             '最常见原因是 TCP 443 已被其他服务（如 Caddy / Nginx）占用。'
                             '日志尾部：%s' % (xr_state, xr_log.strip()[-400:])})
 
-                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % data.get('reality_config', {}).get('port', '')})
+                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % config_section(data, 'reality_config').get('port', '')})
             except Exception as e:
                 # 二进制已经换成新版后，后续配置一步失败（例如找不到空闲端口）时要说清楚：
                 # 旧回复只有「安装执行异常」，管理员不知道正在跑的协议下次重启就会用新核心。
@@ -11982,7 +11982,7 @@ if __name__ == '__main__':
             """随机且**持久**的 WS 路径。路径本身不是机密，但随机值能挡掉
             按固定路径扫描的主动探测；它写在订阅里，所以必须稳定。"""
             with data_lock:
-                existing = (data.get('vmess_config') or {}).get('ws_path')
+                existing = config_section(data, 'vmess_config').get('ws_path')
             if isinstance(existing, str) and re.fullmatch(r'/[A-Za-z0-9_\-]{8,48}', existing):
                 return existing
             return '/' + secrets.token_urlsafe(18).replace('=', '')
@@ -12114,8 +12114,10 @@ if __name__ == '__main__':
                 old = dict(config_section(data, 'vlessenc_config'))
                 blocked_ports = {
                     m.get('listen_port'), m.get('subscription_port'),
-                    (data.get('reality_config') or {}).get('port'),
-                    (data.get('vmess_config') or {}).get('port'),
+                    # config_section 清洗（2026-11-06 修）：配置段被改成字符串 / 列表时旧写法
+                    # 抛 AttributeError，VLESS Encryption 每次启用都失败。
+                    config_section(data, 'reality_config').get('port'),
+                    config_section(data, 'vmess_config').get('port'),
                 }
             try:
                 _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
