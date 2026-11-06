@@ -14192,6 +14192,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if awg_route in ('awg-conf', 'awg-qr.svg'):
                 if not self.is_authenticated():
                     return self.reply(401, b'Authentication required', www_auth=True)
+                # awg_run 先排 awg_operation_lock：AWG 更新 / 换协议线持锁可达数分钟，
+                # 默认 30 秒死线一到连接就被掐断（2026-11-06 修，与 peer_del 同理）。
+                self._extend_deadline(120)
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 name = (query.get('name', [''])[0] or '').strip()
                 if not VALID_AWG_NAME_RE.match(name):

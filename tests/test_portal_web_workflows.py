@@ -265,6 +265,23 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 409, body)
         reload_gost.assert_not_called()
 
+    def test_awg_conf_download_extends_the_deadline(self):
+        """AWG 配置下载要延长死线，否则 AWG 更新持锁时 30 秒就被掐断（2026-11-06 修）。"""
+        extend = self.handler._extend_deadline = Mock(return_value=True)
+        self.ns['awg_installed'] = lambda: False
+        self.data.setdefault('token', 'test-token')
+        self.handler.path = '/test-token/awg-conf?name=c1'
+        self.handler.headers = {}
+        self.handler.is_authenticated = lambda: True
+        self.handler.check_rate_limit = lambda **k: True
+        self.handler.reply = lambda status, body=b'', *a, **k: (status, body)
+        try:
+            extract_method('do_GET', self.ns)(self.handler)
+        except Exception:
+            pass   # 只关心是否延长了死线；后续分支依赖大量闭包
+        self.assertTrue(extend.called, 'AWG 配置下载没有延长死线')
+        self.assertGreaterEqual(extend.call_args[0][0], 60)
+
     def test_padded_password_is_rejected_not_trimmed(self):
         """Web 建户不静默去掉密码首尾空白（2026-11-04 修，与 API 同一规则）。"""
         status, _ = self.invoke('_h_post_manage_user', {'action': 'create', 'user_id': 'qa-user',
