@@ -48,6 +48,16 @@ class ServiceCommandExitCodeTests(unittest.TestCase):
         self.assertIn('RC=1', out)
         self.assertNotIn('已启动', out)
 
+    def test_stop_reports_failure_when_service_stays_up(self):
+        script = '\n'.join([
+            'log_step() { :; }', 'log_info() { echo "INFO $*"; }', 'log_err() { echo "ERR $*"; }',
+            'require_installed() { :; }',
+            'systemctl() { [[ "$1" == stop ]] && return 1; [[ "$1" == is-active ]] && return 0; return 0; }',
+            fn('stop_service'), 'stop_service; echo "RC=$?"'])
+        out = self.run_sh(script).stdout
+        self.assertIn('RC=1', out)
+        self.assertNotIn('已停止', out)
+
     def test_status_when_not_installed_is_nonzero(self):
         script = '\n'.join(['HY2_BIN=/nonexistent/hysteria', 'log_err() { :; }',
                             fn('status_service'), 'status_service; echo "RC=$?"'])

@@ -5416,7 +5416,11 @@ start_service() {
 stop_service() {
     require_installed || return 1
     log_step "停止 Hysteria 2 服务..."
-    systemctl stop hysteria-server
+    # 看结果再报（2026-11-06 修）：stop 超时 / 失败时旧实现照报「已停止」，服务其实还在跑。
+    if ! systemctl stop hysteria-server || systemctl is-active --quiet hysteria-server; then
+        log_err "Hysteria 2 未能停止，请运行 'systemctl status hysteria-server' 查看原因。"
+        return 1
+    fi
     log_info "已停止。"
 }
 
