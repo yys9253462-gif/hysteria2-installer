@@ -3078,8 +3078,11 @@ METEREOF2
             if [[ -n "$_cert" && "$_cert" != /* && ! -f "$_cert" ]]; then
                 [[ -f "$HY2_DIR/$_cert" ]] && _cert="$HY2_DIR/$_cert"
             fi
-            [[ -n "$_cert" && -f "$_cert" ]] || _cert="$HY2_DIR/cert/server.crt"
-            if [[ -f "$_cert" ]]; then
+            # 内置 ACME 不退回旧自签证书（同 sync_cert_meta，2026-11-06 修）
+            if [[ -z "$_cert" || ! -f "$_cert" ]]; then
+                grep -q '^acme:' "$HY2_DIR/config.yaml" && _cert="" || _cert="$HY2_DIR/cert/server.crt"
+            fi
+            if [[ -n "$_cert" && -f "$_cert" ]]; then
                 _subj="$(openssl x509 -in "$_cert" -noout -subject 2>/dev/null | sed 's/^subject=//' | sed 's/ *$//')"
                 _iss="$(openssl x509 -in "$_cert" -noout -issuer 2>/dev/null | sed 's/^issuer=//' | sed 's/ *$//')"
                 _cn="$(openssl x509 -in "$_cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -1 | sed 's/ *$//')"
@@ -3959,7 +3962,13 @@ sync_cert_meta() {
     if [[ -n "$cert_file" && "$cert_file" != /* && ! -f "$cert_file" ]]; then
         [[ -f "${HY2_DIR}/${cert_file}" ]] && cert_file="${HY2_DIR}/${cert_file}"
     fi
-    [[ -n "$cert_file" && -f "$cert_file" ]] || cert_file="${HY2_CERT_DIR}/server.crt"
+    if [[ -z "$cert_file" || ! -f "$cert_file" ]]; then
+        # 内置 ACME（没有 tls.cert）不能退回 server.crt（2026-11-06 修）：自签改 ACME 后那张
+        # 旧自签证书还在，拿它「自愈」会把 meta 改回 self_signed / www.bing.com / insecure。
+        # ACME 证书在 hysteria 的缓存里，交给 portal.py 的 sync_cert_trust 处理。
+        grep -q '^acme:' "$HY2_CONFIG" && return 0
+        cert_file="${HY2_CERT_DIR}/server.crt"
+    fi
     [[ -f "$cert_file" ]] || return 0
 
     local cn sans subject issuer self_signed="false" acme_block="false"
