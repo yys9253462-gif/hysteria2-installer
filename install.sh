@@ -1067,7 +1067,12 @@ setup_certificates() {
         CERT_FILE="$HY2_CUSTOM_CERT_FILE"
         KEY_FILE="$HY2_CUSTOM_KEY_FILE"
         SERVER_NAME="${HY2_DOMAIN:-$PUBLIC_IP}"
-        IS_INSECURE="${HY2_CUSTOM_INSECURE:-false}"
+        # 归一成 JSON 布尔（2026-11-06 修）：它原样进 jq --argjson，yes / True 让 jq 失败、
+        # client_meta.json 被截成空文件；1 写进去后自愈逻辑按字符串比较，每次都判漂移。
+        case "${HY2_CUSTOM_INSECURE:-false}" in
+            1|true|TRUE|True|yes|YES|Yes) IS_INSECURE="true" ;;
+            *) IS_INSECURE="false" ;;
+        esac
         log_info "已复用迁移证书，未改动DNS。"
         return
     fi
