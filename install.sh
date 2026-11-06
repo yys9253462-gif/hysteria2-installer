@@ -602,7 +602,9 @@ hy2_acme_check_existing() {
 # 之前交互路径不校验、环境变量路径更不校验，输错会一路写进配置，
 # 表现是「显示安装成功但服务起不来」，新手完全想不到是自己打错了。
 is_valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 65535 ))
+    # 不收前导零（2026-11-06 修）：bash 算术把 020000 当八进制（8192），跳跃区间检查漏判；
+    # 08 / 09 直接报 value too great for base；port_owner 拿 0443 去 grep 找不到占用者。
+    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 ))
 }
 
 # 主机名：标签 1-63 位字母数字与连字符、不以连字符开头结尾，至少两段，总长 ≤ 253。
@@ -1376,15 +1378,26 @@ _nginx_cert_candidates() {
 
 # 证书的 CN 或 SAN 是否命中目标域名
 _cert_matches_domain() {
-    local c="$1" domain="$2" txt
-    txt="$(openssl x509 -in "$c" -noout -subject -ext subjectAltName 2>/dev/null)"
-    [[ -n "$txt" ]] || return 1
-    grep -qiE "(^|[^a-zA-Z0-9.-])${domain//./\\.}([^a-zA-Z0-9.-]|$)" <<<"$txt" && return 0
-    # 通配符只覆盖一级子域（2026-11-04 修）：hy2.example.com 匹配 *.example.com，
-    # 旧实现只认精确名字，可用的通配符证书被跳过、退回自签。
-    local parent="${domain#*.}"
-    [[ "$parent" != "$domain" && "$parent" == *.* ]] || return 1
-    grep -qiE "(^|[^a-zA-Z0-9.-])\*\.${parent//./\\.}([^a-zA-Z0-9.-]|$)" <<<"$txt"
+    local c="$1" domain="$2" names n parent
+    # 只比对证书真正的名字（2026-11-06 修）：旧实现在 -subject 整行里 grep，O= / OU= / L=
+    # 里出现目标域名也算命中，于是复用 / 导入了一张不覆盖该域名的证书，客户端校验失败。
+    # 有 SAN 就只看 SAN 的 DNS 项（与客户端行为一致），没有 SAN 才看 CN。
+    names="$(openssl x509 -in "$c" -noout -ext subjectAltName 2>/dev/null \
+        | tr ',' '\n' | sed -n 's/^[[:space:]]*DNS:[[:space:]]*//p')"
+    if [[ -z "$names" ]]; then
+        names="$(openssl x509 -in "$c" -noout -subject -nameopt multiline 2>/dev/null \
+            | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p')"
+    fi
+    [[ -n "$names" ]] || return 1
+    domain="${domain,,}"
+    parent="${domain#*.}"
+    while IFS= read -r n; do
+        n="${n,,}"; n="${n%"${n##*[![:space:]]}"}"
+        [[ "$n" == "$domain" ]] && return 0
+        # 通配符只覆盖一级子域：hy2.example.com 匹配 *.example.com（2026-11-04 修）
+        [[ "$parent" != "$domain" && "$parent" == *.* && "$n" == "*.${parent}" ]] && return 0
+    done <<<"$names"
+    return 1
 }
 
 # ------------------------------------------------------------------------------

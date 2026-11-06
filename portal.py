@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.34'
+PORTAL_VERSION = '2.35'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -8053,6 +8053,12 @@ def serve(path):
         raise SystemExit('[portal] portal.json 缺少必需字段: %s。'
                          '请从备份恢复 portal.json 或重新执行安装。'
                          % ', '.join(_missing))
+    # users 必须是对象（2026-11-06 修）：被写成列表 / 字符串时旧实现照常启动，随后十几处
+    # data.get('users', {}).get(...) 全部抛 AttributeError，开户、改密、续费、分享页一律 500。
+    # 与缺字段同样处理：给出明确错误并退出，不拿空表顶替（那会让所有用户静默失效）。
+    if not isinstance(data.get('users'), dict):
+        raise SystemExit('[portal] portal.json 的 users 不是对象（当前是 %s）。'
+                         '请从备份恢复 portal.json 或重新执行安装。' % type(data.get('users')).__name__)
     # 与 prepare() 同一条规则：空串/None 不能当密钥用（.get 的默认值只在
     # 键缺失时生效，手工改坏或截断写入会留下空串）。
     # 🔴 两者都必须是字符串：hmac.new(...encode()) 在数字/None 上抛异常，
@@ -10183,6 +10189,11 @@ if __name__ == '__main__':
                     password_changed = False
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
+                        # 条目被改坏时按「不存在」覆盖掉（2026-11-06 修）：否则
+                        # `'view_nonce' in existing` / existing.get 抛 TypeError/AttributeError，
+                        # 坏条目也没法通过重建修复。
+                        if not isinstance(existing, dict):
+                            existing = None
                         # 只认明确的真值：字符串 "0"/"false" 不该被当成 true。
                         _create_only = str(params.get('create_only', '')).strip().lower() in ('1', 'true', 'yes', 'on')
                         if _create_only and existing is not None:
@@ -10396,7 +10407,7 @@ if __name__ == '__main__':
                     password_changed = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        if u is None:
+                        if not isinstance(u, dict):   # 条目改坏同样按不存在（2026-11-06 修）
                             conflict = (404, 'User not found')
                         elif 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
                             conflict = (409, 'Password already in use by another user')
@@ -10456,7 +10467,9 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        if not u:
+                        # 条目被改成数字 / 字符串时按不存在处理（2026-11-06 修）：`not u` 放行后
+                        # u.get 抛 AttributeError，续费在锁内 500。
+                        if not isinstance(u, dict):
                             conflict = (404, 'User not found')
                         else:
                             # expires_at 可能是 None（「永久」的表示方式之一）：
@@ -10621,7 +10634,9 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        missing = not u
+                        # 同上：`not u` 对 7 / "x" 为假，随后 u.get / u['status'] 抛异常，
+                        # 滥用用户根本停不掉（2026-11-06 修）。
+                        missing = not isinstance(u, dict)
                         if not missing:
                             previous = copy.deepcopy(u)
                             before = u.get('status', 'active')
@@ -11820,7 +11835,7 @@ if __name__ == '__main__':
                             '最常见原因是 TCP 443 已被其他服务（如 Caddy / Nginx）占用。'
                             '日志尾部：%s' % (xr_state, xr_log.strip()[-400:])})
 
-                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % data.get('reality_config', {}).get('port', '')})
+                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % config_section(data, 'reality_config').get('port', '')})
             except Exception as e:
                 # 二进制已经换成新版后，后续配置一步失败（例如找不到空闲端口）时要说清楚：
                 # 旧回复只有「安装执行异常」，管理员不知道正在跑的协议下次重启就会用新核心。
@@ -11976,7 +11991,7 @@ if __name__ == '__main__':
             """随机且**持久**的 WS 路径。路径本身不是机密，但随机值能挡掉
             按固定路径扫描的主动探测；它写在订阅里，所以必须稳定。"""
             with data_lock:
-                existing = (data.get('vmess_config') or {}).get('ws_path')
+                existing = config_section(data, 'vmess_config').get('ws_path')
             if isinstance(existing, str) and re.fullmatch(r'/[A-Za-z0-9_\-]{8,48}', existing):
                 return existing
             return '/' + secrets.token_urlsafe(18).replace('=', '')
@@ -12108,8 +12123,10 @@ if __name__ == '__main__':
                 old = dict(config_section(data, 'vlessenc_config'))
                 blocked_ports = {
                     m.get('listen_port'), m.get('subscription_port'),
-                    (data.get('reality_config') or {}).get('port'),
-                    (data.get('vmess_config') or {}).get('port'),
+                    # config_section 清洗（2026-11-06 修）：配置段被改成字符串 / 列表时旧写法
+                    # 抛 AttributeError，VLESS Encryption 每次启用都失败。
+                    config_section(data, 'reality_config').get('port'),
+                    config_section(data, 'vmess_config').get('port'),
                 }
             try:
                 _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
@@ -13215,6 +13232,8 @@ if __name__ == '__main__':
                     conflict = None
                     with data_lock:
                         existing = data.get('users', {}).get(user_id)
+                        if not isinstance(existing, dict):   # 条目改坏＝不存在（2026-11-06 修）
+                            existing = None
                         if existing is not None:
                             _pw = existing.get('password')
                             tail = _pw[-4:] if isinstance(_pw, str) else ''
@@ -13980,9 +13999,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        missing_user = u is None
+                        # 条目不是对象时按不存在返回 404（2026-11-06 修），旧实现 u.items() 抛异常
+                        missing_user = not isinstance(u, dict)
                         result = None
-                        if u is not None:
+                        if not missing_user:
                             result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
                             # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
                             result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
@@ -14072,7 +14092,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 authed = self.is_authenticated()
                 with data_lock:
                     u = data.get('users', {}).get(target_uid)
-                    u_copy = dict(u) if u else None
+                    # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
+                    u_copy = dict(u) if isinstance(u, dict) else None
 
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 k_val = query.get('k', [''])[0]
@@ -14230,7 +14251,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                 with data_lock:
                     u = data.get('users', {}).get(target_uid)
-                    u_copy = dict(u) if u else None
+                    # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
+                    u_copy = dict(u) if isinstance(u, dict) else None
                 if not u_copy:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(404, {'ok': False, 'error': 'User not found'})
