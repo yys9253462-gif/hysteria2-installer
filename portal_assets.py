@@ -3073,6 +3073,13 @@ loadProxyServices();
 function closeUserModal() {
   if (uModal) uModal.classList.remove('show');
 }
+// Esc 关闭专属连接 / 代理详情弹窗（2026-11-06 加）：确认框已支持 Esc，这两个此前只能点 × 或遮罩。
+// 确认框开着时它自己的 Esc 处理优先，这里不抢。
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || document.querySelector('#custom-confirm-modal.show')) return;
+  if (uModal && uModal.classList.contains('show')) closeUserModal();
+  if (typeof proxyModal !== 'undefined' && proxyModal && proxyModal.classList.contains('show')) closeProxyModal();
+});
 if (uModalClose) uModalClose.addEventListener('click', closeUserModal);
 if (uModal) {
   uModal.addEventListener('click', (e) => {
