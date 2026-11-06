@@ -3472,7 +3472,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <div class="api-box">
       <div>
         <div style="font-size:11px;color:var(--muted);font-weight:700">API 基础地址 (Base URL)</div>
-        <div class="api-key-code" id="api-base-val">https://{host}:{sub_port}</div>
+        <div class="api-key-code" id="api-base-val">https://{html.escape(_host_for_url(host))}:{sub_port}</div>
       </div>
       <button class="button" type="button" data-copy="api-base-val" data-orig="复制地址">复制地址</button>
     </div>
