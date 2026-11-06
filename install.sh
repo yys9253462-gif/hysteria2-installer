@@ -5371,7 +5371,7 @@ menu_amneziawg() {
 status_service() {
     if [[ ! -f "$HY2_BIN" ]]; then
         log_err "Hysteria 2 未安装！"
-        return
+        return 1   # 监控脚本靠退出码判断（2026-11-06 修：旧实现未安装也返回 0）
     fi
     echo -e "\n${CYAN}--- Hysteria 2 运行状态 ---${PLAIN}"
     systemctl status hysteria-server --no-pager || true
