@@ -2904,6 +2904,9 @@ if [[ "$TARGET" == "core" ]]; then
     fi
     # Type=simple：restart 返回 0 只说明进程起来了，要等几秒确认没有立刻退出（2026-11-03 修）。
     hy2_restarted_ok() {
+        # 先清失败计数（2026-11-06 修）：新版本起不来时会立刻回滚并再重启一次，连同之前的
+        # 重启很容易撞上 StartLimitBurst，旧核心也被拒绝启动，回滚等于没回滚。
+        systemctl reset-failed hysteria-server 2>/dev/null || true
         systemctl restart hysteria-server 2>/dev/null || return 1
         sleep 3
         systemctl is-active --quiet hysteria-server
@@ -3062,6 +3065,7 @@ sys.exit(1 if (data.get('traffic_suspend') or {}).get('suspended') else 0)
 PYSUSPEND
                 then
                     echo "已补写 trafficStats 段，重启 hysteria-server 使其生效"
+                    systemctl reset-failed hysteria-server 2>/dev/null || true
                     systemctl restart hysteria-server 2>/dev/null || true
                 else
                     echo "已补写 trafficStats 段；节点停用或状态不可读，暂不重启 hysteria-server"

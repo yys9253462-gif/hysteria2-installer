@@ -46,7 +46,7 @@ esac
 ''')
         self._command('systemctl', '''#!/bin/sh
 printf '%s\n' "$*" >> "$TEST_ROOT/calls"
-if [ "${FAIL_FIRST:-0}" = 1 ] && [ ! -f "$TEST_ROOT/failed-once" ]; then
+if [ "$1" = restart ] && [ "${FAIL_FIRST:-0}" = 1 ] && [ ! -f "$TEST_ROOT/failed-once" ]; then
   touch "$TEST_ROOT/failed-once"; exit 1
 fi
 exit 0
@@ -124,7 +124,9 @@ esac
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.binary.read_bytes(), OLD)
         # 回滚后的重启也要确认旧核心确实起来了（2026-11-03：restart 之后查 is-active）。
-        self.assertEqual(self.calls(), ['restart hysteria-server', 'restart hysteria-server',
+        # 每次重启前先清失败计数（2026-11-06 起），否则回滚后旧核心也可能被拒绝启动。
+        self.assertEqual(self.calls(), ['reset-failed hysteria-server', 'restart hysteria-server',
+                                        'reset-failed hysteria-server', 'restart hysteria-server',
                                         'is-active --quiet hysteria-server'])
 
     @unittest.skipIf(os.name == 'nt', 'Windows filesystems do not preserve POSIX executable mode bits')
