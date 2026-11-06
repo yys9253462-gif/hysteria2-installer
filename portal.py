@@ -2383,7 +2383,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     fake_sni_hint = (f' · <span style="opacity:.75">伪装 SNI: {html.escape(server_name)}'
                      f'（自签模式，非真实域名）</span>') if is_insecure else ""
     sub_port = resolve_subscription_port(m)[0]
-    _raw_pin = (m.get("pin_sha256") or "").strip().lower()
+    _raw_pin = m.get("pin_sha256")
+    _raw_pin = _raw_pin.strip().lower() if isinstance(_raw_pin, str) else ""
     pin_sha256 = _raw_pin if (is_insecure and len(_raw_pin) == 64
                               and all(c in "0123456789abcdef" for c in _raw_pin)) else ""
     pin_block = (f'<div class="api-box"><div><div style="font-size:11px;color:var(--muted);font-weight:700">'
