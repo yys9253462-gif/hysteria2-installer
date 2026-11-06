@@ -6664,7 +6664,7 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
 
 
 
-def managed_reserved_ports(meta, data, config=None, exclude_key=None):
+def managed_reserved_ports(meta, data, config=None, exclude_key=None, keep_disabled=False):
     """汇总「本机其它协议正在用 / 配置里已占」的端口，供 _pick_reality_port 避让。
 
     2026-10-24 修：三个启用流程各自只避开 hy2 与订阅端口，彼此之间不避让 ——
@@ -6687,7 +6687,11 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None):
         section = data.get(key)
         if key == 'anytls_config' and not (isinstance(section, dict) and section.get('enabled')):
             continue
-        if isinstance(section, dict) and section.get('enabled') is False:
+        # Reality / VMess / VLESS Encryption 停用后保留端口、再启用要沿用它：别的协议选端口时
+        # 也要避开（2026-11-06 修）。旧实现跳过停用段，VMess / Reality 可能占走 VLESS
+        # Encryption 停用期间保留的端口，后者再启用只能换端口，已发的订阅全部指错。
+        # 选新端口的调用方传 keep_disabled=True；只问「此刻谁占着」的调用方停用段不算。
+        if isinstance(section, dict) and section.get('enabled') is False and not keep_disabled:
             continue
         if key == exclude_key:
             # 协议**自己**的端口不是冲突：重新启用时应当沿用它。
@@ -9489,7 +9493,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            _avoid |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='reality_config')
+            _avoid |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='reality_config', keep_disabled=True)
             # 已关闭的 Reality 保留下来的端口不算「自己的」（2026-11-04 修，与 VMess /
             # VLESS-Enc / AnyTLS 一致）：停用期间 Caddy / Nginx 可能已占了它，再开启时
             # 照旧沿用就绑不上、回 500，而不是换一个空闲端口。
@@ -11079,7 +11083,7 @@ if __name__ == '__main__':
                         _cfg_now = None
                     with data_lock:
                         _data_now = dict(data)
-                    _avoid = managed_reserved_ports(_meta_now, _data_now, _cfg_now)
+                    _avoid = managed_reserved_ports(_meta_now, _data_now, _cfg_now, keep_disabled=True)
                     _avoid |= _listening_ports()
                     if port and port in _avoid:
                         # 显式端口也要检查：否则 gost 起不来 → 回滚 →
@@ -11947,7 +11951,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config')
+            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config', keep_disabled=True)
             blocked.add(reality_port)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2087,
@@ -12060,7 +12064,7 @@ if __name__ == '__main__':
                 _cfg_now = None
             with data_lock:
                 _data_now = dict(data)
-            blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config')
+            blocked_ports |= managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vlessenc_config', keep_disabled=True)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2088, extra_blocked=blocked_ports,
                 own_active=has_managed_inbound(_cfg_now or {}, VLESSENC_INBOUND_TAG))
@@ -12479,7 +12483,7 @@ if __name__ == '__main__':
                             if Path('/etc/hysteria/xray.json').exists() else None)
             except (OSError, ValueError):
                 _cfg_now = None
-            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config')
+            blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config', keep_disabled=True)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2096, extra_blocked=blocked,
                 own_active=_systemd_state(ANYTLS_SERVICE) == 'active')
