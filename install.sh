@@ -5899,8 +5899,12 @@ flow_reconfigure() {
 # 只收回本次确实被换掉、且没有托管协议仍在用的端口；nft 规则不动（无法证明归属）。
 close_replaced_ports() {
     local old_udp="$1" old_tcp="$2" in_use
-    in_use="$(jq -r '[.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
-        | map(select(type == "object") | .port | numbers) | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    # gost 代理服务的端口也算在用（2026-11-06 补）：它们同样由门户放行，被换掉的订阅端口
+    # 恰好与某条代理同号时不能把那条代理的放行一起收回。
+    in_use="$(jq -r '([.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
+        | map(select(type == "object") | .port | numbers))
+        + ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | numbers) else [] end)
+        | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
     _close_one() {   # $1=port $2=proto
         is_valid_port "$1" || return 0
         grep -qx "$1" <<<"$in_use" && return 0

@@ -43,6 +43,11 @@ class CloseReplacedPortsTests(unittest.TestCase):
     def test_unchanged_ports_are_kept(self):
         self.assertNotIn('UFW', self.run_close(51000, 52000))
 
+    def test_port_used_by_a_gost_proxy_is_kept(self):
+        out = self.run_close(44300, 8999, {'proxy_services': [{'port': 8999}, 'junk']})
+        self.assertNotIn('8999', out)
+        self.assertIn('44300/udp', out)
+
     def test_port_still_used_by_managed_protocol_is_kept(self):
         out = self.run_close(44300, 8999, {'tuic_config': {'port': 44300}})
         self.assertNotIn('44300', out)
