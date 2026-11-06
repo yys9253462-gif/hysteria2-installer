@@ -113,6 +113,9 @@ class WebWorkflowTests(unittest.TestCase):
         self.handler.headers = {'Content-Length': str(len(body))}
         self.handler.rfile = io.BytesIO(body)
         method = extract_method(name, self.ns)
+        if name == '_h_post_set_bbr':
+            locked = extract_method('_set_bbr_locked', self.ns)
+            self.handler._set_bbr_locked = lambda: locked(self.handler)
         if name == '_ob_manage':
             method(self.handler)
         else:
@@ -281,6 +284,16 @@ class WebWorkflowTests(unittest.TestCase):
             pass   # 只关心是否延长了死线；后续分支依赖大量闭包
         self.assertTrue(extend.called, 'AWG 配置下载没有延长死线')
         self.assertGreaterEqual(extend.call_args[0][0], 60)
+
+    def test_concurrent_bbr_request_is_refused(self):
+        """BBR 设置串行化：已有一个在应用时第二个回 409（2026-11-06 修）。"""
+        lock = self.ns['bbr_apply_lock']
+        lock.acquire()
+        try:
+            status, body = self.invoke('_h_post_set_bbr', {'version': 'v1'})
+        finally:
+            lock.release()
+        self.assertEqual(status, 409, body)
 
     def test_padded_password_is_rejected_not_trimmed(self):
         """Web 建户不静默去掉密码首尾空白（2026-11-04 修，与 API 同一规则）。"""

@@ -5031,6 +5031,7 @@ anytls_apply_lock = threading.Lock()
 # 核心安装/卸载串行化：两个并发 install-core 会同时写 xray.new / sing-box.new，
 # 后完成者覆盖前者；与 uninstall 并发时还可能「刚装好就被删」（2026-10-29 加）。
 core_operation_lock = threading.Lock()
+bbr_apply_lock = threading.Lock()
 # AWG 操作串行化：peer-add 是「读 peers.json → 算下一个地址 → 写回」的
 # 读-改-写，两个并发请求会同时读到旧列表 —— 后写者覆盖前者（客户端丢失），
 # 或两名客户端拿到同一个 address（2026-10-29 加）。
@@ -12965,6 +12966,16 @@ if __name__ == '__main__':
             """Apply only an available kernel algorithm, verify it, and restore on failure."""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            # 串行化（2026-11-06 修）：两个请求同时改时，后一个把前一个写的文件当成「原状」快照，
+            # 失败回滚就停在前一个的状态，文件与 bbr_target_version 对不上。
+            if not bbr_apply_lock.acquire(blocking=False):
+                return self.reply_json(409, {'ok': False, 'error': '另一个 BBR 设置正在应用，请稍后再试'})
+            try:
+                return self._set_bbr_locked()
+            finally:
+                bbr_apply_lock.release()
+
+        def _set_bbr_locked(self):
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
