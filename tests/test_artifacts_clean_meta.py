@@ -79,5 +79,28 @@ class SharePageHostTests(unittest.TestCase):
         self.assertIn('<!doctype html', page.lower())
 
 
+class RealityParamsTests(unittest.TestCase):
+    """Reality 的 sni / 公钥 / short_id 改坏时不出错误节点（2026-11-06 修）。"""
+    GOOD = {'port': 443, 'dest_sni': 'www.apple.com', 'public_key': 'AbC-123_xyz', 'short_id': '0012'}
+
+    def nodes(self, rcfg):
+        uri, clash, sing = portal.artifacts(BASE, reality=rcfg, user_id='bob')
+        return [o for o in json.loads(sing)['outbounds'] if o.get('type') == 'vless']
+
+    def test_valid_config_still_yields_a_node(self):
+        out = self.nodes(self.GOOD)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['tls']['reality']['short_id'], '0012')
+        self.assertIn('sid=0012', portal.reality_uri_for_user(self.GOOD, 'bob', '1.2.3.4'))
+
+    def test_corrupt_fields_drop_the_node(self):
+        for bad in ({'dest_sni': 123}, {'dest_sni': 'a b&c'}, {'public_key': 5},
+                    {'short_id': 12}, {'short_id': 'ab#cd'}):
+            with self.subTest(bad=bad):
+                rcfg = dict(self.GOOD, **bad)
+                self.assertEqual(self.nodes(rcfg), [])
+                self.assertEqual(portal.reality_uri_for_user(rcfg, 'bob', '1.2.3.4'), '')
+
+
 if __name__ == '__main__':
     unittest.main()

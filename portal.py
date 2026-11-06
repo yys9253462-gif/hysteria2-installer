@@ -7059,6 +7059,32 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None, own_act
                '当前监听 %s）' % (_REALITY_PORT_CANDIDATES, sorted(listening)[:12]))
 
 
+_REALITY_SID_RE = re.compile(r'^[0-9A-Za-z]{1,16}$')
+_REALITY_SNI_RE = re.compile(r'^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$')
+# 只拦会破坏直链 / 配置的值（数字、含 & # 空白），不卡长度：密钥由 xray x25519 生成。
+_REALITY_KEY_RE = re.compile(r'^[A-Za-z0-9_=+/-]{1,128}$')
+
+
+def reality_client_params(rcfg):
+    """客户端连接 Reality 要用的 (port, sni, public_key, short_id)；任一项改坏返回 None（2026-11-06 加）。
+
+    这些值进 vless:// 直链与 Clash / sing-box 配置：dest_sni / short_id 被改成数字时
+    订阅里出现 `servername: 123`、丢掉前导零的 short-id，客户端拒收或握手失败；
+    含 & / # 的值还会把直链截断。
+    """
+    if not isinstance(rcfg, dict):
+        return None
+    port = _valid_port(rcfg.get('port', 443))
+    sni = rcfg.get('dest_sni', 'www.apple.com')
+    pbk = rcfg.get('public_key', '')
+    sid = rcfg.get('short_id', '')
+    if not (port and isinstance(sni, str) and _REALITY_SNI_RE.match(sni.strip())
+            and isinstance(pbk, str) and _REALITY_KEY_RE.match(pbk)
+            and isinstance(sid, str) and _REALITY_SID_RE.match(sid)):
+        return None
+    return port, sni.strip(), pbk, sid
+
+
 def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     """给某个用户拼他自己的 VLESS-Reality 直链。
 
@@ -7068,17 +7094,10 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     """
     # 同 VMess / VLESS-Encryption：非 dict 配置在订阅路径上直接抛
     # AttributeError，用户拿不到任何节点。
-    if not isinstance(rcfg, dict):
+    params = reality_client_params(rcfg)
+    if params is None:
         return ''
-    short_id = rcfg.get('short_id', '')
-    dest_sni = rcfg.get('dest_sni', 'www.apple.com')
-    pub_key = rcfg.get('public_key', '')
-    # 端口必须是合法整数：被改成 "abc" / None / 70000 时链路会拼出
-    # `vless://...#:abc` 这种所有客户端都拒绝的地址，而页面照样显示成功
-    # （与 VMess 分支同一套 _valid_port 校验，2026-10-30 修）。
-    port = _valid_port(rcfg.get('port', 443))
-    if not (short_id and dest_sni and pub_key and port):
-        return ''
+    port, dest_sni, pub_key, short_id = params
     uid_uuid = reality_uuid_for_user(user_id)
     tag = label or ('VLESS-Reality-' + str(user_id))
     return (f"vless://{uid_uuid}@{_host_for_url(public_ip)}:{port}"
@@ -7235,11 +7254,9 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         ruri = reality_uri_for_user(reality, user_id, public_ip,
                                     label=(name + '-Reality'))
         r_uuid = reality_uuid_for_user(user_id)
-        r_port = _valid_port(reality.get('port', 443))
-        r_sni = reality.get('dest_sni', 'www.apple.com')
-        r_pbk = reality.get('public_key', '')
-        r_sid = reality.get('short_id', '')
-        if ruri and r_pbk and r_sid and r_port:
+        _rp = reality_client_params(reality)
+        r_port, r_sni, r_pbk, r_sid = _rp if _rp else (0, '', '', '')
+        if ruri and _rp:
             rname = name + '-Reality'
             # mihomo 的写法：tls 是布尔值，reality-opts 用连字符键（2026-11-03 修）。
             # 旧写法 tls=dict(...) / reality_opts 让 mihomo v1.19.15 整份配置加载失败
