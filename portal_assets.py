@@ -2712,10 +2712,16 @@ async function waitForCoreUpgrade() {
     let state;
     try {
       const res = await fetch(location.pathname + 'upgrade-status', {credentials:'same-origin'});
+      // 会话过期不再空等 5 分钟（2026-11-06 修）
+      if (res.status === 401 || portalSessionExpired) throw new Error('登录已失效，请刷新页面重新登录后查看更新结果');
       if (!res.ok) continue;
       state = (await res.json()).job || {};
-    } catch (_) { continue; }
-    if (state.state === 'completed') return;
+    } catch (e) {
+      if (e && String(e.message || '').startsWith('登录已失效')) throw e;
+      continue;
+    }
+    // 把任务自己的结果交给调用方：「未替换现有补丁」「停用中已就位」等不能被「已接受」盖掉
+    if (state.state === 'completed') return state;
     if (state.state === 'failed' || state.state === 'interrupted') throw new Error(state.error || '核心更新失败');
   }
   throw new Error('更新任务尚未确认完成，请刷新查看版本状态');
@@ -2740,7 +2746,8 @@ async function doUpgrade(target) {
     if (json.ok) {
       if (target === 'core' && json.applying) {
         if (updateStatusMsg) updateStatusMsg.textContent = '更新任务运行中，正在等待验证实际结果...';
-        await waitForCoreUpgrade();
+        const job = await waitForCoreUpgrade();
+        if (job && job.message) json.message = job.message;
       }
       const msg = json.message || '升级已触发';
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
