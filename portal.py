@@ -9905,7 +9905,12 @@ if __name__ == '__main__':
                     # 的单调计数器累计（见 usage-meter-core）。
                     client_ip = client_addr.rsplit(':', 1)[0].strip('[]') if client_addr else ''
                     try:  # 与计量模块同一写法，避免 IPv6 表示不同导致同一设备被算两次
-                        client_ip = str(ipaddress.ip_address(client_ip)) if client_ip else ''
+                        _addr = ipaddress.ip_address(client_ip) if client_ip else None
+                        # 双栈监听时 IPv4 客户端报成 ::ffff:a.b.c.d（2026-11-06 修）：拦截名单与
+                        # Reality 在线 IP 都是纯 IPv4，不还原就永远对不上，同一设备还会被算成两个。
+                        if _addr is not None and _addr.version == 6 and _addr.ipv4_mapped:
+                            _addr = _addr.ipv4_mapped
+                        client_ip = str(_addr) if _addr is not None else ''
                     except ValueError:
                         pass
                 except Exception:
