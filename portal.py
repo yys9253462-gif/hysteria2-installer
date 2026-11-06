@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.32'
+PORTAL_VERSION = '2.33'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -4887,7 +4887,10 @@ def managed_inbound_index(config, tag):
     # 撤销也覆盖不到它。判据必须按协议各自独立。
     if tag == REALITY_INBOUND_TAG:
         for i, item in enumerate(inbounds):
-            if (isinstance(item, dict) and item.get('protocol') == 'vless'
+            # 只认领**没有 tag** 的旧入站（2026-11-06 修）：机主自己加的、带别的 tag 的
+            # Reality 入站旧实现也认成托管的，一次开关就被删掉或改写，用户表还会被写进去。
+            if (isinstance(item, dict) and not item.get('tag')
+                    and item.get('protocol') == 'vless'
                     and (item.get('streamSettings') or {}).get('security') == 'reality'):
                 return i, item
     return -1, None

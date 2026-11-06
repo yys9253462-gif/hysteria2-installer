@@ -2904,6 +2904,9 @@ if [[ "$TARGET" == "core" ]]; then
     fi
     # Type=simple：restart 返回 0 只说明进程起来了，要等几秒确认没有立刻退出（2026-11-03 修）。
     hy2_restarted_ok() {
+        # 先清失败计数（2026-11-06 修）：新版本起不来时会立刻回滚并再重启一次，连同之前的
+        # 重启很容易撞上 StartLimitBurst，旧核心也被拒绝启动，回滚等于没回滚。
+        systemctl reset-failed hysteria-server 2>/dev/null || true
         systemctl restart hysteria-server 2>/dev/null || return 1
         sleep 3
         systemctl is-active --quiet hysteria-server
@@ -3062,6 +3065,7 @@ sys.exit(1 if (data.get('traffic_suspend') or {}).get('suspended') else 0)
 PYSUSPEND
                 then
                     echo "已补写 trafficStats 段，重启 hysteria-server 使其生效"
+                    systemctl reset-failed hysteria-server 2>/dev/null || true
                     systemctl restart hysteria-server 2>/dev/null || true
                 else
                     echo "已补写 trafficStats 段；节点停用或状态不可读，暂不重启 hysteria-server"
@@ -5371,7 +5375,7 @@ menu_amneziawg() {
 status_service() {
     if [[ ! -f "$HY2_BIN" ]]; then
         log_err "Hysteria 2 未安装！"
-        return
+        return 1   # 监控脚本靠退出码判断（2026-11-06 修：旧实现未安装也返回 0）
     fi
     echo -e "\n${CYAN}--- Hysteria 2 运行状态 ---${PLAIN}"
     systemctl status hysteria-server --no-pager || true
@@ -5401,14 +5405,26 @@ start_service() {
     require_installed || return 1
     refuse_if_suspended || return 1
     log_step "启动 Hysteria 2 服务..."
-    systemctl start hysteria-server
+    systemctl start hysteria-server || return 1
+    # 与 restart_service 同理（2026-11-06 修）：Type=simple 下 start 一 fork 就返回 0，
+    # 配置坏 / 端口被占时核心 0.1 秒后就退出，旧实现照报「已启动」。
+    sleep 3
+    if ! systemctl is-active --quiet hysteria-server; then
+        log_err "Hysteria 2 启动后立即退出，最近日志："
+        journalctl -u hysteria-server -n 15 --no-pager >&2 || true
+        return 1
+    fi
     log_info "已启动。"
 }
 
 stop_service() {
     require_installed || return 1
     log_step "停止 Hysteria 2 服务..."
-    systemctl stop hysteria-server
+    # 看结果再报（2026-11-06 修）：stop 超时 / 失败时旧实现照报「已停止」，服务其实还在跑。
+    if ! systemctl stop hysteria-server || systemctl is-active --quiet hysteria-server; then
+        log_err "Hysteria 2 未能停止，请运行 'systemctl status hysteria-server' 查看原因。"
+        return 1
+    fi
     log_info "已停止。"
 }
 
@@ -5450,6 +5466,11 @@ show_teyir_access() {
     require_installed || return 1
     local access="$HY2_DIR/portal-access.json"
     [[ -f "$access" ]] || { log_err "未找到门户凭据文件 ${access}。"; return 1; }
+    # 与 info 同一处理（2026-11-06 修）：文件损坏时给出可操作的提示，而不是一句 jq 解析错误。
+    if ! jq -e 'type == "object"' "$access" >/dev/null 2>&1; then
+        log_err "门户凭据文件 ${access} 已损坏，执行 bash install.sh refresh-page 可重建。"
+        return 1
+    fi
     echo -e "\n${CYAN}------------ 接入 Teyir 控制台 ------------${PLAIN}"
     echo -e "门户地址 url     : ${GREEN}$(jq -r '.url // ""' "$access")${PLAIN}"
     echo -e "门户用户名       : ${GREEN}$(jq -r '.username // ""' "$access")${PLAIN}"
@@ -5883,8 +5904,12 @@ flow_reconfigure() {
 # 只收回本次确实被换掉、且没有托管协议仍在用的端口；nft 规则不动（无法证明归属）。
 close_replaced_ports() {
     local old_udp="$1" old_tcp="$2" in_use
-    in_use="$(jq -r '[.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
-        | map(select(type == "object") | .port | numbers) | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    # gost 代理服务的端口也算在用（2026-11-06 补）：它们同样由门户放行，被换掉的订阅端口
+    # 恰好与某条代理同号时不能把那条代理的放行一起收回。
+    in_use="$(jq -r '([.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
+        | map(select(type == "object") | .port | numbers))
+        + ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | numbers) else [] end)
+        | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
     _close_one() {   # $1=port $2=proto
         is_valid_port "$1" || return 0
         grep -qx "$1" <<<"$in_use" && return 0
@@ -6147,7 +6172,11 @@ if [[ $# -gt 0 ]]; then
             exec "$AWG_CTL_BIN" "$@"
             ;;
         *)
-            menu
+            # 未知 / 拼错的命令报错退出（2026-11-06 修）：旧实现进交互菜单，无终端时读到 EOF
+            # 以 0 退出，cron / 自动化里打错命令也报成功。
+            log_err "未知命令: $1"
+            log_err "可用: install update info refresh-page status restart uninstall awg-install awg-menu awg-status awg-update awg-uninstall awg"
+            exit 2
             ;;
     esac
 else

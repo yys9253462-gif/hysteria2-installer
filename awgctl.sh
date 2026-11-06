@@ -1292,6 +1292,12 @@ cmd_uninstall() {
         log_info "已移除二进制"
     fi
 
+    # 删 meta 之前收回监听端口的放行（2026-11-06 修）：meta 一删就没人知道开过哪个端口，
+    # 旧实现卸载后 ufw / firewalld 里的 UDP 放行永久留着。
+    local old_port
+    old_port="$(meta_get port)"
+    [[ -n "$old_port" ]] && revoke_firewall "$old_port"
+
     rm -rf "$AWG_DIR"
     # 再清掉可能因此变空的厂商级父目录（/etc/amnezia）。
     # 用 rmdir 而不是 rm -rf：只在它确实为空时删除，

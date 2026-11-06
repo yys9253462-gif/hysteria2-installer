@@ -100,4 +100,13 @@ class LiveTests(unittest.TestCase):
   connections=m.parse_events([row('client disconnected',uid='other',addr='198.51.100.9:2',time=1),row('client connected',addr='203.0.113.8:1',time=2)])
   self.assertEqual(m.confirmed_ips(connections,'user',1),['203.0.113.8'])
   self.assertIsNone(m.confirmed_ips(connections,'other',1))
+class MappedIpTests(unittest.TestCase):
+ """双栈监听报来的 ::ffff:a.b.c.d 还原成 IPv4（2026-11-06 修）。"""
+ def test_journal_address_is_unmapped(self):
+  self.assertEqual(m._addr_ip('[::ffff:203.0.113.8]:1234'),'203.0.113.8')
+  self.assertEqual(m._addr_ip('203.0.113.8:1234'),'203.0.113.8')
+  self.assertEqual(m._addr_ip('[2001:db8::1]:1'),'2001:db8::1')
+ def test_core_live_ip_is_unmapped(self):
+  self.assertEqual(m._norm_ip('::ffff:203.0.113.8'),'203.0.113.8')
+
 if __name__=='__main__':unittest.main()
