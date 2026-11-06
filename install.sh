@@ -5466,6 +5466,11 @@ show_teyir_access() {
     require_installed || return 1
     local access="$HY2_DIR/portal-access.json"
     [[ -f "$access" ]] || { log_err "未找到门户凭据文件 ${access}。"; return 1; }
+    # 与 info 同一处理（2026-11-06 修）：文件损坏时给出可操作的提示，而不是一句 jq 解析错误。
+    if ! jq -e 'type == "object"' "$access" >/dev/null 2>&1; then
+        log_err "门户凭据文件 ${access} 已损坏，执行 bash install.sh refresh-page 可重建。"
+        return 1
+    fi
     echo -e "\n${CYAN}------------ 接入 Teyir 控制台 ------------${PLAIN}"
     echo -e "门户地址 url     : ${GREEN}$(jq -r '.url // ""' "$access")${PLAIN}"
     echo -e "门户用户名       : ${GREEN}$(jq -r '.username // ""' "$access")${PLAIN}"

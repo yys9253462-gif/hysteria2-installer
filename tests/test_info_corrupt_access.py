@@ -30,6 +30,17 @@ class InfoCorruptAccessTests(unittest.TestCase):
         self.assertIn('refresh-page', out)
         self.assertIn('RC=1', out)
 
+    def test_teyir_access_menu_also_points_to_refresh(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / 'portal-access.json').write_text('{"url": "https://a')
+            script = '\n'.join(['set -eo pipefail', 'HY2_DIR=%s' % td, 'CYAN= GREEN= YELLOW= PLAIN=',
+                                'log_err() { echo "ERR $*"; }', 'require_installed() { :; }',
+                                fn('show_teyir_access'), 'show_teyir_access || echo "RC=$?"'])
+            out = subprocess.run([BASH, '-c', script], capture_output=True, text=True,
+                                 encoding='utf-8', timeout=20).stdout
+        self.assertIn('refresh-page', out)
+        self.assertIn('RC=1', out)
+
     def test_missing_fields_do_not_print_null(self):
         out = self.info('{"url": "https://a.example/t/"}')
         self.assertNotIn('null', out)
