@@ -2222,13 +2222,20 @@ setup_system_firewall() {
         # 用 list ruleset 的层级结构解析（格式在所有 nft 版本间稳定）：
         # 先记下当前所在的 table（"table <family> <name>"）/ chain，
         # 遇到 "hook input ... policy drop" 就输出 "<family> <table> <chain>"。
-        local nft_input
-        nft_input=$(nft list ruleset 2>/dev/null | awk '
-            /^table /            { tbl=$2" "$3; chain="" }
-            /^[[:space:]]*chain /{ chain=$2; sub(/\{.*/,"",chain); sub(/:$/,"",chain) }
-            /hook input/ && /policy drop/ && chain != "" { print tbl " " chain; exit }
+        # 收集**所有**会拦截的 input 链（2026-11-06 修）：旧实现只取第一条 policy drop 链就 exit，
+        # 双栈主机上 ip6 的 INPUT 链没放行，IPv6 客户端连不上；以「policy accept + 末尾 drop」
+        # 方式写的链（nftables.conf 常见写法）则完全被跳过，一个端口都没放。
+        local nft_inputs nft_input
+        nft_inputs=$(nft list ruleset 2>/dev/null | awk '
+            function flush() { if (cur != "" && (pdrop || tdrop)) print cur; cur=""; pdrop=0; tdrop=0 }
+            /^table /                 { flush(); tbl=$2" "$3 }
+            /^[[:space:]]*chain /     { flush(); chain=$2; sub(/\{.*/,"",chain); sub(/:$/,"",chain); inchain=1; hooked=0 }
+            inchain && /hook input/   { hooked=1; cur=tbl " " chain; if (/policy drop/) pdrop=1 }
+            inchain && hooked && /^[[:space:]]*(drop|reject)([[:space:]]|$)/ { tdrop=1 }
+            END { flush() }
         ')
-        if [[ -n "$nft_input" ]]; then
+        while IFS= read -r nft_input; do
+            [[ -n "$nft_input" ]] || continue
             # nft_input = "<family> <table> <chain>"，正好是 nft 命令需要的三个参数。
             # 用 read 拆分而不是 set --，避免覆盖函数自身的位置参数（$1/$2/$3）。
             local nft_fam nft_tbl nft_chain
@@ -2265,7 +2272,7 @@ setup_system_firewall() {
                 log_info "nftables 规则已齐备（udp ${port} / tcp ${HY2_SUB_PORT}），跳过。"
             fi
             unset -f _nft_has _nft_ensure
-        fi
+        done <<<"$nft_inputs"
     fi
     # 裸 iptables 兜底（既无 ufw/firewalld，也无 nft 的情况）。
     # 注意：这里处理的是 filter/INPUT 的放行，与端口跳跃的 nat/REDIRECT 无关。
