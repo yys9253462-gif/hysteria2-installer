@@ -6147,7 +6147,11 @@ if [[ $# -gt 0 ]]; then
             exec "$AWG_CTL_BIN" "$@"
             ;;
         *)
-            menu
+            # 未知 / 拼错的命令报错退出（2026-11-06 修）：旧实现进交互菜单，无终端时读到 EOF
+            # 以 0 退出，cron / 自动化里打错命令也报成功。
+            log_err "未知命令: $1"
+            log_err "可用: install update info refresh-page status restart uninstall awg-install awg-menu awg-status awg-update awg-uninstall awg"
+            exit 2
             ;;
     esac
 else
