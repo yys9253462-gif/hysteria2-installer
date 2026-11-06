@@ -1215,6 +1215,12 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 409, body)
         self.assertNotIn('pend-a', self.data['users'])
 
+    def test_api_update_of_a_corrupt_user_entry_is_404(self):
+        """用户条目被改成非对象时 users/update 回 404 而不是 500（2026-11-06 修）。"""
+        self.data['users']['brokenx'] = 7
+        status, body = self.invoke_api({'user_id': 'brokenx', 'ip_limit': 2}, endpoint='users/update')
+        self.assertEqual(status, 404, body)
+
     def test_dot_only_user_ids_cannot_be_created(self):
         """'.' / '..' 开户会让分享链接被折叠成别的地址，开户时就拒绝（2026-11-04 修）。"""
         self.ns['user_id_shareable'] = portal.user_id_shareable

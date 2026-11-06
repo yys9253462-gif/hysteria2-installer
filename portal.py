@@ -10402,7 +10402,7 @@ if __name__ == '__main__':
                     password_changed = False
                     with data_lock:
                         u = data.get('users', {}).get(user_id)
-                        if u is None:
+                        if not isinstance(u, dict):   # 条目改坏同样按不存在（2026-11-06 修）
                             conflict = (404, 'User not found')
                         elif 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
                             conflict = (409, 'Password already in use by another user')
@@ -14078,7 +14078,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 authed = self.is_authenticated()
                 with data_lock:
                     u = data.get('users', {}).get(target_uid)
-                    u_copy = dict(u) if u else None
+                    # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
+                    u_copy = dict(u) if isinstance(u, dict) else None
 
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 k_val = query.get('k', [''])[0]
@@ -14236,7 +14237,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                 with data_lock:
                     u = data.get('users', {}).get(target_uid)
-                    u_copy = dict(u) if u else None
+                    # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
+                    u_copy = dict(u) if isinstance(u, dict) else None
                 if not u_copy:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(404, {'ok': False, 'error': 'User not found'})
