@@ -675,15 +675,36 @@ document.querySelectorAll('[data-copy]').forEach(button => {
   button.addEventListener('click', async () => {
     const field = document.getElementById(button.dataset.copy);
     const status = document.getElementById('copy-status');
+    if (!field) return;
+    const val = field.value || field.textContent || '';
+    // http 下没有 navigator.clipboard、或权限被拒时走 execCommand 兜底（2026-11-06 修）：
+    // 旧实现对 <div> 类的字段（API Key、pin）什么都没选中，却提示「已选中，请按 Ctrl+C」。
+    let copied = false;
     try {
-      const val = field.value || field.textContent || '';
-      await navigator.clipboard.writeText(val);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(val);
+        copied = true;
+      }
+    } catch (_) { copied = false; }
+    if (!copied) {
+      const ta = document.createElement('textarea');
+      ta.value = val;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
+      ta.remove();
+    }
+    if (copied) {
       if (status) status.textContent = '已复制到剪贴板 ✓';
       button.textContent = '已复制 ✓';
       setTimeout(() => { button.textContent = button.dataset.orig || '复制'; }, 1800);
-    } catch (_) {
-      if (field.select) { field.focus(); field.select(); }
+    } else if (field.select) {
+      field.focus(); field.select();
       if (status) status.textContent = '已选中，请按 Ctrl+C 复制';
+    } else {
+      if (status) status.textContent = '浏览器不允许自动复制，请手动选中内容后复制';
     }
   });
 });
@@ -3425,15 +3446,35 @@ USER_SCRIPT = r"""
 document.querySelectorAll('[data-copy]').forEach(button => {
   button.addEventListener('click', async () => {
     const field = document.getElementById(button.dataset.copy);
+    if (!field) return;
+    const val = field.value || field.textContent || '';
+    const orig = button.textContent;
+    // 同管理页（2026-11-06 修）：http 下 navigator.clipboard 不存在，旧实现静默失败，
+    // 按钮不变也没有提示。先试 execCommand 兜底，都不行再选中并明确告诉用户按 Ctrl+C。
+    let copied = false;
     try {
-      const val = field.value || field.textContent || '';
-      await navigator.clipboard.writeText(val);
-      const orig = button.textContent;
-      button.textContent = '已复制 ✓';
-      setTimeout(() => { button.textContent = orig; }, 1800);
-    } catch (_) {
-      if (field.select) { field.focus(); field.select(); }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(val);
+        copied = true;
+      }
+    } catch (_) { copied = false; }
+    if (!copied) {
+      const ta = document.createElement('textarea');
+      ta.value = val;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
+      ta.remove();
     }
+    if (copied) {
+      button.textContent = '已复制 ✓';
+    } else {
+      if (field.select) { field.focus(); field.select(); }
+      button.textContent = '已选中，请按 Ctrl+C';
+    }
+    setTimeout(() => { button.textContent = orig; }, copied ? 1800 : 4000);
   });
 });
 """
