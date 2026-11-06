@@ -8053,6 +8053,12 @@ def serve(path):
         raise SystemExit('[portal] portal.json 缺少必需字段: %s。'
                          '请从备份恢复 portal.json 或重新执行安装。'
                          % ', '.join(_missing))
+    # users 必须是对象（2026-11-06 修）：被写成列表 / 字符串时旧实现照常启动，随后十几处
+    # data.get('users', {}).get(...) 全部抛 AttributeError，开户、改密、续费、分享页一律 500。
+    # 与缺字段同样处理：给出明确错误并退出，不拿空表顶替（那会让所有用户静默失效）。
+    if not isinstance(data.get('users'), dict):
+        raise SystemExit('[portal] portal.json 的 users 不是对象（当前是 %s）。'
+                         '请从备份恢复 portal.json 或重新执行安装。' % type(data.get('users')).__name__)
     # 与 prepare() 同一条规则：空串/None 不能当密钥用（.get 的默认值只在
     # 键缺失时生效，手工改坏或截断写入会留下空串）。
     # 🔴 两者都必须是字符串：hmac.new(...encode()) 在数字/None 上抛异常，

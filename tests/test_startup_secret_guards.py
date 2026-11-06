@@ -52,6 +52,14 @@ class StartupSecretGuardTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.run_startup(**{'port': ...})
 
+    def test_non_object_users_fails_loudly(self):
+        """users 不是对象时启动就报错（2026-11-06 修），否则所有用户接口都 500。"""
+        for bad in ([], 'x', 7, None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(SystemExit) as caught:
+                    self.run_startup(users=bad)
+                self.assertIn('users', str(caught.exception))
+
     def test_corrupt_auth_hash_is_reported_not_silently_replaced(self):
         for bad in (..., 0, '', None, 12345):
             with self.subTest(bad=bad):
