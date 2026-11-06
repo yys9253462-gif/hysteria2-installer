@@ -102,5 +102,20 @@ class RealityParamsTests(unittest.TestCase):
                 self.assertEqual(portal.reality_uri_for_user(rcfg, 'bob', '1.2.3.4'), '')
 
 
+class ProtocolHostTests(unittest.TestCase):
+    """VMess / VLESS-Enc / AnyTLS / TUIC 直链的 domain / sni 改坏时不拼出假地址（2026-11-06 修）。"""
+    def test_corrupt_domain_and_sni(self):
+        import base64
+        vm = portal.vmess_uri_for_user({'port': 2087, 'domain': 123, 'sni': ['x'], 'ws_path': '/p'}, 'bob', '1.2.3.4')
+        doc = json.loads(base64.b64decode(vm[len('vmess://'):] + '==').decode())
+        self.assertEqual((doc['add'], doc['sni']), ('1.2.3.4', '1.2.3.4'))
+        self.assertIn('sni=1.2.3.4', portal.vlessenc_uri_for_user(
+            {'port': 2088, 'domain': None, 'sni': 5, 'encryption': 'e'}, 'bob', '1.2.3.4'))
+        self.assertEqual(portal.anytls_uri_for_user({'port': 2096, 'domain': 7, 'secret': 's', 'enabled': True}, 'bob'), '')
+        self.assertEqual(portal.tuic_uri_for_user({'port': 41000, 'domain': ['d'], 'secret': 's', 'enabled': True}, 'bob'), '')
+        self.assertIn('@n.example.com:41000?sni=n.example.com', portal.tuic_uri_for_user(
+            {'port': 41000, 'domain': 'n.example.com', 'sni': 1, 'secret': 's', 'enabled': True}, 'bob'))
+
+
 if __name__ == '__main__':
     unittest.main()

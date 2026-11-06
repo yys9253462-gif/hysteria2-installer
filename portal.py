@@ -4969,6 +4969,21 @@ def vmess_clients(data):
     return clients
 
 
+def protocol_host_sni(cfg, fallback=''):
+    """托管 TLS 协议直链用的 (host, sni)：只认非空字符串，改坏的值退回 fallback（2026-11-06 加）。
+
+    domain / sni 被改成数字、列表或 null 时，旧实现把 123、['d'] 原样拼进 vmess:// /
+    vless:// / anytls:// / tuic://，客户端导入后连一个不存在的地址。
+    """
+    def clean(v):
+        return v.strip() if isinstance(v, str) and v.strip() else ''
+    fb = clean(fallback)
+    host = clean(cfg.get('domain')) if isinstance(cfg, dict) else ''
+    host = host or fb
+    sni = (clean(cfg.get('sni')) if isinstance(cfg, dict) else '') or host
+    return host, sni
+
+
 def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     """拼一条标准 vmess:// 直链（Base64 JSON，v2rayN / NekoBox / Shadowrocket 通用）。
 
@@ -4980,7 +4995,7 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     # 而调用点在用户订阅生成路径上 —— 一条坏配置让整份订阅 500。
     if not isinstance(vcfg, dict):
         return ''
-    host = vcfg.get('domain') or public_ip
+    host, _sni = protocol_host_sni(vcfg, public_ip)
     # 与 VLESS-Reality 同一套端口校验：`"abc"` / True / 70000 会生成一条
     # 客户端无法解析的链接（admin 面板仍显示成功）。
     port = _valid_port(vcfg.get('port'))
@@ -4992,7 +5007,7 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
         'v': '2', 'ps': tag, 'add': str(host), 'port': str(port),
         'id': vmess_uuid_for_user(user_id), 'aid': '0', 'scy': 'auto',
         'net': 'ws', 'type': 'none', 'host': str(host), 'path': path,
-        'tls': 'tls', 'sni': str(vcfg.get('sni') or host), 'alpn': '',
+        'tls': 'tls', 'sni': _sni, 'alpn': '',
         'fp': 'chrome',
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
@@ -5138,12 +5153,12 @@ def anytls_uri_for_user(acfg, user_id, label=None):
     secret = acfg.get('secret')
     if not isinstance(secret, str) or not secret:
         return ''
-    host = acfg.get('domain')
+    host, _sni = protocol_host_sni(acfg)
     port = _valid_port(acfg.get('port'))
     if not (host and port):
         return ''
     pwd = anytls_password_for_user(secret, user_id)
-    params = urlencode({'sni': acfg.get('sni') or host})
+    params = urlencode({'sni': _sni})
     return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
 
 
@@ -5352,12 +5367,12 @@ def tuic_uri_for_user(tcfg, user_id, label=None):
     secret = tcfg.get('secret')
     if not isinstance(secret, str) or not secret:
         return ''
-    host = tcfg.get('domain')
+    host, _sni = protocol_host_sni(tcfg)
     port = _valid_port(tcfg.get('port'))
     if not (host and port):
         return ''
     u, pwd = tuic_credentials_for_user(secret, user_id)
-    params = urlencode({'sni': tcfg.get('sni') or host, 'alpn': 'h3',
+    params = urlencode({'sni': _sni, 'alpn': 'h3',
                         'congestion_control': 'bbr', 'udp_relay_mode': 'native'})
     return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(label or ('TUIC-' + str(user_id)))}"
 
@@ -5732,14 +5747,14 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     """
     if not isinstance(vcfg, dict):
         return ''
-    host = vcfg.get('domain') or public_ip
+    host, _sni = protocol_host_sni(vcfg, public_ip)
     # 同 Reality / VMess：非整数端口会让客户端解析失败。
     port = _valid_port(vcfg.get('port'))
     enc = vcfg.get('encryption', '')
     if not (host and port and enc):
         return ''
     tag = label or ('VLESS-Enc-' + str(user_id))
-    params = {'encryption': enc, 'security': 'tls', 'sni': str(vcfg.get('sni') or host),
+    params = {'encryption': enc, 'security': 'tls', 'sni': _sni,
               'type': 'tcp', 'headerType': 'none', 'fp': 'chrome'}
     return (f"vless://{reality_uuid_for_user(user_id)}@{_host_for_url(host)}:{port}"
             f"?{urlencode(params, safe='')}#{quote(tag)}")
