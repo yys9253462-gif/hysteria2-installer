@@ -73,6 +73,11 @@ class AuthDenyTests(unittest.TestCase):
         with patch.object(time, 'time', return_value=1000):
             return env['handle'](handler)
 
+    def test_ipv4_mapped_client_matches_a_plain_ipv4_deny(self):
+        """双栈监听报来的 ::ffff:a.b.c.d 与纯 IPv4 拦截名单对得上（2026-11-06 修）。"""
+        out = self.auth({'sub_a': {'198.51.100.2': 2000}}, client='[::ffff:198.51.100.2]')
+        self.assertFalse(out['ok'])
+
     def test_denied_ip_is_refused(self):
         out = self.auth({'sub_a': {'198.51.100.2': 2000}})
         self.assertFalse(out.get('ok'), out)

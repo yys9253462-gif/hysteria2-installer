@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.31'
+PORTAL_VERSION = '2.32'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -5031,6 +5031,7 @@ anytls_apply_lock = threading.Lock()
 # 核心安装/卸载串行化：两个并发 install-core 会同时写 xray.new / sing-box.new，
 # 后完成者覆盖前者；与 uninstall 并发时还可能「刚装好就被删」（2026-10-29 加）。
 core_operation_lock = threading.Lock()
+bbr_apply_lock = threading.Lock()
 # AWG 操作串行化：peer-add 是「读 peers.json → 算下一个地址 → 写回」的
 # 读-改-写，两个并发请求会同时读到旧列表 —— 后写者覆盖前者（客户端丢失），
 # 或两名客户端拿到同一个 address（2026-10-29 加）。
@@ -8708,7 +8709,10 @@ def serve(path):
 
     def _remote_root_shas():
         now = time.time()
-        if _ver_cache['data'] is not None and now - _ver_cache['t'] < 300:
+        # 失败也缓存 60 秒（2026-11-06 修）：旧实现失败不记缓存，每次打开页面都再请求两次
+        # GitHub（各 8 秒超时）；限流后一直被限流，GitHub 不通时页面多等 16 秒。
+        ttl = 300 if _ver_cache['data'] is not None else 60
+        if _ver_cache['t'] and now - _ver_cache['t'] < ttl:
             return _ver_cache['data']
         try:
             req = urllib.request.Request(
@@ -8729,6 +8733,8 @@ def serve(path):
                 return shas
         except Exception as exc:
             _log_ignored('version_check', exc)
+        _ver_cache['t'] = now
+        _ver_cache['data'] = None
         return None
 
     def _version_triple(local_path, remote_name):
@@ -9899,7 +9905,12 @@ if __name__ == '__main__':
                     # 的单调计数器累计（见 usage-meter-core）。
                     client_ip = client_addr.rsplit(':', 1)[0].strip('[]') if client_addr else ''
                     try:  # 与计量模块同一写法，避免 IPv6 表示不同导致同一设备被算两次
-                        client_ip = str(ipaddress.ip_address(client_ip)) if client_ip else ''
+                        _addr = ipaddress.ip_address(client_ip) if client_ip else None
+                        # 双栈监听时 IPv4 客户端报成 ::ffff:a.b.c.d（2026-11-06 修）：拦截名单与
+                        # Reality 在线 IP 都是纯 IPv4，不还原就永远对不上，同一设备还会被算成两个。
+                        if _addr is not None and _addr.version == 6 and _addr.ipv4_mapped:
+                            _addr = _addr.ipv4_mapped
+                        client_ip = str(_addr) if _addr is not None else ''
                     except ValueError:
                         pass
                 except Exception:
@@ -12960,6 +12971,16 @@ if __name__ == '__main__':
             """Apply only an available kernel algorithm, verify it, and restore on failure."""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            # 串行化（2026-11-06 修）：两个请求同时改时，后一个把前一个写的文件当成「原状」快照，
+            # 失败回滚就停在前一个的状态，文件与 bbr_target_version 对不上。
+            if not bbr_apply_lock.acquire(blocking=False):
+                return self.reply_json(409, {'ok': False, 'error': '另一个 BBR 设置正在应用，请稍后再试'})
+            try:
+                return self._set_bbr_locked()
+            finally:
+                bbr_apply_lock.release()
+
+        def _set_bbr_locked(self):
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
@@ -14192,6 +14213,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if awg_route in ('awg-conf', 'awg-qr.svg'):
                 if not self.is_authenticated():
                     return self.reply(401, b'Authentication required', www_auth=True)
+                # awg_run 先排 awg_operation_lock：AWG 更新 / 换协议线持锁可达数分钟，
+                # 默认 30 秒死线一到连接就被掐断（2026-11-06 修，与 peer_del 同理）。
+                self._extend_deadline(120)
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 name = (query.get('name', [''])[0] or '').strip()
                 if not VALID_AWG_NAME_RE.match(name):

@@ -675,15 +675,36 @@ document.querySelectorAll('[data-copy]').forEach(button => {
   button.addEventListener('click', async () => {
     const field = document.getElementById(button.dataset.copy);
     const status = document.getElementById('copy-status');
+    if (!field) return;
+    const val = field.value || field.textContent || '';
+    // http 下没有 navigator.clipboard、或权限被拒时走 execCommand 兜底（2026-11-06 修）：
+    // 旧实现对 <div> 类的字段（API Key、pin）什么都没选中，却提示「已选中，请按 Ctrl+C」。
+    let copied = false;
     try {
-      const val = field.value || field.textContent || '';
-      await navigator.clipboard.writeText(val);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(val);
+        copied = true;
+      }
+    } catch (_) { copied = false; }
+    if (!copied) {
+      const ta = document.createElement('textarea');
+      ta.value = val;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
+      ta.remove();
+    }
+    if (copied) {
       if (status) status.textContent = '已复制到剪贴板 ✓';
       button.textContent = '已复制 ✓';
       setTimeout(() => { button.textContent = button.dataset.orig || '复制'; }, 1800);
-    } catch (_) {
-      if (field.select) { field.focus(); field.select(); }
+    } else if (field.select) {
+      field.focus(); field.select();
       if (status) status.textContent = '已选中，请按 Ctrl+C 复制';
+    } else {
+      if (status) status.textContent = '浏览器不允许自动复制，请手动选中内容后复制';
     }
   });
 });
@@ -2691,10 +2712,16 @@ async function waitForCoreUpgrade() {
     let state;
     try {
       const res = await fetch(location.pathname + 'upgrade-status', {credentials:'same-origin'});
+      // 会话过期不再空等 5 分钟（2026-11-06 修）
+      if (res.status === 401 || portalSessionExpired) throw new Error('登录已失效，请刷新页面重新登录后查看更新结果');
       if (!res.ok) continue;
       state = (await res.json()).job || {};
-    } catch (_) { continue; }
-    if (state.state === 'completed') return;
+    } catch (e) {
+      if (e && String(e.message || '').startsWith('登录已失效')) throw e;
+      continue;
+    }
+    // 把任务自己的结果交给调用方：「未替换现有补丁」「停用中已就位」等不能被「已接受」盖掉
+    if (state.state === 'completed') return state;
     if (state.state === 'failed' || state.state === 'interrupted') throw new Error(state.error || '核心更新失败');
   }
   throw new Error('更新任务尚未确认完成，请刷新查看版本状态');
@@ -2719,7 +2746,8 @@ async function doUpgrade(target) {
     if (json.ok) {
       if (target === 'core' && json.applying) {
         if (updateStatusMsg) updateStatusMsg.textContent = '更新任务运行中，正在等待验证实际结果...';
-        await waitForCoreUpgrade();
+        const job = await waitForCoreUpgrade();
+        if (job && job.message) json.message = job.message;
       }
       const msg = json.message || '升级已触发';
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
@@ -3045,6 +3073,13 @@ loadProxyServices();
 function closeUserModal() {
   if (uModal) uModal.classList.remove('show');
 }
+// Esc 关闭专属连接 / 代理详情弹窗（2026-11-06 加）：确认框已支持 Esc，这两个此前只能点 × 或遮罩。
+// 确认框开着时它自己的 Esc 处理优先，这里不抢。
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape' || document.querySelector('#custom-confirm-modal.show')) return;
+  if (uModal && uModal.classList.contains('show')) closeUserModal();
+  if (typeof proxyModal !== 'undefined' && proxyModal && proxyModal.classList.contains('show')) closeProxyModal();
+});
 if (uModalClose) uModalClose.addEventListener('click', closeUserModal);
 if (uModal) {
   uModal.addEventListener('click', (e) => {
@@ -3425,15 +3460,35 @@ USER_SCRIPT = r"""
 document.querySelectorAll('[data-copy]').forEach(button => {
   button.addEventListener('click', async () => {
     const field = document.getElementById(button.dataset.copy);
+    if (!field) return;
+    const val = field.value || field.textContent || '';
+    const orig = button.textContent;
+    // 同管理页（2026-11-06 修）：http 下 navigator.clipboard 不存在，旧实现静默失败，
+    // 按钮不变也没有提示。先试 execCommand 兜底，都不行再选中并明确告诉用户按 Ctrl+C。
+    let copied = false;
     try {
-      const val = field.value || field.textContent || '';
-      await navigator.clipboard.writeText(val);
-      const orig = button.textContent;
-      button.textContent = '已复制 ✓';
-      setTimeout(() => { button.textContent = orig; }, 1800);
-    } catch (_) {
-      if (field.select) { field.focus(); field.select(); }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(val);
+        copied = true;
+      }
+    } catch (_) { copied = false; }
+    if (!copied) {
+      const ta = document.createElement('textarea');
+      ta.value = val;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
+      ta.remove();
     }
+    if (copied) {
+      button.textContent = '已复制 ✓';
+    } else {
+      if (field.select) { field.focus(); field.select(); }
+      button.textContent = '已选中，请按 Ctrl+C';
+    }
+    setTimeout(() => { button.textContent = orig; }, copied ? 1800 : 4000);
   });
 });
 """

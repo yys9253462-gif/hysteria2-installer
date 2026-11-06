@@ -116,6 +116,7 @@ class AwgConfDownloadPeersTests(unittest.TestCase):
         sent = {}
         handler = SimpleNamespace(
             path='/tok/awg-conf?name=phone', is_authenticated=lambda: True,
+            _extend_deadline=lambda *a, **k: True,
             reply=lambda status, body, *a, **kw: sent.update(status=status, body=body),
             send_response=lambda status: sent.update(status=status),
             send_header=lambda *a: None, end_headers=lambda: None,

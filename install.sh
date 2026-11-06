@@ -1067,7 +1067,12 @@ setup_certificates() {
         CERT_FILE="$HY2_CUSTOM_CERT_FILE"
         KEY_FILE="$HY2_CUSTOM_KEY_FILE"
         SERVER_NAME="${HY2_DOMAIN:-$PUBLIC_IP}"
-        IS_INSECURE="${HY2_CUSTOM_INSECURE:-false}"
+        # 归一成 JSON 布尔（2026-11-06 修）：它原样进 jq --argjson，yes / True 让 jq 失败、
+        # client_meta.json 被截成空文件；1 写进去后自愈逻辑按字符串比较，每次都判漂移。
+        case "${HY2_CUSTOM_INSECURE:-false}" in
+            1|true|TRUE|True|yes|YES|Yes) IS_INSECURE="true" ;;
+            *) IS_INSECURE="false" ;;
+        esac
         log_info "已复用迁移证书，未改动DNS。"
         return
     fi
@@ -2762,15 +2767,6 @@ acl:
     - warp_socks(suffix:generativelanguage.googleapis.com)
     - warp_socks(suffix:alkalimakersuite-pa.clients6.google.com)
     - direct_ipv4(all)
-    - warp_socks(chatgpt.com)
-    - warp_socks(oaistatic.com)
-    - warp_socks(oaiusercontent.com)
-    - warp_socks(ai.com)
-    - warp_socks(gemini.google.com)
-    - warp_socks(aistudio.google.com)
-    - warp_socks(generativelanguage.googleapis.com)
-    - warp_socks(anthropic.com)
-    - warp_socks(claude.ai)
 EOF
 fi
 
@@ -2795,7 +2791,13 @@ fi
 
 # acl 段无实际变化时不重启，避免无谓掐断所有在线用户
 if [[ "${BEFORE_ACL:-}" != "$(sed -n '/^acl:/,$p' "$CONFIG")" ]]; then
-    systemctl restart hysteria-server 2>/dev/null || true
+    # 流量超额停用期间只改配置不拉起服务（2026-11-04 修），否则手动跑一次本脚本就绕过限额；
+    # 重启前清失败计数，连续切换几次不会撞上 StartLimitBurst 把服务锁死。
+    if [[ "$(jq -r '.traffic_suspend.suspended // false' /etc/hysteria/portal.json 2>/dev/null)" != "true" ]]; then
+        systemctl stop hysteria-server 2>/dev/null || true
+        systemctl reset-failed hysteria-server 2>/dev/null || true
+        systemctl start hysteria-server 2>/dev/null || true
+    fi
 fi
 EOTW
     chmod +x "$HY2_DIR/toggle_warp.sh"
@@ -3081,8 +3083,11 @@ METEREOF2
             if [[ -n "$_cert" && "$_cert" != /* && ! -f "$_cert" ]]; then
                 [[ -f "$HY2_DIR/$_cert" ]] && _cert="$HY2_DIR/$_cert"
             fi
-            [[ -n "$_cert" && -f "$_cert" ]] || _cert="$HY2_DIR/cert/server.crt"
-            if [[ -f "$_cert" ]]; then
+            # 内置 ACME 不退回旧自签证书（同 sync_cert_meta，2026-11-06 修）
+            if [[ -z "$_cert" || ! -f "$_cert" ]]; then
+                grep -q '^acme:' "$HY2_DIR/config.yaml" && _cert="" || _cert="$HY2_DIR/cert/server.crt"
+            fi
+            if [[ -n "$_cert" && -f "$_cert" ]]; then
                 _subj="$(openssl x509 -in "$_cert" -noout -subject 2>/dev/null | sed 's/^subject=//' | sed 's/ *$//')"
                 _iss="$(openssl x509 -in "$_cert" -noout -issuer 2>/dev/null | sed 's/^issuer=//' | sed 's/ *$//')"
                 _cn="$(openssl x509 -in "$_cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -1 | sed 's/ *$//')"
@@ -3962,7 +3967,13 @@ sync_cert_meta() {
     if [[ -n "$cert_file" && "$cert_file" != /* && ! -f "$cert_file" ]]; then
         [[ -f "${HY2_DIR}/${cert_file}" ]] && cert_file="${HY2_DIR}/${cert_file}"
     fi
-    [[ -n "$cert_file" && -f "$cert_file" ]] || cert_file="${HY2_CERT_DIR}/server.crt"
+    if [[ -z "$cert_file" || ! -f "$cert_file" ]]; then
+        # 内置 ACME（没有 tls.cert）不能退回 server.crt（2026-11-06 修）：自签改 ACME 后那张
+        # 旧自签证书还在，拿它「自愈」会把 meta 改回 self_signed / www.bing.com / insecure。
+        # ACME 证书在 hysteria 的缓存里，交给 portal.py 的 sync_cert_trust 处理。
+        grep -q '^acme:' "$HY2_CONFIG" && return 0
+        cert_file="${HY2_CERT_DIR}/server.crt"
+    fi
     [[ -f "$cert_file" ]] || return 0
 
     local cn sans subject issuer self_signed="false" acme_block="false"
