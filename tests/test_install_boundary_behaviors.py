@@ -351,6 +351,11 @@ jq(){
     def test_info_with_no_saved_range_has_no_hopping_hint(self):
         self.assertNotIn("UDP 20000-40000", self.probe_hint(None))
 
+    def test_main_listen_port_is_always_listed(self):
+        """主监听 UDP 端口必须列出：直连走它，不走跳跃区间（2026-11-06 修）。"""
+        self.assertIn("UDP 14617", self.probe_hint("20000-40000"))
+        self.assertIn("UDP 14617", self.probe_hint(""))
+
 
 @unittest.skipUnless(BASH, "requires Bash")
 class TestGostInstallRollback(unittest.TestCase):

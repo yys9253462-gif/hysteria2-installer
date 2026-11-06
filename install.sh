@@ -3468,6 +3468,16 @@ show_client_configs() {
     if [[ ! -v HOP_PORT_RANGE ]]; then
         _hop_range_display="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
     fi
+    # 主监听端口必须单独列出（2026-11-06 修）：订阅里的 `port:` 直连它、不走跳跃区间，
+    # 而它通常在 20000-40000 之外。旧提示只列跳跃区间，照着放行的用户直连全部超时；
+    # 没有 iptables（跳跃关闭）时更是一个 UDP 端口都没列。
+    local _listen_display="${LISTEN_PORT:-}"
+    if [[ -z "$_listen_display" && -f "$HY2_META_FILE" ]]; then
+        _listen_display="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_listen_display" ]]; then
+        echo -e "    ${GREEN}UDP ${_listen_display}${PLAIN}        Hysteria 2 主监听端口（客户端直连它）"
+    fi
     if [[ -n "$_hop_range_display" ]]; then
         echo -e "    ${GREEN}UDP ${_hop_range_display}${PLAIN}   节点连接用的端口跳跃区间（要放行整个区间，不是单个端口）"
     fi
