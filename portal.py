@@ -15448,6 +15448,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
 if __name__ == '__main__':
     _cmd = sys.argv[1] if len(sys.argv) > 1 else ''
+    # 缺参数时报用法并以 2 退出（2026-11-12 修）：旧实现直接取 sys.argv[n]，抛 IndexError
+    # 堆栈，安装脚本日志或管理员手敲时看不出少了哪个参数。
+    _usage = {'prepare': (2, '<client_meta.json> <门户端口> [API Key]'),
+              'refresh': (1, '<client_meta.json>'),
+              'adopt': (2, '<client_meta.json> <门户端口> [API Key]'),
+              'selfheal': (1, '<client_meta.json> [config.yaml]'),
+              'serve': (1, '<portal.json>')}
+    if _cmd in _usage and len(sys.argv) - 2 < _usage[_cmd][0]:
+        print('[portal] 用法: python3 portal.py %s %s' % (_cmd, _usage[_cmd][1]), file=sys.stderr)
+        sys.exit(2)
     if _cmd == 'prepare':
         api_key = sys.argv[4] if len(sys.argv) > 4 else None
         prepare(sys.argv[2], sys.argv[3], api_key)
@@ -15471,8 +15481,7 @@ if __name__ == '__main__':
         #    于是「自愈」实际**启动了第二个门户进程**（或因参数不对报
         #    无关的 KeyError），而调用方看到的是「命令成功」——
         #    又是一次静默降级。这里必须显式报错并以非 0 退出。
-        print('[portal] 未知子命令: %r（可用: prepare / refresh / selfheal / serve）'
-              % _cmd, file=sys.stderr)
+        print('[portal] 未知子命令: %r（可用: %s）' % (_cmd, ' / '.join(_usage)), file=sys.stderr)
         sys.exit(2)
 
 
