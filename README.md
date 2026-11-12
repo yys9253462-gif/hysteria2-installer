@@ -159,7 +159,7 @@ PANEL_ADMIN_TOKEN=<JWT> python3 panel-join.py --register --panel https://你的�
 ## 🔒 安全说明
 
 - 门户只监听 `127.0.0.1`，由 Hysteria 在订阅端口上做 HTTPS 转发；门户同时是 Hysteria 的鉴权后端，门户停了用户就连不上。
-- 页面路径与登录密码都是 256-bit 随机值；会话 cookie 为 `HttpOnly`、`SameSite=Strict`、`Secure`。
+- 页面路径与登录密码都是 256-bit 随机值（凭据文件丢失后自动重建的密码也一样）；会话 cookie 为 `HttpOnly`、`SameSite=Strict`，经 HTTPS 访问时带 `Secure`（运维用 `ssh -L` 以 HTTP 直连门户时不带，否则浏览器会丢弃它、登录后反复跳回登录页）。
 - 网页、API、`/auth`、登录各自限流；代理用户无法访问节点本机、内网与云元数据地址。
 - 下载校验的摘要与产物来自同一上游发布，挡得住镜像和中间人篡改，挡不住上游账号本身被攻破。
 - GitHub 匿名 API 每 IP 每小时 60 次；同一台机器上其它程序也在调用时，面板的版本检测与更新会失败。可把一个**无任何权限的** GitHub token 写入 `/etc/hysteria/github-token`（权限 0600），面板与安装脚本只在访问 `api.github.com` 时带上它，额度提高到每小时 5000 次。

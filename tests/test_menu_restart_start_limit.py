@@ -40,7 +40,8 @@ class MenuRestartStartLimitTests(unittest.TestCase):
         script = '\n'.join([
             'log_step() { :; }', 'log_info() { echo "INFO $*"; }', 'log_err() { echo "ERR $*"; }',
             'require_installed() { :; }', 'refuse_if_suspended() { :; }', 'sleep() { :; }',
-            'journalctl() { :; }', LIMITED_SYSTEMCTL, fn(name), '%s; echo "RC=$?"' % name])
+            'journalctl() { :; }', 'warn_if_portal_down() { :; }', LIMITED_SYSTEMCTL, fn(name),
+            '%s; echo "RC=$?"' % name])
         return subprocess.run([BASH, '-c', script], capture_output=True, text=True,
                               encoding='utf-8', timeout=20).stdout
 

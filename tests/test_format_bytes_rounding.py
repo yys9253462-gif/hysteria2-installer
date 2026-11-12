@@ -21,13 +21,26 @@ class FormatBytesRoundingTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('node'), 'requires node')
     def test_modal_js(self):
-        s = portal.SCRIPT
-        i = s.index('const fmtBytes = v => {')
-        js = s[i:s.index('};', i) + 2] + '\nfor (const v of [%s]) console.log(fmtBytes(v));' % ','.join(
-            str(v) for v in (1024 ** 2 - 1, 1024 ** 3 - 1, 1024 ** 4 - 1))
-        out = subprocess.run(['node', '-e', js], capture_output=True, text=True, timeout=20).stdout.split('\n')
-        self.assertEqual(out[:3], ['1.00 MB', '1.00 GB', '1.00 TB'])
+        """用户弹窗的 fmtBytes 与后端逐字一致（2026-11-13 起 KB 也是一位小数，同用户表）。"""
+        values = [1023, 1536, 1024 ** 2 - 1, 1024 ** 3 - 1, 1024 ** 4 - 1, 3 * 1024 ** 4]
+        js = modal_formatter(portal.SCRIPT) + 'console.log(JSON.stringify(%s.map(fmtBytes)));' % values
+        out = subprocess.run(['node', '-e', js], capture_output=True, text=True, timeout=20)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), [portal.format_bytes(v) for v in values])
 
+
+
+def modal_formatter(src):
+    """用户弹窗里的 fmtBytes（连同公用的 fmtUnits，旧版本没有它；旧写法是多行箭头函数）。"""
+    start = src.index('const fmtBytes = v =>')
+    end = src.index('\n', start)
+    if src[end - 1] == '{':
+        end = src.index('\n      };', start) + len('\n      };')
+    helper = ''
+    if 'function fmtUnits(' in src:
+        h = src.index('function fmtUnits(')
+        helper = src[h:src.index('\n}\n', h) + 3]
+    return helper + src[start:end] + '\n'
 
 
 def live_formatters(src):

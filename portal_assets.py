@@ -526,8 +526,13 @@ function showConfirm(options = {}) {
   }
   okBtn.textContent = options.confirmText || '确定执行';
   okBtn.className = 'confirm-btn ' + (options.isDanger ? 'danger' : 'primary');
+  // 焦点移进弹窗、关闭后还回去（2026-11-13 修）：旧实现焦点留在背后触发它的按钮上，键盘用户
+  // 要按好几下 Tab 才摸到「确定 / 取消」，Tab 还会跑到弹窗背后的页面。危险操作默认停在「取消」，
+  // 回车不会误删；普通确认停在「确定」。
+  const previousFocus = document.activeElement;
   modal.classList.add('show');
   confirmOpen = true;
+  (options.isDanger ? cancelBtn : okBtn).focus();
 
   return new Promise((resolve) => {
     function cleanup(result) {
@@ -537,12 +542,19 @@ function showConfirm(options = {}) {
       document.removeEventListener('keydown', onKey);
       modal.removeEventListener('click', onBackdrop);
       confirmOpen = false;
+      if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
       resolve(result);
     }
     function onOk() { cleanup(true); }
     function onCancel() { cleanup(false); }
-    // Esc 关闭：纯键盘用户此前只能用 Tab 逐个跳到按钮。
-    function onKey(e) { if (e.key === 'Escape') cleanup(false); }
+    // Esc 关闭；Tab 只在两个按钮间切换。
+    function onKey(e) {
+      if (e.key === 'Escape') { cleanup(false); return; }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        (document.activeElement === okBtn ? cancelBtn : okBtn).focus();
+      }
+    }
     // 点背板关闭：与用户弹窗行为一致（此前确认弹窗只能点按钮）。
     function onBackdrop(e) { if (e.target === modal) cleanup(false); }
     okBtn.addEventListener('click', onOk);
@@ -3017,8 +3029,24 @@ const btnCopyPFmt = document.getElementById('btn-copy-pfmt');
 
 let curProxyServerHost = location.hostname;
 
+// 弹窗打开时把焦点放到关闭按钮、关闭后还回去（2026-11-13 修，同确认框）：旧实现焦点留在背后的
+// 触发按钮上，读屏与纯键盘用户不知道弹窗已经打开，关掉后焦点也丢了。
+let modalReturnFocus = null;
+function focusModal(closeBtn) {
+  if (modalReturnFocus === null) modalReturnFocus = document.activeElement || null;
+  if (closeBtn && typeof closeBtn.focus === 'function') closeBtn.focus();
+}
+function restoreModalFocus() {
+  const target = modalReturnFocus;
+  modalReturnFocus = null;
+  if (target && typeof target.focus === 'function') target.focus();
+}
+
 function closeProxyModal() {
-  if (proxyModal) proxyModal.classList.remove('show');
+  if (proxyModal && proxyModal.classList.contains('show')) {
+    proxyModal.classList.remove('show');
+    restoreModalFocus();
+  }
 }
 if (pmClose) pmClose.addEventListener('click', closeProxyModal);
 if (proxyModal) {
@@ -3072,6 +3100,7 @@ function showProxyResult(data) {
   });
 
   proxyModal.classList.add('show');
+  focusModal(pmClose);
 }
 
 // 绑定秒级一键生成按钮
@@ -3238,7 +3267,10 @@ async function loadProxyServices() {
 loadProxyServices();
 
 function closeUserModal() {
-  if (uModal) uModal.classList.remove('show');
+  if (uModal && uModal.classList.contains('show')) {
+    uModal.classList.remove('show');
+    restoreModalFocus();
+  }
 }
 // Esc 关闭专属连接 / 代理详情弹窗（2026-11-06 加）：确认框已支持 Esc，这两个此前只能点 × 或遮罩。
 // 确认框开着时它自己的 Esc 处理优先，这里不抢。
@@ -3278,6 +3310,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
     uModalSub.textContent = '正在获取专属配置与独立连接页...';
     uModalBody.innerHTML = '<div style="text-align:center;padding:36px;color:var(--muted)">加载专属数据中...</div>';
     uModal.classList.add('show');
+    focusModal(uModalClose);
     
     try {
       const res = await fetch('/' + token + '/user-config?user_id=' + encodeURIComponent(uid), { credentials: 'same-origin' });
@@ -3304,19 +3337,15 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         .map((x, i) => `
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">${obEsc(x.label)} 直链（UDP 不通时用）:</div>
-              <textarea id="um-extra-${i}" class="link" style="height:52px;font-size:11px" readonly>${obEsc(x.uri)}</textarea>
+              <textarea id="um-extra-${i}" class="link" aria-label="${obEsc(x.label)} 直链" style="height:52px;font-size:11px" readonly>${obEsc(x.uri)}</textarea>
               <div style="margin-top:6px"><button class="button" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-extra-${i}">复制 ${obEsc(x.label)} 直链</button></div>
             </div>`).join('');
       
       // 统一用 fmtBytes：旧写法把已用强制成 MB、配额强制成 GB，
       // 小配额（如 500 MB）会显示成「0.5 GB」，大用量则是「1536.0 MB」。
-      const fmtBytes = v => {
-        let n = Number(v || 0), i = 0;
-        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        // 取整后到 1024 也要进位（2026-11-04 修，同后端 format_bytes）：否则显示「1024.00 KB」
-        while ((n >= 1024 || (i && Number(n.toFixed(2)) >= 1024)) && i < units.length - 1) { n /= 1024; i++; }
-        return (i ? n.toFixed(2) : n.toFixed(0)) + ' ' + units[i];
-      };
+      // 与用户表、后端 format_bytes 同一写法（2026-11-13 修）：此前 KB 显示两位小数，
+      // 同一个用量在表格里是「1.5 KB」、弹窗里是「1.50 KB」。
+      const fmtBytes = v => fmtUnits(v, ['B', 'KB', 'MB', 'GB', 'TB'], [0, 1, 2, 2, 2]);
       let trafficText = (json.traffic_limit > 0)
         ? (fmtBytes(json.traffic_used) + ' / ' + fmtBytes(json.traffic_limit))
         : (fmtBytes(json.traffic_used) + ' (不限)');
@@ -3338,7 +3367,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div style="background:#eaf5ef;border:1px solid #c3ddd5;border-radius:12px;padding:12px 14px">
           <div style="font-size:12px;font-weight:700;color:var(--accent);margin-bottom:6px">🌐 专属独立连接页面 (可直接发给客户):</div>
           <div class="input-with-action">
-            <input type="text" id="um-share-url" value="${obEsc(shareUrl)}" readonly style="font-size:12px;height:38px">
+            <input type="text" id="um-share-url" aria-label="专属连接页面链接" value="${obEsc(shareUrl)}" readonly style="font-size:12px;height:38px">
             <button class="button primary" style="padding:0 12px;height:38px;font-size:12px" type="button" data-modal-copy="um-share-url">复制页面链接</button>
             <a class="button" style="padding:0 12px;height:38px;font-size:12px" href="${obEsc(shareUrl)}" target="_blank">打开页面 ↗</a>
           </div>
@@ -3347,13 +3376,13 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div class="user-connect-grid">
           <div style="text-align:center;background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px">
             <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:8px">专属二维码扫码导入</div>
-            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${json.qr_svg || '<p style="color:var(--muted)">二维码生成中...</p>'}</div>
+            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${json.qr_svg || '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
             <div style="font-size:11px;color:var(--muted);margin-top:8px">Shadowrocket / v2rayNG / Nekobox</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:12px">
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">专属节点直链 (URI):</div>
-              <textarea id="um-uri" class="link" style="height:65px;font-size:11px" readonly>${obEsc(json.uri)}</textarea>
+              <textarea id="um-uri" class="link" aria-label="Hy2 节点直链" style="height:65px;font-size:11px" readonly>${obEsc(json.uri)}</textarea>
               <div style="margin-top:6px;display:flex;gap:8px">
                 <button class="button primary" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-uri">复制直链</button>
               </div>
@@ -3362,26 +3391,26 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Clash / Mihomo 专属订阅链接:</div>
               <div class="input-with-action">
-                <input type="text" id="um-clash-sub" value="${location.origin}/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" readonly style="font-size:11px;height:36px">
+                <input type="text" id="um-clash-sub" aria-label="Clash 订阅链接" value="${location.origin}/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" readonly style="font-size:11px;height:36px">
                 <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-clash-sub">复制订阅</button>
                 <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" download="clash-${uid}.yaml">下载 ↓</a>
               </div>
               <details style="margin-top:6px">
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
-                <textarea id="um-clash" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.clash)}</textarea>
+                <textarea id="um-clash" class="link" aria-label="Clash 配置文本" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.clash)}</textarea>
                 <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-clash">复制文本</button></div>
               </details>
             </div>
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Sing-box 专属订阅链接:</div>
               <div class="input-with-action">
-                <input type="text" id="um-sing-sub" value="${obEsc(location.origin + singSubPath)}" readonly style="font-size:11px;height:36px">
+                <input type="text" id="um-sing-sub" aria-label="Sing-box 订阅链接" value="${obEsc(location.origin + singSubPath)}" readonly style="font-size:11px;height:36px">
                 <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-sing-sub">复制订阅</button>
                 <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="${obEsc(singSubPath)}" download="sing-box-${obEsc(uid)}.json">下载 ↓</a>
               </div>
               <details style="margin-top:6px">
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
-                <textarea id="um-sing" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.sing_box)}</textarea>
+                <textarea id="um-sing" class="link" aria-label="Sing-box 配置文本" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.sing_box)}</textarea>
                 <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-sing">复制文本</button></div>
               </details>
             </div>

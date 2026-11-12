@@ -285,6 +285,25 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertTrue(extend.called, 'AWG 配置下载没有延长死线')
         self.assertGreaterEqual(extend.call_args[0][0], 60)
 
+    def test_admin_qr_falls_back_to_a_readable_image(self):
+        """生成不出二维码（qrencode 是可选依赖）时给一张说明图，而不是空内容（2026-11-13 修）。"""
+        self.data.setdefault('token', 'test-token')
+        self.ns['regenerate_page'] = lambda: None
+        self.handler.path = '/test-token/qr.svg'
+        self.handler.headers = {}
+        self.handler.is_authenticated = lambda: True
+        self.handler.check_rate_limit = lambda **k: True
+        replies = []
+        self.handler.reply = lambda status, body=b'', *a, **k: replies.append((status, body))
+        for stored, check in (('', lambda body: '二维码生成失败' in body.decode('utf-8')),
+                              ('<svg>REAL</svg>', lambda body: body == b'<svg>REAL</svg>')):
+            with self.subTest(stored=stored):
+                self.data['qr'] = stored
+                replies.clear()
+                extract_method('do_GET', self.ns)(self.handler)
+                self.assertEqual(replies[-1][0], 200)
+                self.assertTrue(check(replies[-1][1]), replies[-1][1][:120])
+
     def test_concurrent_bbr_request_is_refused(self):
         """BBR 设置串行化：已有一个在应用时第二个回 409（2026-11-06 修）。"""
         lock = self.ns['bbr_apply_lock']
@@ -2409,6 +2428,13 @@ class WebWorkflowTests(unittest.TestCase):
             vmess_uri_for_user=broken)
         links = extract_method('_user_extra_links', self.ns)(self.handler, 'alice', '1.2.3.4')
         self.assertEqual(links, [('Reality', 'vless://alice@1.2.3.4#Reality-alice')])
+        # 分享页要二维码（2026-11-13 加），每张只等几秒，几个协议加起来也不会把分享页拖住。
+        timeouts = []
+        self.ns['qr_svg_for'] = lambda link, timeout=20: timeouts.append(timeout) or '<svg>%s</svg>' % link
+        links = extract_method('_user_extra_links', self.ns)(self.handler, 'alice', '1.2.3.4', with_qr=True)
+        self.assertEqual(links, [('Reality', 'vless://alice@1.2.3.4#Reality-alice',
+                                  '<svg>vless://alice@1.2.3.4#Reality-alice</svg>')])
+        self.assertTrue(timeouts and max(timeouts) <= 5, timeouts)
 
 
     def test_awg_peer_delete_extends_its_deadline(self):

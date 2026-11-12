@@ -24,8 +24,15 @@ PAYLOAD = {'ok': True, 'uri': 'hysteria2://x@h:1/', 'clash': 'proxies: []', 'sin
 def modal_block(src):
     start = src.index('let userModalSeq = 0;')
     loop = src.index("document.querySelectorAll('.btn-user-connect')", start)
+    helpers = ''
+    if 'let modalReturnFocus = null;' in src:   # 弹窗焦点辅助函数（2026-11-13 加，旧版本没有）
+        h = src.index('let modalReturnFocus = null;')
+        helpers = src[h:src.index('\n}\n', src.index('function restoreModalFocus(', h)) + 3]
+    if 'function fmtUnits(' in src:             # 弹窗的 fmtBytes 用它（2026-11-13 起）
+        h = src.index('function fmtUnits(')
+        helpers += src[h:src.index('\n}\n', h) + 3]
     return src[src.index('function obEsc('):src.index('\n}\n', src.index('function obEsc(')) + 3] \
-        + src[start:src.index('\n});\n', loop) + 5]
+        + helpers + src[start:src.index('\n});\n', loop) + 5]
 
 
 @unittest.skipUnless(NODE, 'requires node')
@@ -33,7 +40,7 @@ class UserModalSingBoxTest(unittest.TestCase):
     def open_modal(self):
         js = r"""
 const mk = () => ({textContent: '', innerHTML: '', classList: {add() {}, remove() {}}, querySelectorAll: () => []});
-const uModal = mk(), uModalBody = mk(), uModalTitle = mk(), uModalSub = mk();
+const uModal = mk(), uModalBody = mk(), uModalTitle = mk(), uModalSub = mk(), uModalClose = mk();
 const location = {origin: 'https://h.example.com:8443'};
 const btn = {dataset: {uid: 'alice', token: 'tok', key: 'kkk'}, addEventListener(type, fn) { this.onclick = fn; }};
 const document = {querySelectorAll: sel => (sel === '.btn-user-connect' ? [btn] : [])};

@@ -141,6 +141,13 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
 # 网页新建用户时数值超范围的提示，上下限与 REST API 的 users/create 相同。
 QUOTA_RANGE_ERROR = '有效期须为 1-36500 天，同时在线网络数 0-1000，流量限额 0-1000000 GB'.encode('utf-8')
+# 二维码生成不出来时（qrencode 是可选依赖，RHEL 系未开 EPEL 时装不上）各页面统一的说明。
+QR_UNAVAILABLE_TEXT = '二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入'
+QR_UNAVAILABLE_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="260" height="260" viewBox="0 0 260 260">'
+                      '<rect width="260" height="260" rx="12" fill="#f4f8f7"/>'
+                      '<text x="130" y="118" text-anchor="middle" font-size="16" fill="#5f5e5a">二维码生成失败</text>'
+                      '<text x="130" y="146" text-anchor="middle" font-size="12" fill="#5f5e5a">请复制节点直链导入</text>'
+                      '</svg>')
 
 
 def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
@@ -205,7 +212,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.42'
+PORTAL_VERSION = '2.43'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2371,8 +2378,10 @@ def portal_access_payload(url, username, password, api_key):
 
 def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token="", session_secret="",
               username="", password=""):
-    def field(identifier, value, kind="link"):
-        return f'<textarea id="{identifier}" class="{kind}" aria-label="{identifier}" readonly spellcheck="false">{html.escape(value)}</textarea>'
+    def field(identifier, value, kind="link", label=None):
+        # 读屏念的是 aria-label（2026-11-13 修）：旧实现直接用元素 id，念出来是「hy2-link」这类代码名。
+        return (f'<textarea id="{identifier}" class="{kind}" aria-label="{html.escape(label or identifier)}" '
+                f'readonly spellcheck="false">{html.escape(value)}</textarea>')
     def copy(identifier):
         return f'<button class="button primary" type="button" data-copy="{identifier}" data-orig="复制">复制</button>'
     
@@ -2476,13 +2485,13 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     users_table_html = "".join(user_rows) or '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:24px">暂无多用户数据</td></tr>'
     obfs_badge = "Salamander" if obfs_pw else "QUIC"
-    field_hy2 = field("hy2-link", uri)
+    field_hy2 = field("hy2-link", uri, label="Hy2 节点直链")
     copy_hy2 = copy("hy2-link")
-    field_sub = field("clash-subscription", subscription)
+    field_sub = field("clash-subscription", subscription, label="Clash 订阅链接")
     copy_sub = copy("clash-subscription")
-    field_clash_cfg = field("clash-config", clash, "config")
+    field_clash_cfg = field("clash-config", clash, "config", label="Clash 完整配置")
     copy_clash_cfg = copy("clash-config")
-    field_sing_cfg = field("sing-config", sing, "config")
+    field_sing_cfg = field("sing-config", sing, "config", label="Sing-box 出站配置")
     copy_sing_cfg = copy("sing-config")
 
     # 接入 TEYIR 控制台（hy2-ops-console）用的四个字段。
@@ -2500,7 +2509,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         portal_access_payload(access_url, username, password, api_key or ""),
         ensure_ascii=False)
     field_access_json = (
-        f'<textarea id="teyir-access-json" class="config" aria-label="teyir-access-json" '
+        f'<textarea id="teyir-access-json" class="config" aria-label="TEYIR 接入凭据（JSON）" '
         f'readonly spellcheck="false" style="height:92px">{html.escape(access_json)}</textarea>')
     copy_access_json = copy("teyir-access-json")
 
@@ -2783,7 +2792,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
 
       <form class="warp-add-form" id="form-add-warp-rule">
-        <input class="warp-domain-input" id="input-warp-domain" type="text" placeholder="输入要走 WARP 的域名，例如 netflix.com / bing.com" required>
+        <input class="warp-domain-input" id="input-warp-domain" type="text" aria-label="要走 WARP 的域名" placeholder="输入要走 WARP 的域名，例如 netflix.com / bing.com" required>
         <button class="warp-add-btn" type="submit">＋ 添加分流域名</button>
       </form>
 
@@ -2831,13 +2840,13 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="ob-probe-ip" id="ob-outbound-ip">探测中...</div>
         <div class="ob-probe-sub" id="ob-outbound-ip-note">只检测所选出站端点的可达性，不代表已配置分流规则的实际出口</div>
         <div class="ob-probe-actions">
-          <select id="ob-probe-kind" class="ob-select">
+          <select id="ob-probe-kind" class="ob-select" aria-label="探测哪个出站">
             <option value="direct">直连（服务器本机）</option>
             <option value="warp">WARP (127.0.0.1:19898)</option>
             <option value="socks5">自定义 SOCKS5</option>
             <option value="http">自定义 HTTP</option>
           </select>
-          <input type="text" id="ob-probe-addr" class="ob-input"
+          <input type="text" id="ob-probe-addr" class="ob-input" aria-label="要探测的代理地址"
                  placeholder="1.2.3.4:1080 或 http://1.2.3.4:8080" hidden>
           <button class="button" id="btn-ob-probe" type="button">探测出口</button>
         </div>
@@ -2953,8 +2962,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <span class="ob-rules-hint" id="ob-rules-hint">仅在「按域名分流」模式下生效</span>
       </div>
       <div class="ob-add-form">
-        <input type="text" id="ob-rule-domain" class="ob-input" placeholder="域名，如 openai.com">
-        <select id="ob-rule-outbound" class="ob-select"></select>
+        <input type="text" id="ob-rule-domain" class="ob-input" aria-label="分流规则的域名" placeholder="域名，如 openai.com">
+        <select id="ob-rule-outbound" class="ob-select" aria-label="该域名走哪个出站"></select>
         <button class="button" id="btn-ob-rule-add" type="button">添加规则</button>
       </div>
       <div class="ob-rules-list" id="ob-rules-list">
@@ -3006,8 +3015,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <!-- 已安装后的客户端管理面板 -->
     <div id="awg-panel" style="display:none">
       <div class="awg-add-form">
-        <input class="awg-input" id="awg-peer-name" type="text" placeholder="新客户端名称（字母/数字/._-）" autocomplete="off" spellcheck="false">
-        <input class="awg-input" id="awg-peer-endpoint" type="text" placeholder="连接地址（默认沿用已保存的地址）" autocomplete="off" spellcheck="false">
+        <input class="awg-input" id="awg-peer-name" type="text" aria-label="新客户端名称" placeholder="新客户端名称（字母/数字/._-）" autocomplete="off" spellcheck="false">
+        <input class="awg-input" id="awg-peer-endpoint" type="text" aria-label="客户端连接地址" placeholder="连接地址（默认沿用已保存的地址）" autocomplete="off" spellcheck="false">
         <button class="button primary" id="btn-add-awg-peer" type="button" style="white-space:nowrap">＋ 新增客户端</button>
       </div>
 
@@ -3076,7 +3085,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#eff6ff;color:#2563eb">01</span><div><h2>VLESS 直链 (URI)</h2><p>支持一键导入主流现代客户端</p></div></div>
-            <textarea class="link" id="reality-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="reality-uri-val" aria-label="VLESS-Reality 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px;display:flex;justify-content:space-between;align-items:center">
               <button class="button primary" id="btn-copy-reality-uri" type="button">复制 Reality 直链</button>
               <button class="button" id="btn-reset-reality-keys" type="button" style="font-size:11px;color:var(--muted)" title="重置将重新生成密钥对（用户 UUID 不变）">🔄 重新生成密钥对</button>
@@ -3144,7 +3153,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#f3e8ff;color:#7c3aed">01</span><div><h2>VMess 直链 (URI)</h2><p>Base64 标准格式，导入即用</p></div></div>
-            <textarea class="link" id="vmess-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="vmess-uri-val" aria-label="VMess 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px">
               <button class="button primary" id="btn-copy-vmess-uri" type="button">复制 VMess 直链</button>
             </div>
@@ -3205,7 +3214,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>VLESS 直链 (URI)</h2><p>含 encryption 参数，导入即用</p></div></div>
-            <textarea class="link" id="vlessenc-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="vlessenc-uri-val" aria-label="VLESS Encryption 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px">
               <button class="button primary" id="btn-copy-vlessenc-uri" type="button">复制 VLESS 直链</button>
             </div>
@@ -3265,7 +3274,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>AnyTLS 直链 (URI)</h2><p>anytls:// 格式，导入即用</p></div></div>
-            <textarea class="link" id="anytls-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="anytls-uri-val" aria-label="AnyTLS 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px">
               <button class="button primary" id="btn-copy-anytls-uri" type="button">复制 AnyTLS 直链</button>
             </div>
@@ -3325,7 +3334,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>TUIC 直链 (URI)</h2><p>tuic:// 格式（v5），导入即用</p></div></div>
-            <textarea class="link" id="tuic-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="tuic-uri-val" aria-label="TUIC 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px">
               <button class="button primary" id="btn-copy-tuic-uri" type="button">复制 TUIC 直链</button>
             </div>
@@ -3602,16 +3611,16 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 <p id="copy-status" class="status" role="status" aria-live="polite"></p>
 
 <!-- 入站代理创建成功高颜值模态框 (现代轻奢 + 二维码) -->
-<div class="modal-backdrop" id="proxy-modal">
+<div class="modal-backdrop" id="proxy-modal" role="dialog" aria-modal="true" aria-labelledby="pm-title">
   <div class="pm-card">
     <div class="modal-head">
       <div>
-        <h2 style="margin:0;font-size:19px;color:var(--accent);display:flex;align-items:center;gap:6px">
+        <h2 id="pm-title" style="margin:0;font-size:19px;color:var(--accent);display:flex;align-items:center;gap:6px">
           <span>🎉 入站代理服务创建成功</span>
         </h2>
         <p style="font-size:12px;margin-top:2px;color:var(--muted)">GOST 核心已秒级热载入并监听，可直接配置或扫码导入使用</p>
       </div>
-      <button class="modal-close" type="button" id="pm-close">&times;</button>
+      <button class="modal-close" type="button" id="pm-close" aria-label="关闭">&times;</button>
     </div>
 
     <!-- 顶部主连接节点 Banner -->
@@ -3654,14 +3663,14 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div>
           <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:4px">标准直连 URL (URI)</div>
           <div class="pm-code-box">
-            <input class="pm-code-input" id="res-purl" readonly value="">
+            <input class="pm-code-input" id="res-purl" aria-label="代理标准直连 URL" readonly value="">
             <button class="button primary" id="btn-copy-purl" type="button" style="padding:4px 12px;font-size:11px;white-space:nowrap">复制 URL</button>
           </div>
         </div>
         <div>
           <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:4px">通用爬虫/软件格式 (Host:Port:User:Pass)</div>
           <div class="pm-code-box">
-            <input class="pm-code-input" id="res-pfmt" readonly value="">
+            <input class="pm-code-input" id="res-pfmt" aria-label="代理 Host:Port:User:Pass 格式" readonly value="">
             <button class="button" id="btn-copy-pfmt" type="button" style="padding:4px 12px;font-size:11px;white-space:nowrap">复制格式</button>
           </div>
         </div>
@@ -3683,17 +3692,17 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     </div>
   </div>
 </div>
-<div class="toast-container" id="toast-container"></div>
+<div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
 
 <!-- 专属用户连接模态框 -->
-<div class="modal-backdrop" id="user-modal">
+<div class="modal-backdrop" id="user-modal" role="dialog" aria-modal="true" aria-labelledby="um-title">
   <div class="modal-card">
     <div class="modal-head">
       <div>
         <h2 id="um-title" style="margin:0;font-size:18px">专属用户连接</h2>
         <p id="um-sub" style="font-size:12px;margin-top:2px;color:var(--muted)"></p>
       </div>
-      <button class="modal-close" type="button" id="um-close">&times;</button>
+      <button class="modal-close" type="button" id="um-close" aria-label="关闭">&times;</button>
     </div>
     <div id="um-body"></div>
   </div>
@@ -3797,15 +3806,24 @@ def _extra_link_boxes(extra_links):
     用 v2rayNG / Shadowrocket 按链接导入的用户永远拿不到备用节点。
     """
     parts = []
-    for i, (label, link) in enumerate(extra_links or ()):
+    for i, item in enumerate(extra_links or ()):
+        label, link = item[0], item[1]
         if not isinstance(link, str) or not link:
             continue
         box_id = 'u-extra-uri-%d' % i
+        # 带上二维码（2026-11-13 加）：客户常在电脑上开分享页、用手机扫码导入，UDP 不通时要的恰恰是
+        # 这些备用节点，旧页面只给文字。只嵌 qrencode 生成的 SVG（与 Hy2 二维码同一来源）。
+        qr = item[2] if len(item) > 2 else ''
+        qr_html = ('<details style="margin-top:6px"><summary style="font-size:12px;color:var(--muted)">'
+                   '显示 %s 二维码（手机扫码导入）</summary><div class="qr-frame" style="max-width:220px;'
+                   'margin:8px 0">%s</div></details>' % (html.escape(label), qr)
+                   if isinstance(qr, str) and '<svg' in qr else '')
         parts.append(
             '<div style="margin-top:14px"><p class="note" style="margin-bottom:4px">%s 直链（UDP 不通时用）</p>'
-            '<textarea id="%s" class="link" readonly>%s</textarea>'
-            '<div class="actions"><button class="button" type="button" data-copy="%s">复制 %s 直链</button></div></div>'
-            % (html.escape(label), box_id, html.escape(link), box_id, html.escape(label)))
+            '<textarea id="%s" class="link" aria-label="%s 直链" readonly>%s</textarea>'
+            '<div class="actions"><button class="button" type="button" data-copy="%s">复制 %s 直链</button></div>%s</div>'
+            % (html.escape(label), box_id, html.escape(label), html.escape(link), box_id, html.escape(label),
+               qr_html))
     return ''.join(parts)
 
 
@@ -3844,6 +3862,9 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # sing-box 也给订阅链接（2026-11-13 加）：SFA / SFI 用「远程配置」填链接即可自动更新，
     # 响应头本来就带更新间隔；旧页面只给整段 JSON 和下载，节点换端口后客户得重新导入。
     sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/sing-box.json?k={user_key}"
+    # 生成不出二维码时说清楚（2026-11-13 修）：旧页面留一个空框，下面还写着「扫描即可直接接入」。
+    qr_block = (qr_svg if isinstance(qr_svg, str) and '<svg' in qr_svg
+                else '<p class="hint">%s</p>' % html.escape(QR_UNAVAILABLE_TEXT))
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>个人专属连接 · {html.escape(uid)}</title><style>{STYLE}</style></head><body><main style="max-width:860px">
 <nav class="topbar"><div class="brand"><span class="logo">H₂</span> HYSTERIA <span> / 个人连接中心</span></div><div>{status_html}</div></nav>
@@ -3868,7 +3889,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     <div class="eyebrow">QUICK CONNECT</div>
     <h2>扫码快速导入</h2>
     <p class="hint">支持 v2rayNG / Shadowrocket / Nekobox</p>
-    <div class="qr-frame" style="margin:16px 0">{qr_svg}</div>
+    <div class="qr-frame" style="margin:16px 0">{qr_block}</div>
     <p class="hint">在客户端点击右上角扫描即可直接接入</p>
     <div class="tags"><span class="tag">Hysteria 2</span><span class="tag">专属认证</span><span class="tag">{obfs_badge}</span></div>
   </section>
@@ -3877,7 +3898,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
   <div class="stack">
     <section class="card">
       <div class="card-head"><span class="step">01</span><div><h2>节点直链 (URI)</h2><p>全平台通用直链 (点击一键导入/剪贴板导入)</p></div></div>
-      <textarea id="u-hy2-uri" class="link" readonly>{html.escape(uri)}</textarea>
+      <textarea id="u-hy2-uri" class="link" aria-label="Hy2 节点直链" readonly>{html.escape(uri)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-hy2-uri">复制直链</button>
       </div>
@@ -3887,28 +3908,28 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
 
     <section class="card">
       <div class="card-head"><span class="step">02</span><div><h2>Clash / Mihomo 专属订阅</h2><p>适用于 Clash Verge / Clash.Meta 核心客户端 (一键订阅同步)</p></div></div>
-      <textarea id="u-clash-sub" class="link" style="height:68px" readonly>{html.escape(clash_sub_url)}</textarea>
+      <textarea id="u-clash-sub" class="link" aria-label="Clash 订阅链接" style="height:68px" readonly>{html.escape(clash_sub_url)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-clash-sub">复制订阅链接</button>
         <a class="button" href="/{token}/u/{quote(uid)}/clash.yaml?k={user_key}" download="clash-{uid}.yaml">下载 clash.yaml ↓</a>
       </div>
       <details style="margin-top:10px">
         <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
-        <textarea id="u-clash-cfg" class="config" style="height:110px;margin-top:6px" readonly>{html.escape(clash)}</textarea>
+        <textarea id="u-clash-cfg" class="config" aria-label="Clash 原始配置" style="height:110px;margin-top:6px" readonly>{html.escape(clash)}</textarea>
         <div style="margin-top:4px"><button class="button" type="button" data-copy="u-clash-cfg" style="padding:4px 10px;font-size:11px">复制配置文本</button></div>
       </details>
     </section>
 
     <section class="card">
       <div class="card-head"><span class="step">03</span><div><h2>Sing-box 专属订阅</h2><p>适用 SFI / SFA / Sing-box 客户端（远程配置，一键订阅同步）</p></div></div>
-      <textarea id="u-sing-sub" class="link" style="height:68px" readonly>{html.escape(sing_sub_url)}</textarea>
+      <textarea id="u-sing-sub" class="link" aria-label="Sing-box 订阅链接" style="height:68px" readonly>{html.escape(sing_sub_url)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-sing-sub">复制订阅链接</button>
         <a class="button" href="/{token}/u/{quote(uid)}/sing-box.json?k={user_key}" download="sing-box-{uid}.json">下载 sing-box.json ↓</a>
       </div>
       <details style="margin-top:10px">
         <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
-        <textarea id="u-sing-cfg" class="config" style="height:110px;margin-top:6px" readonly>{html.escape(sing)}</textarea>
+        <textarea id="u-sing-cfg" class="config" aria-label="Sing-box 原始配置" style="height:110px;margin-top:6px" readonly>{html.escape(sing)}</textarea>
         <div style="margin-top:4px"><button class="button" type="button" data-copy="u-sing-cfg" style="padding:4px 10px;font-size:11px">复制配置文本</button></div>
       </details>
     </section>
@@ -7555,15 +7576,15 @@ def prepare(meta_path, port, node_api_key=None):
         atomic_write_private(path, json.dumps(value, ensure_ascii=False).encode('utf-8'))
 
 
-def qr_svg_for(uri):
+def qr_svg_for(uri, timeout=20):
     """生成二维码 SVG；失败返回 None（调用方据此保留旧图）。
 
     抽出来是为了能在**数据锁外**先算好：qrencode 是子进程，最长 20 秒，
-    在锁内跑会阻塞 /auth（2026-10-29 修）。
+    在锁内跑会阻塞 /auth（2026-10-29 修）。分享页一次要出好几张时传更短的 timeout。
     """
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
-                            input=str(uri).encode(), capture_output=True, timeout=20)
+                            input=str(uri).encode(), capture_output=True, timeout=timeout)
         if qr.returncode == 0 and qr.stdout:
             return qr.stdout.decode('utf-8', 'replace')
     except Exception as exc:
@@ -7797,7 +7818,8 @@ def ensure_portal_access(root, meta, data):
         except (OSError, ValueError):
             pass
     username = secrets.token_hex(8)
-    password = secrets.token_urlsafe(18)
+    # 与首次安装（prepare）同样 256 位（2026-11-13 修）：旧实现重建时只有 144 位，README 写的是 256 位。
+    password = secrets.token_urlsafe(32)
     auth = base64.b64encode(f'{username}:{password}'.encode())
     data['auth_hash'] = hashlib.sha256(auth).hexdigest()
     host = meta['public_ip'] if meta.get('is_insecure') else meta.get('server_name', 'localhost')
@@ -8911,14 +8933,16 @@ def serve(path):
         """把启动自检脚本写到 GOST_SELFCHECK_PATH (unit 的 ExecStartPost 调用).
 
         install.sh 的 install_gost() 会写同一份内容; 这里再写一次是为了覆盖
-        "服务器上已装过旧版 gost、unit 却没有自检" 的情况。
+        "服务器上已装过旧版 gost、unit 却没有自检" 的情况。返回是否写成功。
         """
         try:
             GOST_SELFCHECK_PATH.parent.mkdir(parents=True, exist_ok=True)
             GOST_SELFCHECK_PATH.write_text(GOST_SELFCHECK_SCRIPT, encoding='utf-8')
             os.chmod(str(GOST_SELFCHECK_PATH), 0o755)
-        except OSError:
-            pass
+            return True
+        except OSError as exc:
+            _log_ignored('gost_selfcheck_write', exc)
+            return False
 
     def gost_owned():
         """gost 是本工具装的：有所有权标记，且单元指向本工具的配置（与一键安装同一判据）。"""
@@ -8954,10 +8978,16 @@ def serve(path):
         needed = ('ExecReload=/bin/kill -HUP $MAINPID',
                   '-R 30s',
                   'ExecStartPost=' + GOST_SELFCHECK_PATH.as_posix())
-        if all(s in current for s in needed):
+        # ExecStartPost 指向的脚本必须真的在（2026-11-13 修）：脚本不在时 systemd 把每次启动都判为
+        # 失败并停掉 gost，入站代理全部不可用。旧实现单元齐全就返回、不管脚本被删；写脚本失败也
+        # 悄悄吞掉，照样换上引用它的新单元。
+        if all(s in current for s in needed) and GOST_SELFCHECK_PATH.is_file():
             return                                   # 已是最新, 不做任何事
         try:
-            write_gost_selfcheck()
+            if not write_gost_selfcheck():
+                return                               # 留着旧单元，至少还能启动
+            if all(s in current for s in needed):
+                return                               # 只是补回脚本，单元不用动
             unit_path.write_text(GOST_UNIT_CONTENT, encoding='utf-8')
             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=5)
         except Exception as exc:
@@ -11520,7 +11550,9 @@ if __name__ == '__main__':
                 # 确保 systemd 服务存在
                 # 先落地启动自检脚本 (unit 的 ExecStartPost 会调用它), 再写 unit.
                 assets_modified = True
-                write_gost_selfcheck()
+                if not write_gost_selfcheck():
+                    raise RuntimeError('无法写入启动自检脚本 %s（单元的 ExecStartPost 依赖它，写不进去 gost 必然启动失败）'
+                                       % GOST_SELFCHECK_PATH)
                 service_content = GOST_UNIT_CONTENT
                 Path('/etc/systemd/system/gost.service').write_text(service_content, encoding='utf-8')
                 owner_marker = Path('/etc/hysteria/.hy2-gost-owned')
@@ -14257,7 +14289,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                       'text/html; charset=utf-8')
 
                 m = read_meta_file(meta_path)
-                # 🔴 2026-10-31：这个分享页会跑一到两次 qrencode（各 10 秒超时），
+                # 🔴 2026-10-31：这个分享页要跑 qrencode：Hy2 一张（10 秒超时），2026-11-13 起每个
+                # 备用协议再各一张（5 秒超时，最多 5 张），最坏约 35 秒；
                 # 而默认连接死线 30 秒、且并发受 BoundedSemaphore(8) 限制。
                 # 低配机 + 多人同时打开分享页时会在 30 秒整被 watch_deadlines
                 # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
@@ -14308,7 +14341,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     listen_port = m.get('listen_port', 19984)
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
                     page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0],
-                                          extra_links=self._user_extra_links(target_uid, _pub_clean))
+                                          extra_links=self._user_extra_links(target_uid, _pub_clean, with_qr=True))
                     return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
                 else:
                     return self.reply(404, b'Not found')
@@ -14559,13 +14592,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 连接照样被掐断 —— 这是用户点「下载配置」的路径。
                 raw_content = data.get(key)
                 content = raw_content.encode() if isinstance(raw_content, str) else b''
+            if key == 'qr' and b'<svg' not in content:
+                # 生成不出二维码时给一张说明图（2026-11-13 修）：旧实现回空内容，页面上是一个裂开的图片。
+                content = QR_UNAVAILABLE_SVG.encode('utf-8')
             self.reply(200, content, mime)
 
-        def _user_extra_links(self, user_id, public_ip):
+        def _user_extra_links(self, user_id, public_ip, with_qr=False):
             """该用户在其它已启用协议上的直链 [(名称, 直链)]，与 users/create 的回包同一组生成器。
 
             分享页（2026-11-04 加）与管理员的「专属连接」弹窗（2026-11-13 加）共用：UDP 被封的
             网络要靠 Reality / VMess 等 TCP 协议兜底。生成失败的一项只跳过、不影响其它。
+            with_qr=True 时每项多带一张二维码 SVG（分享页用；在锁外调用，qrencode 是子进程）。
             """
             _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
             _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
@@ -14583,7 +14620,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     _log_ignored('share_extra_uri', exc)
                     continue
                 if isinstance(link, str) and link:
-                    links.append((label, link))
+                    # 每张最多等 5 秒：五个协议都开着时，旧的 20 秒上限能让分享页卡上一分多钟。
+                    links.append((label, link, qr_svg_for(link, timeout=5) or '') if with_qr else (label, link))
             return links
 
         def _render_index_page(self):
