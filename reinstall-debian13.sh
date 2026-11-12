@@ -45,6 +45,7 @@
 # ---------------------------------------------------------------------------
 #   PORT        新系统 SSH 端口，默认 22
 #   PASSWORD    新系统 root 密码，默认随机生成一个（★ 务必记下）
+#               只能用字母、数字和 ._@%+=:,~^-，且不能以 - 开头
 #   DISK        目标磁盘，默认自动探测
 #   MIRROR      镜像站，默认 http://deb.debian.org/debian/
 #   RELEASE     Debian 版本号，默认 13
@@ -144,6 +145,26 @@ ask() {
     printf '%s' "$_val"
 }
 
+# root 密码只收安全字符（2026-11-12 修）：InstallNET 生成哈希时写的是
+# `openssl passwd -6 ''$tmpWORD''`，密码其实没加引号 —— 空格被拆成多个参数，
+# * ? [ 按当前目录的文件名展开，- 开头被当成选项。磁盘清空后新系统的 root
+# 密码就不是输入的那个，SSH 登不上。
+PASSWORD_RULE="root 密码只能用字母、数字和 ._@%+=:,~^-，且不能以 - 开头"
+password_ok() {
+    case "$1" in
+        ''|-*|*[!A-Za-z0-9._@%+=:,~^-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# 打印开头整段注释：写死行号会把后面的常量与默认值代码一起打出来（2026-11-12 修）。
+print_help() {
+    for _f in "$0" rd13.sh; do
+        [ -f "$_f" ] && awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$_f" && return 0
+    done
+    return 1
+}
+
 # ── 参数解析 ─────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -157,7 +178,7 @@ while [ $# -gt 0 ]; do
         --swap)        SWAP_MB="${2:-}";  shift 2 ;;
         --net)         NET_MODE="${2:-}"; shift 2 ;;
         --force-rescue-disk) FORCE_RESCUE=1; shift ;;
-        -h|--help)     sed -n '2,72p' "$0" 2>/dev/null || sed -n '2,72p' "rd13.sh"; exit 0 ;;
+        -h|--help)     print_help; exit 0 ;;
         *) die "未知参数：$1（用 --help 看用法）" ;;
     esac
 done
@@ -182,6 +203,10 @@ case "$RELEASE" in
 esac
 
 [ -n "$MIRROR" ] || die "镜像地址不能为空"
+
+if [ -n "$PASSWORD" ] && ! password_ok "$PASSWORD"; then
+    die "${PASSWORD_RULE}：InstallNET 不加引号地使用密码，特殊字符会让装好的系统用这个密码登不上"
+fi
 
 # 初始化日志（失败会降级为不打日志，不会让脚本挂掉）
 init_log
@@ -463,7 +488,7 @@ if [ -z "$PASSWORD" ]; then
     if [ "$ASSUME_YES" = "1" ]; then
         PASSWORD="$_random_pwd"
     else
-        PASSWORD="$(ask "新系统 root 密码（不含特殊字符）[回车使用随机密码]： " "$_random_pwd")"
+        PASSWORD="$(ask "新系统 root 密码（字母、数字或 ._@%+=:,~^-）[回车使用随机密码]： " "$_random_pwd")"
     fi
     if [ "$PASSWORD" = "$_random_pwd" ]; then
         warn "已自动生成 root 密码：$PASSWORD"
@@ -472,6 +497,7 @@ if [ -z "$PASSWORD" ]; then
     unset _random_pwd
 fi
 [ -n "$PASSWORD" ] || die "root 密码不能为空"
+password_ok "$PASSWORD" || die "${PASSWORD_RULE}，请重新运行并换一个密码"
 
 printf '\n'
 printf '   磁盘      %s\n' "$DISK"
