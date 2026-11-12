@@ -658,34 +658,60 @@ class WebWorkflowTests(unittest.TestCase):
                 read_clients = body.index('inbound[\'settings\'][\'clients\'] = ' + builder)
                 self.assertGreater(read_clients, lock)
 
-    def test_xray_startup_restarts_stopped_service_with_matching_clients(self):
-        config = {'inbounds': [
-            {'tag': portal.REALITY_INBOUND_TAG, 'settings': {'clients': []}},
-            {'tag': portal.VMESS_INBOUND_TAG, 'settings': {'clients': []}},
-        ]}
+    def recover_on_start(self, clients, state='inactive', restart_sticks=True,
+                         apply_result=True, suspended=False):
+        """跑一次门户启动时的 Xray 对齐；返回 (日志说明, systemctl 调用, apply_access 次数)。"""
         path = self.hdir / 'xray.json'
-        path.write_text(json.dumps(config), encoding='utf-8')
-        calls = []
-        result = portal.recover_xray_service_on_start(
-            {'users': {}}, path, run=lambda args, **kw:
-                calls.append(args) or SimpleNamespace(returncode=0),
-            systemd_state=lambda _: 'inactive', suspended=lambda _: False)
-        self.assertTrue(result)
-        self.assertEqual(calls, [['systemctl', 'reset-failed', 'xray'],
-                                 ['systemctl', 'restart', 'xray'],
-                                 ['systemctl', 'enable', 'xray']])
+        path.unlink(missing_ok=True)
+        if clients is not None:
+            path.write_text(json.dumps({'inbounds': [
+                {'tag': portal.VMESS_INBOUND_TAG, 'settings': {'clients': clients}}]}), encoding='utf-8')
+        service, calls, applied = {'state': state}, [], []
 
-    def test_xray_startup_does_not_restart_suspended_service(self):
-        config = {'inbounds': [{'tag': portal.VMESS_INBOUND_TAG,
-                                'settings': {'clients': []}}]}
-        path = self.hdir / 'xray.json'
-        path.write_text(json.dumps(config), encoding='utf-8')
-        calls = []
-        result = portal.recover_xray_service_on_start(
-            {'users': {}}, path, run=lambda *a, **kw: calls.append(a),
-            systemd_state=lambda _: 'inactive', suspended=lambda _: True)
-        self.assertFalse(result)
-        self.assertEqual(calls, [])
+        def run(args, **kwargs):
+            calls.append(args)
+            if args[1] == 'restart' and restart_sticks:
+                service['state'] = 'active'
+            return SimpleNamespace(returncode=0)
+
+        def apply_access():
+            applied.append(True)
+            return apply_result
+
+        note = portal.recover_xray_service_on_start(
+            self.STARTUP_DATA, threading.RLock(), apply_access, lambda unit: suspended, path,
+            run=run, systemd_state=lambda unit: service['state'], sleep=lambda seconds: None)
+        return note, calls, len(applied)
+
+    STARTUP_DATA = {'users': {'alice': {'status': 'active'}}}
+
+    def test_startup_restarts_a_stopped_xray_and_confirms_it_came_up(self):
+        in_sync = portal.vmess_clients(self.STARTUP_DATA)
+        self.assertEqual(self.recover_on_start(None), ('', [], 0))
+        self.assertEqual(self.recover_on_start(in_sync, state='active'), ('', [], 0))
+        self.assertEqual(self.recover_on_start(in_sync),
+                         ('启动时恢复了 xray 服务',
+                          [['systemctl', 'reset-failed', 'xray'], ['systemctl', 'restart', 'xray']], 0))
+        note, calls, _ = self.recover_on_start(in_sync, restart_sticks=False)
+        self.assertTrue(note.startswith('启动时恢复 xray 服务失败'), note)
+        self.assertIn(['systemctl', 'restart', 'xray'], calls)
+        self.assertEqual(self.recover_on_start(in_sync, suspended=True), ('', [], 0))
+
+    def test_startup_rewrites_drifted_clients_and_only_then_starts_xray(self):
+        stale = [{'id': portal.vmess_uuid_for_user('bob'), 'email': 'bob'}]
+        # 运行中：apply_access 自己改写并重启，不再额外重启。
+        self.assertEqual(self.recover_on_start(stale, state='active'),
+                         ('启动时按 portal.json 重写了 xray clients',
+                          [['systemctl', 'reset-failed', 'xray']], 1))
+        # 停着：改写成功后还要把它拉起来。
+        note, calls, applied = self.recover_on_start(stale)
+        self.assertEqual(note, '启动时按 portal.json 重写了 xray clients；启动时恢复了 xray 服务')
+        self.assertEqual((calls[-1], applied), (['systemctl', 'restart', 'xray'], 1))
+        # 没改写成功：旧文件里的 bob 可能是该收回的用户，不能拉起。
+        note, calls, applied = self.recover_on_start(stale, apply_result=False)
+        self.assertEqual(note, '启动时补同步 clients 失败，交给撤销线程重试')
+        self.assertNotIn(['systemctl', 'restart', 'xray'], calls)
+        self.assertEqual(self.recover_on_start(stale, suspended=True), ('', [], 0))
 
     def test_vmess_disable_save_failure_restores_inbound_and_state(self):
         path = self.hdir / 'xray.json'
@@ -1992,32 +2018,6 @@ class WebWorkflowTests(unittest.TestCase):
                       proposed['outbounds'])
         self.assertNotEqual(proposed['outbounds'][0]['protocol'], 'blackhole')
 
-    def test_startup_recovery_restarts_xray_when_matching_config_service_is_stopped(self):
-        config = {'inbounds': [{'tag': portal.REALITY_INBOUND_TAG,
-                                'settings': {'clients': []}}]}
-        calls = []
-        data = {'users': {'admin_master': {'status': 'active'}}}
-        restarted = portal.recover_xray_service_on_start(
-            data, self.hdir / 'xray.json',
-            run=lambda args, **kw: calls.append(args) or SimpleNamespace(returncode=0),
-            systemd_state=lambda _: 'inactive', suspended=lambda _: False)
-        self.assertFalse(restarted)  # no config file
-        path = self.hdir / 'xray.json'
-        path.write_text(json.dumps(config), encoding='utf-8')
-        restarted = portal.recover_xray_service_on_start(
-            data, path,
-            run=lambda args, **kw: calls.append(args) or SimpleNamespace(returncode=0),
-            systemd_state=lambda _: 'inactive', suspended=lambda _: False)
-        self.assertTrue(restarted)
-        self.assertEqual(calls, [['systemctl', 'reset-failed', 'xray'],
-                                 ['systemctl', 'restart', 'xray'],
-                                 ['systemctl', 'enable', 'xray']])
-        calls.clear()
-        self.assertFalse(portal.recover_xray_service_on_start(
-            data, path, run=lambda args, **kw: calls.append(args),
-            systemd_state=lambda _: 'inactive', suspended=lambda _: True))
-        self.assertEqual(calls, [])
-
     def test_xray_transaction_invalid_config_keeps_original_bytes(self):
         path = self.hdir / 'xray.json'
         old = b'{"inbounds":[]}'
@@ -2335,8 +2335,28 @@ class WebWorkflowTests(unittest.TestCase):
         self.awg_suspended_fixture(False)
         status, payload = self.invoke('_h_post_manage_amneziawg', {'action': 'start'})
         self.assertEqual(status, 200, payload)
-        self.run.assert_called_once()
         self.assertEqual(self.run.call_args[0][0], ['systemctl', 'start', 'amneziawg-server'])
+
+    def test_awg_start_and_restart_get_past_the_start_limit(self):
+        """单元是 StartLimitBurst=5 / 300 秒：撞上限后不先 reset-failed，网页「启动 / 重启」
+        5 分钟内只会报失败（2026-11-13 修）。桩里的 systemctl 在清计数前一律拒绝启动。"""
+        for action in ('start', 'restart'):
+            with self.subTest(action=action):
+                self.awg_suspended_fixture(False)
+                calls, cleared = [], []
+
+                def limited_run(args, **kwargs):
+                    calls.append(args)
+                    if args[1] == 'reset-failed':
+                        cleared.append(True)
+                    elif args[1] in ('start', 'restart') and not cleared:
+                        return SimpleNamespace(returncode=1, stdout='', stderr=
+                            'Job for amneziawg-server.service failed because start of the service was attempted too often.')
+                    return SimpleNamespace(returncode=0, stdout='', stderr='')
+                self.ns['subprocess'] = SimpleNamespace(run=limited_run, TimeoutExpired=subprocess.TimeoutExpired)
+                status, payload = self.invoke('_h_post_manage_amneziawg', {'action': action})
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(calls[-1], ['systemctl', action, 'amneziawg-server'])
 
 
     def test_awg_peer_delete_extends_its_deadline(self):

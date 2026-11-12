@@ -148,6 +148,9 @@ if [ -z "$DISK" ]; then
 fi
 [ -n "$DISK" ] && [ -b "$DISK" ] || die "找不到可用磁盘，请用 --disk /dev/xxx 指定"
 is_whole_disk "$DISK" || die "$DISK 不是整块磁盘（像是分区），请指定整块磁盘，例如 /dev/vda"
+# 之后一律用真实设备名（2026-11-13 修）：--disk 给 /dev/disk/by-id/... 链接时，分区名按「盘名 + 1 / p1」
+# 推出来的是不存在的路径 —— 分区表已经写完、到格式化这步才失败，盘上数据没了、系统也没装上。
+DISK="$(readlink -f "$DISK" 2>/dev/null || printf '%s' "$DISK")"
 ok "目标磁盘：$DISK"
 
 DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null || echo 0) / 2048))

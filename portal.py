@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.40'
+PORTAL_VERSION = '2.41'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -7958,32 +7958,59 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     return changed
 
 
-def recover_xray_service_on_start(data, config_path='/etc/hysteria/xray.json', run=subprocess.run,
-                                  systemd_state=None, suspended=None):
-    """Restore Xray when its enabled inbound config is valid but service is stopped."""
+def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
+                                  config_path='/etc/hysteria/xray.json', run=subprocess.run,
+                                  systemd_state=None, sleep=time.sleep):
+    """门户启动时让 Xray 与 portal.json 对齐，返回要写进日志的说明；无事可做返回空串。
+
+    托管入站的 clients 与 portal.json 不一致时，交给 apply_access 按 data 重写 xray.json
+    （2026-11-03 修）：只 restart 的话 Xray 重读的还是同一份旧文件，门户在 portal.json 已存、
+    xray.json 未写时崩溃，新开 / 续费的用户就一直连不上 Reality / VMess。
+    服务停着时重启，并等它真的起来了才说「已恢复」（2026-11-13 修）：旧实现不看结果，Xray 因
+    端口被占 / 配置坏起不来时日志照写「恢复了 xray 服务」；clients 不一致时 apply_access 对
+    停着的 Xray 只改文件不重启，旧实现也就不再拉起它。流量超额停用期间一律不动。
+    """
     systemd_state = systemd_state or _systemd_state
-    suspended = suspended or _unit_suspended
     path = Path(config_path)
     if not path.exists():
-        return False
-    config = json.loads(path.read_text(encoding='utf-8'))
-    desired = {REALITY_INBOUND_TAG: reality_clients(data),
-               VMESS_INBOUND_TAG: vmess_clients(data),
-               VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
+        return ''
+    with data_lock:
+        wanted = {REALITY_INBOUND_TAG: reality_clients(data),
+                  VMESS_INBOUND_TAG: vmess_clients(data),
+                  VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
     current = {}
-    for tag in MANAGED_INBOUND_TAGS:
-        index, inbound = managed_inbound_index(config, tag)
-        if index >= 0:
-            current[tag] = inbound.get('settings', {}).get('clients') or []
-    mismatch = any(desired[tag] != (current.get(tag) or []) for tag in current)
-    service_stopped = bool(current) and systemd_state('xray') != 'active'
-    if (mismatch or service_stopped) and not suspended('xray'):
-        run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
-        run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
-        if mismatch:
-            run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
-        return True
-    return False
+    try:
+        config = json.loads(path.read_text(encoding='utf-8'))
+        for tag in MANAGED_INBOUND_TAGS:
+            index, inbound = managed_inbound_index(config, tag)
+            if index >= 0:
+                current[tag] = inbound.get('settings', {}).get('clients') or []
+    except Exception:
+        current = {}
+    if not current or suspended('xray'):
+        return ''
+    mismatch = any(wanted[tag] != current[tag] for tag in current)
+    if not mismatch and systemd_state('xray') == 'active':
+        return ''
+    # 先清失败计数：连续崩溃撞上启动频率上限时 restart 会被直接拒绝。
+    run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+    notes = []
+    if mismatch:
+        # current != wanted 时 apply_access 自己就会改写，运行中的 Xray 会被它重启，不需要 force_ids。
+        # 没改写成功就不能拉起：旧文件里可能还有该收回的用户，起来就等于重新放行。
+        if not apply_access():
+            return '启动时补同步 clients 失败，交给撤销线程重试'
+        notes.append('启动时按 portal.json 重写了 xray clients')
+        if systemd_state('xray') == 'active':
+            return notes[0]
+    run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
+    # Type=simple：restart 一 fork 就返回，配置坏 / 端口被占时 Xray 随后才退出（同安装 Xray）。
+    sleep(2)
+    if systemd_state('xray') == 'active':
+        notes.append('启动时恢复了 xray 服务')
+    else:
+        notes.append('启动时恢复 xray 服务失败' + _unit_failure_hint('xray'))
+    return '；'.join(notes)
 
 
 def repair_missing_api_key(portal_path, data):
@@ -11658,6 +11685,12 @@ if __name__ == '__main__':
                     # 与 peer 增删 / 更新串行（2026-11-04 修）：在它们中途停掉接口，热添加会
                     # 落在正在关闭的接口上，更新自己的重启也会和这里打架。
                     with awg_operation_lock:
+                        if action != 'stop':
+                            # 先清失败计数（2026-11-13 修，同终端菜单与 awgctl）：单元是 StartLimitBurst=5 /
+                            # 300 秒，连续加客户端（热加入失败会兜底重启）再点几次重启就撞上限，之后 5 分钟内
+                            # 点「启动」只会拿到 start of the service was attempted too often。
+                            subprocess.run(['systemctl', 'reset-failed', AWG_SVC_NAME],
+                                           capture_output=True, timeout=5)
                         proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
                                               capture_output=True, text=True, timeout=30)
                     if proc.returncode != 0:
@@ -15419,44 +15452,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     server.login_failures = []
     server.login_source_failures = collections.OrderedDict()
 
-    # 启动时比较完整托管客户端列表；服务已停止但配置匹配时也尝试恢复。
+    # 启动时比较完整托管客户端列表；服务已停止时也尝试恢复。
     try:
         # 与 apply_access 用同一个文件（portal_path.parent），检查与修复看的是同一份配置。
-        _startup_xray = portal_path.parent / 'xray.json'
-        if _startup_xray.exists():
-            with data_lock:
-                _want = {REALITY_INBOUND_TAG: reality_clients(data),
-                         VMESS_INBOUND_TAG: vmess_clients(data),
-                         VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
-            _got = {}
-            try:
-                _cfg = json.loads(_startup_xray.read_text(encoding='utf-8'))
-                for _tag in MANAGED_INBOUND_TAGS:
-                    _idx, _inb = managed_inbound_index(_cfg, _tag)
-                    if _idx >= 0:
-                        _got[_tag] = _inb.get('settings', {}).get('clients') or []
-            except Exception:
-                _got = {}
-            _mismatch = any(_want[tag] != (_got.get(tag) or []) for tag in _got)
-            _stopped = bool(_got) and _systemd_state('xray') != 'active'
-            if _mismatch and not unit_suspended('xray'):
-                # clients 与 portal.json 不一致时要按 data 重写 xray.json（2026-11-03 修）：
-                # 旧实现只 restart，Xray 重读的还是同一份旧文件。门户在 portal.json 已存、
-                # xray.json 未写时崩溃，新开 / 续费的用户就一直连不上 Reality / VMess。
-                # 先 reset-failed：停止状态的 xray 会被 apply 视为停用而不重启。
-                subprocess.run(['systemctl', 'reset-failed', 'xray'],
-                               capture_output=True, timeout=5)
-                # current != wanted 时 apply_access 自己就会改写并重启，不需要 force_ids。
-                if apply_access():
-                    print('[portal] 启动时按 portal.json 重写了 xray clients', file=sys.stderr)
-                else:
-                    print('[portal] 启动时补同步 clients 失败，交给撤销线程重试', file=sys.stderr)
-            elif _stopped and not unit_suspended('xray'):
-                subprocess.run(['systemctl', 'reset-failed', 'xray'],
-                               capture_output=True, timeout=5)
-                subprocess.run(['systemctl', 'restart', 'xray'],
-                               capture_output=True, timeout=10)
-                print('[portal] 启动时恢复了 xray 服务', file=sys.stderr)
+        _startup_note = recover_xray_service_on_start(
+            data, data_lock, apply_access, unit_suspended, portal_path.parent / 'xray.json')
+        if _startup_note:
+            print('[portal] ' + _startup_note, file=sys.stderr)
     except Exception as e:
         print('[portal] 启动补同步跳过: %s' % str(e)[:120], file=sys.stderr)
 

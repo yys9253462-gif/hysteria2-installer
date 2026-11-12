@@ -3286,6 +3286,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
       
       const shareUrl = location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '?k=' + userKey;
+      // 与客户分享页一致也给 sing-box 订阅（2026-11-13 加）：接口一直回着 sing_box，旧弹窗只用了
+      // Clash 那份，用 sing-box / Hiddify 的客户只能让管理员另开分享页去找。
+      const singSubPath = '/' + token + '/u/' + encodeURIComponent(uid) + '/sing-box.json?k=' + userKey;
       
       // 统一用 fmtBytes：旧写法把已用强制成 MB、配额强制成 GB，
       // 小配额（如 500 MB）会显示成「0.5 GB」，大用量则是「1536.0 MB」。
@@ -3348,6 +3351,19 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
                 <textarea id="um-clash" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.clash)}</textarea>
                 <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-clash">复制文本</button></div>
+              </details>
+            </div>
+            <div>
+              <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Sing-box 专属订阅链接:</div>
+              <div class="input-with-action">
+                <input type="text" id="um-sing-sub" value="${obEsc(location.origin + singSubPath)}" readonly style="font-size:11px;height:36px">
+                <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-sing-sub">复制订阅</button>
+                <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="${obEsc(singSubPath)}" download="sing-box-${obEsc(uid)}.json">下载 ↓</a>
+              </div>
+              <details style="margin-top:6px">
+                <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
+                <textarea id="um-sing" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.sing_box)}</textarea>
+                <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-sing">复制文本</button></div>
               </details>
             </div>
           </div>
@@ -3452,6 +3468,16 @@ async function loadAwgState() {
   } catch (e) { markStatusUnknown(awgBadge); }   // 不弹窗，只在徽章上标出查询失败
 }
 
+// 创建时间按浏览器本地时间显示（2026-11-13 修）：awgctl 存的是 UTC（…Z），旧实现原样显示，
+// 国内看到的钟点差 8 小时。原文留在悬停提示里；解析不了的值照原样显示。
+function fmtAwgCreated(value) {
+  const d = typeof value === 'string' && value ? new Date(value) : null;
+  if (!d || isNaN(d.getTime())) return value || '-';
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
 function renderAwgPeers(peers) {
   if (!awgPeerTbody) return;
   if (!peers.length) {
@@ -3465,7 +3491,8 @@ function renderAwgPeers(peers) {
       // 名称/地址虽受后端正则限制，仍统一走 obEsc —— 与其他表格保持同一套转义习惯。
       + '<td><strong>' + obEsc(p.name) + '</strong></td>'
       + '<td>' + obEsc(p.address) + '</td>'
-      + '<td style="color:var(--muted);font-size:11.5px">' + obEsc(p.created_at || '-') + '</td>'
+      + '<td style="color:var(--muted);font-size:11.5px" title="' + obEsc(p.created_at || '') + '">'
+      + obEsc(fmtAwgCreated(p.created_at)) + '</td>'
       + '<td style="white-space:nowrap">'
       + '<button class="button" type="button" data-awg-conf="' + enc + '" style="' + bs + '">下载配置</button> '
       + '<button class="button" type="button" data-awg-qr="' + enc + '" style="' + bs + '">二维码</button> '

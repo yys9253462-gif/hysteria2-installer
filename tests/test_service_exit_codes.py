@@ -63,6 +63,19 @@ class ServiceCommandExitCodeTests(unittest.TestCase):
                             fn('status_service'), 'status_service; echo "RC=$?"'])
         self.assertIn('RC=1', self.run_sh(script).stdout)
 
+    def test_status_is_nonzero_when_core_or_portal_is_down(self):
+        """服务停着 / 失败时也返回非零，门户（Hy2 鉴权后端）一起看（2026-11-13 修）。"""
+        for down, expected in (('', 'RC=0'), ('hysteria-server', 'RC=1'), ('hysteria-portal', 'RC=1')):
+            with self.subTest(down=down or 'none'):
+                script = '\n'.join([
+                    'HY2_BIN=/bin/sh', 'log_err() { :; }', 'CYAN=; PLAIN=',
+                    # systemctl status：在运行返回 0，不在运行返回 3（与真实 systemctl 一致）
+                    'systemctl() { echo "STATUS $2"; [[ "$2" == "%s" ]] && return 3; return 0; }' % down,
+                    fn('status_service'), 'status_service; echo "RC=$?"'])
+                out = self.run_sh(script).stdout
+                self.assertIn(expected, out)
+                self.assertIn('STATUS hysteria-portal', out)
+
 
 if __name__ == '__main__':
     unittest.main()

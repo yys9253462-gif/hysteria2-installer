@@ -4352,6 +4352,16 @@ EOCP
 }
 
 # 7. 服务状态与管理命令
+# 旧版 WARP 出站（官方客户端代理模式的 127.0.0.1:40000）改指 wireproxy。只在确实有旧地址时
+# 才改并重启 Hysteria（2026-11-13 修）：旧实现装 WARP 时无条件重启，新装机根本没有这一行，
+# 装一次 WARP 就把所有在线用户断开一次。
+warp_migrate_legacy_outbound() {
+    [[ -f "$HY2_CONFIG" ]] && grep -qF 'addr: 127.0.0.1:40000' "$HY2_CONFIG" || return 0
+    sed -i "s|addr: 127.0.0.1:40000|addr: $1|g" "$HY2_CONFIG"
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    systemctl restart hysteria-server 2>/dev/null || true
+}
+
 install_warp_local_proxy() {
     # BUGFIX #7/#8: Cloudflare 官方 cloudflare-warp 包在 Debian 12 / bookworm 因 signed-by
     # apt keyring 解析 bug 永远装不上，且失败会残留无效 apt 源。改为直接从 GitHub release
@@ -4596,10 +4606,7 @@ EOF
     fi
 
     # 7. 把 hysteria config.yaml 的 outbound warp_socks 端口同步到 19898
-    if [[ -f "$HY2_CONFIG" ]]; then
-        sed -i "s|addr: 127.0.0.1:40000|addr: ${WARP_SOCKS_ADDR}|g" "$HY2_CONFIG"
-        systemctl restart hysteria-server 2>/dev/null || true
-    fi
+    warp_migrate_legacy_outbound "$WARP_SOCKS_ADDR"
 
     # 8. Watchdog (走 WARP socks5 探活, 失败则重启 wireproxy)
     cat > /usr/local/bin/hy2-warp-watchdog.sh <<EOWD
@@ -5497,8 +5504,14 @@ status_service() {
         log_err "Hysteria 2 未安装！"
         return 1   # 监控脚本靠退出码判断（2026-11-06 修：旧实现未安装也返回 0）
     fi
+    # 服务停着 / 失败时也返回非零，并一起看门户（2026-11-13 修）：旧实现照样返回 0，拿 status
+    # 做健康检查的脚本把挂掉的节点当成正常；门户是 Hy2 的鉴权后端，它挂了所有用户都连不上。
+    local rc=0
     echo -e "\n${CYAN}--- Hysteria 2 运行状态 ---${PLAIN}"
-    systemctl status hysteria-server --no-pager || true
+    systemctl status hysteria-server --no-pager || rc=1
+    echo -e "\n${CYAN}--- 门户（Hy2 鉴权后端）运行状态 ---${PLAIN}"
+    systemctl status hysteria-portal --no-pager || rc=1
+    return "$rc"
 }
 
 require_installed() {
@@ -5612,8 +5625,10 @@ show_teyir_access() {
 
 view_logs() {
     require_installed || return 1
-    echo -e "${CYAN}正在查看 Hysteria 2 实时日志 (Ctrl+C 退出日志并返回菜单)...${PLAIN}"
-    journalctl -u hysteria-server -f -n 50
+    # 门户日志一起看（2026-11-13 修）：门户是 Hy2 的鉴权后端，用户连不上时原因常在它那边
+    # （鉴权失败、收回失败、计量异常），旧实现只跟核心的日志，还得另外手敲命令。
+    echo -e "${CYAN}正在查看 Hysteria 2 与门户（鉴权后端）的实时日志 (Ctrl+C 退出日志并返回菜单)...${PLAIN}"
+    journalctl -u hysteria-server -u hysteria-portal -f -n 50
 }
 
 uninstall_all() {
