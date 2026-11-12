@@ -2250,6 +2250,9 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
         stripped = line.strip()
         if stripped.startswith('listenHTTPS:'):
             raw = stripped.split(':', 1)[1].strip()
+            # 行尾注释（`:11690  # 订阅端口`）YAML 合法：旧实现整串判不成数字，
+            # 缺 subscription_port 的老 meta 订阅链接被拼成 443（2026-11-12 修）。
+            raw = re.split(r'\s+#', raw, maxsplit=1)[0]
             # 形如 ":11690" / "0.0.0.0:11690" / "11690"
             # 去掉可能的引号（`: "8443"` 这种写法 YAML 完全合法）。
             raw = raw.rsplit(':', 1)[-1].strip().strip('"').strip("'")
