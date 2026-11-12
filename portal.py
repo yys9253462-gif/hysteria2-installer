@@ -13427,8 +13427,9 @@ log() { echo "[warp] $*"; }
 for t in curl jq; do
     command -v "$t" >/dev/null 2>&1 && continue
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y -qq "$t" >/dev/null 2>&1 || true
+        # 等 dpkg 锁（与 install.sh 同理，2026-11-12）；整个脚本 180 秒超时，这里只等 60 秒。
+        apt-get -o DPkg::Lock::Timeout=60 update -qq >/dev/null 2>&1 || true
+        apt-get -o DPkg::Lock::Timeout=60 install -y -qq "$t" >/dev/null 2>&1 || true
     elif command -v yum >/dev/null 2>&1; then
         yum install -y "$t" >/dev/null 2>&1 || true
     fi

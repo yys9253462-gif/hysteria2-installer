@@ -865,8 +865,12 @@ install_dependencies() {
     # 安装随即中止；apt 遇到缺包同样整批拒绝。
     local _pm=() _pkg
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq || true
-        _pm=(apt-get install -y -qq)
+        # 等 dpkg 锁而不是立刻失败（2026-11-12 修）：新开的 Debian / Ubuntu 云主机开机后
+        # unattended-upgrades 常占着锁，旧实现立刻报 Could not get lock，jq 装不上，
+        # 随后以「关键依赖缺失」中止，看不出真正原因。apt 1.9.11 以前的版本忽略此选项。
+        local _apt_wait=(-o DPkg::Lock::Timeout=300)
+        apt-get "${_apt_wait[@]}" update -qq || true
+        _pm=(apt-get "${_apt_wait[@]}" install -y -qq)
     elif command -v dnf >/dev/null 2>&1; then
         _pm=(dnf install -y)
     elif command -v yum >/dev/null 2>&1; then
@@ -903,6 +907,9 @@ install_dependencies() {
         log_err "  Debian/Ubuntu : apt-get update && apt-get install -y ${missing_critical[*]}"
         log_err "  CentOS/RHEL   : yum install -y ${missing_critical[*]}"
         log_err "  Alpine        : apk add ${missing_critical[*]}"
+        if [[ "${_pm[0]:-}" == apt-get ]]; then
+            log_err "若上方提示 Could not get lock：系统自动更新还在跑，等它结束（几分钟）后重新运行本脚本即可。"
+        fi
         return 1
     fi
     if (( ${#missing_soft[@]} > 0 )); then
