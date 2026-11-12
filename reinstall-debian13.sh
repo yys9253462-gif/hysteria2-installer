@@ -344,6 +344,9 @@ if [ -z "$DISK" ]; then
 fi
 [ -n "$DISK" ] && [ -b "$DISK" ] || die "找不到可用磁盘，请用 --disk /dev/xxx 指定"
 is_whole_disk "$DISK" || die "$DISK 不是整块磁盘（像是分区），请指定整块磁盘，例如 /dev/vda"
+# 之后一律用真实设备名（2026-11-13 修）：/dev/disk/by-id/... 这类链接去对 /proc/mounts 永远对不上，
+# 「正被挂载」这条救援盘特征会漏掉；传给 InstallNET 的也必须是 /dev/vdX 这种写法。
+DISK="$(readlink -f "$DISK" 2>/dev/null || printf '%s' "$DISK")"
 
 DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null || echo 0) / 2048))
 ok "目标磁盘：$DISK（约 ${DISK_SIZE_MB} MB）"
@@ -639,7 +642,10 @@ fi
 ok "已下载 InstallNET.sh（$_size 字节）"
 
 # 组装参数
-set -- -debian "$RELEASE" -port "$PORT" -pwd "$PASSWORD" -mirror "$MIRROR" -swap "$SWAP_MB"
+# -setdisk：装到体检、确认过的这块盘（2026-11-13 修）。旧实现不传，InstallNET 自己挑盘：优先根分区
+# 所在盘，救援环境里退到「第一块有容量的盘」，只排除带 iso9660 签名的；多块盘又有 LVM 时对 debian
+# 还会改成所有磁盘一起分区。用户按提示用 --disk /dev/vdb 避开救援盘，实际被清空的却可能是 vda。
+set -- -debian "$RELEASE" -port "$PORT" -pwd "$PASSWORD" -mirror "$MIRROR" -swap "$SWAP_MB" -setdisk "$DISK"
 
 case "$NET_MODE" in
     static)
