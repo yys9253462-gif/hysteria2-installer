@@ -552,22 +552,59 @@ function showConfirm(options = {}) {
   });
 }
 
+// 用户表单在页内提交（2026-11-12 修）：原生提交时，重名、密码已被占用、收回未完成等错误
+// 让浏览器跳到一张只有一行纯文本的错误页，填好的表单也跟着没了。成功时服务端回 302，
+// 整页刷新看新列表；没有 JS 时表单照旧原生提交。
+async function submitUserForm(form) {
+  const btn = form.querySelector('[type="submit"]');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(form.getAttribute('action'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      redirect: 'manual',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(new FormData(form)).toString()
+    });
+    if (res.type === 'opaqueredirect' || res.ok) {
+      location.hash = '#users';
+      location.reload();
+      return;
+    }
+    const text = (await res.text()).trim();
+    alert(text || ('操作失败（HTTP ' + res.status + '）'));
+  } catch (e) {
+    alert('请求异常: ' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // 🔴 删除用户的二次确认不能写成内联的 onsubmit="return confirm(...)"：
 // CSP 的 script-src 只允许带哈希的脚本、没有 'unsafe-inline'，内联事件处理器
 // 会被浏览器直接拒绝 —— 表现为点了「删除」毫无提示、用户被静默删掉。
 // 必须在这里用 addEventListener 绑定。
-document.querySelectorAll('form.js-confirm-delete').forEach(form => {
-  form.addEventListener('submit', (e) => {
-    e.preventDefault();
-    showConfirm({
-      title: '注销用户',
-      text: form.dataset.confirm || '确定注销此用户？此操作不可撤销。',
-      icon: '⚠️',
-      isDanger: true,
-      confirmText: '确定注销'
-    }).then(ok => { if (ok) form.submit(); });
+function bindUserForms() {
+  document.querySelectorAll('form.js-confirm-delete').forEach(form => {
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      showConfirm({
+        title: '注销用户',
+        text: form.dataset.confirm || '确定注销此用户？此操作不可撤销。',
+        icon: '⚠️',
+        isDanger: true,
+        confirmText: '确定注销'
+      }).then(ok => { if (ok) submitUserForm(form); });
+    });
   });
-});
+  document.querySelectorAll('form.js-user-form').forEach(form => {
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      submitUserForm(form);
+    });
+  });
+}
+bindUserForms();
 
 function switchSubtab(paneId, subId) {
   const pane = document.getElementById('pane-' + paneId);

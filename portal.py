@@ -2624,7 +2624,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     <details style="margin-bottom:18px">
       <summary class="button" style="margin-bottom:12px;list-style:none">＋ 手动添加/开通新用户</summary>
-      <form class="modal-form" method="POST" action="/{token}/manage-user">
+      <form class="modal-form js-user-form" method="POST" action="/{token}/manage-user">
         <input type="hidden" name="action" value="create">
         
         <div class="form-field">
