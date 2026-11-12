@@ -5551,6 +5551,7 @@ start_service() {
         return 1
     fi
     log_info "已启动。"
+    warn_if_portal_down
 }
 
 stop_service() {
@@ -5562,6 +5563,16 @@ stop_service() {
         return 1
     fi
     log_info "已停止。"
+}
+
+# 核心起来了但门户停着时提醒（2026-11-13 修）：门户是 Hy2 的鉴权后端，它停着用户照样连不上，
+# 旧实现只报「已启动 / 已重启」，像是问题已经解决。只提醒、恒返回 0：它是 start / restart_service
+# 的最后一句，非零会被核心升级当成重启失败而回滚。
+warn_if_portal_down() {
+    systemctl is-active --quiet hysteria-portal 2>/dev/null && return 0
+    log_warn "门户（Hy2 鉴权后端）没有在运行，用户仍然连不上：请用菜单 15「重启门户」，"
+    log_warn "或执行 systemctl restart hysteria-portal；原因看 journalctl -u hysteria-portal -e。"
+    return 0
 }
 
 restart_service() {
@@ -5580,6 +5591,7 @@ restart_service() {
         return 1
     fi
     log_info "已重启。"
+    warn_if_portal_down
 }
 
 restart_portal() {

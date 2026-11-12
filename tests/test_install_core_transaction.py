@@ -144,7 +144,8 @@ mv() {{
             else:
                 names = INSTALL_HELPERS + ('install_binary', 'require_installed',
                                            'traffic_suspended', 'refuse_if_suspended',
-                                           'restart_service', 'flow_update_core')
+                                           'warn_if_portal_down', 'restart_service',
+                                           'flow_update_core')
                 script = prelude + '\n'.join(extract_install_fn(n) for n in names)
                 script += ('\nif flow_update_core; then exit 0; else exit $?; fi\n'
                            if conditional else '\nflow_update_core\n')
