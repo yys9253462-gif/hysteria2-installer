@@ -4177,12 +4177,18 @@ refresh_portal() {
         log_err "portal.py refresh 失败，未报告刷新成功。"
         return 1
     fi
+    systemctl reset-failed hysteria-portal 2>/dev/null || true
     if ! systemctl restart hysteria-portal; then
         log_err "门户重启命令失败；原服务状态可能仍在运行，请检查日志。"
         return 1
     fi
+    # 与 restart_portal 同理等几秒再确认（2026-11-12 修）：Type=simple 下 restart 一 fork 就返回，
+    # 刚换上的门户文件 import 失败时零点几秒后才退出，旧实现紧接着查 is-active 照样是 active，
+    # 报「网页已更新」—— 而门户是 Hy2 的鉴权后端，它起不来所有用户都连不上。
+    sleep 3
     if ! systemctl is-active --quiet hysteria-portal; then
-        log_err "门户重启失败（Hy2 鉴权后端不可用），请运行 'journalctl -u hysteria-portal -e' 查看日志。"
+        log_err "门户重启失败（Hy2 鉴权后端不可用），最近日志："
+        journalctl -u hysteria-portal -n 15 --no-pager >&2 || true
         return 1
     fi
     log_info "网页已更新，节点参数和登录凭据保持不变。"
