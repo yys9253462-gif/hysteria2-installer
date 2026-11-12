@@ -125,6 +125,13 @@ meta_set() {
     fi
 }
 
+# 重启前先清失败计数：单元设了 StartLimitBurst=5 / 300 秒，5 分钟内第 6 次重启（安装、更新、
+# 切协议线、resync、热加入失败的兜底）会被直接拒绝，事务回滚那次同样起不来，AWG 一直停着。
+awg_restart_service() {
+    systemctl reset-failed "$AWG_SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$AWG_SERVICE_NAME"
+}
+
 is_installed() {
     [[ -x "$AWG_GO_BIN" && -x "$AWG_BIN" && -x "$AWG_QUICK_BIN" && -f "$AWG_CONFIG" ]]
 }
@@ -225,7 +232,7 @@ awg_transaction_restore() {
     esac
     if [[ "$enabled" != "not-found" ]]; then
         case "$active" in
-            active) systemctl restart "$AWG_SERVICE_NAME" || return 1 ;;
+            active) awg_restart_service || return 1 ;;
             inactive|failed) systemctl stop "$AWG_SERVICE_NAME" || return 1 ;;
             '') ;;
             *) return 1 ;;
@@ -831,7 +838,7 @@ peer_apply_live_add() {
         rm -f "$pskf"
         # 热添加失败时按刚渲染好的配置重启接口（2026-11-04 修，与 peer-del 一致）：旧实现
         # 只打一句「请 resync」并照报创建成功，用户拿到的配置永远握不上手。
-        if ! systemctl restart "$AWG_SERVICE_NAME"; then
+        if ! awg_restart_service; then
             die "客户端已写入配置，但未能加入运行中的 AWG 接口（重启 ${AWG_SERVICE_NAME} 失败）"
         fi
         log_warn "无法热添加该客户端，已按新配置重启 AmneziaWG（其他客户端会短暂重连）。"
@@ -850,7 +857,7 @@ peer_apply_live_del() {
     if [[ -n "$pub" && "$pub" != null ]] && "$AWG_BIN" set "$AWG_LINK" peer "$pub" remove 2>/dev/null; then
         return 0
     fi
-    if ! systemctl restart "$AWG_SERVICE_NAME"; then
+    if ! awg_restart_service; then
         die "客户端已从配置删除，但无法移除运行中的连接（重启 ${AWG_SERVICE_NAME} 失败）"
     fi
     log_warn "无法热移除该客户端，已按新配置重启 AmneziaWG（其他客户端会短暂重连）。"
@@ -1204,7 +1211,7 @@ cmd_install() {
     fi
 
     log_step "启动 AmneziaWG 服务..."
-    systemctl restart "$AWG_SERVICE_NAME"
+    awg_restart_service
     sleep 2
 
     if ! service_active; then
@@ -1278,7 +1285,7 @@ cmd_uninstall() {
     fi
     if ! systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null; then
         if [[ "$was_enabled" == 1 ]]; then systemctl enable "$AWG_SERVICE_NAME" >/dev/null 2>&1 || true; fi
-        if [[ "$was_active" == 1 ]]; then systemctl start "$AWG_SERVICE_NAME" >/dev/null 2>&1 || true; fi
+        if [[ "$was_active" == 1 ]]; then awg_restart_service >/dev/null 2>&1 || true; fi
         die "无法禁用 ${AWG_SERVICE_NAME}，服务已按原状态恢复且未删除资产。"
     fi
 
@@ -1446,7 +1453,7 @@ cmd_update() {
         render_server_config
     fi
 
-    if ! systemctl restart "$AWG_SERVICE_NAME"; then
+    if ! awg_restart_service; then
         log_err "更新后服务重启失败，最近日志："
         journalctl -u "$AWG_SERVICE_NAME" -n 25 --no-pager >&2 || true
         exit 1
@@ -1473,7 +1480,7 @@ cmd_resync() {
     awg_transaction_snapshot || die "无法为 AWG 重新同步创建回滚快照"
     trap awg_transaction_on_exit EXIT
     render_server_config
-    systemctl restart "$AWG_SERVICE_NAME" || die "重载后服务异常，已恢复原配置"
+    awg_restart_service || die "重载后服务异常，已恢复原配置"
     sleep 2
     service_active || die "重载后服务异常，已恢复原配置"
     awg_transaction_finish

@@ -5511,6 +5511,9 @@ start_service() {
     require_installed || return 1
     refuse_if_suspended || return 1
     log_step "启动 Hysteria 2 服务..."
+    # 先清失败计数（2026-11-12 修）：单元是 StartLimitBurst=5 / 300 秒，配置写坏时崩溃重启约
+    # 50 秒就撞上限，修好配置后在菜单里启动 / 重启会被直接拒绝长达 5 分钟。
+    systemctl reset-failed hysteria-server 2>/dev/null || true
     systemctl start hysteria-server || return 1
     # 与 restart_service 同理（2026-11-06 修）：Type=simple 下 start 一 fork 就返回 0，
     # 配置坏 / 端口被占时核心 0.1 秒后就退出，旧实现照报「已启动」。
@@ -5538,6 +5541,7 @@ restart_service() {
     require_installed || return 1
     refuse_if_suspended || return 1
     log_step "重启 Hysteria 2 服务..."
+    systemctl reset-failed hysteria-server 2>/dev/null || true   # 同 start_service
     systemctl restart hysteria-server || return 1
     # 单元是 Type=simple：restart 在进程 fork 出来时就返回 0（2026-11-03 修）。
     # 新核心不认配置、绑不上端口时约 0.1 秒后就退出，旧实现照样报「已重启」，
@@ -5554,6 +5558,7 @@ restart_service() {
 restart_portal() {
     require_installed || return 1
     log_step "重启门户（私密信息页 / Hy2 鉴权后端 / 控制台 API）..."
+    systemctl reset-failed hysteria-portal 2>/dev/null || true   # 同 start_service
     systemctl restart hysteria-portal || return 1
     # 与 restart_service 同理确认还活着（2026-11-04 修）：Type=simple 下 restart 一 fork
     # 就返回成功，门户包半更新导致 import 失败时照报「已重启」—— 而门户是 Hy2 的

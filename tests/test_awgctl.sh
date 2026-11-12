@@ -363,6 +363,27 @@ exit 0
 check_eq "缺公钥的 peer-del 会重启接口（两次）" "$(grep -c '^systemctl restart' "$_live_calls")" "2"
 check_eq "有公钥时只做热移除" "$(grep -c '^awg set awg0 peer pub-real remove' "$_live_calls")" "1"
 
+# 单元是 StartLimitBurst=5 / 300 秒：撞上上限后 restart 会被拒，兜底重启前必须先清
+# 失败计数，否则 AWG 接口一直停着（2026-11-12 修）。
+_limit_calls="${WORK}/limit-calls"
+: > "$_limit_calls"
+# 用 if 接住退出码：source 进来的 awgctl 开着 set -e，裸子 shell 失败会让整个测试脚本直接退出。
+if (
+    service_active() { return 0; }
+    _awg_limited=1
+    systemctl() {
+        echo "systemctl $*" >> "$_limit_calls"
+        case "$1" in
+            reset-failed) _awg_limited=0 ;;
+            restart|start) [[ "$_awg_limited" == 0 ]] || return 1 ;;
+        esac
+        return 0
+    }
+    peer_apply_live_del null
+) >/dev/null 2>&1; then _limit_rc=0; else _limit_rc=$?; fi
+check_eq "撞上启动频率上限后，热移除失败的兜底重启仍能成功" "$_limit_rc" "0"
+check_eq "兜底重启前先 reset-failed" "$(head -n1 "$_limit_calls")" "systemctl reset-failed ${AWG_SERVICE_NAME}"
+
 # qr 与 client-conf 同一套检查：存下的坏地址不能编进二维码（2026-11-04 修）。
 _qr_out="$( (is_installed() { return 0; }; qrencode() { cat >/dev/null; echo QR-RENDERED; }
              meta_set endpoint "..."; cmd_qr one) 2>&1 || true)"
