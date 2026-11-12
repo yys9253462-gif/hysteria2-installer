@@ -3446,6 +3446,34 @@ EOF
 }
 
 # 6. 显示私密信息页的访问凭据，节点数据只在认证后提供。
+# 门户里已启用的其它协议 / 代理端口，每行「协议 端口 说明」（2026-11-12 加）：安全组提示
+# 此前只列 Hy2 自己的端口，在门户里开了 Reality / TUIC 等的用户照着放行仍然连不上。
+# 口径与门户一致：Xray 系看 xray.json 里的托管入站，sing-box 系看已启用且配置文件在。
+enabled_protocol_ports() {
+    local xray="$HY2_DIR/xray.json" portal="$HY2_DIR/portal.json" awg_port
+    if [[ -f "$xray" ]]; then
+        jq -r '{"vless-reality-in": "VLESS-Reality", "vmess-ws-in": "VMess", "vless-enc-in": "VLESS-Enc"} as $n
+            | .inbounds[]? | select(type == "object" and (.tag | type) == "string" and $n[.tag] != null)
+            | select((.port | type) == "number") | "TCP \(.port) \($n[.tag])"' "$xray" 2>/dev/null || true
+    fi
+    if [[ -f "$portal" ]]; then
+        if [[ -f "$HY2_DIR/anytls.json" ]]; then
+            jq -r '.anytls_config | select(type == "object" and .enabled == true) | .port | numbers | "TCP \(.) AnyTLS"' \
+                "$portal" 2>/dev/null || true
+        fi
+        if [[ -f "$HY2_DIR/tuic.json" ]]; then
+            jq -r '.tuic_config | select(type == "object" and .enabled == true) | .port | numbers | "UDP \(.) TUIC"' \
+                "$portal" 2>/dev/null || true
+        fi
+        jq -r '(.proxy_services // []) | if type == "array" then .[] else empty end | select(type == "object")
+            | (.port | numbers) as $p | "TCP \($p) 入站代理（\(.type // "proxy")）"' "$portal" 2>/dev/null || true
+    fi
+    if [[ -f "$AWG_CONFIG" ]]; then
+        awg_port="$(sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\)[[:space:]]*$/\1/p' "$AWG_CONFIG" | head -n 1)"
+        if [[ -n "$awg_port" ]]; then echo "UDP ${awg_port} AmneziaWG"; fi
+    fi
+}
+
 show_client_configs() {
     if [[ ! -f "$HY2_DIR/portal-access.json" ]]; then
         log_err "尚未生成信息页，请重新配置。"
@@ -3527,6 +3555,11 @@ show_client_configs() {
     if [[ "$_cert_type_display" == "acme" ]]; then
         echo -e "    ${GREEN}TCP 80${PLAIN}        申请 / 续期 Let's Encrypt 证书用"
     fi
+    local _proto _port _label
+    while read -r _proto _port _label; do
+        [[ -n "$_port" ]] || continue
+        echo -e "    ${GREEN}${_proto} ${_port}${PLAIN}        ${_label}"
+    done < <(enabled_protocol_ports)
 
     local key
     key=$(jq -r '.api_key // empty' "$HY2_DIR/portal-access.json" 2>/dev/null) || true
