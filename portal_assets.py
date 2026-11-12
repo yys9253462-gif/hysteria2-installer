@@ -641,21 +641,12 @@ document.querySelectorAll('.subtab-btn').forEach(btn => {
   });
 });
 
+// 这里只切页、不拉状态：脚本还没执行到各状态卡片的 const 声明，此时调用 check*Status
+// 只会抛「Cannot access … before initialization」；各卡片在定义处已各自拉过一次。
 if (location.hash) {
   const hash = location.hash.substring(1);
   const [tabId, subId] = hash.split('/');
-  if (document.getElementById('pane-' + tabId)) {
-    switchTab(tabId, subId);
-    // 直达链接同样要刷新：否则从书签/外部链接进来时看到的是页面加载瞬间的旧状态。
-    if (tabId === 'reality') {
-      checkRealityStatus();
-      checkVmessStatus();
-      checkVlessencStatus();
-      // 深链接路径此前漏了 AnyTLS：书签进入时卡片会停在首屏旧状态。
-      checkAnytlsStatus();
-      checkTuicStatus();
-    }
-  }
+  if (document.getElementById('pane-' + tabId)) switchTab(tabId, subId);
 }
 
 function genRandom(targetId, prefix='') {
@@ -2715,6 +2706,14 @@ document.querySelectorAll('.js-goto').forEach(btn => {
 const btnRefreshCores = document.getElementById('btn-refresh-cores');
 if (btnRefreshCores) btnRefreshCores.addEventListener('click', loadCores);
 if (location.hash.startsWith('#cores')) loadCores();
+
+// 门户开着时改地址栏哈希、打开同页书签不会重新加载页面，只触发 hashchange；
+// 旧实现没监听，地址栏写着 #cores，页面还停在原来的标签（2026-11-12 修）。
+function routeFromHash() {
+  const target = location.hash.substring(1);
+  if (document.getElementById('pane-' + target.split('/')[0])) gotoTarget(target);
+}
+window.addEventListener('hashchange', routeFromHash);
 
 
 // 版本检测与一键更新交互
