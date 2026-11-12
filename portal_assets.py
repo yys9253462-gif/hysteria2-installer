@@ -1792,10 +1792,12 @@ if (btnResetRealityKeys) {
 // 旧实现只有 .then 没有 .catch，失败时按钮毫无反应，看起来像点坏了。
 // 失败时退回「选中文本」并提示手动复制（与页面通用 [data-copy] 处理器一致）。
 function copyWithFeedback(text, button, doneText) {
-  const orig = button.textContent;
+  // 原文只记第一次（同用户页，2026-11-12 修）：恢复前再点一下会把「已复制 ✓」当成原文。
+  const orig = button.dataset.orig || (button.dataset.orig = button.textContent);
   const ok = () => {
     button.textContent = doneText;
-    setTimeout(() => { button.textContent = orig; }, 1500);
+    clearTimeout(button._restoreTimer);
+    button._restoreTimer = setTimeout(() => { button.textContent = orig; }, 1500);
   };
   const fallback = () => {
     const ta = document.createElement('textarea');
@@ -3606,7 +3608,9 @@ document.querySelectorAll('[data-copy]').forEach(button => {
     const field = document.getElementById(button.dataset.copy);
     if (!field) return;
     const val = field.value || field.textContent || '';
-    const orig = button.textContent;
+    // 原文只在第一次点击时记下（2026-11-12 修）：旧实现每次都读当前文字，恢复前再点一下，
+    // 「已复制 ✓」/「已选中，请按 Ctrl+C」就被当成原文，按钮永远停在那句话上。
+    const orig = button.dataset.orig || (button.dataset.orig = button.textContent);
     // 同管理页（2026-11-06 修）：http 下 navigator.clipboard 不存在，旧实现静默失败，
     // 按钮不变也没有提示。先试 execCommand 兜底，都不行再选中并明确告诉用户按 Ctrl+C。
     let copied = false;
@@ -3632,7 +3636,8 @@ document.querySelectorAll('[data-copy]').forEach(button => {
       if (field.select) { field.focus(); field.select(); }
       button.textContent = '已选中，请按 Ctrl+C';
     }
-    setTimeout(() => { button.textContent = orig; }, copied ? 1800 : 4000);
+    clearTimeout(button._restoreTimer);
+    button._restoreTimer = setTimeout(() => { button.textContent = orig; }, copied ? 1800 : 4000);
   });
 });
 """
