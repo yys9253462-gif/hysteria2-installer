@@ -8911,14 +8911,16 @@ def serve(path):
         """把启动自检脚本写到 GOST_SELFCHECK_PATH (unit 的 ExecStartPost 调用).
 
         install.sh 的 install_gost() 会写同一份内容; 这里再写一次是为了覆盖
-        "服务器上已装过旧版 gost、unit 却没有自检" 的情况。
+        "服务器上已装过旧版 gost、unit 却没有自检" 的情况。返回是否写成功。
         """
         try:
             GOST_SELFCHECK_PATH.parent.mkdir(parents=True, exist_ok=True)
             GOST_SELFCHECK_PATH.write_text(GOST_SELFCHECK_SCRIPT, encoding='utf-8')
             os.chmod(str(GOST_SELFCHECK_PATH), 0o755)
-        except OSError:
-            pass
+            return True
+        except OSError as exc:
+            _log_ignored('gost_selfcheck_write', exc)
+            return False
 
     def gost_owned():
         """gost 是本工具装的：有所有权标记，且单元指向本工具的配置（与一键安装同一判据）。"""
@@ -8954,10 +8956,16 @@ def serve(path):
         needed = ('ExecReload=/bin/kill -HUP $MAINPID',
                   '-R 30s',
                   'ExecStartPost=' + GOST_SELFCHECK_PATH.as_posix())
-        if all(s in current for s in needed):
+        # ExecStartPost 指向的脚本必须真的在（2026-11-13 修）：脚本不在时 systemd 把每次启动都判为
+        # 失败并停掉 gost，入站代理全部不可用。旧实现单元齐全就返回、不管脚本被删；写脚本失败也
+        # 悄悄吞掉，照样换上引用它的新单元。
+        if all(s in current for s in needed) and GOST_SELFCHECK_PATH.is_file():
             return                                   # 已是最新, 不做任何事
         try:
-            write_gost_selfcheck()
+            if not write_gost_selfcheck():
+                return                               # 留着旧单元，至少还能启动
+            if all(s in current for s in needed):
+                return                               # 只是补回脚本，单元不用动
             unit_path.write_text(GOST_UNIT_CONTENT, encoding='utf-8')
             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=5)
         except Exception as exc:
@@ -11520,7 +11528,9 @@ if __name__ == '__main__':
                 # 确保 systemd 服务存在
                 # 先落地启动自检脚本 (unit 的 ExecStartPost 会调用它), 再写 unit.
                 assets_modified = True
-                write_gost_selfcheck()
+                if not write_gost_selfcheck():
+                    raise RuntimeError('无法写入启动自检脚本 %s（单元的 ExecStartPost 依赖它，写不进去 gost 必然启动失败）'
+                                       % GOST_SELFCHECK_PATH)
                 service_content = GOST_UNIT_CONTENT
                 Path('/etc/systemd/system/gost.service').write_text(service_content, encoding='utf-8')
                 owner_marker = Path('/etc/hysteria/.hy2-gost-owned')
