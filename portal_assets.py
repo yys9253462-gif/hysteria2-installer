@@ -805,7 +805,7 @@ function markStatusUnknown(badge, detail) {
 // 列表 / 表格加载失败时同样不能停在「加载中」（2026-11-12 修）。只替换仍是加载占位的
 // 元素：已经渲染过的数据不因之后某次刷新失败被清空。
 function markLoadFailed(el, text) {
-  if (!el || !/加载中|正在加载/.test(el.textContent || '')) return;
+  if (!el || !/加载中|正在加载|正在拉取/.test(el.textContent || '')) return;
   if (el.tagName === 'TBODY') {
     const cell = el.querySelector('td');
     const cols = (cell && cell.getAttribute('colspan')) || '1';
@@ -821,15 +821,26 @@ function markLoadFailed(el, text) {
 // 只认最新一次请求（2026-11-04 修，与 VMess 卡片同一做法）：轮询回包比开关后的状态查询
 // 晚到时会把卡片刷回切换之前的状态，管理员再点一次就切反了。
 let warpStatusSeq = 0;
+function markWarpRulesFailed() {
+  markLoadFailed(warpRulesCount, '数量未知');
+  markLoadFailed(warpTagsCloud, '分流规则读取失败，请刷新页面重试');
+}
+
 async function checkWarpStatus() {
   if (!warpBadge) return;
   const seq = ++warpStatusSeq;
   try {
     const res = await fetch(location.pathname + 'warp-status', { credentials: 'same-origin' });
-    if (!res.ok) { if (seq === warpStatusSeq) markStatusUnknown(warpBadge); return; }
+    if (!res.ok) { if (seq === warpStatusSeq) { markStatusUnknown(warpBadge); markWarpRulesFailed(); } return; }
     const json = await res.json();
     if (seq !== warpStatusSeq) return;
-    if (!json.ok) { markStatusUnknown(warpBadge, json.error); return; }
+    if (!json.ok) { markStatusUnknown(warpBadge, json.error); markWarpRulesFailed(); return; }
+
+    // 分流名单与 WARP 装没装无关（门户里一直有默认名单，未安装时也能增删）：先渲染。
+    // 旧实现在「未安装」分支提前 return，数量与列表永远停在「加载中…」（2026-11-12 修）。
+    if (Array.isArray(json.rules)) {
+      renderWarpRules(json.rules, json.installed && json.enabled && json.applied && !json.overridden);
+    }
 
     if (btnInstallWarp) {
       if (!json.installed) {
@@ -872,11 +883,7 @@ async function checkWarpStatus() {
         btnToggleWarp.className = 'toggle-btn off';
       }
     }
-
-    if (Array.isArray(json.rules)) {
-      renderWarpRules(json.rules, json.enabled && json.applied && !json.overridden);
-    }
-  } catch (_) { if (seq === warpStatusSeq) markStatusUnknown(warpBadge); }
+  } catch (_) { if (seq === warpStatusSeq) { markStatusUnknown(warpBadge); markWarpRulesFailed(); } }
 }
 
 if (btnToggleWarp) {
