@@ -958,17 +958,14 @@ if (btnInstallWarp) {
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
-      if (!res.ok) {
-        const errText = await res.text();
-        showToast('安装失败 (HTTP ' + res.status + '): ' + errText, 'error');
-        return;
-      }
+      // 失败回包按 JSON 读出原因（2026-11-12 修）：旧实现把整段响应原文拼进提示，用户看到的是
+      // {"ok": false, "error": ...} 一串；会话过期或反代回 502 时是整页 HTML。
       const json = await res.json();
-      if (json.ok) {
+      if (res.ok && json.ok) {
         showToast(json.message || 'Cloudflare WARP 安装成功！服务已自动就绪。', 'success');
         await checkWarpStatus();
       } else {
-        showToast(json.error || '安装失败，请检查网络', 'error');
+        showToast(json.error || ('安装失败（HTTP ' + res.status + '），请检查网络'), 'error');
       }
     } catch (e) {
       showToast('安装请求异常: ' + e.message, 'error');
