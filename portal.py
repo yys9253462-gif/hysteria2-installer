@@ -2771,7 +2771,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       <div style="display:flex;gap:10px;align-items:center">
         <span class="status-pill" id="warp-badge" style="background:#eaf3de;color:#27500a">检测中...</span>
         <button class="button primary" id="btn-install-warp" type="button" style="padding:6px 14px;font-size:12px;display:none">⚡ 一键安装 WARP</button>
-        <button class="toggle-btn off" id="btn-toggle-warp" type="button">切换中...</button>
+        <button class="toggle-btn off" id="btn-toggle-warp" type="button" style="display:none">切换中...</button>
       </div>
     </div>
 

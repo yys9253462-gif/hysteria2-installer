@@ -947,6 +947,9 @@ async function checkWarpStatus() {
 
 if (btnToggleWarp) {
   btnToggleWarp.addEventListener('click', async () => {
+    // 按卡片显示的状态发送明确的 enable / disable（2026-11-13 修，同协议开关）；开关要等状态查询
+    // 成功才显示，旧页面一加载就显示「切换中...」且可点，查询失败时点下去是盲翻。
+    const action = btnToggleWarp.classList.contains('on') ? 'disable' : 'enable';
     btnToggleWarp.disabled = true;
     btnToggleWarp.textContent = '切换中...';
     try {
@@ -954,7 +957,7 @@ if (btnToggleWarp) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       const json = await res.json();
       if (!json.ok) alert(json.error || '切换失败');
