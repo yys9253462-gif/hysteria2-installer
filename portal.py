@@ -2378,8 +2378,10 @@ def portal_access_payload(url, username, password, api_key):
 
 def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token="", session_secret="",
               username="", password=""):
-    def field(identifier, value, kind="link"):
-        return f'<textarea id="{identifier}" class="{kind}" aria-label="{identifier}" readonly spellcheck="false">{html.escape(value)}</textarea>'
+    def field(identifier, value, kind="link", label=None):
+        # 读屏念的是 aria-label（2026-11-13 修）：旧实现直接用元素 id，念出来是「hy2-link」这类代码名。
+        return (f'<textarea id="{identifier}" class="{kind}" aria-label="{html.escape(label or identifier)}" '
+                f'readonly spellcheck="false">{html.escape(value)}</textarea>')
     def copy(identifier):
         return f'<button class="button primary" type="button" data-copy="{identifier}" data-orig="复制">复制</button>'
     
@@ -2483,13 +2485,13 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     users_table_html = "".join(user_rows) or '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:24px">暂无多用户数据</td></tr>'
     obfs_badge = "Salamander" if obfs_pw else "QUIC"
-    field_hy2 = field("hy2-link", uri)
+    field_hy2 = field("hy2-link", uri, label="Hy2 节点直链")
     copy_hy2 = copy("hy2-link")
-    field_sub = field("clash-subscription", subscription)
+    field_sub = field("clash-subscription", subscription, label="Clash 订阅链接")
     copy_sub = copy("clash-subscription")
-    field_clash_cfg = field("clash-config", clash, "config")
+    field_clash_cfg = field("clash-config", clash, "config", label="Clash 完整配置")
     copy_clash_cfg = copy("clash-config")
-    field_sing_cfg = field("sing-config", sing, "config")
+    field_sing_cfg = field("sing-config", sing, "config", label="Sing-box 出站配置")
     copy_sing_cfg = copy("sing-config")
 
     # 接入 TEYIR 控制台（hy2-ops-console）用的四个字段。
@@ -2507,7 +2509,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         portal_access_payload(access_url, username, password, api_key or ""),
         ensure_ascii=False)
     field_access_json = (
-        f'<textarea id="teyir-access-json" class="config" aria-label="teyir-access-json" '
+        f'<textarea id="teyir-access-json" class="config" aria-label="TEYIR 接入凭据（JSON）" '
         f'readonly spellcheck="false" style="height:92px">{html.escape(access_json)}</textarea>')
     copy_access_json = copy("teyir-access-json")
 
@@ -2790,7 +2792,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       </div>
 
       <form class="warp-add-form" id="form-add-warp-rule">
-        <input class="warp-domain-input" id="input-warp-domain" type="text" placeholder="输入要走 WARP 的域名，例如 netflix.com / bing.com" required>
+        <input class="warp-domain-input" id="input-warp-domain" type="text" aria-label="要走 WARP 的域名" placeholder="输入要走 WARP 的域名，例如 netflix.com / bing.com" required>
         <button class="warp-add-btn" type="submit">＋ 添加分流域名</button>
       </form>
 
@@ -2838,13 +2840,13 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="ob-probe-ip" id="ob-outbound-ip">探测中...</div>
         <div class="ob-probe-sub" id="ob-outbound-ip-note">只检测所选出站端点的可达性，不代表已配置分流规则的实际出口</div>
         <div class="ob-probe-actions">
-          <select id="ob-probe-kind" class="ob-select">
+          <select id="ob-probe-kind" class="ob-select" aria-label="探测哪个出站">
             <option value="direct">直连（服务器本机）</option>
             <option value="warp">WARP (127.0.0.1:19898)</option>
             <option value="socks5">自定义 SOCKS5</option>
             <option value="http">自定义 HTTP</option>
           </select>
-          <input type="text" id="ob-probe-addr" class="ob-input"
+          <input type="text" id="ob-probe-addr" class="ob-input" aria-label="要探测的代理地址"
                  placeholder="1.2.3.4:1080 或 http://1.2.3.4:8080" hidden>
           <button class="button" id="btn-ob-probe" type="button">探测出口</button>
         </div>
@@ -2960,8 +2962,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <span class="ob-rules-hint" id="ob-rules-hint">仅在「按域名分流」模式下生效</span>
       </div>
       <div class="ob-add-form">
-        <input type="text" id="ob-rule-domain" class="ob-input" placeholder="域名，如 openai.com">
-        <select id="ob-rule-outbound" class="ob-select"></select>
+        <input type="text" id="ob-rule-domain" class="ob-input" aria-label="分流规则的域名" placeholder="域名，如 openai.com">
+        <select id="ob-rule-outbound" class="ob-select" aria-label="该域名走哪个出站"></select>
         <button class="button" id="btn-ob-rule-add" type="button">添加规则</button>
       </div>
       <div class="ob-rules-list" id="ob-rules-list">
@@ -3013,8 +3015,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <!-- 已安装后的客户端管理面板 -->
     <div id="awg-panel" style="display:none">
       <div class="awg-add-form">
-        <input class="awg-input" id="awg-peer-name" type="text" placeholder="新客户端名称（字母/数字/._-）" autocomplete="off" spellcheck="false">
-        <input class="awg-input" id="awg-peer-endpoint" type="text" placeholder="连接地址（默认沿用已保存的地址）" autocomplete="off" spellcheck="false">
+        <input class="awg-input" id="awg-peer-name" type="text" aria-label="新客户端名称" placeholder="新客户端名称（字母/数字/._-）" autocomplete="off" spellcheck="false">
+        <input class="awg-input" id="awg-peer-endpoint" type="text" aria-label="客户端连接地址" placeholder="连接地址（默认沿用已保存的地址）" autocomplete="off" spellcheck="false">
         <button class="button primary" id="btn-add-awg-peer" type="button" style="white-space:nowrap">＋ 新增客户端</button>
       </div>
 
@@ -3083,7 +3085,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#eff6ff;color:#2563eb">01</span><div><h2>VLESS 直链 (URI)</h2><p>支持一键导入主流现代客户端</p></div></div>
-            <textarea class="link" id="reality-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="reality-uri-val" aria-label="VLESS-Reality 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px;display:flex;justify-content:space-between;align-items:center">
               <button class="button primary" id="btn-copy-reality-uri" type="button">复制 Reality 直链</button>
               <button class="button" id="btn-reset-reality-keys" type="button" style="font-size:11px;color:var(--muted)" title="重置将重新生成密钥对（用户 UUID 不变）">🔄 重新生成密钥对</button>
@@ -3151,7 +3153,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#f3e8ff;color:#7c3aed">01</span><div><h2>VMess 直链 (URI)</h2><p>Base64 标准格式，导入即用</p></div></div>
-            <textarea class="link" id="vmess-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="vmess-uri-val" aria-label="VMess 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px">
               <button class="button primary" id="btn-copy-vmess-uri" type="button">复制 VMess 直链</button>
             </div>
@@ -3212,7 +3214,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>VLESS 直链 (URI)</h2><p>含 encryption 参数，导入即用</p></div></div>
-            <textarea class="link" id="vlessenc-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="vlessenc-uri-val" aria-label="VLESS Encryption 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px">
               <button class="button primary" id="btn-copy-vlessenc-uri" type="button">复制 VLESS 直链</button>
             </div>
@@ -3272,7 +3274,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>AnyTLS 直链 (URI)</h2><p>anytls:// 格式，导入即用</p></div></div>
-            <textarea class="link" id="anytls-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="anytls-uri-val" aria-label="AnyTLS 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px">
               <button class="button primary" id="btn-copy-anytls-uri" type="button">复制 AnyTLS 直链</button>
             </div>
@@ -3332,7 +3334,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="stack">
           <section class="card" style="border-color:#d7e2ee">
             <div class="card-head"><span class="step" style="background:#ccfbf1;color:#0f766e">01</span><div><h2>TUIC 直链 (URI)</h2><p>tuic:// 格式（v5），导入即用</p></div></div>
-            <textarea class="link" id="tuic-uri-val" readonly style="height:86px;font-size:11.5px"></textarea>
+            <textarea class="link" id="tuic-uri-val" aria-label="TUIC 直链" readonly style="height:86px;font-size:11.5px"></textarea>
             <div class="actions" style="margin-top:12px">
               <button class="button primary" id="btn-copy-tuic-uri" type="button">复制 TUIC 直链</button>
             </div>
@@ -3661,14 +3663,14 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div>
           <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:4px">标准直连 URL (URI)</div>
           <div class="pm-code-box">
-            <input class="pm-code-input" id="res-purl" readonly value="">
+            <input class="pm-code-input" id="res-purl" aria-label="代理标准直连 URL" readonly value="">
             <button class="button primary" id="btn-copy-purl" type="button" style="padding:4px 12px;font-size:11px;white-space:nowrap">复制 URL</button>
           </div>
         </div>
         <div>
           <div style="font-size:11px;font-weight:700;color:var(--muted);margin-bottom:4px">通用爬虫/软件格式 (Host:Port:User:Pass)</div>
           <div class="pm-code-box">
-            <input class="pm-code-input" id="res-pfmt" readonly value="">
+            <input class="pm-code-input" id="res-pfmt" aria-label="代理 Host:Port:User:Pass 格式" readonly value="">
             <button class="button" id="btn-copy-pfmt" type="button" style="padding:4px 12px;font-size:11px;white-space:nowrap">复制格式</button>
           </div>
         </div>
@@ -3896,7 +3898,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
   <div class="stack">
     <section class="card">
       <div class="card-head"><span class="step">01</span><div><h2>节点直链 (URI)</h2><p>全平台通用直链 (点击一键导入/剪贴板导入)</p></div></div>
-      <textarea id="u-hy2-uri" class="link" readonly>{html.escape(uri)}</textarea>
+      <textarea id="u-hy2-uri" class="link" aria-label="Hy2 节点直链" readonly>{html.escape(uri)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-hy2-uri">复制直链</button>
       </div>
@@ -3906,28 +3908,28 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
 
     <section class="card">
       <div class="card-head"><span class="step">02</span><div><h2>Clash / Mihomo 专属订阅</h2><p>适用于 Clash Verge / Clash.Meta 核心客户端 (一键订阅同步)</p></div></div>
-      <textarea id="u-clash-sub" class="link" style="height:68px" readonly>{html.escape(clash_sub_url)}</textarea>
+      <textarea id="u-clash-sub" class="link" aria-label="Clash 订阅链接" style="height:68px" readonly>{html.escape(clash_sub_url)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-clash-sub">复制订阅链接</button>
         <a class="button" href="/{token}/u/{quote(uid)}/clash.yaml?k={user_key}" download="clash-{uid}.yaml">下载 clash.yaml ↓</a>
       </div>
       <details style="margin-top:10px">
         <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
-        <textarea id="u-clash-cfg" class="config" style="height:110px;margin-top:6px" readonly>{html.escape(clash)}</textarea>
+        <textarea id="u-clash-cfg" class="config" aria-label="Clash 原始配置" style="height:110px;margin-top:6px" readonly>{html.escape(clash)}</textarea>
         <div style="margin-top:4px"><button class="button" type="button" data-copy="u-clash-cfg" style="padding:4px 10px;font-size:11px">复制配置文本</button></div>
       </details>
     </section>
 
     <section class="card">
       <div class="card-head"><span class="step">03</span><div><h2>Sing-box 专属订阅</h2><p>适用 SFI / SFA / Sing-box 客户端（远程配置，一键订阅同步）</p></div></div>
-      <textarea id="u-sing-sub" class="link" style="height:68px" readonly>{html.escape(sing_sub_url)}</textarea>
+      <textarea id="u-sing-sub" class="link" aria-label="Sing-box 订阅链接" style="height:68px" readonly>{html.escape(sing_sub_url)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-sing-sub">复制订阅链接</button>
         <a class="button" href="/{token}/u/{quote(uid)}/sing-box.json?k={user_key}" download="sing-box-{uid}.json">下载 sing-box.json ↓</a>
       </div>
       <details style="margin-top:10px">
         <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
-        <textarea id="u-sing-cfg" class="config" style="height:110px;margin-top:6px" readonly>{html.escape(sing)}</textarea>
+        <textarea id="u-sing-cfg" class="config" aria-label="Sing-box 原始配置" style="height:110px;margin-top:6px" readonly>{html.escape(sing)}</textarea>
         <div style="margin-top:4px"><button class="button" type="button" data-copy="u-sing-cfg" style="padding:4px 10px;font-size:11px">复制配置文本</button></div>
       </details>
     </section>

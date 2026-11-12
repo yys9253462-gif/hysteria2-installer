@@ -3337,7 +3337,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         .map((x, i) => `
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">${obEsc(x.label)} 直链（UDP 不通时用）:</div>
-              <textarea id="um-extra-${i}" class="link" style="height:52px;font-size:11px" readonly>${obEsc(x.uri)}</textarea>
+              <textarea id="um-extra-${i}" class="link" aria-label="${obEsc(x.label)} 直链" style="height:52px;font-size:11px" readonly>${obEsc(x.uri)}</textarea>
               <div style="margin-top:6px"><button class="button" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-extra-${i}">复制 ${obEsc(x.label)} 直链</button></div>
             </div>`).join('');
       
@@ -3367,7 +3367,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div style="background:#eaf5ef;border:1px solid #c3ddd5;border-radius:12px;padding:12px 14px">
           <div style="font-size:12px;font-weight:700;color:var(--accent);margin-bottom:6px">🌐 专属独立连接页面 (可直接发给客户):</div>
           <div class="input-with-action">
-            <input type="text" id="um-share-url" value="${obEsc(shareUrl)}" readonly style="font-size:12px;height:38px">
+            <input type="text" id="um-share-url" aria-label="专属连接页面链接" value="${obEsc(shareUrl)}" readonly style="font-size:12px;height:38px">
             <button class="button primary" style="padding:0 12px;height:38px;font-size:12px" type="button" data-modal-copy="um-share-url">复制页面链接</button>
             <a class="button" style="padding:0 12px;height:38px;font-size:12px" href="${obEsc(shareUrl)}" target="_blank">打开页面 ↗</a>
           </div>
@@ -3382,7 +3382,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
           <div style="display:flex;flex-direction:column;gap:12px">
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">专属节点直链 (URI):</div>
-              <textarea id="um-uri" class="link" style="height:65px;font-size:11px" readonly>${obEsc(json.uri)}</textarea>
+              <textarea id="um-uri" class="link" aria-label="Hy2 节点直链" style="height:65px;font-size:11px" readonly>${obEsc(json.uri)}</textarea>
               <div style="margin-top:6px;display:flex;gap:8px">
                 <button class="button primary" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-uri">复制直链</button>
               </div>
@@ -3391,26 +3391,26 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Clash / Mihomo 专属订阅链接:</div>
               <div class="input-with-action">
-                <input type="text" id="um-clash-sub" value="${location.origin}/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" readonly style="font-size:11px;height:36px">
+                <input type="text" id="um-clash-sub" aria-label="Clash 订阅链接" value="${location.origin}/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" readonly style="font-size:11px;height:36px">
                 <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-clash-sub">复制订阅</button>
                 <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" download="clash-${uid}.yaml">下载 ↓</a>
               </div>
               <details style="margin-top:6px">
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
-                <textarea id="um-clash" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.clash)}</textarea>
+                <textarea id="um-clash" class="link" aria-label="Clash 配置文本" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.clash)}</textarea>
                 <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-clash">复制文本</button></div>
               </details>
             </div>
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Sing-box 专属订阅链接:</div>
               <div class="input-with-action">
-                <input type="text" id="um-sing-sub" value="${obEsc(location.origin + singSubPath)}" readonly style="font-size:11px;height:36px">
+                <input type="text" id="um-sing-sub" aria-label="Sing-box 订阅链接" value="${obEsc(location.origin + singSubPath)}" readonly style="font-size:11px;height:36px">
                 <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-sing-sub">复制订阅</button>
                 <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="${obEsc(singSubPath)}" download="sing-box-${obEsc(uid)}.json">下载 ↓</a>
               </div>
               <details style="margin-top:6px">
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
-                <textarea id="um-sing" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.sing_box)}</textarea>
+                <textarea id="um-sing" class="link" aria-label="Sing-box 配置文本" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.sing_box)}</textarea>
                 <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-sing">复制文本</button></div>
               </details>
             </div>
