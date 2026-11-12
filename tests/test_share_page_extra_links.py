@@ -22,6 +22,17 @@ class SharePageExtraLinksTests(unittest.TestCase):
     def test_hy2_only_page_is_unchanged(self):
         self.assertNotIn('u-extra-uri', self.page(()))
 
+    def test_extra_links_carry_a_scannable_qr(self):
+        """客户在电脑上开分享页、用手机扫码导入：备用节点也要有二维码（2026-11-13 加）。"""
+        page = self.page([('Reality', 'vless://u@1.2.3.4:443', '<svg id="qr-reality"></svg>'),
+                          ('VMess', 'vmess://x', '')])
+        self.assertIn('<svg id="qr-reality"></svg>', page)
+        self.assertIn('显示 Reality 二维码', page)
+        self.assertNotIn('显示 VMess 二维码', page, '没有二维码时不该渲染空的展开块')
+        # 只嵌 SVG：别的内容不进页面；旧的两元组照常渲染。
+        self.assertNotIn('<b>x</b>', self.page([('Reality', 'vless://a', '<b>x</b>')]))
+        self.assertIn('u-extra-uri-0', self.page([('Reality', 'vless://a')]))
+
 
 if __name__ == '__main__':
     unittest.main()

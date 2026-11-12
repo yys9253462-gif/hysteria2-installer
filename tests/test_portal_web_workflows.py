@@ -2428,6 +2428,13 @@ class WebWorkflowTests(unittest.TestCase):
             vmess_uri_for_user=broken)
         links = extract_method('_user_extra_links', self.ns)(self.handler, 'alice', '1.2.3.4')
         self.assertEqual(links, [('Reality', 'vless://alice@1.2.3.4#Reality-alice')])
+        # 分享页要二维码（2026-11-13 加），每张只等几秒，几个协议加起来也不会把分享页拖住。
+        timeouts = []
+        self.ns['qr_svg_for'] = lambda link, timeout=20: timeouts.append(timeout) or '<svg>%s</svg>' % link
+        links = extract_method('_user_extra_links', self.ns)(self.handler, 'alice', '1.2.3.4', with_qr=True)
+        self.assertEqual(links, [('Reality', 'vless://alice@1.2.3.4#Reality-alice',
+                                  '<svg>vless://alice@1.2.3.4#Reality-alice</svg>')])
+        self.assertTrue(timeouts and max(timeouts) <= 5, timeouts)
 
 
     def test_awg_peer_delete_extends_its_deadline(self):

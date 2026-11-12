@@ -3804,15 +3804,24 @@ def _extra_link_boxes(extra_links):
     用 v2rayNG / Shadowrocket 按链接导入的用户永远拿不到备用节点。
     """
     parts = []
-    for i, (label, link) in enumerate(extra_links or ()):
+    for i, item in enumerate(extra_links or ()):
+        label, link = item[0], item[1]
         if not isinstance(link, str) or not link:
             continue
         box_id = 'u-extra-uri-%d' % i
+        # 带上二维码（2026-11-13 加）：客户常在电脑上开分享页、用手机扫码导入，UDP 不通时要的恰恰是
+        # 这些备用节点，旧页面只给文字。只嵌 qrencode 生成的 SVG（与 Hy2 二维码同一来源）。
+        qr = item[2] if len(item) > 2 else ''
+        qr_html = ('<details style="margin-top:6px"><summary style="font-size:12px;color:var(--muted)">'
+                   '显示 %s 二维码（手机扫码导入）</summary><div class="qr-frame" style="max-width:220px;'
+                   'margin:8px 0">%s</div></details>' % (html.escape(label), qr)
+                   if isinstance(qr, str) and '<svg' in qr else '')
         parts.append(
             '<div style="margin-top:14px"><p class="note" style="margin-bottom:4px">%s 直链（UDP 不通时用）</p>'
-            '<textarea id="%s" class="link" readonly>%s</textarea>'
-            '<div class="actions"><button class="button" type="button" data-copy="%s">复制 %s 直链</button></div></div>'
-            % (html.escape(label), box_id, html.escape(link), box_id, html.escape(label)))
+            '<textarea id="%s" class="link" aria-label="%s 直链" readonly>%s</textarea>'
+            '<div class="actions"><button class="button" type="button" data-copy="%s">复制 %s 直链</button></div>%s</div>'
+            % (html.escape(label), box_id, html.escape(label), html.escape(link), box_id, html.escape(label),
+               qr_html))
     return ''.join(parts)
 
 
@@ -7565,15 +7574,15 @@ def prepare(meta_path, port, node_api_key=None):
         atomic_write_private(path, json.dumps(value, ensure_ascii=False).encode('utf-8'))
 
 
-def qr_svg_for(uri):
+def qr_svg_for(uri, timeout=20):
     """生成二维码 SVG；失败返回 None（调用方据此保留旧图）。
 
     抽出来是为了能在**数据锁外**先算好：qrencode 是子进程，最长 20 秒，
-    在锁内跑会阻塞 /auth（2026-10-29 修）。
+    在锁内跑会阻塞 /auth（2026-10-29 修）。分享页一次要出好几张时传更短的 timeout。
     """
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
-                            input=str(uri).encode(), capture_output=True, timeout=20)
+                            input=str(uri).encode(), capture_output=True, timeout=timeout)
         if qr.returncode == 0 and qr.stdout:
             return qr.stdout.decode('utf-8', 'replace')
     except Exception as exc:
@@ -14277,7 +14286,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                       'text/html; charset=utf-8')
 
                 m = read_meta_file(meta_path)
-                # 🔴 2026-10-31：这个分享页会跑一到两次 qrencode（各 10 秒超时），
+                # 🔴 2026-10-31：这个分享页要跑 qrencode：Hy2 一张（10 秒超时），2026-11-13 起每个
+                # 备用协议再各一张（5 秒超时，最多 5 张），最坏约 35 秒；
                 # 而默认连接死线 30 秒、且并发受 BoundedSemaphore(8) 限制。
                 # 低配机 + 多人同时打开分享页时会在 30 秒整被 watch_deadlines
                 # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
@@ -14328,7 +14338,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     listen_port = m.get('listen_port', 19984)
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
                     page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0],
-                                          extra_links=self._user_extra_links(target_uid, _pub_clean))
+                                          extra_links=self._user_extra_links(target_uid, _pub_clean, with_qr=True))
                     return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
                 else:
                     return self.reply(404, b'Not found')
@@ -14589,6 +14599,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             分享页（2026-11-04 加）与管理员的「专属连接」弹窗（2026-11-13 加）共用：UDP 被封的
             网络要靠 Reality / VMess 等 TCP 协议兜底。生成失败的一项只跳过、不影响其它。
+            with_qr=True 时每项多带一张二维码 SVG（分享页用；在锁外调用，qrencode 是子进程）。
             """
             _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
             _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
@@ -14606,7 +14617,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     _log_ignored('share_extra_uri', exc)
                     continue
                 if isinstance(link, str) and link:
-                    links.append((label, link))
+                    # 每张最多等 5 秒：五个协议都开着时，旧的 20 秒上限能让分享页卡上一分多钟。
+                    links.append((label, link, qr_svg_for(link, timeout=5) or '') if with_qr else (label, link))
             return links
 
         def _render_index_page(self):
