@@ -1271,6 +1271,24 @@ class WebWorkflowTests(unittest.TestCase):
         status, body = self.invoke_api({'user_id': 'brokenx', 'ip_limit': 2}, endpoint='users/update')
         self.assertEqual(status, 404, body)
 
+    def test_web_user_form_errors_are_readable(self):
+        """页内提交后报错原样弹给管理员：写成中文并说明怎么改（2026-11-13 修）。"""
+        self.ns['user_id_shareable'] = portal.user_id_shareable
+        for params, want_status, hint in (
+                ({'action': 'create', 'user_id': '张三'}, 400, '字母、数字'),
+                ({'action': 'create', 'user_id': 'admin_master'}, 400, '保留名'),
+                ({'action': 'create', 'user_id': 'qa-user', 'duration_days': '0'}, 400, '1-36500 天'),
+                ({'action': 'delete', 'user_id': 'admin_master'}, 400, '机主账号不能删除'),
+                ({'action': 'delete', 'user_id': 'not-present'}, 404, '请刷新页面'),
+                ({'action': 'bogus', 'user_id': 'qa-user'}, 400, '刷新页面后重试')):
+            with self.subTest(params=params):
+                status, body = self.invoke('_h_post_manage_user', params)
+                text = body.decode('utf-8') if isinstance(body, bytes) else str(body)
+                self.assertEqual(status, want_status, text)
+                self.assertIn(hint, text)
+                for english in ('Invalid', 'Reserved', 'Cannot', 'not found', 'Bad request'):
+                    self.assertNotIn(english, text)
+
     def test_dot_only_user_ids_cannot_be_created(self):
         """'.' / '..' 开户会让分享链接被折叠成别的地址，开户时就拒绝（2026-11-04 修）。"""
         self.ns['user_id_shareable'] = portal.user_id_shareable
@@ -1797,6 +1815,26 @@ class WebWorkflowTests(unittest.TestCase):
         (units / 'hy2-anytls.service').write_text('[Unit]\n', encoding='utf-8')
         states['hy2-anytls'] = 'failed'
         self.assertEqual(cores()['sing-box']['state'], 'failed')
+
+    def test_core_reinstall_says_running_services_still_use_the_old_binary(self):
+        """装上新二进制后，正在跑的进程仍是旧版本：要说清楚，不能只报「安装完成」（2026-11-13 修）。"""
+        self.handler._extend_deadline = lambda seconds, heavy=False: True
+        for name, running, expect_note in (('xray', {'xray'}, True), ('xray', set(), False),
+                                            ('sing-box', {'hy2-tuic'}, True)):
+            with self.subTest(name=name, running=running):
+                self.ns.update(
+                    install_xray_binary=lambda: (True, 'Xray-core 安装完成'),
+                    install_singbox=lambda: (True, 'sing-box 安装完成'),
+                    write_xray_unit=lambda: None, xray_unit_foreign=lambda: False,
+                    core_operation_lock=threading.Lock(),
+                    acquire_core_operation_lock=lambda: os.open(os.devnull, os.O_RDONLY),
+                    ANYTLS_SERVICE='hy2-anytls', TUIC_SERVICE='hy2-tuic',
+                    _systemd_state=lambda unit, up=frozenset(running): 'active' if unit in up else 'inactive')
+                status, body = self.invoke('_h_post_install_core', {'name': name})
+                self.assertEqual(status, 200, body)
+                self.assertEqual('仍是旧核心' in body['message'], expect_note, body['message'])
+                if expect_note:
+                    self.assertIn(sorted(running)[0], body['message'])
 
     def test_warp_toggle_does_not_destroy_global_custom_outbound_mode(self):
         state = {'warp_enabled': True, 'outbound_mode': 'global',
@@ -2357,6 +2395,20 @@ class WebWorkflowTests(unittest.TestCase):
                 status, payload = self.invoke('_h_post_manage_amneziawg', {'action': action})
                 self.assertEqual(status, 200, payload)
                 self.assertEqual(calls[-1], ['systemctl', action, 'amneziawg-server'])
+
+    def test_user_extra_links_cover_enabled_protocols_and_skip_failures(self):
+        """分享页与管理弹窗共用的附加直链：只列已启用的协议，生成失败的一项跳过（2026-11-13）。"""
+        def broken(*args, **kwargs):
+            raise ValueError('bad vmess config')
+        self.ns.update(
+            _active_reality_config=lambda: {'port': 443}, _active_vmess_config=lambda: {'port': 2087},
+            _active_vlessenc_config=lambda: None, _active_anytls_config=lambda: None,
+            _active_tuic_config=lambda: None, _served_singbox_config=lambda cfg, service: cfg,
+            ANYTLS_SERVICE='hy2-anytls', TUIC_SERVICE='hy2-tuic',
+            reality_uri_for_user=lambda cfg, uid, ip, label=None: 'vless://%s@%s#%s' % (uid, ip, label),
+            vmess_uri_for_user=broken)
+        links = extract_method('_user_extra_links', self.ns)(self.handler, 'alice', '1.2.3.4')
+        self.assertEqual(links, [('Reality', 'vless://alice@1.2.3.4#Reality-alice')])
 
 
     def test_awg_peer_delete_extends_its_deadline(self):

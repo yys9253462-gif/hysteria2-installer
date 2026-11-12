@@ -128,6 +128,12 @@ class UserConfigExpiryTest(unittest.TestCase):
         self.assertEqual(body['ip_limit'], 0)
         self.assertEqual(body['traffic_used'], 0)
 
+    def test_user_config_lists_extra_protocol_links(self):
+        """弹窗要拿到其它已启用协议的直链（2026-11-13 加）；本夹具没开别的协议，应是空列表。"""
+        status, body = self.user_config('dated')
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body.get('extra_links'), [])
+
     def test_unusable_accounts_say_why(self):
         """弹窗要知道账号现在能不能连（2026-11-12 修），文字与用户表的状态徽标一致。"""
         for uid, expected in (('dated', None), ('forever', None), ('stopped', '已停用'),

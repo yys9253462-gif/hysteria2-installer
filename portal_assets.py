@@ -2600,6 +2600,11 @@ const CORE_STATE_TEXT = {
   failed: ['● 运行失败', '#fff1f0', '#cf3c3c'],
   activating: ['● 启动中', '#fffbe6', '#ad6800'],
   none: ['○ 无服务', '#f1efe8', '#5f5e5a'],
+  // 查不到状态、正在停止或重载时不再显示英文原词（2026-11-13 修）：后端 systemctl 没回话时
+  // 给的是 unknown，旧卡片显示「已安装 · ● unknown」。
+  deactivating: ['● 停止中', '#fffbe6', '#ad6800'],
+  reloading: ['● 重载中', '#fffbe6', '#ad6800'],
+  unknown: ['? 状态未知', '#f1efe8', '#5f5e5a'],
 };
 
 function coreEl(tag, cls, text) {
@@ -2930,10 +2935,17 @@ const speedTxEl = document.getElementById('node-speed-tx');
 const rxTagEl = document.getElementById('rx-active-tag');
 const txTagEl = document.getElementById('tx-active-tag');
 
+// 按当前单位的小数位取整后满 1024 就进位（2026-11-13 修，同后端 format_bytes 与用户弹窗）：
+// 旧实现先换算再四舍五入，1048575 B 显示成「1024.00 KB」、1023.6 B/s 显示成「1024 B/s」——
+// 首屏服务端渲染的「1.00 MB」两秒后就被轮询改写成「1024.00 KB」。digits[i] 是第 i 级单位的小数位。
+function fmtUnits(value, units, digits) {
+  let n = Number(value || 0), i = 0;
+  while (i < units.length - 1 && Number(n.toFixed(digits[i])) >= 1024) { n /= 1024; i++; }
+  return n.toFixed(digits[i]) + ' ' + units[i];
+}
+
 function fmtSpeed(bytesPerSec) {
-  if (bytesPerSec < 1024) return bytesPerSec.toFixed(0) + ' B/s';
-  if (bytesPerSec < 1024 * 1024) return (bytesPerSec / 1024).toFixed(1) + ' KB/s';
-  return (bytesPerSec / (1024 * 1024)).toFixed(2) + ' MB/s';
+  return fmtUnits(bytesPerSec, ['B/s', 'KB/s', 'MB/s'], [0, 1, 2]);
 }
 
 let trafficPollPending = false;
@@ -2953,12 +2965,8 @@ async function pollTrafficSpeed() {
     if (txTagEl) txTagEl.className = (json.node_tx > 1024) ? 'speed-badge active' : 'speed-badge';
 
     // 累计用量同样实时更新，避免只能刷新页面后看到新值。
-    const fmtUsage = value => {
-      let n = Number(value || 0), i = 0;
-      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-      return (i ? n.toFixed(2) : n.toFixed(0)) + ' ' + units[i];
-    };
+    // 小数位与后端 format_bytes 相同（KB 一位、其余两位），刷新前后同一个数字写法不变。
+    const fmtUsage = value => fmtUnits(value, ['B', 'KB', 'MB', 'GB', 'TB'], [0, 1, 2, 2, 2]);
     const totalUsage = document.getElementById('total-used-bytes');
     if (totalUsage) totalUsage.textContent = fmtUsage(json.total_used_bytes);
     document.querySelectorAll('[data-user-usage]').forEach(el => {
@@ -3289,6 +3297,16 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       // 与客户分享页一致也给 sing-box 订阅（2026-11-13 加）：接口一直回着 sing_box，旧弹窗只用了
       // Clash 那份，用 sing-box / Hiddify 的客户只能让管理员另开分享页去找。
       const singSubPath = '/' + token + '/u/' + encodeURIComponent(uid) + '/sing-box.json?k=' + userKey;
+      // 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）：UDP 不通的客户要靠 Reality / VMess
+      // 等 TCP 协议兜底，旧弹窗只有 Hy2 一条，管理员只能另开分享页去找。
+      const extraLinksHtml = (Array.isArray(json.extra_links) ? json.extra_links : [])
+        .filter(x => x && typeof x.uri === 'string' && x.uri)
+        .map((x, i) => `
+            <div>
+              <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">${obEsc(x.label)} 直链（UDP 不通时用）:</div>
+              <textarea id="um-extra-${i}" class="link" style="height:52px;font-size:11px" readonly>${obEsc(x.uri)}</textarea>
+              <div style="margin-top:6px"><button class="button" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-extra-${i}">复制 ${obEsc(x.label)} 直链</button></div>
+            </div>`).join('');
       
       // 统一用 fmtBytes：旧写法把已用强制成 MB、配额强制成 GB，
       // 小配额（如 500 MB）会显示成「0.5 GB」，大用量则是「1536.0 MB」。
@@ -3340,6 +3358,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
                 <button class="button primary" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-uri">复制直链</button>
               </div>
             </div>
+            ${extraLinksHtml}
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Clash / Mihomo 专属订阅链接:</div>
               <div class="input-with-action">

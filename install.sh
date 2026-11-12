@@ -6120,8 +6120,16 @@ flow_refresh_portal() {
 }
 
 unit_state_text() {
-    if systemctl is-active --quiet "$1" 2>/dev/null; then
+    # 按实际状态说（2026-11-13 修）：旧实现不是「运行中」就是「已停止」，配置写坏后服务失败、
+    # 或正在崩溃自动重启，也显示「已停止」—— 像是有人把它停了，管理员去点启动而不是看日志。
+    local state
+    state="$(systemctl is-active "$1" 2>/dev/null)" || true
+    if [[ "$state" == active ]]; then
         echo -e "${GREEN}运行中${PLAIN}"
+    elif [[ "$state" == failed ]]; then
+        echo -e "${RED}运行失败${PLAIN}（菜单 12 查看日志）"
+    elif [[ "$state" == activating ]]; then
+        echo -e "${YELLOW}启动中 / 自动重启中${PLAIN}"
     elif systemctl list-unit-files "$1.service" 2>/dev/null | grep -q "^$1.service"; then
         echo -e "${RED}已停止${PLAIN}"
     else
@@ -6158,15 +6166,11 @@ show_menu_status() {
     [[ -f /usr/local/bin/gost ]] && extra+="GOST: $(unit_state_text gost)  "
     [[ -f /etc/systemd/system/wireproxy.service ]] && extra+="WARP: $(unit_state_text wireproxy)"
     [[ -n "$extra" ]] && echo -e "扩展服务: ${extra}"
-    # AmneziaWG 状态：仅在本机装了 AWG 时显示
+    # AmneziaWG 状态：仅在本机装了 AWG 时显示；与上面各服务同一套状态文字（失败不再显示成「未运行」）
     if [[ -f "$AWG_CONFIG" ]]; then
         local _awg_port
         _awg_port="$(jq -r '.port // "?"' "$AWG_META_FILE" 2>/dev/null || echo '?')"
-        if systemctl is-active --quiet amneziawg-server 2>/dev/null; then
-            echo -e "AWG 状态 : ${GREEN}运行中${PLAIN} | 协议线: AWG $(awg_current_line).x | UDP ${_awg_port}"
-        else
-            echo -e "AWG 状态 : ${YELLOW}已安装但未运行${PLAIN} | 协议线: AWG $(awg_current_line).x"
-        fi
+        echo -e "AWG 状态 : $(unit_state_text amneziawg-server) | 协议线: AWG $(awg_current_line).x | UDP ${_awg_port}"
     fi
 }
 

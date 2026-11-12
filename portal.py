@@ -139,6 +139,8 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 # user_id 的唯一格式定义。serve() 内沿用同名局部变量指向它，
 # 模块级辅助函数（撤销队列清洗等）也用它，避免两套规则漂移。
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
+# 网页新建用户时数值超范围的提示，上下限与 REST API 的 users/create 相同。
+QUOTA_RANGE_ERROR = '有效期须为 1-36500 天，同时在线网络数 0-1000，流量限额 0-1000000 GB'.encode('utf-8')
 
 
 def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
@@ -203,7 +205,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.41'
+PORTAL_VERSION = '2.42'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -3839,6 +3841,9 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     if sub_port is None:
         sub_port = resolve_subscription_port({})[0]
     clash_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/clash.yaml?k={user_key}"
+    # sing-box 也给订阅链接（2026-11-13 加）：SFA / SFI 用「远程配置」填链接即可自动更新，
+    # 响应头本来就带更新间隔；旧页面只给整段 JSON 和下载，节点换端口后客户得重新导入。
+    sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/sing-box.json?k={user_key}"
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>个人专属连接 · {html.escape(uid)}</title><style>{STYLE}</style></head><body><main style="max-width:860px">
 <nav class="topbar"><div class="brand"><span class="logo">H₂</span> HYSTERIA <span> / 个人连接中心</span></div><div>{status_html}</div></nav>
@@ -3895,12 +3900,17 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     </section>
 
     <section class="card">
-      <div class="card-head"><span class="step">03</span><div><h2>Sing-box 出站配置</h2><p>适用 SFI / SFA / Sing-box 客户端</p></div></div>
-      <textarea id="u-sing-cfg" class="config" style="height:140px" readonly>{html.escape(sing)}</textarea>
+      <div class="card-head"><span class="step">03</span><div><h2>Sing-box 专属订阅</h2><p>适用 SFI / SFA / Sing-box 客户端（远程配置，一键订阅同步）</p></div></div>
+      <textarea id="u-sing-sub" class="link" style="height:68px" readonly>{html.escape(sing_sub_url)}</textarea>
       <div class="actions">
-        <button class="button primary" type="button" data-copy="u-sing-cfg">复制配置</button>
+        <button class="button primary" type="button" data-copy="u-sing-sub">复制订阅链接</button>
         <a class="button" href="/{token}/u/{quote(uid)}/sing-box.json?k={user_key}" download="sing-box-{uid}.json">下载 sing-box.json ↓</a>
       </div>
+      <details style="margin-top:10px">
+        <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
+        <textarea id="u-sing-cfg" class="config" style="height:110px;margin-top:6px" readonly>{html.escape(sing)}</textarea>
+        <div style="margin-top:4px"><button class="button" type="button" data-copy="u-sing-cfg" style="padding:4px 10px;font-size:11px">复制配置文本</button></div>
+      </details>
     </section>
   </div>
 </div>
@@ -9898,17 +9908,27 @@ if __name__ == '__main__':
                 # 按来源计 10 次 / 10 分钟（2026-11-03 修）：旧实现全局 10 次，知道
                 # token 的人刷 10 次错误密码就把管理员锁在门外。全局保留 200 次作
                 # 兜底，换来源爆破的总尝试次数仍然有界。
-                per_source = self.server.login_source_failures.get(self._web_source_key(), [])
+                source = self._web_source_key()
+                per_source = self.server.login_source_failures.get(source, [])
                 per_source[:] = [t for t in per_source if now - t < 600]
-                if len(per_source) >= 10 or len(self.server.login_failures) >= 200:
+                global_locked = len(self.server.login_failures) >= 200
+                if len(per_source) >= 10 or global_locked:
                     # 🔴 2026-10-31：锁定必须留痕。旧实现静默返回 True，
                     # 管理员只会看到「尝试次数过多，请 10 分钟后再试」，
                     # 而日志里查不到是谁、什么时候开始的 —— 分不清是自己
-                    # 输错了还是有人在刷。这里每轮最多打一条（去重见 _login_lock_logged）。
-                    if not getattr(self.server, '_login_lock_logged', False):
-                        self.server._login_lock_logged = True
-                        print('[portal] 登录失败达上限，已锁定 %d 秒（%d 次失败）'
-                              % (600, len(self.server.login_failures)), file=sys.stderr)
+                    # 输错了还是有人在刷。
+                    # 每个来源每轮锁定记一条并写明来源（2026-11-13 修）：旧实现全局只记一次、
+                    # 有人登录成功才重置，之后别的来源被锁、同一来源过了 10 分钟再被锁都没有日志，
+                    # 而那唯一一条里也没有来源。
+                    logged = self.server.__dict__.setdefault('_login_lock_logged_at', {})
+                    key = '全局' if global_locked else source
+                    if now - logged.get(key, now - 600) >= 600:
+                        for old_key in [k for k, t in logged.items() if now - t >= 600]:
+                            del logged[old_key]
+                        logged[key] = now
+                        print('[portal] 登录失败达上限，%s已锁定 600 秒（该来源 %d 次、全局 %d 次失败）'
+                              % ('所有来源' if global_locked else '来源 %s ' % source,
+                                 len(per_source), len(self.server.login_failures)), file=sys.stderr)
                     return True
                 return False
 
@@ -9939,7 +9959,7 @@ if __name__ == '__main__':
             with data_lock:
                 self.server.login_failures.clear()
                 self.server.login_source_failures.clear()
-                self.server._login_lock_logged = False
+                self.server.__dict__.pop('_login_lock_logged_at', None)
 
         def _web_source_key(self):
             """Web 失败计数的来源键：masquerade 代理进来的取 X-Forwarded-For 最后一跳。
@@ -12522,6 +12542,13 @@ if __name__ == '__main__':
                             ok, msg = install_singbox()
                     finally:
                         os.close(core_lock_fd)
+                if ok:
+                    # 正在跑的进程还是旧二进制（2026-11-13 修）：卡片上的版本读的是磁盘上的新文件，
+                    # 旧提示只说「安装完成」，像是新核心已经在用。不替管理员重启，免得断开所有用户。
+                    units = ['xray'] if name == 'xray' else [ANYTLS_SERVICE, TUIC_SERVICE]
+                    running = [u for u in units if _systemd_state(u) == 'active']
+                    if running:
+                        msg += '；正在运行的 %s 仍是旧核心，下次重启该服务（或在协议页关闭再开启）后才换成新版本' % '、'.join(running)
                 return self.reply_json(200 if ok else 500, {'ok': ok, ('message' if ok else 'error'): msg})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
@@ -13269,9 +13296,13 @@ if __name__ == '__main__':
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
         def _h_post_manage_user(self, prefix):
-            """POST /manage-user 的处理逻辑（从 do_POST 机械搬移而来）。"""
+            """POST /manage-user 的处理逻辑（从 do_POST 机械搬移而来）。
+
+            报错一律写成中文并说明怎么改（2026-11-13 修）：页内提交后这些文字原样弹给管理员，
+            旧实现一半是「Invalid user_id format」「User not found」这类英文。
+            """
             if not self.is_authenticated():
-                return self.reply(401, b'Unauthorized')
+                return self.reply(401, '登录已失效，请刷新页面重新登录'.encode('utf-8'))
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace')
@@ -13280,19 +13311,19 @@ if __name__ == '__main__':
                 user_id = form.get('user_id', [''])[0].strip()
                 now_ts = int(time.time())
                 if action not in ('create', 'delete'):
-                    return self.reply(400, b'Invalid action')
+                    return self.reply(400, '请求无效，请刷新页面后重试'.encode('utf-8'))
                 with data_lock:
                     previous_user = copy.deepcopy(data.get('users', {}).get(user_id))
 
 
                 if not VALID_USER_ID_RE.match(user_id):
-                    return self.reply(400, b'Invalid user_id format')
+                    return self.reply(400, '用户标识只能用字母、数字、点、下划线和连字符，长度 1-64'.encode('utf-8'))
                 # 与 REST API 同一条规则：保留名不能作为真实用户（placeholder 会和
                 # Xray 的占位 client 撞 email，admin_master 是机主账号）。
                 if action == 'create' and user_id in RESERVED_USER_IDS:
-                    return self.reply(400, b'Reserved user_id')
+                    return self.reply(400, 'admin_master 与 placeholder 是保留名，请换一个用户标识'.encode('utf-8'))
                 if action == 'create' and not user_id_shareable(user_id):
-                    return self.reply(400, 'user_id 不能只由点组成'.encode('utf-8'))
+                    return self.reply(400, '用户标识不能只由点组成'.encode('utf-8'))
 
                 if action == 'create' and user_id:
                     # 不再静默去掉首尾空白（2026-11-04 修）：「abc 」被存成「abc」，客户端按输入的
@@ -13307,12 +13338,12 @@ if __name__ == '__main__':
                         ip_limit = int(form.get('ip_limit', ['0'])[0] or 0)
                         traffic_gb = float(form.get('traffic_gb', ['0'])[0] or 0)
                     except (ValueError, TypeError, OverflowError):
-                        return self.reply(400, b'Invalid duration, IP limit or traffic quota')
+                        return self.reply(400, QUOTA_RANGE_ERROR)
                     # 上限 1e6 GB：没有上限时超大值会在 int() 处抛 OverflowError。
                     # 天数上限与 REST API 的 users/create 一致（1..36500）。
                     if (not 1 <= days <= 36500 or not 0 <= ip_limit <= 1000 or not math.isfinite(traffic_gb)
                             or not 0 <= traffic_gb <= 1000000):
-                        return self.reply(400, b'Invalid duration, IP limit or traffic quota')
+                        return self.reply(400, QUOTA_RANGE_ERROR)
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
                     note = form.get('note', [''])[0].strip()[:200]
                     # 🔴 2026-10-09 修：原来是无条件赋值，同名 id 会被**静默覆盖** ——
@@ -13371,7 +13402,7 @@ if __name__ == '__main__':
                     # "User not found" —— 机主自己都被踢下线、再也连不上节点，
                     # 只能重装。所以这里必须拒绝，UI 那边也不渲染删除按钮。
                     if user_id == MASTER_USER_ID:
-                        return self.reply(400, b'Cannot delete the master account')
+                        return self.reply(400, '机主账号不能删除'.encode('utf-8'))
                     delete_missing = False
                     with data_lock:
                         if user_id not in data.get('users', {}):
@@ -13392,7 +13423,7 @@ if __name__ == '__main__':
                             global_ip_deny.pop(user_id, None)
                     if delete_missing:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
-                        return self.reply(404, b'User not found')
+                        return self.reply(404, '该用户已不存在（可能已在别处删除），请刷新页面'.encode('utf-8'))
 
                 regenerate_page()
                 if not self._sync_reality_clients():
@@ -13409,7 +13440,8 @@ if __name__ == '__main__':
                     save_data()
                     if revoked_pending:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
-                        return self.reply(503, b'Access revocation pending; retry required')
+                        return self.reply(503, '用户已删除，但节点上的旧连接还没确认断开，后台会自动重试；请稍后刷新页面确认'
+                                          .encode('utf-8'))
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
                 regenerate_page()
@@ -13419,7 +13451,7 @@ if __name__ == '__main__':
                 self.end_headers()
                 return
             except (ValueError, TypeError, UnicodeDecodeError):
-                return self.reply(400, b'Bad request')
+                return self.reply(400, '请求无效，请刷新页面后重试'.encode('utf-8'))
             except Exception as exc:
                 # 保存 / 同步阶段的失败不是请求的错（2026-11-04 修）：旧实现一律回 400，
                 # 磁盘满时管理员看到「Bad request」，重试又撞「用户已存在」。
@@ -14131,8 +14163,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 无限流量、不过期。用低权限凭据换高权限凭据就是提权。
                     # 实测已确认 auth_password / obfs_password 都被返回。
                     # capabilities 早就是白名单的，这里对齐同一套做法。
-                    _secret_keys = {'auth_password', 'obfs_password', 'pin_sha256'}
-                    public_meta = {k: v for k, v in m.items() if k not in _secret_keys}
+                    # 真按白名单取（2026-11-13 修）：旧实现只剔除三个已知密钥，client_meta.json
+                    # 以后新增的任何字段（包括新的密钥）都会自动发给只持有低权限 api_key 的一方。
+                    # 控制台读的就是这几项（hy2-ops-console 的 portalMeta）。
+                    _public_keys = ('public_ip', 'server_name', 'listen_port', 'subscription_port',
+                                    'hop_port_range', 'cert_type', 'is_insecure')
+                    public_meta = {k: m[k] for k in _public_keys if k in m}
                     return self.reply_json(200, {'ok': True, 'meta': public_meta, 'users_count': users_count, 'time': int(time.time())})
                 if sub == 'users/list':
                     # BUGFIX #10: 商城节点对账用, 列出所有动态用户 (脱敏不返回 password)
@@ -14271,24 +14307,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     _insecure, server_name, _pub_clean, host = clean_node_identity(m)
                     listen_port = m.get('listen_port', 19984)
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
-                    # 其它已启用协议的直链，与 users/create 的回包同一组生成器（2026-11-04 加）
-                    _pub = _pub_clean
-                    _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
-                    _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
-                    _t = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
-                    extra = []
-                    for _label, _make in (
-                            ('Reality', lambda: reality_uri_for_user(_r, target_uid, _pub, label=f"Reality-{target_uid}") if _r else ''),
-                            ('VMess', lambda: vmess_uri_for_user(_v, target_uid, _pub, label=f"VMess-{target_uid}") if _v else ''),
-                            ('VLESS-Enc', lambda: vlessenc_uri_for_user(_e, target_uid, _pub, label=f"VLESS-Enc-{target_uid}") if _e else ''),
-                            ('AnyTLS', lambda: anytls_uri_for_user(_a, target_uid, label=f"AnyTLS-{target_uid}") if _a else ''),
-                            ('TUIC', lambda: tuic_uri_for_user(_t, target_uid, label=f"TUIC-{target_uid}") if _t else '')):
-                        try:
-                            extra.append((_label, _make()))
-                        except Exception as exc:
-                            _log_ignored('share_extra_uri', exc)
                     page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0],
-                                          extra_links=extra)
+                                          extra_links=self._user_extra_links(target_uid, _pub_clean))
                     return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
                 else:
                     return self.reply(404, b'Not found')
@@ -14383,6 +14403,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'user_id': target_uid,
                     'note': u_copy.get('note', ''),
                     'uri': uri,
+                    # 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）
+                    'extra_links': [{'label': label, 'uri': link} for label, link
+                                    in self._user_extra_links(target_uid, clean_node_identity(m)[2])],
                     'clash': clash_yaml,
                     'sing_box': sing_json,
                     'qr_svg': qr_svg,
@@ -14537,6 +14560,31 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 raw_content = data.get(key)
                 content = raw_content.encode() if isinstance(raw_content, str) else b''
             self.reply(200, content, mime)
+
+        def _user_extra_links(self, user_id, public_ip):
+            """该用户在其它已启用协议上的直链 [(名称, 直链)]，与 users/create 的回包同一组生成器。
+
+            分享页（2026-11-04 加）与管理员的「专属连接」弹窗（2026-11-13 加）共用：UDP 被封的
+            网络要靠 Reality / VMess 等 TCP 协议兜底。生成失败的一项只跳过、不影响其它。
+            """
+            _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
+            _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
+            _t = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
+            links = []
+            for label, make in (
+                    ('Reality', lambda: reality_uri_for_user(_r, user_id, public_ip, label=f"Reality-{user_id}") if _r else ''),
+                    ('VMess', lambda: vmess_uri_for_user(_v, user_id, public_ip, label=f"VMess-{user_id}") if _v else ''),
+                    ('VLESS-Enc', lambda: vlessenc_uri_for_user(_e, user_id, public_ip, label=f"VLESS-Enc-{user_id}") if _e else ''),
+                    ('AnyTLS', lambda: anytls_uri_for_user(_a, user_id, label=f"AnyTLS-{user_id}") if _a else ''),
+                    ('TUIC', lambda: tuic_uri_for_user(_t, user_id, label=f"TUIC-{user_id}") if _t else '')):
+                try:
+                    link = make()
+                except Exception as exc:
+                    _log_ignored('share_extra_uri', exc)
+                    continue
+                if isinstance(link, str) and link:
+                    links.append((label, link))
+            return links
 
         def _render_index_page(self):
             """渲染首页 HTML（不落盘，portal.json 只存摘要）。

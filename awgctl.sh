@@ -1257,7 +1257,7 @@ cmd_install() {
     log_info "AmneziaWG 安装完成。"
     log_info "别忘了在云厂商安全组放行 UDP ${port}。"
     echo ""
-    cmd_status
+    cmd_status || true   # 只是收尾展示；服务是否起来上面已经核实过
 }
 
 cmd_uninstall() {
@@ -1373,6 +1373,9 @@ cmd_status() {
         "$AWG_BIN" show "$AWG_LINK" 2>/dev/null || true
     fi
     echo "=================================================="
+    # 装了却没在运行时退出码非零（2026-11-13 修，同 install.sh status）：旧实现一律返回 0，
+    # 拿 `bash install.sh awg-status` 做健康检查的脚本把挂掉的 AWG 当成正常。未安装照旧返回 0。
+    [[ "$active" == "yes" ]] || return 3
     return 0
 }
 
@@ -1575,6 +1578,7 @@ hy2-awgctl —— AmneziaWG (AWG) 服务端控制工具
 
 退出码:
   0 成功   1 失败（含参数错误、服务启动失败）
+  status 已安装但服务没在运行时返回 3（未安装返回 0），可直接用于监控
 EOF
 }
 

@@ -527,6 +527,26 @@ class TestPortalRuntime(unittest.TestCase):
         self.assertIn("public_ip", meta)
         self.assertIn("server_name", meta)
 
+    def test_node_meta_only_returns_whitelisted_fields(self):
+        """client_meta.json 以后新增的字段不能自动外发（2026-11-13 修）：旧实现只剔除三个已知密钥。"""
+        access = json.loads((Path(self.tmp) / "portal-access.json").read_text())
+        original = self.meta_path.read_text(encoding="utf-8")
+        meta_now = json.loads(original)
+        meta_now["future_secret"] = "FUTURE_SECRET_DO_NOT_LEAK"
+        self.meta_path.write_text(json.dumps(meta_now), encoding="utf-8")
+        try:
+            st, data = self._req("/api/v1/node/meta",
+                                 headers={"Authorization": "Bearer " + access["api_key"]})
+        finally:
+            self.meta_path.write_text(original, encoding="utf-8")
+        self.assertEqual(st, 200)
+        self.assertNotIn("FUTURE_SECRET_DO_NOT_LEAK", data.decode("utf-8"))
+        meta = json.loads(data)["meta"]
+        self.assertLessEqual(set(meta), {"public_ip", "server_name", "listen_port", "subscription_port",
+                                         "hop_port_range", "cert_type", "is_insecure"})
+        self.assertEqual(meta["public_ip"], meta_now["public_ip"])
+        self.assertEqual(meta["is_insecure"], meta_now["is_insecure"])
+
     # ---- 症状：换证后二维码/下载配置仍是旧节点 ----
     def test_refresh_syncs_download_artifacts(self):
         """改**订阅端口**再 refresh，验证 clash/sing/qr 三者都跟着变。
