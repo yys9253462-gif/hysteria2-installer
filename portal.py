@@ -9906,17 +9906,27 @@ if __name__ == '__main__':
                 # 按来源计 10 次 / 10 分钟（2026-11-03 修）：旧实现全局 10 次，知道
                 # token 的人刷 10 次错误密码就把管理员锁在门外。全局保留 200 次作
                 # 兜底，换来源爆破的总尝试次数仍然有界。
-                per_source = self.server.login_source_failures.get(self._web_source_key(), [])
+                source = self._web_source_key()
+                per_source = self.server.login_source_failures.get(source, [])
                 per_source[:] = [t for t in per_source if now - t < 600]
-                if len(per_source) >= 10 or len(self.server.login_failures) >= 200:
+                global_locked = len(self.server.login_failures) >= 200
+                if len(per_source) >= 10 or global_locked:
                     # 🔴 2026-10-31：锁定必须留痕。旧实现静默返回 True，
                     # 管理员只会看到「尝试次数过多，请 10 分钟后再试」，
                     # 而日志里查不到是谁、什么时候开始的 —— 分不清是自己
-                    # 输错了还是有人在刷。这里每轮最多打一条（去重见 _login_lock_logged）。
-                    if not getattr(self.server, '_login_lock_logged', False):
-                        self.server._login_lock_logged = True
-                        print('[portal] 登录失败达上限，已锁定 %d 秒（%d 次失败）'
-                              % (600, len(self.server.login_failures)), file=sys.stderr)
+                    # 输错了还是有人在刷。
+                    # 每个来源每轮锁定记一条并写明来源（2026-11-13 修）：旧实现全局只记一次、
+                    # 有人登录成功才重置，之后别的来源被锁、同一来源过了 10 分钟再被锁都没有日志，
+                    # 而那唯一一条里也没有来源。
+                    logged = self.server.__dict__.setdefault('_login_lock_logged_at', {})
+                    key = '全局' if global_locked else source
+                    if now - logged.get(key, now - 600) >= 600:
+                        for old_key in [k for k, t in logged.items() if now - t >= 600]:
+                            del logged[old_key]
+                        logged[key] = now
+                        print('[portal] 登录失败达上限，%s已锁定 600 秒（该来源 %d 次、全局 %d 次失败）'
+                              % ('所有来源' if global_locked else '来源 %s ' % source,
+                                 len(per_source), len(self.server.login_failures)), file=sys.stderr)
                     return True
                 return False
 
@@ -9947,7 +9957,7 @@ if __name__ == '__main__':
             with data_lock:
                 self.server.login_failures.clear()
                 self.server.login_source_failures.clear()
-                self.server._login_lock_logged = False
+                self.server.__dict__.pop('_login_lock_logged_at', None)
 
         def _web_source_key(self):
             """Web 失败计数的来源键：masquerade 代理进来的取 X-Forwarded-For 最后一跳。
