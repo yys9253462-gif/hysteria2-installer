@@ -2935,10 +2935,17 @@ const speedTxEl = document.getElementById('node-speed-tx');
 const rxTagEl = document.getElementById('rx-active-tag');
 const txTagEl = document.getElementById('tx-active-tag');
 
+// 按当前单位的小数位取整后满 1024 就进位（2026-11-13 修，同后端 format_bytes 与用户弹窗）：
+// 旧实现先换算再四舍五入，1048575 B 显示成「1024.00 KB」、1023.6 B/s 显示成「1024 B/s」——
+// 首屏服务端渲染的「1.00 MB」两秒后就被轮询改写成「1024.00 KB」。digits[i] 是第 i 级单位的小数位。
+function fmtUnits(value, units, digits) {
+  let n = Number(value || 0), i = 0;
+  while (i < units.length - 1 && Number(n.toFixed(digits[i])) >= 1024) { n /= 1024; i++; }
+  return n.toFixed(digits[i]) + ' ' + units[i];
+}
+
 function fmtSpeed(bytesPerSec) {
-  if (bytesPerSec < 1024) return bytesPerSec.toFixed(0) + ' B/s';
-  if (bytesPerSec < 1024 * 1024) return (bytesPerSec / 1024).toFixed(1) + ' KB/s';
-  return (bytesPerSec / (1024 * 1024)).toFixed(2) + ' MB/s';
+  return fmtUnits(bytesPerSec, ['B/s', 'KB/s', 'MB/s'], [0, 1, 2]);
 }
 
 let trafficPollPending = false;
@@ -2958,12 +2965,8 @@ async function pollTrafficSpeed() {
     if (txTagEl) txTagEl.className = (json.node_tx > 1024) ? 'speed-badge active' : 'speed-badge';
 
     // 累计用量同样实时更新，避免只能刷新页面后看到新值。
-    const fmtUsage = value => {
-      let n = Number(value || 0), i = 0;
-      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-      while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-      return (i ? n.toFixed(2) : n.toFixed(0)) + ' ' + units[i];
-    };
+    // 小数位与后端 format_bytes 相同（KB 一位、其余两位），刷新前后同一个数字写法不变。
+    const fmtUsage = value => fmtUnits(value, ['B', 'KB', 'MB', 'GB', 'TB'], [0, 1, 2, 2, 2]);
     const totalUsage = document.getElementById('total-used-bytes');
     if (totalUsage) totalUsage.textContent = fmtUsage(json.total_used_bytes);
     document.querySelectorAll('[data-user-usage]').forEach(el => {
