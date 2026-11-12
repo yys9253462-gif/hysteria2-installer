@@ -5625,8 +5625,10 @@ show_teyir_access() {
 
 view_logs() {
     require_installed || return 1
-    echo -e "${CYAN}正在查看 Hysteria 2 实时日志 (Ctrl+C 退出日志并返回菜单)...${PLAIN}"
-    journalctl -u hysteria-server -f -n 50
+    # 门户日志一起看（2026-11-13 修）：门户是 Hy2 的鉴权后端，用户连不上时原因常在它那边
+    # （鉴权失败、收回失败、计量异常），旧实现只跟核心的日志，还得另外手敲命令。
+    echo -e "${CYAN}正在查看 Hysteria 2 与门户（鉴权后端）的实时日志 (Ctrl+C 退出日志并返回菜单)...${PLAIN}"
+    journalctl -u hysteria-server -u hysteria-portal -f -n 50
 }
 
 uninstall_all() {
