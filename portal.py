@@ -11748,7 +11748,6 @@ if __name__ == '__main__':
                     previous_warp_rules_exists = 'warp_rules' in data
                     previous_warp_state = copy.deepcopy(data.get('warp_enabled', False))
                     previous_warp_rules = copy.deepcopy(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
-                    rules = normalize_route_rules(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
                     if action == 'toggle':
                         data['warp_enabled'] = not bool(data.get('warp_enabled'))
                     elif action in ('enable', 'disable'):
@@ -11760,7 +11759,13 @@ if __name__ == '__main__':
                                           and not warp_backend_installed())
                     if warp_not_installed:
                         data['warp_enabled'] = previous_warp_state
-                    elif action == 'add_rule':
+                    # 没保存过名单时与页面显示同一口径（routing_state）：WARP 开着、或这次被打开 /
+                    # 关掉，才落成默认名单。旧实现无条件从默认名单起步 —— WARP 关着时页面显示
+                    # 「0 个已配置」，点「+ Netflix」后却冒出整套默认域名（2026-11-12 修）。
+                    defaults_apply = bool(previous_warp_state) or bool(data.get('warp_enabled'))
+                    rules = normalize_route_rules(
+                        routing_state(dict(data, warp_enabled=defaults_apply))['warp_rules'])
+                    if action == 'add_rule':
                         raw = form.get('domain', [''])[0].strip().lower()
                         domain = re.sub(r'^[a-zA-Z]+://', '', raw).split('/')[0].split(':')[0].strip('.')
                         if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
@@ -11775,7 +11780,9 @@ if __name__ == '__main__':
                         rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
                         keep = {r['domain'] for r in rules}
                         rules.extend({'domain': d, 'outbound': 'warp_socks'} for d in DEFAULT_WARP_DOMAINS if d not in keep)
-                    data['warp_rules'] = rules
+                    # 域名不合法时直接回 400、不落盘，内存里也不能先改（否则与磁盘不一致到重启）。
+                    if not bad_domain and (rules or previous_warp_rules_exists):
+                        data['warp_rules'] = rules
                     new_state = bool(data.get('warp_enabled'))
                     current_rules = [r['domain'] for r in rules if r['outbound'] in ('warp', 'warp_socks')]
 
