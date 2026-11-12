@@ -3113,7 +3113,7 @@ METEREOF2
         # cert_type/server_name/is_insecure/pin_sha256 会与真实证书漂移，面板就会把
         # 错误的 sni 发给客户端（CRYPTO_ERROR 0x150）。以证书为唯一事实来源修正。
         if [[ -f "$HY2_DIR/client_meta.json" && -f "$HY2_DIR/config.yaml" ]] && command -v jq >/dev/null 2>&1; then
-            _cert="$(awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t]/{f=0}' "$HY2_DIR/config.yaml" 2>/dev/null || true)"
+            _cert="$(config_tls_cert "$HY2_DIR/config.yaml")"
             # config.yaml 里的 cert 是相对 /etc/hysteria 的路径，必须显式拼回 HY2_DIR。
             if [[ -n "$_cert" && "$_cert" != /* && ! -f "$_cert" ]]; then
                 [[ -f "$HY2_DIR/$_cert" ]] && _cert="$HY2_DIR/$_cert"
@@ -3214,7 +3214,7 @@ EOCS2
               'WantedBy=timers.target' \
               > /etc/systemd/system/hy2-cert-selfheal.timer
             _cwd="$HY2_DIR/cert"
-            _cc="$(awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t]/{f=0}' "$HY2_DIR/config.yaml" 2>/dev/null || true)"
+            _cc="$(config_tls_cert "$HY2_DIR/config.yaml")"
             if [[ -n "$_cc" ]]; then
                 case "$_cc" in
                     /*) _cwd="$(dirname "$_cc")" ;;
@@ -3998,6 +3998,14 @@ PYSECRET
 #    于是面板把 sni=www.bing.com 发给客户端 → CRYPTO_ERROR 0x150。
 #    portal.py 的 sync_cert_trust() 已能以证书为唯一事实来源自愈；这里做同样
 #    的事，保证「不通过 portal 初始化」的路径（refresh / 在线升级）也修得到。
+# config.yaml 里 tls.cert 的值，与门户 _config_tls_cert_path 同一规则（2026-11-12 抽出）：
+# cert / key 顺序任意，去掉引号与行尾注释，段内顶格注释不算段落结束。旧实现四处各抄
+# 一份 awk，`cert: /a.crt  # 注释` 读成带注释的路径，meta 自愈找不到证书、path 单元盯错目录。
+# 用法：config_tls_cert <config.yaml>
+config_tls_cert() {
+    awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");sub(/[ \t]+#.*$/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t#]/{f=0}' "$1" 2>/dev/null || true
+}
+
 sync_cert_meta() {
     [[ -f "$HY2_META_FILE" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
@@ -4008,7 +4016,7 @@ sync_cert_meta() {
     #    而 install.sh 可能从任意 CWD 被调起 —— 必须显式相对 $HY2_DIR 解析，
     #    否则 `-f` 判空一定失败，自愈会被静默跳过（2026-10-08 真实踩到）。
     local cert_file
-    cert_file="$(awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t]/{f=0}' "$HY2_CONFIG" 2>/dev/null || true)"
+    cert_file="$(config_tls_cert "$HY2_CONFIG")"
     if [[ -n "$cert_file" && "$cert_file" != /* && ! -f "$cert_file" ]]; then
         [[ -f "${HY2_DIR}/${cert_file}" ]] && cert_file="${HY2_DIR}/${cert_file}"
     fi
@@ -4249,7 +4257,7 @@ EOCT
     # 单文件 PathChanged 在 rename 场景下可能因 inode 变化而漏触发，盯目录更稳。
     local cert_watch_dir="$HY2_CERT_DIR"
     local _cc
-    _cc="$(awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t]/{f=0}' "$HY2_CONFIG" 2>/dev/null || true)"
+    _cc="$(config_tls_cert "$HY2_CONFIG")"
     if [[ -n "$_cc" ]]; then
         if [[ "$_cc" != /* ]]; then
             cert_watch_dir="$(dirname "${HY2_DIR}/${_cc}")"
