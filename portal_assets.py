@@ -3376,7 +3376,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div class="user-connect-grid">
           <div style="text-align:center;background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px">
             <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:8px">专属二维码扫码导入</div>
-            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${json.qr_svg || '<p style="color:var(--muted)">二维码生成中...</p>'}</div>
+            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${json.qr_svg || '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
             <div style="font-size:11px;color:var(--muted);margin-top:8px">Shadowrocket / v2rayNG / Nekobox</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:12px">

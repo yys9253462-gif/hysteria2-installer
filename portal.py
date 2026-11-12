@@ -141,6 +141,13 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
 # 网页新建用户时数值超范围的提示，上下限与 REST API 的 users/create 相同。
 QUOTA_RANGE_ERROR = '有效期须为 1-36500 天，同时在线网络数 0-1000，流量限额 0-1000000 GB'.encode('utf-8')
+# 二维码生成不出来时（qrencode 是可选依赖，RHEL 系未开 EPEL 时装不上）各页面统一的说明。
+QR_UNAVAILABLE_TEXT = '二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入'
+QR_UNAVAILABLE_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="260" height="260" viewBox="0 0 260 260">'
+                      '<rect width="260" height="260" rx="12" fill="#f4f8f7"/>'
+                      '<text x="130" y="118" text-anchor="middle" font-size="16" fill="#5f5e5a">二维码生成失败</text>'
+                      '<text x="130" y="146" text-anchor="middle" font-size="12" fill="#5f5e5a">请复制节点直链导入</text>'
+                      '</svg>')
 
 
 def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
@@ -3844,6 +3851,9 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # sing-box 也给订阅链接（2026-11-13 加）：SFA / SFI 用「远程配置」填链接即可自动更新，
     # 响应头本来就带更新间隔；旧页面只给整段 JSON 和下载，节点换端口后客户得重新导入。
     sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/sing-box.json?k={user_key}"
+    # 生成不出二维码时说清楚（2026-11-13 修）：旧页面留一个空框，下面还写着「扫描即可直接接入」。
+    qr_block = (qr_svg if isinstance(qr_svg, str) and '<svg' in qr_svg
+                else '<p class="hint">%s</p>' % html.escape(QR_UNAVAILABLE_TEXT))
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>个人专属连接 · {html.escape(uid)}</title><style>{STYLE}</style></head><body><main style="max-width:860px">
 <nav class="topbar"><div class="brand"><span class="logo">H₂</span> HYSTERIA <span> / 个人连接中心</span></div><div>{status_html}</div></nav>
@@ -3868,7 +3878,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     <div class="eyebrow">QUICK CONNECT</div>
     <h2>扫码快速导入</h2>
     <p class="hint">支持 v2rayNG / Shadowrocket / Nekobox</p>
-    <div class="qr-frame" style="margin:16px 0">{qr_svg}</div>
+    <div class="qr-frame" style="margin:16px 0">{qr_block}</div>
     <p class="hint">在客户端点击右上角扫描即可直接接入</p>
     <div class="tags"><span class="tag">Hysteria 2</span><span class="tag">专属认证</span><span class="tag">{obfs_badge}</span></div>
   </section>
@@ -14569,9 +14579,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 连接照样被掐断 —— 这是用户点「下载配置」的路径。
                 raw_content = data.get(key)
                 content = raw_content.encode() if isinstance(raw_content, str) else b''
+            if key == 'qr' and b'<svg' not in content:
+                # 生成不出二维码时给一张说明图（2026-11-13 修）：旧实现回空内容，页面上是一个裂开的图片。
+                content = QR_UNAVAILABLE_SVG.encode('utf-8')
             self.reply(200, content, mime)
 
-        def _user_extra_links(self, user_id, public_ip):
+        def _user_extra_links(self, user_id, public_ip, with_qr=False):
             """该用户在其它已启用协议上的直链 [(名称, 直链)]，与 users/create 的回包同一组生成器。
 
             分享页（2026-11-04 加）与管理员的「专属连接」弹窗（2026-11-13 加）共用：UDP 被封的
