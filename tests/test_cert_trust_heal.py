@@ -849,7 +849,7 @@ class TestRepoInvariants(unittest.TestCase):
         text = INSTALL.read_text(encoding="utf-8")
         self.assertIn("setup_cert_selfheal() {", text)
         # called from setup_portal (fresh install) and refresh_portal (existing install)
-        self.assertIn("    setup_cert_selfheal\n", text)
+        self.assertIn("    setup_cert_selfheal || log_warn", text)
         self.assertIn("setup_cert_selfheal >/dev/null 2>&1 || log_warn", text)
         self.assertIn('if ! portal_ensure_py; then', text)
         self.assertIn('if ! python3 "$HY2_DIR/portal.py" refresh "$HY2_META_FILE"; then', text)

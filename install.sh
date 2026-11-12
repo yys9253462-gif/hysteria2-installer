@@ -4250,7 +4250,8 @@ EOF
     systemctl restart hysteria-portal
     sleep 1
     systemctl is-active --quiet hysteria-portal || { log_err "信息页服务启动失败"; return 1; }
-    setup_cert_selfheal
+    # 门户已经起来了，自愈单元只是兜底：启用失败给提示，不让整个安装判失败。
+    setup_cert_selfheal || log_warn "证书一致性自愈单元未能启用（不影响节点使用）；证书被带外替换后请在菜单里执行「刷新信息页」。"
 }
 
 # 证书一致性定时/事件自愈（2026-10-08）。
@@ -4264,7 +4265,7 @@ EOF
 #      续期是 rename 替换，PathChanged 必然命中），做到「换完即修」。
 # 执行体是一个只调 `portal.py selfheal` 的脚本：幂等，无漂移时零写入。
 setup_cert_selfheal() {
-    cat > /usr/local/bin/hy2-cert-selfheal.sh <<'EOCS'
+    cat > /usr/local/bin/hy2-cert-selfheal.sh <<'EOCS' || return 1
 #!/usr/bin/env bash
 # 证书信任模型自愈：以 config.yaml 实际使用的证书为唯一事实来源，
 # 幂等修正 client_meta.json 的 cert_type/server_name/is_insecure/pin_sha256。
@@ -4290,9 +4291,9 @@ fi
 unset _out
 exit 0
 EOCS
-    chmod 755 /usr/local/bin/hy2-cert-selfheal.sh
+    chmod 755 /usr/local/bin/hy2-cert-selfheal.sh || return 1
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.service <<'EOCU'
+    cat > /etc/systemd/system/hy2-cert-selfheal.service <<'EOCU' || return 1
 [Unit]
 Description=Hysteria 2 certificate trust-model self-heal
 After=network.target
@@ -4302,7 +4303,7 @@ Type=oneshot
 ExecStart=/usr/local/bin/hy2-cert-selfheal.sh
 EOCU
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.timer <<'EOCT'
+    cat > /etc/systemd/system/hy2-cert-selfheal.timer <<'EOCT' || return 1
 [Unit]
 Description=Run certificate self-heal every 30 minutes
 
@@ -4330,7 +4331,7 @@ EOCT
     fi
     [[ -d "$cert_watch_dir" ]] || cert_watch_dir="$HY2_CERT_DIR"
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.path <<EOCP
+    cat > /etc/systemd/system/hy2-cert-selfheal.path <<EOCP || return 1
 [Unit]
 Description=Watch certificate dir and self-heal trust model on change
 
@@ -4343,8 +4344,10 @@ WantedBy=paths.target
 EOCP
 
     systemctl daemon-reload
-    systemctl enable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || true
-    systemctl enable --now hy2-cert-selfheal.path  >/dev/null 2>&1 || true
+    # 看结果再报（2026-11-12 修）：旧实现两条 enable 失败都吞掉、照报「已启用」并返回 0，
+    # refresh_portal 里「证书自愈单元未能补齐」的提示永远不会出现。
+    systemctl enable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || return 1
+    systemctl enable --now hy2-cert-selfheal.path  >/dev/null 2>&1 || return 1
     log_info "证书一致性自愈已启用（每 30 分钟 + 证书目录变更即时触发）。"
 }
 
