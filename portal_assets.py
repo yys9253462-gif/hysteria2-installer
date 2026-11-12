@@ -802,6 +802,22 @@ function markStatusUnknown(badge, detail) {
   badge.style.color = '#5f5e5a';
 }
 
+// 列表 / 表格加载失败时同样不能停在「加载中」（2026-11-12 修）。只替换仍是加载占位的
+// 元素：已经渲染过的数据不因之后某次刷新失败被清空。
+function markLoadFailed(el, text) {
+  if (!el || !/加载中|正在加载/.test(el.textContent || '')) return;
+  if (el.tagName === 'TBODY') {
+    const cell = el.querySelector('td');
+    const cols = (cell && cell.getAttribute('colspan')) || '1';
+    el.innerHTML = '<tr><td colspan="' + obEsc(cols) + '" style="text-align:center;color:#cf3c3c;padding:20px">'
+      + obEsc(text) + '</td></tr>';
+  } else if (el.tagName === 'P' || el.tagName === 'SPAN') {
+    el.textContent = text;
+  } else {
+    el.innerHTML = '<span class="ob-empty">' + obEsc(text) + '</span>';
+  }
+}
+
 // 只认最新一次请求（2026-11-04 修，与 VMess 卡片同一做法）：轮询回包比开关后的状态查询
 // 晚到时会把卡片刷回切换之前的状态，管理员再点一次就切反了。
 let warpStatusSeq = 0;
@@ -1191,18 +1207,26 @@ let OB_STATE = { mode: 'rules', outbounds: [], rules: [], builtin: [] };
 
 async function loadOutbounds() {
   if (!obEls.list) return;
+  let failure = '';
   try {
     const res = await fetch(location.pathname + 'outbounds/list',
       { credentials: 'same-origin' });
-    if (!res.ok) return;
+    if (!res.ok) { failure = 'HTTP ' + res.status; return; }
     const json = await res.json();
-    if (!json.ok) return;
+    if (!json.ok) { failure = json.error || '服务器返回失败'; return; }
     OB_STATE = { mode: json.mode || 'rules', outbounds: json.outbounds || [], rules: json.rules || [], builtin: json.builtin || [] };
     obSetModeUI(OB_STATE.mode);
     renderOutboundList(OB_STATE.outbounds);
     renderOutboundRules(OB_STATE.rules, OB_STATE.outbounds, OB_STATE.builtin);
     if (json.apply_error && !json.applying && !json.applied) obMsg(json.apply_error, 'err');
-  } catch (_) {}
+  } catch (e) {
+    failure = (e && e.message) || '网络异常';
+  } finally {
+    if (failure) {
+      const text = '出站配置加载失败（' + failure + '），请刷新页面重试';
+      [obEls.modeNote, obEls.list, obEls.rulesList].forEach(el => markLoadFailed(el, text));
+    }
+  }
 }
 
 async function probeOutbound(kind, addr, insecure = false) {
@@ -3026,9 +3050,17 @@ async function loadProxyServices() {
   if (!proxyTbody) return;
   try {
     const res = await fetch(location.pathname + 'proxy-services', { credentials: 'same-origin' });
-    if (!res.ok) { markStatusUnknown(gostBadge); return; }
+    if (!res.ok) {
+      markStatusUnknown(gostBadge);
+      markLoadFailed(proxyTbody, '代理服务列表加载失败（HTTP ' + res.status + '），请刷新页面重试');
+      return;
+    }
     const json = await res.json();
-    if (!json.ok) { markStatusUnknown(gostBadge, json.error); return; }
+    if (!json.ok) {
+      markStatusUnknown(gostBadge, json.error);
+      markLoadFailed(proxyTbody, '代理服务列表加载失败（' + (json.error || '服务器返回失败') + '），请刷新页面重试');
+      return;
+    }
 
     if (gostBadge) {
       if (!json.gost_installed) {
@@ -3103,7 +3135,10 @@ async function loadProxyServices() {
         } finally { btn.disabled = false; }
       });
     });
-  } catch (_) { markStatusUnknown(gostBadge); }
+  } catch (_) {
+    markStatusUnknown(gostBadge);
+    markLoadFailed(proxyTbody, '代理服务列表加载失败，请刷新页面重试');
+  }
 }
 
 // proxyForm replaced with instant buttons
