@@ -3839,6 +3839,9 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     if sub_port is None:
         sub_port = resolve_subscription_port({})[0]
     clash_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/clash.yaml?k={user_key}"
+    # sing-box 也给订阅链接（2026-11-13 加）：SFA / SFI 用「远程配置」填链接即可自动更新，
+    # 响应头本来就带更新间隔；旧页面只给整段 JSON 和下载，节点换端口后客户得重新导入。
+    sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/sing-box.json?k={user_key}"
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>个人专属连接 · {html.escape(uid)}</title><style>{STYLE}</style></head><body><main style="max-width:860px">
 <nav class="topbar"><div class="brand"><span class="logo">H₂</span> HYSTERIA <span> / 个人连接中心</span></div><div>{status_html}</div></nav>
@@ -3895,12 +3898,17 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     </section>
 
     <section class="card">
-      <div class="card-head"><span class="step">03</span><div><h2>Sing-box 出站配置</h2><p>适用 SFI / SFA / Sing-box 客户端</p></div></div>
-      <textarea id="u-sing-cfg" class="config" style="height:140px" readonly>{html.escape(sing)}</textarea>
+      <div class="card-head"><span class="step">03</span><div><h2>Sing-box 专属订阅</h2><p>适用 SFI / SFA / Sing-box 客户端（远程配置，一键订阅同步）</p></div></div>
+      <textarea id="u-sing-sub" class="link" style="height:68px" readonly>{html.escape(sing_sub_url)}</textarea>
       <div class="actions">
-        <button class="button primary" type="button" data-copy="u-sing-cfg">复制配置</button>
+        <button class="button primary" type="button" data-copy="u-sing-sub">复制订阅链接</button>
         <a class="button" href="/{token}/u/{quote(uid)}/sing-box.json?k={user_key}" download="sing-box-{uid}.json">下载 sing-box.json ↓</a>
       </div>
+      <details style="margin-top:10px">
+        <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
+        <textarea id="u-sing-cfg" class="config" style="height:110px;margin-top:6px" readonly>{html.escape(sing)}</textarea>
+        <div style="margin-top:4px"><button class="button" type="button" data-copy="u-sing-cfg" style="padding:4px 10px;font-size:11px">复制配置文本</button></div>
+      </details>
     </section>
   </div>
 </div>
