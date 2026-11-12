@@ -2387,6 +2387,25 @@ document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
   });
 });
 
+// 重启后等门户真正恢复再刷新（2026-11-12 修）：确认框承诺「就绪后重连」，旧实现却到 25 秒
+// 无条件刷新；VPS 重启常要 30~90 秒，多半落在浏览器的「无法访问此网站」错误页。
+// 只认 2xx 或 401（会话随重启失效，刷新后重新登录即可）；反代先起来时回的 502 不算恢复。
+async function waitPortalBack(timeoutMs = 300000, intervalMs = 3000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const ctrl = new AbortController();
+    const abortTimer = setTimeout(() => ctrl.abort(), 5000);
+    try {
+      const res = await fetch(location.pathname + 'traffic-speed',
+        { credentials: 'same-origin', cache: 'no-store', signal: ctrl.signal });
+      if (res.ok || res.status === 401) return true;
+    } catch (_) {
+    } finally { clearTimeout(abortTimer); }
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  return false;
+}
+
 if (btnRebootServer) {
   btnRebootServer.addEventListener('click', async () => {
     const confirmed = await showConfirm({
@@ -2413,14 +2432,21 @@ if (btnRebootServer) {
         btnRebootServer.textContent = '🔄 立即重启服务器生效';
         return;
       }
-      alert("服务器正在重启中，系统将在 25 秒后自动刷新页面！");
+      alert("服务器正在重启中，25 秒后开始检测，恢复后自动刷新页面！");
       let countdown = 25;
-      const timer = setInterval(() => {
+      const timer = setInterval(async () => {
         countdown--;
         btnRebootServer.textContent = '正在重启中 (' + countdown + 's)...';
         if (countdown <= 0) {
           clearInterval(timer);
-          location.reload();
+          btnRebootServer.textContent = '⏳ 等待服务器恢复...';
+          if (await waitPortalBack()) {
+            location.reload();
+            return;
+          }
+          btnRebootServer.disabled = false;
+          btnRebootServer.textContent = '🔄 立即重启服务器生效';
+          alert('5 分钟内仍未检测到服务器恢复：请稍后手动刷新页面，或到服务商控制台查看机器状态。');
         }
       }, 1000);
     } catch (e) {
