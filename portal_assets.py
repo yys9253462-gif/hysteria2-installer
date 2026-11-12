@@ -450,13 +450,15 @@ SCRIPT = r"""
 (function () {
   const parseJson = Response.prototype.json;
   Response.prototype.json = async function () {
+    // 页面请求只靠 Cookie 鉴权，401 只能是登录过期（2026-11-13 修）：多数端点的 401 回的是
+    // JSON {"error":"Unauthorized"}，解析得出来，旧实现就把这个英文单词原样弹给管理员。
+    if (this.status === 401) return { ok: false, error: '登录已过期，请刷新页面重新登录' };
     const copy = this.clone();
     try {
       return await parseJson.call(this);
     } catch (err) {
       let text = '';
       try { text = (await copy.text()).trim().slice(0, 200); } catch (_) {}
-      if (this.status === 401) return { ok: false, error: '登录已过期，请刷新页面重新登录' };
       if (this.status === 429) return { ok: false, error: '请求太频繁，请稍后再试' };
       return { ok: false, error: text ? ('服务器返回 ' + this.status + '：' + text) : ('服务器返回 ' + this.status) };
     }
