@@ -30,9 +30,11 @@ class MeterTransactionIntegrityTests(unittest.TestCase):
                 meter = runtime.PortalMeter(data, threading.RLock(), lambda: None,
                     {'hysteria': {'url': 'http://127.0.0.1:1', 'secret': 'x'},
                      'reality': bad}, epoch=lambda _: 'epoch')
+                # Xray 没在跑也要把坏配置记成失败：只有配置正常时才按「没在跑」跳过（2026-11-12）。
                 with patch.object(runtime.readers, 'read_live_connections', return_value={}), \
                      patch.object(runtime.readers, 'read_hysteria', side_effect=lambda *_: copy.deepcopy(counters)), \
-                     patch.object(runtime.readers, 'read_hysteria_online', return_value={}):
+                     patch.object(runtime.readers, 'read_hysteria_online', return_value={}), \
+                     patch.object(runtime.readers, 'service_running', create=True, return_value=False):
                     meter.poll()
                     counters['u']['tx'] = 25
                     meter.poll()

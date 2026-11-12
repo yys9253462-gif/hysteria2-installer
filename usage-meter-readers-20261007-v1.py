@@ -16,6 +16,14 @@ def service_epoch(service):
     return value
 
 
+def service_running(service):
+    """inactive / failed 视为没在跑；systemd 不可用等读不出状态时按在跑处理，交给后续读取报错。"""
+    if service not in ('hysteria-server', 'xray'):
+        raise ValueError('unsupported service')
+    r = subprocess.run(['systemctl', 'is-active', service], capture_output=True, timeout=5)
+    return r.stdout.decode().strip() not in ('inactive', 'failed')
+
+
 def read_hysteria(url, secret):
     p=urlparse(url)
     if p.scheme != 'http' or p.hostname not in ('127.0.0.1','::1') or p.path not in ('','/'):
