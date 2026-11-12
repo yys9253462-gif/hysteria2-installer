@@ -3754,6 +3754,32 @@ def _safe_int(value, default=0):
     except (TypeError, ValueError, OverflowError):
         return default
 
+
+def subscription_userinfo(user):
+    """用户订阅响应的 subscription-userinfo 头（2026-11-12 加）。
+
+    Clash Verge / Stash / Shadowrocket / sing-box 据此在订阅列表显示已用、总量与到期。
+    计量只记每个用户上下行的合计，按惯例全部计在 download；不限量写 total=0，
+    未设到期（永久）写 expire=0。坏值（布尔 / 负数 / 无法解析）一律按 0。
+    """
+    def _num(value):
+        n = 0 if isinstance(value, bool) else _safe_int(value)
+        return n if n > 0 else 0
+    return 'upload=0; download=%d; total=%d; expire=%d' % (
+        _num(user.get('used_bytes')), _num(user.get('limit_bytes')), _num(user.get('expires_at')))
+
+
+def subscription_profile_headers(meta, user_id, ext):
+    """用户订阅的配置名与自动更新间隔（2026-11-12 加）。
+
+    没有文件名时 Clash Verge 等只能用网址或「Remote File」命名，买家同时导入几份订阅时
+    分不清；24 小时自动更新让节点改端口 / 换协议后客户端自己跟上。文件名只留安全字符。
+    """
+    name = re.sub(r'[^A-Za-z0-9._-]', '_', '%s-%s' % (clean_node_identity(meta)[3], user_id)).strip('._')
+    return (('profile-update-interval', '24'),
+            ('Content-Disposition', 'attachment; filename="%s.%s"' % ((name or 'subscription')[:80], ext)))
+
+
 def _extra_link_boxes(extra_links):
     """分享页里其它已启用协议的直链（2026-11-04 加）。
 
@@ -14141,10 +14167,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     anytls=_served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE),
                     tuic=_served_singbox_config(_active_tuic_config(), TUIC_SERVICE))
 
+                userinfo = (('subscription-userinfo', subscription_userinfo(u_copy)),)
                 if action_file == 'clash.yaml':
-                    return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml')
+                    return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml',
+                                      extra_headers=userinfo + subscription_profile_headers(m, target_uid, 'yaml'))
                 elif action_file == 'sing-box.json':
-                    return self.reply(200, sing_json.encode('utf-8'), 'application/json')
+                    return self.reply(200, sing_json.encode('utf-8'), 'application/json',
+                                      extra_headers=userinfo + subscription_profile_headers(m, target_uid, 'json'))
                 elif action_file == 'qr.svg':
                     try:
                         qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
@@ -15183,11 +15212,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
         # 默认带 charset（2026-11-04 修）：网页表单的错误回复是中文 UTF-8，旧默认值没写
         # charset，浏览器按本地编码解出乱码（例如「该密码已被其他用户使用」）。
-        def reply(self, code, body, mime='text/plain; charset=utf-8', www_auth=False):
+        def reply(self, code, body, mime='text/plain; charset=utf-8', www_auth=False, extra_headers=()):
             self.send_response(code)
             self._responded = True
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(len(body)))
+            for _name, _value in extra_headers:
+                self.send_header(_name, _value)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')
