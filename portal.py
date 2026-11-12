@@ -14320,6 +14320,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
 
+                denial = user_access_denial(u_copy)
                 return self.reply_json(200, {
                     'ok': True,
                     'user_id': target_uid,
@@ -14338,6 +14339,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'traffic_used': _safe_int(u_copy.get('used_bytes', 0)),
                     'traffic_limit': _safe_int(u_copy.get('limit_bytes', 0)),
                     'ip_limit': _display_ip_limit(u_copy),
+                    # 与用户表同一判据（2026-11-12 修）：旧响应没有账号状态，停用 / 到期 / 超额的
+                    # 账号在弹窗里照样是「可直接发给客户」的链接，发出去客户也连不上。
+                    'status_text': (None if denial is None
+                                    else _STATUS_PILL_TEXT.get(denial, ('不可用', ''))[0]),
                 })
 
             # ---------------- AmneziaWG (AWG) ----------------

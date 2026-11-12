@@ -3208,6 +3208,15 @@ if (uModal) {
 // 只认最后一次点击的回包（2026-11-04 修）：先点慢的 A、关掉再点 B，A 的回包晚到会把
 // B 标题下的内容换成 A 的链接与二维码，管理员复制出去就把 A 的凭据发给了 B 的客户。
 let userModalSeq = 0;
+// 账号当前连不上时在弹窗顶部说清楚（2026-11-12 修）：旧弹窗只列到期时间，停用 / 到期 /
+// 超额的账号也照样给出「可直接发给客户」的链接。
+function userStatusBanner(statusText) {
+  if (!statusText) return '';
+  return '<div style="background:#fff1f0;border:1px solid #ffccc7;color:#cf3c3c;border-radius:12px;'
+    + 'padding:10px 14px;font-size:13px;font-weight:600">⚠️ 该账号当前不可用（' + obEsc(statusText)
+    + '）：客户端现在连不上，发链接前请先续期、启用或调整流量。</div>';
+}
+
 document.querySelectorAll('.btn-user-connect').forEach(btn => {
   btn.addEventListener('click', async () => {
     const mySeq = ++userModalSeq;
@@ -3257,7 +3266,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         : new Date(json.expires_at * 1000).toLocaleString());
       let ipText = (json.ip_limit > 0) ? (json.ip_limit + ' IP') : '不限';
       
-      uModalBody.innerHTML = `
+      uModalBody.innerHTML = `${userStatusBanner(json.status_text)}
         <div class="user-meta-bar">
           <span>📅 到期: <b>${expireText}</b></span>
           <span>📊 流量: <b>${trafficText}</b></span>
