@@ -285,6 +285,46 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertTrue(extend.called, 'AWG 配置下载没有延长死线')
         self.assertGreaterEqual(extend.call_args[0][0], 60)
 
+    def test_awg_conf_and_qr_errors_are_readable(self):
+        """「下载配置」「二维码」在新标签页里直接打开，报错原样显示给管理员：要中文并说明怎么办（2026-11-13 修）。"""
+        self.data.setdefault('token', 'test-token')
+        self.handler._extend_deadline = lambda *a: True
+        self.handler.headers = {}
+        self.handler.is_authenticated = lambda: True
+        self.handler.check_rate_limit = lambda **k: True
+        replies = []
+        self.handler.reply = lambda status, body=b'', *a, **k: replies.append((status, body.decode('utf-8')))
+        self.ns.update(VALID_AWG_NAME_RE=portal.re.compile(r'^[A-Za-z0-9_.\-]{1,32}$'),
+                       awg_installed=lambda: True, ensure_awgctl=lambda: True,
+                       awg_peers=lambda: [{'name': 'c1', 'endpoint': ''}], awg_state=lambda: {'endpoint': ''},
+                       awg_endpoint_error=lambda endpoint: '',
+                       awg_run=lambda args, timeout=60: (0, '[Interface]\nPrivateKey = test-only\n', ''),
+                       subprocess=SimpleNamespace(run=Mock(side_effect=FileNotFoundError('qrencode')),
+                                                  TimeoutExpired=subprocess.TimeoutExpired))
+        do_get = extract_method('do_GET', self.ns)
+
+        def get(route, **overrides):
+            saved = {k: self.ns[k] for k in overrides}
+            self.ns.update(overrides)
+            try:
+                replies.clear()
+                self.handler.path = '/test-token/' + route
+                do_get(self.handler)
+                return replies[-1]
+            finally:
+                self.ns.update(saved)
+
+        cases = [(get('awg-conf?name=bad%20name'), 400, '客户端名称不合法'),
+                 (get('awg-conf?name=c1', awg_installed=lambda: False), 404, '未安装'),
+                 (get('awg-conf?name=c1', ensure_awgctl=lambda: False), 500, 'journalctl -u hysteria-portal'),
+                 (get('awg-conf?name=ghost'), 404, '不存在'),
+                 (get('awg-conf?name=c1'), 400, '连接地址'),
+                 (get('awg-qr.svg?name=c1&endpoint=vpn.example.com'), 500, '下载配置')]
+        for (status, body), want, phrase in cases:
+            with self.subTest(phrase=phrase):
+                self.assertEqual(status, want, body)
+                self.assertIn(phrase, body)
+
     def test_admin_qr_falls_back_to_a_readable_image(self):
         """生成不出二维码（qrencode 是可选依赖）时给一张说明图，而不是空内容（2026-11-13 修）。"""
         self.data.setdefault('token', 'test-token')

@@ -14473,18 +14473,22 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 self._extend_deadline(120)
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 name = (query.get('name', [''])[0] or '').strip()
+                # 这两个地址由「下载配置」「二维码」在新标签页里直接打开，报错原样显示给管理员，
+                # 所以写中文并说明怎么办（2026-11-13 修）；状态码不变，控制台按状态码判断。
                 if not VALID_AWG_NAME_RE.match(name):
-                    return self.reply(400, b'Invalid client name')
+                    return self.reply(400, '客户端名称不合法：只允许字母、数字、点、下划线、连字符，最长 32 个字符'
+                                      .encode('utf-8'))
                 if not awg_installed():
-                    return self.reply(404, b'AmneziaWG is not installed')
+                    return self.reply(404, 'AmneziaWG 未安装'.encode('utf-8'))
                 if not ensure_awgctl():
-                    return self.reply(500, b'hy2-awgctl unavailable')
+                    return self.reply(500, 'AmneziaWG 管理脚本 hy2-awgctl 不可用，原因见门户日志：'
+                                           'journalctl -u hysteria-portal -e'.encode('utf-8'))
 
                 # 客户端不存在时给 404，而不是让底层命令失败后统一报 500 ——
                 # 前端需要能区分「查无此人」与「服务端出错」。
                 peers_now = awg_peers()
                 if not any(p.get('name') == name for p in peers_now):
-                    return self.reply(404, b'Client not found')
+                    return self.reply(404, ('客户端「%s」不存在，可能已被删除，请刷新页面' % name).encode('utf-8'))
 
                 # 连接地址优先用查询参数，其次用安装时记录的 endpoint
                 endpoint = ((query.get('endpoint', [''])[0] or '').strip()
@@ -14492,7 +14496,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                      if p.get('name') == name and p.get('endpoint')), '')
                             or awg_state()['endpoint'])
                 if not endpoint:
-                    return self.reply(400, b'Endpoint not configured; re-run install with an endpoint')
+                    return self.reply(400, '没有可用的连接地址：请在新增客户端时填写连接地址，'
+                                           '或重新安装 AmneziaWG 时设置默认地址'.encode('utf-8'))
                 endpoint_error = awg_endpoint_error(endpoint)
                 if endpoint_error:
                     return self.reply(400, endpoint_error.encode('utf-8'))
@@ -14500,7 +14505,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 try:
                     rc, out, err = awg_run(['client-conf', name, '--endpoint', endpoint], timeout=60)
                 except Exception as exc:
-                    return self.reply(500, ('error: ' + str(exc)).encode('utf-8'))
+                    return self.reply(500, ('生成客户端配置失败：' + str(exc)).encode('utf-8'))
                 if rc != 0 or not out.strip():
                     return self.reply(500, awg_err_tail(rc, out, err, 400).encode('utf-8'))
 
@@ -14537,7 +14542,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                               input=out.encode('utf-8'),
                                               capture_output=True, check=True, timeout=20).stdout
                 except Exception:
-                    return self.reply(500, b'qrencode is not available on this server')
+                    return self.reply(500, '二维码生成失败（服务器可能未安装 qrencode），请改用「下载配置」导入'
+                                      .encode('utf-8'))
                 return self.reply(200, qr_bytes, 'image/svg+xml')
 
             if not self.is_authenticated():
