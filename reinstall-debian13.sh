@@ -157,6 +157,13 @@ password_ok() {
     return 0
 }
 
+# 目标必须是整块磁盘而不是分区（2026-11-12 修）：/dev/vda1 也是块设备，旧实现照收，
+# 擦的是这个分区、容量按 0 算，救援盘判断与后续步骤全部跑偏。/sys/block 下只有整块磁盘；
+# 先解开符号链接（/dev/disk/by-id/... 指向的是整块磁盘时也要认）。用法：is_whole_disk <设备>
+is_whole_disk() {
+    [ -d "${SYS_BLOCK:-/sys/block}/$(basename "$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")")" ]
+}
+
 # 打印开头整段注释：写死行号会把后面的常量与默认值代码一起打出来（2026-11-12 修）。
 print_help() {
     for _f in "$0" rd13.sh; do
@@ -336,8 +343,9 @@ if [ -z "$DISK" ]; then
     done
 fi
 [ -n "$DISK" ] && [ -b "$DISK" ] || die "找不到可用磁盘，请用 --disk /dev/xxx 指定"
+is_whole_disk "$DISK" || die "$DISK 不是整块磁盘（像是分区），请指定整块磁盘，例如 /dev/vda"
 
-DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$DISK")/size" 2>/dev/null || echo 0) / 2048))
+DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null || echo 0) / 2048))
 ok "目标磁盘：$DISK（约 ${DISK_SIZE_MB} MB）"
 
 # ── 救援盘识别：三条特征同时命中时【硬拦截】───────────────────────────

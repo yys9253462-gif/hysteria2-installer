@@ -1,3 +1,16 @@
+## 2026-11-12 — 第二十八批十项修复，门户 2.38
+
+- 卸载时收回本工具放行过的 ufw / firewalld 端口（UDP 主端口、跳跃区间、TCP 订阅端口、各协议与代理端口）：此前只有「改端口」会收回旧端口，卸载后这些端口一直开着。TCP 80 / 443 保留，机主自己的 gost 的代理端口也保留。
+- 用户订阅带 `subscription-userinfo` 头：Clash Verge / Stash / Shadowrocket / sing-box 在订阅列表里直接显示已用、总量与到期，不限量与永久账号写 0。
+- 安装收尾与 `bash install.sh info` 的安全组提示列出门户里已启用的 Reality / VMess / VLESS-Enc / AnyTLS / TUIC、入站代理与 AmneziaWG 端口：此前只列 Hy2 自己的端口，照着放行仍连不上这些协议。
+- 出站分流面板与入站代理表格加载失败时显示原因，不再永远停在「加载中…」；已经显示过的数据不会因之后某次刷新失败被清空。
+- 用户订阅带配置文件名（`节点-用户.yaml / .json`）与 24 小时自动更新间隔：客户端不再把订阅命名成网址或「Remote File」，节点改端口 / 换协议后自己跟上。
+- 证书到期时间改用标准库解析（`ssl.cert_time_to_seconds`），不再起 `date -d` 子进程：与 locale 无关，没有 GNU date 的系统上证书卡片也不再退化成「未知」。
+- DNS API 签发：Cloudflare 只给 API Token（官方推荐）即可，不再强制邮箱；Global API Key 改用 `HY2_CF_KEY + HY2_CF_EMAIL` 走 `CF_Key`（此前只能塞进 Token，被当成 Bearer 认证失败）；阿里云缺 `HY2_ALICLOUD_SECRET` 时直接说明，不去签发。
+- 安装依赖时等 dpkg 锁（最多 5 分钟，门户在线装 WARP 时 60 秒）：新开的云主机开机后 unattended-upgrades 常占着锁，此前立刻失败，以「关键依赖缺失：jq」中止，看不出真正原因。
+- `alpine2debian.sh` / `reinstall-debian13.sh` 拒绝把分区当成目标磁盘：`/dev/vda1` 也是块设备，此前照收，随后在分区里再建分区表或只擦掉这个分区，装不成系统。
+- `users/renew` 给永久账号（未设到期）续费只加流量：此前把它当成早已过期，写成「今天 + N 天」（`extend_days` 缺省 30），只想加流量的永久用户 30 天后被停。
+
 ## 2026-11-12 — 第二十七批十项修复，门户 2.37
 
 - iptables 在、nat 表却不可用（OpenVZ / 部分 LXC 容器），或加端口跳跃规则失败时，跳过端口跳跃继续安装：此前在 `set -e` 下直接退出，停在「二进制与证书已就位、配置与门户还没写」，重跑每次都卡在同一步。

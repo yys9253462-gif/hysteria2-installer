@@ -84,7 +84,7 @@ new_scenario() {
     # 🔴 场景间共享环境变量会互相污染：函数里的 export（如 SKIP_ACME_SH_UPGRADE）
     #    会影响后续场景，让测出来的结论是假的。
     unset CERT_TYPE CERT_FILE KEY_FILE SERVER_NAME IS_INSECURE ACME_EMAIL
-    unset HY2_CF_TOKEN HY2_CF_EMAIL HY2_ALICLOUD_KEY HY2_ALICLOUD_SECRET HY2_DP_TOKEN
+    unset HY2_CF_TOKEN HY2_CF_KEY HY2_CF_EMAIL HY2_ALICLOUD_KEY HY2_ALICLOUD_SECRET HY2_DP_TOKEN
     unset HY2_DOMAIN HY2_CERT_TYPE SKIP_ACME_SH_UPGRADE ACME_SH_ACCOUNT
     CADDY_CERT_ROOT="${SCEN_DIR}/caddy-nonexistent"   # 默认找不到任何反代证书
 }
@@ -303,7 +303,7 @@ echo
 echo "【场景 3】端口被占 + 无 Caddy 证书 + 无 DNS 凭据 → 必须明确中止"
 new_scenario
 r=0
-( unset HY2_CF_TOKEN HY2_CF_EMAIL HY2_ALICLOUD_KEY HY2_DP_TOKEN
+( unset HY2_CF_TOKEN HY2_CF_KEY HY2_CF_EMAIL HY2_ALICLOUD_KEY HY2_DP_TOKEN
   setup_cert_via_dns_api hy2-test.example.com >/dev/null 2>&1 ) || r=$?
 if [[ $r -eq 2 ]]; then
     ok "场景3: 正确返回「无 DNS 凭据」(2)，未误报为签发失败"

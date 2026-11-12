@@ -98,6 +98,13 @@ run() {
 # 打印开头整段注释：不写死行号，头部增减说明时不会截掉末尾「先跑 --dry-run」的警告。
 usage() { awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"; exit 0; }
 
+# 目标必须是整块磁盘而不是分区（2026-11-12 修）：/dev/vda1 也是块设备，旧实现照收，随后
+# 在分区里再建分区表、擦掉这个分区的数据，却装不成系统。/sys/block 下只有整块磁盘；
+# 先解开符号链接（/dev/disk/by-id/... 指向的是整块磁盘时也要认）。用法：is_whole_disk <设备>
+is_whole_disk() {
+    [ -d "${SYS_BLOCK:-/sys/block}/$(basename "$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")")" ]
+}
+
 # ── 参数解析 ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -140,9 +147,10 @@ if [ -z "$DISK" ]; then
     done
 fi
 [ -n "$DISK" ] && [ -b "$DISK" ] || die "找不到可用磁盘，请用 --disk /dev/xxx 指定"
+is_whole_disk "$DISK" || die "$DISK 不是整块磁盘（像是分区），请指定整块磁盘，例如 /dev/vda"
 ok "目标磁盘：$DISK"
 
-DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$DISK")/size" 2>/dev/null || echo 0) / 2048))
+DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null || echo 0) / 2048))
 if [ "$DISK_SIZE_MB" -gt 0 ]; then
     ok "磁盘容量：约 ${DISK_SIZE_MB} MB"
     if [ "$DISK_SIZE_MB" -lt 1500 ]; then

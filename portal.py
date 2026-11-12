@@ -24,6 +24,7 @@ import select
 import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -202,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.37'
+PORTAL_VERSION = '2.38'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -3754,6 +3755,32 @@ def _safe_int(value, default=0):
     except (TypeError, ValueError, OverflowError):
         return default
 
+
+def subscription_userinfo(user):
+    """用户订阅响应的 subscription-userinfo 头（2026-11-12 加）。
+
+    Clash Verge / Stash / Shadowrocket / sing-box 据此在订阅列表显示已用、总量与到期。
+    计量只记每个用户上下行的合计，按惯例全部计在 download；不限量写 total=0，
+    未设到期（永久）写 expire=0。坏值（布尔 / 负数 / 无法解析）一律按 0。
+    """
+    def _num(value):
+        n = 0 if isinstance(value, bool) else _safe_int(value)
+        return n if n > 0 else 0
+    return 'upload=0; download=%d; total=%d; expire=%d' % (
+        _num(user.get('used_bytes')), _num(user.get('limit_bytes')), _num(user.get('expires_at')))
+
+
+def subscription_profile_headers(meta, user_id, ext):
+    """用户订阅的配置名与自动更新间隔（2026-11-12 加）。
+
+    没有文件名时 Clash Verge 等只能用网址或「Remote File」命名，买家同时导入几份订阅时
+    分不清；24 小时自动更新让节点改端口 / 换协议后客户端自己跟上。文件名只留安全字符。
+    """
+    name = re.sub(r'[^A-Za-z0-9._-]', '_', '%s-%s' % (clean_node_identity(meta)[3], user_id)).strip('._')
+    return (('profile-update-interval', '24'),
+            ('Content-Disposition', 'attachment; filename="%s.%s"' % ((name or 'subscription')[:80], ext)))
+
+
 def _extra_link_boxes(extra_links):
     """分享页里其它已启用协议的直链（2026-11-04 加）。
 
@@ -4303,20 +4330,13 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
     except Exception as exc:
         _log_ignored('cert_info.openssl', exc)
 
-    # notAfter 形如 'Oct  9 00:00:00 2027 GMT' —— 用 dateutil 之类会引入依赖，
-    # 直接交给 openssl 换算成 epoch（-checkend 是相对秒数，但我们要绝对到期时刻，
-    # 所以这里解析文本更稳）。解析失败就留 None，前端只显示「未知」。
+    # notAfter 形如 'Oct  9 00:00:00 2027 GMT'。解析失败就留 None，前端只显示「未知」。
     if info['not_after']:
         try:
-            # ⚠️ LC_ALL=C 是必需的（2026-10-09 修）：not_after 来自 openssl，
-            # 永远是英文月份（Oct  9 ...），但 GNU date 解析 'Oct' 要过 LC_TIME。
-            # 在 zh_CN.UTF-8 下解析失败 -> int('') -> ValueError -> 静默留 None ->
-            # warn_level 变 'unknown'，而卡片没有 unknown 分支，会显示成
-            # 「● 正常 · null 天后到期」的**绿色安慰性假象**，恰好毁掉这张卡片的用途。
-            ts = subprocess.run(['date', '-d', info['not_after'], '+%s'],
-                                capture_output=True, text=True, timeout=5,
-                                env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
-            epoch = int(ts.stdout.strip())
+            # 标准库按证书时间格式解析，与 locale 无关（2026-11-12 改）：旧实现起 GNU
+            # `date -d` 子进程并钉 LC_ALL=C（zh_CN 下曾解析失败，卡片显示「正常 · null
+            # 天后到期」）；busybox 等非 GNU date 根本不认这个格式，同样退化成「未知」。
+            epoch = int(ssl.cert_time_to_seconds(info['not_after']))
             now = int(time.time())
             info['expires_in_days'] = int((epoch - now) // 86400)
             info['expires_at'] = epoch
@@ -10468,13 +10488,21 @@ if __name__ == '__main__':
                             # max(None, int) 会抛 TypeError，而这里在锁内、无兜底，
                             # 连接会被直接掐断（2026-10-29 修）。
                             try:
-                                base_time = max(int(u.get('expires_at') or 0), now_ts)
-                                new_expiry = int(base_time) + days * 86400
+                                # 永久账号（未设到期）续费只加流量（2026-11-12 修，与下面不限量同理）：
+                                # 旧实现 int(None or 0) 当成早已过期，写成「今天 + N 天」，extend_days
+                                # 缺省 30 —— 商城只想加流量时，永久用户被悄悄改成 30 天后停。
+                                raw_expiry = u.get('expires_at')
+                                if raw_expiry is None:
+                                    new_expiry = None
+                                else:
+                                    base_time = max(int(raw_expiry), now_ts)
+                                    new_expiry = int(base_time) + days * 86400
                                 # limit_bytes=0 表示不限量：加流量不能把它变成「只有本次加的量」，
                                 # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
                                 old_limit = int(u.get('limit_bytes', 0))
                                 new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
-                                if not 0 <= new_expiry <= 253402300799 or not 0 <= new_limit <= 2**63 - 1:
+                                if ((new_expiry is not None and not 0 <= new_expiry <= 253402300799)
+                                        or not 0 <= new_limit <= 2**63 - 1):
                                     raise ValueError()
                             except (ValueError, TypeError, OverflowError):
                                 conflict = (400, 'Renewal exceeds supported limits')
@@ -13407,8 +13435,9 @@ log() { echo "[warp] $*"; }
 for t in curl jq; do
     command -v "$t" >/dev/null 2>&1 && continue
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq >/dev/null 2>&1 || true
-        apt-get install -y -qq "$t" >/dev/null 2>&1 || true
+        # 等 dpkg 锁（与 install.sh 同理，2026-11-12）；整个脚本 180 秒超时，这里只等 60 秒。
+        apt-get -o DPkg::Lock::Timeout=60 update -qq >/dev/null 2>&1 || true
+        apt-get -o DPkg::Lock::Timeout=60 install -y -qq "$t" >/dev/null 2>&1 || true
     elif command -v yum >/dev/null 2>&1; then
         yum install -y "$t" >/dev/null 2>&1 || true
     fi
@@ -14141,10 +14170,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     anytls=_served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE),
                     tuic=_served_singbox_config(_active_tuic_config(), TUIC_SERVICE))
 
+                userinfo = (('subscription-userinfo', subscription_userinfo(u_copy)),)
                 if action_file == 'clash.yaml':
-                    return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml')
+                    return self.reply(200, clash_yaml.encode('utf-8'), 'application/yaml',
+                                      extra_headers=userinfo + subscription_profile_headers(m, target_uid, 'yaml'))
                 elif action_file == 'sing-box.json':
-                    return self.reply(200, sing_json.encode('utf-8'), 'application/json')
+                    return self.reply(200, sing_json.encode('utf-8'), 'application/json',
+                                      extra_headers=userinfo + subscription_profile_headers(m, target_uid, 'json'))
                 elif action_file == 'qr.svg':
                     try:
                         qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
@@ -15183,11 +15215,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
         # 默认带 charset（2026-11-04 修）：网页表单的错误回复是中文 UTF-8，旧默认值没写
         # charset，浏览器按本地编码解出乱码（例如「该密码已被其他用户使用」）。
-        def reply(self, code, body, mime='text/plain; charset=utf-8', www_auth=False):
+        def reply(self, code, body, mime='text/plain; charset=utf-8', www_auth=False, extra_headers=()):
             self.send_response(code)
             self._responded = True
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(len(body)))
+            for _name, _value in extra_headers:
+                self.send_header(_name, _value)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')

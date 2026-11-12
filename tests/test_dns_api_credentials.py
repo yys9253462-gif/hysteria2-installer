@@ -28,8 +28,8 @@ class DnsApiCredentialsTests(unittest.TestCase):
             stub = home / '.acme.sh' / 'acme.sh'
             stub.write_text('#!/bin/bash\n'
                             '[[ "$1" == --issue ]] && { printf "ARGS %s\\n" "$*"; '
-                            'printf "ENV CF_Token=%s CF_Email=%s Ali_Key=%s DuckDNS_Token=%s\\n" '
-                            '"$CF_Token" "$CF_Email" "$Ali_Key" "$DuckDNS_Token"; } >> "$HOME/calls"\n'
+                            'printf "ENV CF_Token=%s CF_Email=%s CF_Key=%s Ali_Key=%s Ali_Secret=%s DuckDNS_Token=%s\\n" '
+                            '"$CF_Token" "$CF_Email" "$CF_Key" "$Ali_Key" "$Ali_Secret" "$DuckDNS_Token"; } >> "$HOME/calls"\n'
                             'exit 1\n')
             stub.chmod(0o755)
             script = '\n'.join(['HOME=%s' % home, 'log_info() { :; }', 'log_warn() { :; }',
@@ -53,7 +53,22 @@ class DnsApiCredentialsTests(unittest.TestCase):
     def test_alicloud_key_goes_through_env(self):
         out = self.run_issue(['HY2_ALICLOUD_KEY=ak', 'HY2_ALICLOUD_SECRET=sk'])
         self.assertIn('Ali_Key=ak', out)
+        self.assertIn('Ali_Secret=sk', out)
         self.assertNotIn('--dns_ali_key', out)
+
+    # 2026-11-12 修：Cloudflare API Token 不需要邮箱；Global API Key 走 CF_Key；阿里云缺 Secret 不去签发。
+    def test_cloudflare_api_token_alone_is_enough(self):
+        out = self.run_issue(['HY2_CF_TOKEN=tok'])
+        self.assertIn('--dns dns_cf', out)
+        self.assertIn('CF_Token=tok', out)
+
+    def test_cloudflare_global_key_is_sent_as_cf_key(self):
+        out = self.run_issue(['HY2_CF_KEY=gk', 'HY2_CF_EMAIL=me@x'])
+        self.assertIn('--dns dns_cf', out)
+        self.assertIn('CF_Token= CF_Email=me@x CF_Key=gk', out)
+
+    def test_alicloud_without_secret_is_refused_before_issuing(self):
+        self.assertEqual(self.run_issue(['HY2_ALICLOUD_KEY=ak']), '')
 
 
 if __name__ == '__main__':

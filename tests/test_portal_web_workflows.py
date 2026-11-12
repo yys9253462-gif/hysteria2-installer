@@ -1341,6 +1341,21 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 503)
         self.assertEqual(self.data['users']['qa-user'], original)
 
+    def test_renewing_a_permanent_user_keeps_it_permanent(self):
+        """永久账号（未设到期）续费只加流量，不能被续成「今天 + N 天」（2026-11-12 修）。"""
+        for permanent in ({'expires_at': None}, {}):
+            with self.subTest(permanent=permanent):
+                self.data['users']['perm'] = dict({'password': 'perm-pw', 'status': 'active',
+                                                   'limit_bytes': 1024 ** 3, 'used_bytes': 0}, **permanent)
+                status, body = self.invoke_api({'user_id': 'perm', 'add_traffic_gb': 1}, 'users/renew')
+                self.assertEqual(status, 200, body)
+                self.assertIsNone(self.data['users']['perm'].get('expires_at'), 'permanent user got an expiry')
+                self.assertEqual(self.data['users']['perm']['limit_bytes'], 2 * 1024 ** 3)
+        self.data['users']['dated'] = {'password': 'dated-pw', 'status': 'active', 'expires_at': 2200000000,
+                                       'limit_bytes': 0, 'used_bytes': 0}
+        self.assertEqual(self.invoke_api({'user_id': 'dated', 'extend_days': 1}, 'users/renew')[0], 200)
+        self.assertEqual(self.data['users']['dated']['expires_at'], 2200000000 + 86400)
+
     def test_interrupted_core_upgrade_status_persists_across_restarts(self):
         path = self.hdir / 'portal.json'
         original = {'core_upgrade': {'state': 'running', 'version': 'v9.9.9'}}

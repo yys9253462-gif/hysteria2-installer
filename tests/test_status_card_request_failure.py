@@ -89,9 +89,11 @@ def _block(header):
     return script[start:script.index('\n}\n', start) + 3]
 
 
+SHARED_HELPERS = ('function markStatusUnknown(', 'function markLoadFailed(', 'function obEsc(')
+
+
 def _helpers():
-    header = 'function markStatusUnknown('
-    return _block(header) if header in portal.SCRIPT else ''
+    return ''.join(_block(h) for h in SHARED_HELPERS if h in portal.SCRIPT)
 
 
 def run_node(source):

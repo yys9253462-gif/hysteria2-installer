@@ -865,8 +865,12 @@ install_dependencies() {
     # 安装随即中止；apt 遇到缺包同样整批拒绝。
     local _pm=() _pkg
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -qq || true
-        _pm=(apt-get install -y -qq)
+        # 等 dpkg 锁而不是立刻失败（2026-11-12 修）：新开的 Debian / Ubuntu 云主机开机后
+        # unattended-upgrades 常占着锁，旧实现立刻报 Could not get lock，jq 装不上，
+        # 随后以「关键依赖缺失」中止，看不出真正原因。apt 1.9.11 以前的版本忽略此选项。
+        local _apt_wait=(-o DPkg::Lock::Timeout=300)
+        apt-get "${_apt_wait[@]}" update -qq || true
+        _pm=(apt-get "${_apt_wait[@]}" install -y -qq)
     elif command -v dnf >/dev/null 2>&1; then
         _pm=(dnf install -y)
     elif command -v yum >/dev/null 2>&1; then
@@ -903,6 +907,9 @@ install_dependencies() {
         log_err "  Debian/Ubuntu : apt-get update && apt-get install -y ${missing_critical[*]}"
         log_err "  CentOS/RHEL   : yum install -y ${missing_critical[*]}"
         log_err "  Alpine        : apk add ${missing_critical[*]}"
+        if [[ "${_pm[0]:-}" == apt-get ]]; then
+            log_err "若上方提示 Could not get lock：系统自动更新还在跑，等它结束（几分钟）后重新运行本脚本即可。"
+        fi
         return 1
     fi
     if (( ${#missing_soft[@]} > 0 )); then
@@ -1719,8 +1726,9 @@ EOF
 #   **完全不碰任何端口**，因此与端口占用彻底解耦。
 #
 # 代价：需要 DNS 服务商的 API 凭据。凭据从环境变量读，不落仓库：
-#   HY2_CF_TOKEN + HY2_CF_EMAIL   （Cloudflare）
-#   HY2_ALICLOUD_KEY              （阿里云）
+#   HY2_CF_TOKEN                  （Cloudflare API Token，推荐；邮箱可不填）
+#   HY2_CF_KEY + HY2_CF_EMAIL     （Cloudflare Global API Key）
+#   HY2_ALICLOUD_KEY + HY2_ALICLOUD_SECRET（阿里云）
 #   HY2_DP_TOKEN                  （DuckDNS，交给 acme.sh 的 DuckDNS_Token）
 # 拿不到凭据就明确告诉用户怎么办，而不是静默退回自签。
 setup_cert_via_dns_api() {
@@ -1737,10 +1745,20 @@ setup_cert_via_dns_api() {
     #      把「没有凭据」误报成「acme.sh 安装失败」——
     #      用户会去查网络/目录权限，而真正该做的是导出凭据。2026-10-08 实测命中。
     local provider="" prov_env=""
-    if [[ -n "${HY2_CF_TOKEN:-}" && -n "${HY2_CF_EMAIL:-}" ]]; then
-        provider="Cloudflare"; prov_env="HY2_CF_TOKEN + HY2_CF_EMAIL"
+    # Cloudflare 两种凭据分开认（2026-11-12 修）：API Token 不需要邮箱，旧实现却要求
+    # HY2_CF_EMAIL 才认 Cloudflare，只有 Token（官方推荐）的用户被当成「没有凭据」；
+    # Global API Key 要走 CF_Key + CF_Email，旧实现只能塞进 CF_Token，被当成 Bearer 认证失败。
+    if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
+        provider="Cloudflare"; prov_env="HY2_CF_TOKEN"
+    elif [[ -n "${HY2_CF_KEY:-}" && -n "${HY2_CF_EMAIL:-}" ]]; then
+        provider="Cloudflare"; prov_env="HY2_CF_KEY + HY2_CF_EMAIL"
     elif [[ -n "${HY2_ALICLOUD_KEY:-}" ]]; then
-        provider="阿里云";    prov_env="HY2_ALICLOUD_KEY"
+        # 缺 Secret 时直接说清楚，旧实现照样去签发，最后只报一句看不出原因的认证失败。
+        if [[ -z "${HY2_ALICLOUD_SECRET:-}" ]]; then
+            log_err "阿里云 DNS API 需要 HY2_ALICLOUD_KEY 与 HY2_ALICLOUD_SECRET 两项，缺 HY2_ALICLOUD_SECRET。"
+            return 1
+        fi
+        provider="阿里云";    prov_env="HY2_ALICLOUD_KEY + HY2_ALICLOUD_SECRET"
     elif [[ -n "${HY2_DP_TOKEN:-}" ]]; then
         provider="DuckDNS";   prov_env="HY2_DP_TOKEN"
     else
@@ -1762,11 +1780,16 @@ setup_cert_via_dns_api() {
         # 之类的参数，acme.sh 不认识，直接报 Unknown parameter 退出，DNS API 签发从未成功过。
         # DuckDNS 的插件是 dns_duckdns（旧实现写成了 DNSPod 的 dns_dp）。
         Cloudflare)
-            CF_Token="$HY2_CF_TOKEN" CF_Email="$HY2_CF_EMAIL" \
-                "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+            if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
+                CF_Token="$HY2_CF_TOKEN" CF_Email="${HY2_CF_EMAIL:-}" \
+                    "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+            else
+                CF_Key="$HY2_CF_KEY" CF_Email="$HY2_CF_EMAIL" \
+                    "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+            fi
             ;;
         阿里云)
-            Ali_Key="$HY2_ALICLOUD_KEY" Ali_Secret="${HY2_ALICLOUD_SECRET:-}" \
+            Ali_Key="$HY2_ALICLOUD_KEY" Ali_Secret="$HY2_ALICLOUD_SECRET" \
                 "$acct" --issue --dns dns_ali -d "$domain" || ok=1
             ;;
         DuckDNS)
@@ -1938,7 +1961,8 @@ setup_acme_certificate() {
             log_err " 借 Caddy 签发也未成功 → 剩下唯一自动可行的路是 DNS API。"
             log_err ""
             log_err " 三选一（按你的 DNS 服务商）："
-            log_err "   Cloudflare : export HY2_CF_TOKEN=xxx HY2_CF_EMAIL=xxx@yyy.com"
+            log_err "   Cloudflare : export HY2_CF_TOKEN=xxx                 （API Token，推荐）"
+            log_err "                或 export HY2_CF_KEY=xxx HY2_CF_EMAIL=xxx@yyy.com（Global API Key）"
             log_err "   阿里云     : export HY2_ALICLOUD_KEY=xxx HY2_ALICLOUD_SECRET=xxx"
             log_err "   DuckDNS    : export HY2_DP_TOKEN=xxx"
             log_err " 然后重新运行本脚本即可。"
@@ -3446,6 +3470,34 @@ EOF
 }
 
 # 6. 显示私密信息页的访问凭据，节点数据只在认证后提供。
+# 门户里已启用的其它协议 / 代理端口，每行「协议 端口 说明」（2026-11-12 加）：安全组提示
+# 此前只列 Hy2 自己的端口，在门户里开了 Reality / TUIC 等的用户照着放行仍然连不上。
+# 口径与门户一致：Xray 系看 xray.json 里的托管入站，sing-box 系看已启用且配置文件在。
+enabled_protocol_ports() {
+    local xray="$HY2_DIR/xray.json" portal="$HY2_DIR/portal.json" awg_port
+    if [[ -f "$xray" ]]; then
+        jq -r '{"vless-reality-in": "VLESS-Reality", "vmess-ws-in": "VMess", "vless-enc-in": "VLESS-Enc"} as $n
+            | .inbounds[]? | select(type == "object" and (.tag | type) == "string" and $n[.tag] != null)
+            | select((.port | type) == "number") | "TCP \(.port) \($n[.tag])"' "$xray" 2>/dev/null || true
+    fi
+    if [[ -f "$portal" ]]; then
+        if [[ -f "$HY2_DIR/anytls.json" ]]; then
+            jq -r '.anytls_config | select(type == "object" and .enabled == true) | .port | numbers | "TCP \(.) AnyTLS"' \
+                "$portal" 2>/dev/null || true
+        fi
+        if [[ -f "$HY2_DIR/tuic.json" ]]; then
+            jq -r '.tuic_config | select(type == "object" and .enabled == true) | .port | numbers | "UDP \(.) TUIC"' \
+                "$portal" 2>/dev/null || true
+        fi
+        jq -r '(.proxy_services // []) | if type == "array" then .[] else empty end | select(type == "object")
+            | (.port | numbers) as $p | "TCP \($p) 入站代理（\(.type // "proxy")）"' "$portal" 2>/dev/null || true
+    fi
+    if [[ -f "$AWG_CONFIG" ]]; then
+        awg_port="$(sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\)[[:space:]]*$/\1/p' "$AWG_CONFIG" | head -n 1)"
+        if [[ -n "$awg_port" ]]; then echo "UDP ${awg_port} AmneziaWG"; fi
+    fi
+}
+
 show_client_configs() {
     if [[ ! -f "$HY2_DIR/portal-access.json" ]]; then
         log_err "尚未生成信息页，请重新配置。"
@@ -3527,6 +3579,11 @@ show_client_configs() {
     if [[ "$_cert_type_display" == "acme" ]]; then
         echo -e "    ${GREEN}TCP 80${PLAIN}        申请 / 续期 Let's Encrypt 证书用"
     fi
+    local _proto _port _label
+    while read -r _proto _port _label; do
+        [[ -n "$_port" ]] || continue
+        echo -e "    ${GREEN}${_proto} ${_port}${PLAIN}        ${_label}"
+    done < <(enabled_protocol_ports)
 
     local key
     key=$(jq -r '.api_key // empty' "$HY2_DIR/portal-access.json" 2>/dev/null) || true
@@ -5705,6 +5762,8 @@ uninstall_all() {
             fi
         done
         clear_all_hopping_rules
+        # 机主自己的 gost 保留了配置，它的代理端口也照旧放行。
+        if [[ "$preserve_gost_config" == 1 ]]; then close_installer_ports 0; else close_installer_ports 1; fi
         rm -f "$HY2_SERVICE"
         if [[ -f "$HY2_LOG_DROPIN" ]] && grep -qF '由 hysteria2-installer 生成' "$HY2_LOG_DROPIN"; then
             rm -f "$HY2_LOG_DROPIN"
@@ -5974,6 +6033,44 @@ close_replaced_ports() {
     [[ -n "$old_tcp" && "$old_tcp" != "$HY2_SUB_PORT" ]] && _close_one "$old_tcp" tcp
     unset -f _close_one
     return 0
+}
+
+# 卸载时收回本工具放行过的防火墙端口（2026-11-12 修）：此前只有「改端口」会收回旧端口，
+# 卸载后 UDP 主端口、跳跃区间、TCP 订阅端口与各协议 / 代理端口一直开着，之后谁绑上去谁就暴露。
+# TCP 80 / 443 不收：它们多半也是机主网站在用的端口；nft / 裸 iptables 规则同样不动（无法证明归属）。
+# 用法：close_installer_ports <代理端口是否一起收 1/0>；读 meta 与 portal.json，须在删除配置目录前调用。
+close_installer_ports() {
+    local with_proxies="${1:-1}" ufw_on=0 fwd_on=0 listen range lo hi p tcp_ports
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw_on=1; fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then fwd_on=1; fi
+    [[ "$ufw_on" == 1 || "$fwd_on" == 1 ]] || return 0
+    _fw_close() {   # $1=端口或「起-止」 $2=协议
+        if [[ "$ufw_on" == 1 ]]; then ufw delete allow "${1/-/:}/$2" >/dev/null 2>&1 || true; fi
+        if [[ "$fwd_on" == 1 ]]; then firewall-cmd --remove-port="$1/$2" --permanent >/dev/null 2>&1 || true; fi
+    }
+    listen="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    range="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    if is_valid_port "$listen"; then _fw_close "$listen" udp; fi
+    # 先存下捕获组：is_valid_port 自己也用 =~，会覆盖 BASH_REMATCH。
+    if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+        if is_valid_port "$lo" && is_valid_port "$hi"; then _fw_close "$range" udp; fi
+    fi
+    tcp_ports="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    tcp_ports+=$'\n'"$(jq -r --argjson px "$with_proxies" '
+        ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config] | map(select(type == "object") | .port | numbers))
+        + (if $px == 1 then ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | numbers) else [] end) else [] end)
+        | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    while IFS= read -r p; do
+        is_valid_port "$p" || continue
+        [[ "$p" == 80 || "$p" == 443 ]] && continue
+        _fw_close "$p" tcp
+    done <<<"$tcp_ports"
+    p="$(jq -r '.tuic_config | if type == "object" then (.port | numbers) else empty end' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    if is_valid_port "$p"; then _fw_close "$p" udp; fi
+    if [[ "$fwd_on" == 1 ]]; then firewall-cmd --reload >/dev/null 2>&1 || true; fi
+    unset -f _fw_close
+    log_info "已收回本工具放行的防火墙端口（TCP 80 / 443 保留）。"
 }
 
 # 流量超额停用期间不能走这些菜单（2026-11-04 修）：它们会 restart hysteria-server /
