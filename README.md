@@ -41,10 +41,20 @@ HY2_CERT_TYPE=3 HY2_DOMAIN=hy2.example.com HY2_EMAIL=me@example.com bash install
 | :--- | :--- |
 | `HY2_PORT` | UDP 监听端口，留空自动选取 |
 | `HY2_PASSWORD` | 机主账号密码，留空自动生成 |
-| `HY2_CERT_TYPE` | `1` 自签 / `2` 指定证书文件（需交互）/ `3` 域名申请 Let's Encrypt / `4` 扫描本机已有证书 |
+| `HY2_CERT_TYPE` | `1` 自签 / `2` 指定证书文件（交互选择；免交互用下面的 `HY2_CUSTOM_CERT_FILE`）/ `3` 域名申请 Let's Encrypt / `4` 扫描本机已有证书 |
 | `HY2_DOMAIN` | 域名（SNI），`HY2_CERT_TYPE=3` 时必填 |
 | `HY2_EMAIL` | Let's Encrypt 通知邮箱 |
 | `HY2_PRESERVE_PORTAL` | 已装过时是否沿用门户（凭据、API Key、用户）：`1` 默认保留，`0` 重建 |
+| `HY2_CUSTOM_CERT_FILE` + `HY2_CUSTOM_KEY_FILE` | 免交互使用已有证书：两个文件都要可读、未过期且互相配对；域名取 `HY2_DOMAIN`，缺省用公网 IP |
+| `HY2_CUSTOM_INSECURE` | 配合上一项：证书不被客户端信任（如自签）时设 `1`，订阅里会带上跳过校验 |
+| `HY2_CF_TOKEN` | 80 / 443 被占时改用 DNS API 签发：Cloudflare API Token（推荐，需该域名的 DNS 编辑权限） |
+| `HY2_CF_KEY` + `HY2_CF_EMAIL` | 同上，Cloudflare Global API Key 写法 |
+| `HY2_ALICLOUD_KEY` + `HY2_ALICLOUD_SECRET` | 同上，阿里云 AccessKey（两项都要） |
+| `HY2_DP_TOKEN` | 同上，DuckDNS Token |
+| `HY2_REGEN_SELF_SIGNED` | `1` 强制重新生成自签证书（默认沿用现有证书，pin 不变，已发放的链接不失效） |
+| `HY2_LOG_LEVEL` | Hysteria 日志级别：`debug` / `info`（默认）/ `warn` / `error` |
+| `HY2_ALLOW_CUSTOM_CORE_REPLACE` | `1` 允许用官方核心覆盖当前的定制核心（默认拒绝，避免丢掉定制补丁） |
+| `HY2_NODE_MODE` | 只接受留空或 `2`（商城版）；单机私密模式已移除 |
 
 ### 用域名申请证书
 
