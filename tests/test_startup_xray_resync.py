@@ -55,21 +55,25 @@ class StartupXrayResyncTest(unittest.TestCase):
                 json.dumps({'reality': {'binary': str(fake / 'xray')}}), encoding='utf-8')
             env = dict(os.environ, PATH=str(fake) + os.pathsep + os.environ.get('PATH', ''),
                        HY2_CORE_OPERATION_LOCK=str(root / 'core.lock'))
-            proc = subprocess.Popen([sys.executable, portal.__file__, 'serve', str(root / 'portal.json')],
-                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            try:
-                deadline = time.time() + 20
-                emails = []
-                while time.time() < deadline:
-                    cfg = json.loads((root / 'xray.json').read_text(encoding='utf-8'))
-                    emails = [c.get('email') for c in cfg['inbounds'][0]['settings']['clients']]
-                    if 'buyer' in emails:
-                        break
-                    time.sleep(0.2)
-                self.assertIn('buyer', emails, '启动时没有按 portal.json 重写 xray clients')
-            finally:
-                proc.terminate()
-                proc.wait(timeout=5)
+            # stderr 写文件而不是 PIPE：没人读的管道写满后门户会卡在写日志上；失败时附上它便于排查。
+            stderr_path = root / 'portal.stderr'
+            with open(stderr_path, 'wb') as stderr_file:
+                proc = subprocess.Popen([sys.executable, portal.__file__, 'serve', str(root / 'portal.json')],
+                                        env=env, stdout=subprocess.DEVNULL, stderr=stderr_file)
+                try:
+                    deadline = time.time() + 20
+                    emails = []
+                    while time.time() < deadline:
+                        cfg = json.loads((root / 'xray.json').read_text(encoding='utf-8'))
+                        emails = [c.get('email') for c in cfg['inbounds'][0]['settings']['clients']]
+                        if 'buyer' in emails:
+                            break
+                        time.sleep(0.2)
+                finally:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+            self.assertIn('buyer', emails, '启动时没有按 portal.json 重写 xray clients；门户 stderr：\n'
+                          + stderr_path.read_text(encoding='utf-8', errors='replace')[-2000:])
 
 
 if __name__ == '__main__':
