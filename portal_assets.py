@@ -526,8 +526,13 @@ function showConfirm(options = {}) {
   }
   okBtn.textContent = options.confirmText || '确定执行';
   okBtn.className = 'confirm-btn ' + (options.isDanger ? 'danger' : 'primary');
+  // 焦点移进弹窗、关闭后还回去（2026-11-13 修）：旧实现焦点留在背后触发它的按钮上，键盘用户
+  // 要按好几下 Tab 才摸到「确定 / 取消」，Tab 还会跑到弹窗背后的页面。危险操作默认停在「取消」，
+  // 回车不会误删；普通确认停在「确定」。
+  const previousFocus = document.activeElement;
   modal.classList.add('show');
   confirmOpen = true;
+  (options.isDanger ? cancelBtn : okBtn).focus();
 
   return new Promise((resolve) => {
     function cleanup(result) {
@@ -537,12 +542,19 @@ function showConfirm(options = {}) {
       document.removeEventListener('keydown', onKey);
       modal.removeEventListener('click', onBackdrop);
       confirmOpen = false;
+      if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
       resolve(result);
     }
     function onOk() { cleanup(true); }
     function onCancel() { cleanup(false); }
-    // Esc 关闭：纯键盘用户此前只能用 Tab 逐个跳到按钮。
-    function onKey(e) { if (e.key === 'Escape') cleanup(false); }
+    // Esc 关闭；Tab 只在两个按钮间切换。
+    function onKey(e) {
+      if (e.key === 'Escape') { cleanup(false); return; }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        (document.activeElement === okBtn ? cancelBtn : okBtn).focus();
+      }
+    }
     // 点背板关闭：与用户弹窗行为一致（此前确认弹窗只能点按钮）。
     function onBackdrop(e) { if (e.target === modal) cleanup(false); }
     okBtn.addEventListener('click', onOk);
