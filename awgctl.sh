@@ -453,7 +453,7 @@ download_binaries() {
     # 覆盖现役二进制前先备份，装完立刻验证新文件真的能执行；
     # 任一步失败就整组恢复。旧实现直接覆盖，新版架构不符或损坏时
     # 旧版本已经没了，AWG 直接不可用、只能重装（2026-10-29 修）。
-    local bakd dst f
+    local bakd f
     bakd="$(mktemp -d "${AWG_DIR}/.binbak.XXXXXX")"
     for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
         [[ -e "$f" ]] && cp -a "$f" "$bakd/$(basename "$f")"

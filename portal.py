@@ -35,7 +35,6 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -4398,11 +4397,9 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         return False
     services = ('hysteria-server', 'xray', ANYTLS_SERVICE, TUIC_SERVICE, 'gost')
     failed = []
-    attempted = False
     for service in services:
         if _systemd_state(service) != 'active':
             continue
-        attempted = True
         try:
             result = subprocess.run(['systemctl', 'try-restart', service],
                                     capture_output=True, timeout=20)
@@ -7903,35 +7900,15 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
 
     before = dict(m)
     live_cert, _, _, _ = _resolve_live_cert(root, config_path)
-    cert_files = set()
-    tls_cert = _config_tls_cert_path(config_path)
-    if tls_cert:
-        cert_files.add(Path(tls_cert) if Path(tls_cert).is_absolute()
-                       else Path(config_path).parent / tls_cert)
-    cert_files.add(live_cert)
-    before_cert = {path: hashlib.sha256(path.read_bytes()).hexdigest()
-                   for path in cert_files if path.is_file()}
     changed = sync_cert_trust(m, root, meta_path, config_path=config_path)
     # sync_cert_trust 只在漂移时写盘；pin 的修正也一并在此处理（保持与 refresh 一致）。
     pin_before = m.get('pin_sha256')
     sync_pin(m, root, meta_path)
     if m.get('pin_sha256') != pin_before:
         changed = True
-    after_cert = {path: hashlib.sha256(path.read_bytes()).hexdigest()
-                  for path in cert_files if path.is_file()}
-    cert_changed = before_cert != after_cert
-    runtime_state = root / 'cert-selfheal.json'
-    has_runtime_fingerprint = False
-    if runtime_state.exists():
-        try:
-            _runtime_data = json.loads(runtime_state.read_text(encoding='utf-8'))
-            has_runtime_fingerprint = bool(_runtime_data.get('loaded_cert_sha256'))
-        except (OSError, ValueError, AttributeError):
-            pass
     # 每轮都交给 sync_cert_runtime 比对（2026-11-04 修）：它拿磁盘证书与上次重载时记下的
     # 指纹比，相同就直接返回，不会每 30 分钟重启一次。旧的门槛只看「本轮前后」两次快照，
     # 而本轮里根本不写证书：Caddy / 手工换证后服务一直握着旧证书，到期时 TLS 全挂。
-    del cert_changed, has_runtime_fingerprint
     runtime_reloaded = sync_cert_runtime(root, live_cert)
 
     if changed or runtime_reloaded:

@@ -13,7 +13,6 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
@@ -37,7 +36,6 @@ HY2_LOG_DROPIN="/etc/systemd/system/hysteria-server.service.d/loglevel.conf"
 # ---- AmneziaWG (AWG) ----
 # 引擎逻辑全部在 awgctl.sh 里，本脚本只做交互封装。
 AWG_REPO="yys9253462-gif/hysteria2-installer"
-AWG_RELEASE_TAG="awg-binaries"
 AWG_CTL_BIN="/usr/local/bin/hy2-awgctl"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_LINK="awg0"
@@ -3709,7 +3707,7 @@ PORTAL_FETCH_ALL_VERIFY_FAILED=0
 portal_fetch_py() {
     local dir="$1"
     local repo="${AWG_REPO}"
-    local spec name base mode why m
+    local name base mode why m
     PORTAL_FETCH_ERR=""
     PORTAL_FETCH_FILES_ERR=""
     PORTAL_FETCH_ALL_VERIFY_FAILED=0
