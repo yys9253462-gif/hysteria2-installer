@@ -3286,6 +3286,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
       
       const shareUrl = location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '?k=' + userKey;
+      // 与客户分享页一致也给 sing-box 订阅（2026-11-13 加）：接口一直回着 sing_box，旧弹窗只用了
+      // Clash 那份，用 sing-box / Hiddify 的客户只能让管理员另开分享页去找。
+      const singSubPath = '/' + token + '/u/' + encodeURIComponent(uid) + '/sing-box.json?k=' + userKey;
       
       // 统一用 fmtBytes：旧写法把已用强制成 MB、配额强制成 GB，
       // 小配额（如 500 MB）会显示成「0.5 GB」，大用量则是「1536.0 MB」。
@@ -3348,6 +3351,19 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
                 <textarea id="um-clash" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.clash)}</textarea>
                 <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-clash">复制文本</button></div>
+              </details>
+            </div>
+            <div>
+              <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Sing-box 专属订阅链接:</div>
+              <div class="input-with-action">
+                <input type="text" id="um-sing-sub" value="${obEsc(location.origin + singSubPath)}" readonly style="font-size:11px;height:36px">
+                <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-sing-sub">复制订阅</button>
+                <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="${obEsc(singSubPath)}" download="sing-box-${obEsc(uid)}.json">下载 ↓</a>
+              </div>
+              <details style="margin-top:6px">
+                <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
+                <textarea id="um-sing" class="link" style="height:65px;font-size:10px;margin-top:4px" readonly>${obEsc(json.sing_box)}</textarea>
+                <div style="margin-top:4px"><button class="button" style="padding:2px 8px;font-size:10px" type="button" data-modal-copy="um-sing">复制文本</button></div>
               </details>
             </div>
           </div>
