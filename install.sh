@@ -2536,14 +2536,42 @@ setup_iptables_port_hopping() {
     local l_port="$1"
     local s_port="$2"
     local e_port="$3"
-    
+    local hop_skip=""
+
     # 没有 iptables 命令（极简镜像 / 纯 nftables 主机）时直接跳过：
     # 旧实现会在 set -e 下以 127 退出，安装停在「二进制与证书已就位、
     # 配置与门户还没写」的半成品状态，还会留下一个开机必失败的
     # hy2-iptables.service（2026-10-29 修）。
+    # 命令在、nat 表却不可用（OpenVZ / 部分 LXC 容器、内核缺 nat 模块），或加规则失败
+    # （缺 comment / addrtype 模块）同理（2026-11-12 修）：旧实现照样在 set -e 下退出，
+    # 停在同一个半成品状态，重跑每次都卡在这里。
     if ! command -v iptables >/dev/null 2>&1; then
-        log_warn "本机没有 iptables 命令，跳过端口跳跃（${s_port}-${e_port} -> ${l_port}）。"
-        log_warn "如需端口跳跃，请安装 iptables 后重新执行，或自行用 nftables 配置等价的 UDP 重定向。"
+        hop_skip="本机没有 iptables 命令"
+    elif ! iptables -t nat -S PREROUTING >/dev/null 2>&1; then
+        hop_skip="iptables 的 nat 表不可用（常见于 OpenVZ / LXC 容器）"
+    else
+        if [[ -e /etc/systemd/system/hy2-iptables.service ]] && ! _hy2_iptables_unit_owned; then
+            log_err "发现同名但不属于本安装器的 hy2-iptables.service，拒绝覆盖。"
+            return 1
+        fi
+
+        log_step "配置 iptables 端口跳跃转发规则 (${s_port}-${e_port} -> ${l_port})..."
+
+        clear_all_hopping_rules
+
+        # 注入新规则 (IPv4 + IPv6)
+        # BUGFIX #12: 同时加 PREROUTING + OUTPUT 链, 这样本机 loopback 拨测也能跳到主监听端口
+        # OUTPUT 只认目的为本机地址（2026-11-04 修）：不限目的时，代理替用户发往远端
+        # 20000-40000 端口的 UDP（游戏、WebRTC、VoIP）也被 REDIRECT 到本机监听口，直接断流。
+        if ! iptables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" \
+                || ! iptables -t nat -A OUTPUT -p udp -m addrtype --dst-type LOCAL --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"; then
+            clear_all_hopping_rules
+            hop_skip="iptables 添加 nat 转发规则失败"
+        fi
+    fi
+    if [[ -n "$hop_skip" ]]; then
+        log_warn "${hop_skip}，跳过端口跳跃（${s_port}-${e_port} -> ${l_port}）。"
+        log_warn "如需端口跳跃，请在 iptables（含 nat 表）可用的环境重新执行，或自行用 nftables 配置等价的 UDP 重定向。"
         log_warn "其余功能（Hy2 / Reality / VMess / AnyTLS 等）不受影响。"
         # 不把未配置转发的范围写入订阅元数据或交给防火墙放行。
         HOP_START=""
@@ -2556,21 +2584,6 @@ setup_iptables_port_hopping() {
         return 0
     fi
 
-    if [[ -e /etc/systemd/system/hy2-iptables.service ]] && ! _hy2_iptables_unit_owned; then
-        log_err "发现同名但不属于本安装器的 hy2-iptables.service，拒绝覆盖。"
-        return 1
-    fi
-
-    log_step "配置 iptables 端口跳跃转发规则 (${s_port}-${e_port} -> ${l_port})..."
-    
-    clear_all_hopping_rules
-    
-    # 注入新规则 (IPv4 + IPv6)
-    # BUGFIX #12: 同时加 PREROUTING + OUTPUT 链, 这样本机 loopback 拨测也能跳到主监听端口
-    # OUTPUT 只认目的为本机地址（2026-11-04 修）：不限目的时，代理替用户发往远端
-    # 20000-40000 端口的 UDP（游戏、WebRTC、VoIP）也被 REDIRECT 到本机监听口，直接断流。
-    iptables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
-    iptables -t nat -A OUTPUT     -p udp -m addrtype --dst-type LOCAL --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
     if command -v ip6tables >/dev/null 2>&1; then
         ip6tables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
         ip6tables -t nat -A OUTPUT     -p udp -m addrtype --dst-type LOCAL --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
