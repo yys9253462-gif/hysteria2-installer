@@ -2600,6 +2600,11 @@ const CORE_STATE_TEXT = {
   failed: ['● 运行失败', '#fff1f0', '#cf3c3c'],
   activating: ['● 启动中', '#fffbe6', '#ad6800'],
   none: ['○ 无服务', '#f1efe8', '#5f5e5a'],
+  // 查不到状态、正在停止或重载时不再显示英文原词（2026-11-13 修）：后端 systemctl 没回话时
+  // 给的是 unknown，旧卡片显示「已安装 · ● unknown」。
+  deactivating: ['● 停止中', '#fffbe6', '#ad6800'],
+  reloading: ['● 重载中', '#fffbe6', '#ad6800'],
+  unknown: ['? 状态未知', '#f1efe8', '#5f5e5a'],
 };
 
 function coreEl(tag, cls, text) {
