@@ -26,6 +26,7 @@ globalThis.fetch = () => new Promise(r => pending.push(r));
 const reply = on => new Response(JSON.stringify({ok: true, installed: true, enabled: on, active: on,
   config: on ? {uri: 'vless://x', port: 1, sni: 's', uuid: 'u', qr_svg: ''} : null,
   rules: [], rule_count: 0}));
+function renderWarpRules() {}
 """
 
 CHECKS = r"""
@@ -53,9 +54,11 @@ class StatusCardStaleReplyTests(unittest.TestCase):
         start = decl_at if decl_at >= 0 else fstart
         end = script.index('\n}\n', fstart) + 3
         body = script[start:end]
+        helper_at = script.find('function markStatusUnknown(')
+        helper = script[helper_at:script.index('\n}\n', helper_at) + 3] if helper_at >= 0 else ''
         decl = ''.join('var %s = mk();\n' % n for n in NAMES if n in body)
         checks = CHECKS.replace('FN', fname).replace('BADGE', badge)
-        return subprocess.run([NODE, '-e', HARNESS + decl + body + checks],
+        return subprocess.run([NODE, '-e', HARNESS + decl + helper + body + checks],
                               capture_output=True, text=True, encoding='utf-8', timeout=30)
 
     def test_warp_card(self):

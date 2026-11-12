@@ -48,6 +48,7 @@
 #   DISK         目标磁盘，默认自动探测（/dev/vda → /dev/sda 顺序找）
 #   DEBIAN_SUITE Debian 版本代号，默认 bookworm（= Debian 12）
 #   MIRROR       镜像站，默认阿里云（国内快）
+#   SECURITY_MIRROR 安全更新源，默认跟随 MIRROR（…/debian → …/debian-security）
 #   HOSTNAME     主机名，默认 debian
 #   TIMEZONE     时区，默认 Asia/Shanghai
 #   SWAP_MB      额外建多大 swap 文件（MB），默认 0 = 不建（对齐最小化）
@@ -67,7 +68,7 @@ ROOT_PWD="${ROOT_PWD:-}"
 DISK="${DISK:-}"
 DEBIAN_SUITE="${DEBIAN_SUITE:-bookworm}"
 MIRROR="${MIRROR:-http://mirrors.aliyun.com/debian}"
-SECURITY_MIRROR="${SECURITY_MIRROR:-http://mirrors.aliyun.com/debian-security}"
+SECURITY_MIRROR="${SECURITY_MIRROR:-}"
 HOSTNAME="${HOSTNAME:-debian}"
 TIMEZONE="${TIMEZONE:-Asia/Shanghai}"
 SWAP_MB="${SWAP_MB:-0}"
@@ -94,7 +95,8 @@ run() {
     fi
 }
 
-usage() { sed -n '2,60p' "$0"; exit 0; }
+# 打印开头整段注释：不写死行号，头部增减说明时不会截掉末尾「先跑 --dry-run」的警告。
+usage() { awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"; exit 0; }
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -109,6 +111,16 @@ while [ $# -gt 0 ]; do
         *) die "未知参数: $1（用 --help 看用法）" ;;
     esac
 done
+
+# 安全更新源默认跟随主镜像（2026-11-12 修）：旧实现 --mirror 只换主源，debian-security
+# 仍固定阿里云。它拉取失败时 chroot 里的 apt-get update 在 set -e 下中止，磁盘已清空、
+# 内核与引导却还没装上，重启即失联。
+if [ -z "$SECURITY_MIRROR" ]; then
+    case "$MIRROR" in
+        */debian|*/debian/) SECURITY_MIRROR="${MIRROR%/}-security" ;;
+        *) SECURITY_MIRROR="http://security.debian.org/debian-security" ;;
+    esac
+fi
 
 # ── 第 1 步：环境检查 ────────────────────────────────────────────────────
 info "第 1/9 步：检查运行环境"
@@ -602,7 +614,7 @@ set -eu
 export DEBIAN_FRONTEND=noninteractive
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-# 换镜像源（阿里云，国内快）
+# 换镜像源（与 --mirror / MIRROR、SECURITY_MIRROR 一致）
 cat > /etc/apt/sources.list <<APT_EOF
 deb ${MIRROR} ${DEBIAN_SUITE} main contrib non-free non-free-firmware
 deb ${MIRROR} ${DEBIAN_SUITE}-updates main contrib non-free non-free-firmware

@@ -41,6 +41,20 @@ masquerade:
   listenHTTPS: :8443
 """
 
+# 与 install.sh 写出的格式一致：acme.domains 的列表项带引号。
+INSTALLER_ACME_CONFIG = """listen: :443
+acme:
+  domains:
+    - "%s"
+  email: "ops@example.org"
+
+masquerade:
+  type: proxy
+  listenHTTPS: :8443
+"""
+
+META = {'server_name': 'node.example.com', 'public_ip': '203.0.113.10', 'is_insecure': False}
+
 
 class PanelJoinApiUrlTest(unittest.TestCase):
     def run_join(self, config, meta=None):
@@ -88,6 +102,48 @@ class PanelJoinApiUrlTest(unittest.TestCase):
         result = self.run_join(TLS_CONFIG, {'is_insecure': False})
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertNotIn('https://13427', result.stdout)
+
+    def test_installer_quoted_acme_domain_is_used_whole(self):
+        """安装脚本写 `- "域名"`：旧正则从连字符起截成 node.example.org，无连字符则取不到（2026-11-12 修）。"""
+        for name in ('my-node.example.org', 'example.org'):
+            with self.subTest(name=name):
+                self.assertEqual(self.api_url(INSTALLER_ACME_CONFIG % name), 'https://%s:8443' % name)
+
+
+class PanelJoinConfigValuesTest(unittest.TestCase):
+    """config.yaml 里合法但非默认的写法（2026-11-12 修）。"""
+
+    run_join = PanelJoinApiUrlTest.run_join
+
+    def result(self, config):
+        r = self.run_join(config, META)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_trailing_comments_do_not_hide_ports(self):
+        out = self.result('listen: :443  # 主端口\nmasquerade:\n  type: proxy\n'
+                          '  listenHTTPS: ":8443"  # 订阅 / API\n')
+        self.assertEqual(out['api_url'], 'https://node.example.com:8443')
+        self.assertEqual(out['listen_port'], 443)
+
+    def test_listen_with_bind_address_keeps_port_and_name(self):
+        for listen in ('0.0.0.0:443', '"[::]:443"'):
+            with self.subTest(listen=listen):
+                out = self.result('listen: %s\nmasquerade:\n  listenHTTPS: :8443\n' % listen)
+                self.assertEqual(out['listen_port'], 443)
+                self.assertEqual(out['suggested_name'], 'node.example.com-443')
+
+    def test_out_of_range_api_port_is_refused(self):
+        for port in ('0', '70000'):
+            with self.subTest(port=port):
+                r = self.run_join('listen: :443\nmasquerade:\n  listenHTTPS: :%s\n' % port, META)
+                self.assertEqual(r.returncode, 3, r.stdout)
+                self.assertNotIn('api_url', r.stdout)
+
+    def test_commented_out_listenhttps_is_not_used(self):
+        r = self.run_join('listen: :443\nmasquerade:\n  type: proxy\n  # listenHTTPS: :1111\n', META)
+        self.assertEqual(r.returncode, 3, r.stdout)
+        self.assertNotIn(':1111', r.stdout)
 
 
 if __name__ == '__main__':

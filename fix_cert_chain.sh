@@ -68,6 +68,34 @@ set_tls_cert () {   # $1=config $2=new path
     chmod --reference="$1" "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$1"
 }
+# masquerade 的对外端口，与门户 read_masquerade_port 同一规则（2026-11-12 修）：
+# 跳过注释行，去掉引号与行尾注释，只取最后一个冒号后的数字。旧实现遇到
+# `0.0.0.0:8443` / `":8443"` 拿整串去连，修好的链被报成「验证未通过」。
+masq_https_port () {   # $1=config
+    awk '
+        /^[[:space:]]*listenHTTPS:/ {
+            v = $0
+            sub(/^[[:space:]]*listenHTTPS:[[:space:]]*/, "", v)
+            sub(/[[:space:]]+#.*$/, "", v)
+            gsub(/["\047[:space:]]/, "", v)
+            n = split(v, parts, ":"); v = parts[n]
+            if (v ~ /^[0-9]+$/ && v + 0 >= 1 && v + 0 <= 65535) { print v; exit }
+        }' "$1"
+}
+# 验证用的 SNI：先取 SAN 里第一个 DNS 名（通配符换成 www.），没有 SAN 再退回 CN，
+# 且只取 CN 本身（2026-11-12 修）。旧实现从 -subject 整行截 CN 之后的全部内容：
+# `CN = a.com, O = X` 截成 `a.com,O=X`；不带 CN 的证书得到空串，退回 localhost 去握手。
+cert_sni () {   # $1=cert
+    local s
+    s="$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null \
+         | grep -o 'DNS:[^,[:space:]]*' | head -n1 | cut -d: -f2)"
+    if [[ -z "$s" ]]; then
+        s="$(openssl x509 -in "$1" -noout -subject -nameopt RFC2253 2>/dev/null \
+             | sed 's/^subject= *//' | tr ',' '\n' | sed -n 's/^CN=//p' | head -n1)"
+    fi
+    [[ "$s" == \*.* ]] && s="www.${s#\*.}"
+    printf '%s' "$s"
+}
 
 [[ -f "$CONFIG" ]] || { err "找不到配置文件：$CONFIG"; exit 1; }
 if [[ "$DRY_RUN" != "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
@@ -154,9 +182,9 @@ if [[ "$CHANGED" == "1" ]]; then
 fi
 systemctl is-active --quiet hysteria-server 2>/dev/null || { warn "hysteria-server 当前不是 active，请人工确认。"; }
 
-SUB_PORT="$(awk '/listenHTTPS:/{sub(/^.*listenHTTPS:[[:space:]]*:?/,"");print;exit}' "$CONFIG")"
+SUB_PORT="$(masq_https_port "$CONFIG")"
 [[ -n "$SUB_PORT" ]] || SUB_PORT=8443
-SNI="$(openssl x509 -in "$FINAL_CERT" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | tr -d ' ')"
+SNI="$(cert_sni "$FINAL_CERT")"
 
 if command -v openssl >/dev/null 2>&1; then
     info "验证 127.0.0.1:${SUB_PORT} 服务出的证书链 (SNI=${SNI:-localhost}) ..."

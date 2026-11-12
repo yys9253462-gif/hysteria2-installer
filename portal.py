@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.35'
+PORTAL_VERSION = '2.36'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2250,6 +2250,9 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
         stripped = line.strip()
         if stripped.startswith('listenHTTPS:'):
             raw = stripped.split(':', 1)[1].strip()
+            # 行尾注释（`:11690  # 订阅端口`）YAML 合法：旧实现整串判不成数字，
+            # 缺 subscription_port 的老 meta 订阅链接被拼成 443（2026-11-12 修）。
+            raw = re.split(r'\s+#', raw, maxsplit=1)[0]
             # 形如 ":11690" / "0.0.0.0:11690" / "11690"
             # 去掉可能的引号（`: "8443"` 这种写法 YAML 完全合法）。
             raw = raw.rsplit(':', 1)[-1].strip().strip('"').strip("'")

@@ -81,6 +81,20 @@ def read(path):
         return f.read()
 
 
+def yaml_scalar(v):
+    """去掉外层引号与行尾注释：`":8443"  # 订阅` → `:8443`。
+
+    旧实现把行尾注释当成值的一部分，`listenHTTPS: :8443  # 订阅` 判不出端口，
+    报「没有对外可达的 API 通道」并返回 3（2026-11-12 修）。
+    """
+    v = v.strip()
+    if v[:1] in ('"', "'"):
+        end = v.find(v[0], 1)
+        if end > 0:
+            return v[1:end]
+    return re.split(r"\s+#", v, maxsplit=1)[0].strip()
+
+
 def parse_simple_yaml(text):
     """只取需要的几个键，不引第三方依赖（节点上不一定装了 PyYAML）。
 
@@ -99,12 +113,12 @@ def parse_simple_yaml(text):
             if ":" in body:
                 k, _, v = body.partition(":")
                 top = k.strip()
-                out[top] = {"__value__": v.strip()}
+                out[top] = {"__value__": yaml_scalar(v)}
             continue
         if ":" not in body or top is None:
             continue
         k, _, v = body.partition(":")
-        out[top][k.strip()] = v.strip().strip('"').strip("'")
+        out[top][k.strip()] = yaml_scalar(v)
     return out
 
 
@@ -150,12 +164,16 @@ def main():
     # 再退回 acme.domains 的第一项（列表在 YAML 里是 "- xxx" 行，简单解析拿不到，
     # 所以退回到正则扫）
     domain = meta_host(read(args.meta_file))
-    m = re.search(r"^\s*-\s*([A-Za-z0-9._-]+)\s*$", cfg_text, re.M)
+    # 列表项可能带引号：安装脚本写的就是 `- "域名"`。旧正则不认引号、也不锚定行首，
+    # 从域名中间的连字符起匹配，`my-node.example.com` 被截成 `node.example.com`
+    # 登记到面板；不带连字符的域名则取不到（2026-11-12 修）。
+    item = r"^\s*-\s*[\"']?([A-Za-z0-9._-]+)[\"']?\s*(?:#.*)?$"
+    m = re.search(item, cfg_text, re.M)
     acme_block = re.search(r"^acme:(.*?)(?=^[a-z])", cfg_text, re.M | re.S)
     if not domain and acme_block:
         dm = re.search(r"domains:\s*\n((?:\s*-\s*[^\n]+\n)+)", acme_block.group(1))
         if dm:
-            first = re.search(r"-\s*([A-Za-z0-9._-]+)", dm.group(1))
+            first = re.search(item, dm.group(1), re.M)
             if first:
                 domain = first.group(1)
     if not domain and m:
@@ -166,8 +184,12 @@ def main():
     # 旧实现拼出 https://a.com:0.0.0.0:8443 还返回 0。
     https_port = (masq.get("listenHTTPS") or "").rpartition(":")[2].strip()
     if not https_port.isdigit():
-        m2 = re.search(r"listenHTTPS:\s*\S*?:?(\d+)\s*$", cfg_text, re.M)
+        # 锚定行首：被注释掉的 `# listenHTTPS: :1111` 不能当成对外端口（2026-11-12 修）。
+        m2 = re.search(r"^\s*listenHTTPS:\s*\S*?:?(\d+)[\"']?\s*(?:#.*)?$", cfg_text, re.M)
         https_port = m2.group(1) if m2 else ""
+    # 端口 0 / 越界拼出的地址永远连不上，旧实现照样输出并返回 0（2026-11-12 修）。
+    if not (https_port.isdigit() and 1 <= int(https_port) <= 65535):
+        https_port = ""
 
     if not https_port:
         print("=" * 60, file=sys.stderr)
@@ -180,7 +202,9 @@ def main():
         print("=" * 60, file=sys.stderr)
         return 3
 
-    listen = (cfg.get("listen", {}).get("__value__") or "").lstrip(":")
+    # `listen` 也可能带主机（`0.0.0.0:443` / `[::]:443`）：旧实现只去掉开头的冒号，
+    # listen_port 变成 null、建议节点名成了 `a.com-0.0.0.0:443`（2026-11-12 修）。
+    listen = (cfg.get("listen", {}).get("__value__") or "").rpartition(":")[2].strip()
     if not domain:
         # 没有主机名就拼不出能用的地址；旧实现输出 `https://<端口>` 并返回 0。
         print("取不到节点的对外地址：client_meta.json 没有 server_name / public_ip，"

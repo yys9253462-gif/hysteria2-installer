@@ -68,6 +68,19 @@ class SubscriptionPortTest(unittest.TestCase):
             'masquerade:\n  listenHTTPS: 0.0.0.0:11690\n', encoding='utf-8')
         self.assertEqual(portal.read_masquerade_port(str(self.cfg)), 11690)
 
+    def test_trailing_comment_is_ignored(self):
+        """YAML 行尾注释合法：`:11690  # 订阅端口` 也要读出 11690（2026-11-12 修）。"""
+        for line in ('  listenHTTPS: :11690  # 订阅端口\n', '  listenHTTPS: ":11690" # sub\n',
+                     '  listenHTTPS: 0.0.0.0:11690\t# tab\n'):
+            with self.subTest(line=line):
+                self.cfg.write_text('masquerade:\n' + line, encoding='utf-8')
+                self.assertEqual(portal.read_masquerade_port(str(self.cfg)), 11690)
+
+    def test_commented_out_line_is_skipped(self):
+        self.cfg.write_text('masquerade:\n  # listenHTTPS: :1111\n  listenHTTPS: :11690\n',
+                            encoding='utf-8')
+        self.assertEqual(portal.read_masquerade_port(str(self.cfg)), 11690)
+
     def test_missing_file_returns_none(self):
         self.assertIsNone(portal.read_masquerade_port(str(self.cfg)))
 
@@ -92,6 +105,10 @@ class SubscriptionPortTest(unittest.TestCase):
         self.assertEqual(port, 11690)
         self.assertNotEqual(port, 8443, '缺键时绝不能伪造 8443')
         self.assertEqual(src, 'config.yaml')
+
+    def test_missing_key_with_commented_config_line_does_not_fall_back_to_443(self):
+        self.cfg.write_text('masquerade:\n  listenHTTPS: :11690  # 订阅端口\n', encoding='utf-8')
+        self.assertEqual(portal.resolve_subscription_port({}, str(self.cfg)), (11690, 'config.yaml'))
 
     def test_explicit_value_as_string_is_accepted(self):
         """JSON 里可能是字符串形式，要能容错。"""

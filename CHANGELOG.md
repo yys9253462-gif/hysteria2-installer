@@ -1,3 +1,16 @@
+## 2026-11-12 — 第二十六批十项修复，门户 2.36
+
+- `reinstall-debian13.sh` 下载 InstallNET 时 raw.githubusercontent.com 不通会退回 jsDelivr 镜像，并拒收错误页：此前「镜像」与主源是同一个地址且从未被使用，主源一断就只能失败。
+- `fix_cert_chain.sh` 修复后的自检按门户同一规则读 `listenHTTPS`：`0.0.0.0:8443`、带引号、带行尾注释的写法与被注释掉的行，不再让自检连错端口、把修好的链报成「验证未通过」。
+- 同一自检的 SNI 先取证书 SAN 里的域名（通配符换成 www.），没有再退回 CN 且只取 CN 本身：此前 CN 后面还有字段时截成 `a.com,O=X`，不带 CN 的证书退回 localhost 握手。
+- 门户读取 masquerade 端口时忽略 YAML 行尾注释：此前 `listenHTTPS: :8443  # 订阅端口` 读不出端口，缺 `subscription_port` 的老 meta 订阅链接被拼成 443。
+- `panel-join.py` 认安装脚本自己写的带引号 `acme.domains`：此前 `my-node.example.com` 被截成 `node.example.com` 登记到面板，不带连字符的域名则取不到。
+- `panel-join.py` 去掉配置值的行尾注释与引号，`listen` 带主机时只取端口，对外端口必须在 1–65535，被注释掉的 `listenHTTPS` 不再当成端口：此前带注释的配置误报「没有对外可达的 API 通道」，`:0` 拼出永远连不上的地址还返回成功。
+- `alpine2debian.sh` 的安全更新源跟随 `--mirror` / `MIRROR`（`…/debian` → `…/debian-security`，否则用 security.debian.org）：此前固定阿里云，拉取失败时 chroot 里的 `apt-get update` 中止，磁盘已清空却没装上内核与引导；`--help` 不再按写死的行号截掉末尾的警告。
+- 管理页各状态卡片（WARP、Reality、VMess、VLESS-Enc、AnyTLS、TUIC、BBR、GOST、AmneziaWG）查询失败时显示「状态未知（请求失败）」，服务端错误放进悬停提示：此前接口报错、回 ok:false 或网络中断时徽章永远停在「检测中...」。
+- 「重置 WARP 规则」失败时提示原因，成功后刷新状态：此前失败毫无反应，WARP 生效中仍显示「N 个已配置」。
+- 「重启服务器」倒计时结束后等门户真正响应再刷新，5 分钟仍未恢复则提示去服务商控制台查看：此前 25 秒到点无条件刷新，多半落在浏览器的错误页。
+
 ## 2026-11-06 — 第二十五批十项修复，门户 2.35
 
 - `portal.json` 的 `users` 不是对象时门户启动即报明确错误：此前照常启动，随后开户、改密、续费、分享页十几处 500。
