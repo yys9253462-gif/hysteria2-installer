@@ -2335,8 +2335,28 @@ class WebWorkflowTests(unittest.TestCase):
         self.awg_suspended_fixture(False)
         status, payload = self.invoke('_h_post_manage_amneziawg', {'action': 'start'})
         self.assertEqual(status, 200, payload)
-        self.run.assert_called_once()
         self.assertEqual(self.run.call_args[0][0], ['systemctl', 'start', 'amneziawg-server'])
+
+    def test_awg_start_and_restart_get_past_the_start_limit(self):
+        """单元是 StartLimitBurst=5 / 300 秒：撞上限后不先 reset-failed，网页「启动 / 重启」
+        5 分钟内只会报失败（2026-11-13 修）。桩里的 systemctl 在清计数前一律拒绝启动。"""
+        for action in ('start', 'restart'):
+            with self.subTest(action=action):
+                self.awg_suspended_fixture(False)
+                calls, cleared = [], []
+
+                def limited_run(args, **kwargs):
+                    calls.append(args)
+                    if args[1] == 'reset-failed':
+                        cleared.append(True)
+                    elif args[1] in ('start', 'restart') and not cleared:
+                        return SimpleNamespace(returncode=1, stdout='', stderr=
+                            'Job for amneziawg-server.service failed because start of the service was attempted too often.')
+                    return SimpleNamespace(returncode=0, stdout='', stderr='')
+                self.ns['subprocess'] = SimpleNamespace(run=limited_run, TimeoutExpired=subprocess.TimeoutExpired)
+                status, payload = self.invoke('_h_post_manage_amneziawg', {'action': action})
+                self.assertEqual(status, 200, payload)
+                self.assertEqual(calls[-1], ['systemctl', action, 'amneziawg-server'])
 
 
     def test_awg_peer_delete_extends_its_deadline(self):

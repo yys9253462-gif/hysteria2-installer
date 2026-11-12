@@ -11685,6 +11685,12 @@ if __name__ == '__main__':
                     # 与 peer 增删 / 更新串行（2026-11-04 修）：在它们中途停掉接口，热添加会
                     # 落在正在关闭的接口上，更新自己的重启也会和这里打架。
                     with awg_operation_lock:
+                        if action != 'stop':
+                            # 先清失败计数（2026-11-13 修，同终端菜单与 awgctl）：单元是 StartLimitBurst=5 /
+                            # 300 秒，连续加客户端（热加入失败会兜底重启）再点几次重启就撞上限，之后 5 分钟内
+                            # 点「启动」只会拿到 start of the service was attempted too often。
+                            subprocess.run(['systemctl', 'reset-failed', AWG_SVC_NAME],
+                                           capture_output=True, timeout=5)
                         proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
                                               capture_output=True, text=True, timeout=30)
                     if proc.returncode != 0:
