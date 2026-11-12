@@ -3711,14 +3711,16 @@ if (btnAddAwgPeer) {
 
 if (btnSwitchAwgLine) {
   btnSwitchAwgLine.addEventListener('click', async () => {
-    const target = prompt('切换 AmneziaWG 协议线\n\n2 = AWG 2.x（参数体系稳定）\n3 = AWG 3.x（含头部保护与抗行为分析）\n\n⚠️ 切换会重新生成全部混淆参数，已发放的客户端配置会立即失效，必须重新导出。\n\n请输入目标协议线：', awgCurrentLine === '3' ? '2' : '3');
-    if (target !== '2' && target !== '3') return;
-    if (target === awgCurrentLine) { alert('已经是 AWG ' + awgCurrentLine + '.x，无需切换。'); return; }
+    // 只有两条协议线，直接切到另一条（2026-11-13 修，同终端菜单）：旧实现先弹原生输入框让人手打 2 / 3，
+    // 打成当前线还要再弹一次「无需切换」。
+    const target = awgCurrentLine === '3' ? '2' : '3';
     const confirmed = await showConfirm({
       title: '切换 AWG 协议线',
-      text: '确认切换到 AWG ' + target + '.x？所有已发放的客户端配置都会失效。',
+      text: '确认从 AWG ' + awgCurrentLine + '.x 切换到 AWG ' + target + '.x？\n'
+        + (target === '3' ? 'AWG 3.x 含头部保护与抗行为分析。' : 'AWG 2.x 参数体系稳定。') + '\n'
+        + '切换会重新生成全部混淆参数，所有已发放的客户端配置都会立即失效，必须重新导出。',
       icon: '⚠️',
-      confirmText: '切换',
+      confirmText: '切换到 AWG ' + target + '.x',
       isDanger: true
     });
     if (!confirmed) return;
