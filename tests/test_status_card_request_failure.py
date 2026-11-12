@@ -90,9 +90,29 @@ def _block(header):
 
 
 SHARED_HELPERS = ('function markStatusUnknown(', 'function markLoadFailed(', 'function obEsc(',
-                  'function markWarpRulesFailed(')
+                  'function markWarpRulesFailed(', 'function markBbrFailed(')
 # 卡片函数在失败路径上还会碰到的页面元素（只声明，内容为空即不触发替换）。
-EXTRA_ELEMENTS = ('proxyTbody', 'warpRulesCount', 'warpTagsCloud')
+EXTRA_ELEMENTS = ('proxyTbody', 'warpRulesCount', 'warpTagsCloud', 'bbrCurrentText')
+
+BBR_TEXT_CHECK = r"""
+const MODES = {
+  http500: () => Promise.resolve(new Response('<html>Internal Server Error</html>', {status: 500})),
+  okfalse: () => Promise.resolve(new Response(JSON.stringify({ok: false, error: '磁盘已满'}))),
+  network: () => Promise.reject(new TypeError('Failed to fetch')),
+};
+(async () => {
+  for (const [mode, impl] of Object.entries(MODES)) {
+    bbrCurrentText.textContent = '读取中...';
+    globalThis.fetch = impl;
+    await checkBbrStatus();
+    assert.strictEqual(bbrCurrentText.textContent, '读取失败', mode + ': stuck at ' + bbrCurrentText.textContent);
+  }
+  bbrCurrentText.textContent = 'bbr';
+  globalThis.fetch = MODES.http500;
+  await checkBbrStatus();
+  assert.strictEqual(bbrCurrentText.textContent, 'bbr', 'a later failure wiped the shown algorithm');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
 
 
 def _helpers():
@@ -117,6 +137,12 @@ class StatusCardRequestFailureTests(unittest.TestCase):
                 check = CARD_CHECK.replace('BADGE', badge).replace('FN', fname)
                 r = run_node(HARNESS + decl + _helpers() + body + check)
                 self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_bbr_algorithm_text_reports_a_failed_query(self):
+        """「当前内核拥塞控制」不停在「读取中...」（2026-11-12 修）。"""
+        decl = 'var bbrBadge = mk(); var bbrCurrentText = {textContent: ""};\n'
+        r = run_node(HARNESS + decl + _helpers() + _block('async function checkBbrStatus()') + BBR_TEXT_CHECK)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_reset_warp_rules_reports_failure_and_refreshes_status(self):
         check = RESET_CHECK.replace('BLOCK', _block('if (btnResetWarpRules) {'))

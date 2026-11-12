@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.39'
+PORTAL_VERSION = '2.40'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -3701,11 +3701,18 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 </main><script>{SCRIPT}</script></body></html>"""
 
 
-def login_html(token, error_msg=None):
+def login_html(token, error_msg=None, username=''):
     # token 来自 portal.json：被手工改成含引号/尖括号时，它会原样进 action
     # 属性 —— 既能破坏表单，也是一条自伤 XSS。error_msg 同理，且非字符串时
     # html.escape 直接抛 AttributeError，登录页变成 500（谁都进不来）。
     token = token if isinstance(token, str) else ''
+    # 输错后保留已填的用户名、焦点放到密码框（2026-11-12 加）：用户名是随机串，每次重填很麻烦。
+    username = username.strip()[:128] if isinstance(username, str) else ''
+    user_attrs = ' value="%s"' % html.escape(username) if username else ' autofocus'
+    pwd_focus = ' autofocus' if username else ''
+    # 手机输入法默认把普通文本框首字母大写、自动纠错（2026-11-12 修）：用户名是小写随机串，
+    # 被改一个字母就登录失败、用户看不出原因；密码框点「显示」后同样成了普通文本框。
+    no_rewrite = 'autocapitalize="none" autocorrect="off" spellcheck="false"'
     error_banner = ''
     if isinstance(error_msg, str) and error_msg:
         error_banner = ('<div class="error-tip" role="alert"><span>⚠</span><span>'
@@ -3715,8 +3722,8 @@ def login_html(token, error_msg=None):
 <div class="login-brand"><div class="login-logo">H₂</div><div class="login-badge">HYSTERIA 2 GATEWAY</div><h1 class="login-title">私密身份认证</h1><p class="login-sub">请输入服务器生成的专属凭据以进入节点中心</p></div>
 <form class="login-form" method="POST" action="/{html.escape(token)}/login">
 {error_banner}
-<div class="field-group"><label class="field-label" for="username">用户名 (Username)</label><input class="field-input" id="username" name="username" type="text" autocomplete="username" required autofocus placeholder="输入随机生成的用户名"></div>
-<div class="field-group"><div class="field-label"><label for="password">密码 (Password)</label></div><div class="field-pwd"><input class="field-input" id="password" name="password" type="password" autocomplete="current-password" required placeholder="输入访问密钥"><button type="button" class="toggle-pwd">显示</button></div></div>
+<div class="field-group"><label class="field-label" for="username">用户名 (Username)</label><input class="field-input" id="username" name="username" type="text" autocomplete="username" {no_rewrite} required{user_attrs} placeholder="输入随机生成的用户名"></div>
+<div class="field-group"><div class="field-label"><label for="password">密码 (Password)</label></div><div class="field-pwd"><input class="field-input" id="password" name="password" type="password" autocomplete="current-password" {no_rewrite} required{pwd_focus} placeholder="输入访问密钥"><button type="button" class="toggle-pwd">显示</button></div></div>
 <div class="remember-row"><input type="checkbox" id="remember" name="remember" value="1" checked><label for="remember">在此浏览器保持登录（30天）</label></div>
 <button class="btn-submit" type="submit">立即进入私密中心 →</button>
 </form>
@@ -12407,6 +12414,15 @@ if __name__ == '__main__':
                     return 'none'
                 return _systemd_state(unit) or 'unknown'
 
+            def combined_state(units):
+                # sing-box 一个核心承载 AnyTLS / TUIC 两个单元（2026-11-12 修）：旧实现只看
+                # hy2-anytls，只开 TUIC 时卡片显示「无服务」。有一个失败就报失败，最需要人处理。
+                states = [state_of(u) for u in units]
+                for wanted in ('failed', 'activating', 'active', 'inactive', 'unknown'):
+                    if wanted in states:
+                        return wanted
+                return next((s for s in states if s != 'none'), 'none')
+
             singbox = _singbox_version()
             cores = [
                 {'id': 'hysteria', 'name': 'Hysteria 2', 'used_by': ['Hysteria 2 主协议'],
@@ -12418,7 +12434,8 @@ if __name__ == '__main__':
                  'service': 'xray', 'installable': True, 'manage': 'reality/reality-node'},
                 {'id': 'sing-box', 'name': 'sing-box', 'used_by': ['AnyTLS', 'TUIC'],
                  'version': '.'.join(map(str, singbox)) if singbox else '',
-                 'service': ANYTLS_SERVICE, 'installable': True, 'manage': 'reality/anytls'},
+                 'service': '%s / %s' % (ANYTLS_SERVICE, TUIC_SERVICE),
+                 'units': [ANYTLS_SERVICE, TUIC_SERVICE], 'installable': True, 'manage': 'reality/anytls'},
                 {'id': 'gost', 'name': 'GOST', 'used_by': ['SOCKS5 / HTTP 入站代理'],
                  'version': version_of('/usr/local/bin/gost', ['-V'], r'gost\s+v?([\w.\-]+)'),
                  'service': 'gost', 'installable': False, 'manage': 'proxies/ingress',
@@ -12434,7 +12451,7 @@ if __name__ == '__main__':
             ]
             for core in cores:
                 core['installed'] = bool(core['version'])
-                core['state'] = state_of(core['service'])
+                core['state'] = combined_state(core.pop('units', None) or [core['service']])
             return self.reply_json(200, {'ok': True, 'cores': cores})
 
         def _h_post_install_core(self, prefix):
@@ -13395,15 +13412,22 @@ if __name__ == '__main__':
             if self.login_rate_limited():
                 # 与密码错误用同一页面形态，不给爆破者「已被限流」的区分信号。
                 page = login_html(data['token'],
-                                  error_msg='尝试次数过多，请 10 分钟后再试')
+                                  error_msg='尝试次数过多，请 10 分钟后再试', username=user)
                 return self.reply(429, page.encode('utf-8'), 'text/html; charset=utf-8')
 
-            submitted_auth = base64.b64encode(f'{user}:{pwd}'.encode())
-            submitted_digest = hashlib.sha256(submitted_auth).hexdigest()
+            # 凭据都是随机生成的，首尾不会有空白（2026-11-12 修）：从聊天软件 / 终端复制常带进空格，
+            # 手机输入法也会在词后补空格，旧实现照样判「不正确」。先按原样比，再比去掉首尾空白的。
+            attempts = [(user, pwd)]
+            if (user.strip(), pwd.strip()) != (user, pwd):
+                attempts.append((user.strip(), pwd.strip()))
+            matched = False
+            for _user, _pwd in attempts:
+                submitted_digest = hashlib.sha256(base64.b64encode(f'{_user}:{_pwd}'.encode())).hexdigest()
+                matched = hmac.compare_digest(submitted_digest, data['auth_hash']) or matched
 
-            if not hmac.compare_digest(submitted_digest, data['auth_hash']):
+            if not matched:
                 self.record_login_failure()
-                page = login_html(data['token'], error_msg='用户名或密码不正确，请重新输入')
+                page = login_html(data['token'], error_msg='用户名或密码不正确，请重新输入', username=user)
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
             # 🔴 2026-10-31：登录成功必须清空失败桶。

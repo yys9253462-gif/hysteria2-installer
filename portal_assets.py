@@ -958,17 +958,14 @@ if (btnInstallWarp) {
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
-      if (!res.ok) {
-        const errText = await res.text();
-        showToast('安装失败 (HTTP ' + res.status + '): ' + errText, 'error');
-        return;
-      }
+      // 失败回包按 JSON 读出原因（2026-11-12 修）：旧实现把整段响应原文拼进提示，用户看到的是
+      // {"ok": false, "error": ...} 一串；会话过期或反代回 502 时是整页 HTML。
       const json = await res.json();
-      if (json.ok) {
+      if (res.ok && json.ok) {
         showToast(json.message || 'Cloudflare WARP 安装成功！服务已自动就绪。', 'success');
         await checkWarpStatus();
       } else {
-        showToast(json.error || '安装失败，请检查网络', 'error');
+        showToast(json.error || ('安装失败（HTTP ' + res.status + '），请检查网络'), 'error');
       }
     } catch (e) {
       showToast('安装请求异常: ' + e.message, 'error');
@@ -2228,13 +2225,19 @@ const bbrKernelText = document.getElementById('bbr-kernel-text');
 const bbrRebootTip = document.getElementById('bbr-reboot-tip');
 const btnRebootServer = document.getElementById('btn-reboot-server');
 
+// 「当前内核拥塞控制」同样不能停在「读取中...」（2026-11-12 修，徽章已有 markStatusUnknown）。
+function markBbrFailed(detail) {
+  markStatusUnknown(bbrBadge, detail);
+  if (bbrCurrentText && /读取中/.test(bbrCurrentText.textContent || '')) bbrCurrentText.textContent = '读取失败';
+}
+
 async function checkBbrStatus() {
   if (!bbrBadge) return;
   try {
     const res = await fetch(location.pathname + 'bbr-status', { credentials: 'same-origin' });
-    if (!res.ok) { markStatusUnknown(bbrBadge); return; }
+    if (!res.ok) { markBbrFailed(); return; }
     const json = await res.json();
-    if (!json.ok) { markStatusUnknown(bbrBadge, json.error); return; }
+    if (!json.ok) { markBbrFailed(json.error); return; }
 
     if (Array.isArray(json.available)) document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
       const algo = {v1:'bbr',v2:'bbr2',v3:'bbr3'}[btn.dataset.version];
@@ -2274,7 +2277,7 @@ async function checkBbrStatus() {
         btnRebootServer.style.display = 'none';
       }
     }
-  } catch (_) { markStatusUnknown(bbrBadge); }
+  } catch (_) { markBbrFailed(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -2795,13 +2798,21 @@ function fmtVer(current, latest, hasUpdate, installed) {
   return current + '（最新）';
 }
 
+// 检测失败时版本栏不能停在「检测中...」（2026-11-12 修）：旧实现接口报错、回 ok:false 或网络中断时
+// 直接 return，三栏一直像是还在查。已经显示过的结果不被之后某次失败覆盖。
+function markVersionsUnknown() {
+  [coreVerDisplay, portalVerDisplay, awgVerDisplay].forEach(el => {
+    if (el && /检测中/.test(el.textContent || '')) el.textContent = '检测失败（可点「重新检测」重试）';
+  });
+}
+
 async function checkVersions(force = false) {
   if (!coreVerDisplay || !portalVerDisplay) return;
   try {
     const res = await fetch(location.pathname + 'check-version' + (force ? '?force=1' : ''), { credentials: 'same-origin' });
-    if (!res.ok) return false;
+    if (!res.ok) { markVersionsUnknown(); return false; }
     const json = await res.json();
-    if (!json.ok) return false;
+    if (!json.ok) { markVersionsUnknown(); return false; }
 
     // 核心展示
     coreVerDisplay.textContent = fmtVer(json.core_current, json.core_latest, json.core_has_update, true);
@@ -2828,7 +2839,7 @@ async function checkVersions(force = false) {
       }
     }
     return true;
-  } catch (_) { return false; }
+  } catch (_) { markVersionsUnknown(); return false; }
 }
 
 async function waitForCoreUpgrade() {
@@ -2876,6 +2887,17 @@ async function doUpgrade(target) {
         if (job && job.message) json.message = job.message;
       }
       const msg = json.message || '升级已触发';
+      if (target === 'portal') {
+        // 面板更新会重启门户，新版本起不来时 20 秒后自动回滚再重启：等门户真正恢复再刷新
+        // （2026-11-12 修，同「重启服务器」）。旧实现固定 5 秒后刷新，重启稍慢或走了回滚
+        // 就落到浏览器的「无法访问此网站」。先等 3 秒，让旧进程退出，免得马上被它应答。
+        if (updateStatusMsg) updateStatusMsg.textContent = msg + '，正在等待面板重启完成...';
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        const back = await waitPortalBack();
+        if (updateStatusMsg) updateStatusMsg.textContent = back ? '面板已恢复，正在刷新...' : '面板长时间未恢复，请稍后手动刷新页面';
+        if (back) location.reload();
+        return;
+      }
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
       setTimeout(() => location.reload(), 5000);
     } else {

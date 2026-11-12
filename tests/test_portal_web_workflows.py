@@ -1747,6 +1747,31 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertNotIn('warp_rules', self.data)
 
+    def test_singbox_core_state_covers_both_of_its_units(self):
+        """只开 TUIC 时 sing-box 核心不能显示「无服务」；两个单元有一个失败就报失败（2026-11-12 修）。"""
+        units = self.root / 'etc/systemd/system'
+        units.mkdir(parents=True, exist_ok=True)
+        (units / 'hy2-tuic.service').write_text('[Unit]\n', encoding='utf-8')
+        (units / 'xray.service').write_text('[Unit]\n', encoding='utf-8')
+        states = {'hy2-tuic': 'active', 'xray': 'deactivating'}
+        self.ns.update(_singbox_version=lambda: (1, 12, 4), awg_installed=lambda: False,
+                       AWG_SVC_NAME='amneziawg-server', _systemd_state=lambda unit: states.get(unit, ''))
+
+        def cores():
+            extract_method('_h_get_cores_status', self.ns)(self.handler, 'cores-status')
+            status, body = self.response
+            self.assertEqual(status, 200, body)
+            return {c['id']: c for c in body['cores']}
+
+        current = cores()
+        self.assertEqual(current['sing-box']['state'], 'active')
+        self.assertIn('hy2-tuic', current['sing-box']['service'])
+        self.assertNotIn('units', current['sing-box'])
+        self.assertEqual(current['xray']['state'], 'deactivating', 'single-unit cores keep the raw state')
+        (units / 'hy2-anytls.service').write_text('[Unit]\n', encoding='utf-8')
+        states['hy2-anytls'] = 'failed'
+        self.assertEqual(cores()['sing-box']['state'], 'failed')
+
     def test_warp_toggle_does_not_destroy_global_custom_outbound_mode(self):
         state = {'warp_enabled': True, 'outbound_mode': 'global',
                  'warp_rules': ['openai.com'],

@@ -4177,12 +4177,18 @@ refresh_portal() {
         log_err "portal.py refresh 失败，未报告刷新成功。"
         return 1
     fi
+    systemctl reset-failed hysteria-portal 2>/dev/null || true
     if ! systemctl restart hysteria-portal; then
         log_err "门户重启命令失败；原服务状态可能仍在运行，请检查日志。"
         return 1
     fi
+    # 与 restart_portal 同理等几秒再确认（2026-11-12 修）：Type=simple 下 restart 一 fork 就返回，
+    # 刚换上的门户文件 import 失败时零点几秒后才退出，旧实现紧接着查 is-active 照样是 active，
+    # 报「网页已更新」—— 而门户是 Hy2 的鉴权后端，它起不来所有用户都连不上。
+    sleep 3
     if ! systemctl is-active --quiet hysteria-portal; then
-        log_err "门户重启失败（Hy2 鉴权后端不可用），请运行 'journalctl -u hysteria-portal -e' 查看日志。"
+        log_err "门户重启失败（Hy2 鉴权后端不可用），最近日志："
+        journalctl -u hysteria-portal -n 15 --no-pager >&2 || true
         return 1
     fi
     log_info "网页已更新，节点参数和登录凭据保持不变。"
@@ -4244,7 +4250,8 @@ EOF
     systemctl restart hysteria-portal
     sleep 1
     systemctl is-active --quiet hysteria-portal || { log_err "信息页服务启动失败"; return 1; }
-    setup_cert_selfheal
+    # 门户已经起来了，自愈单元只是兜底：启用失败给提示，不让整个安装判失败。
+    setup_cert_selfheal || log_warn "证书一致性自愈单元未能启用（不影响节点使用）；证书被带外替换后请在菜单里执行「刷新信息页」。"
 }
 
 # 证书一致性定时/事件自愈（2026-10-08）。
@@ -4258,7 +4265,7 @@ EOF
 #      续期是 rename 替换，PathChanged 必然命中），做到「换完即修」。
 # 执行体是一个只调 `portal.py selfheal` 的脚本：幂等，无漂移时零写入。
 setup_cert_selfheal() {
-    cat > /usr/local/bin/hy2-cert-selfheal.sh <<'EOCS'
+    cat > /usr/local/bin/hy2-cert-selfheal.sh <<'EOCS' || return 1
 #!/usr/bin/env bash
 # 证书信任模型自愈：以 config.yaml 实际使用的证书为唯一事实来源，
 # 幂等修正 client_meta.json 的 cert_type/server_name/is_insecure/pin_sha256。
@@ -4284,9 +4291,9 @@ fi
 unset _out
 exit 0
 EOCS
-    chmod 755 /usr/local/bin/hy2-cert-selfheal.sh
+    chmod 755 /usr/local/bin/hy2-cert-selfheal.sh || return 1
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.service <<'EOCU'
+    cat > /etc/systemd/system/hy2-cert-selfheal.service <<'EOCU' || return 1
 [Unit]
 Description=Hysteria 2 certificate trust-model self-heal
 After=network.target
@@ -4296,7 +4303,7 @@ Type=oneshot
 ExecStart=/usr/local/bin/hy2-cert-selfheal.sh
 EOCU
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.timer <<'EOCT'
+    cat > /etc/systemd/system/hy2-cert-selfheal.timer <<'EOCT' || return 1
 [Unit]
 Description=Run certificate self-heal every 30 minutes
 
@@ -4324,7 +4331,7 @@ EOCT
     fi
     [[ -d "$cert_watch_dir" ]] || cert_watch_dir="$HY2_CERT_DIR"
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.path <<EOCP
+    cat > /etc/systemd/system/hy2-cert-selfheal.path <<EOCP || return 1
 [Unit]
 Description=Watch certificate dir and self-heal trust model on change
 
@@ -4337,8 +4344,10 @@ WantedBy=paths.target
 EOCP
 
     systemctl daemon-reload
-    systemctl enable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || true
-    systemctl enable --now hy2-cert-selfheal.path  >/dev/null 2>&1 || true
+    # 看结果再报（2026-11-12 修）：旧实现两条 enable 失败都吞掉、照报「已启用」并返回 0，
+    # refresh_portal 里「证书自愈单元未能补齐」的提示永远不会出现。
+    systemctl enable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || return 1
+    systemctl enable --now hy2-cert-selfheal.path  >/dev/null 2>&1 || return 1
     log_info "证书一致性自愈已启用（每 30 分钟 + 证书目录变更即时触发）。"
 }
 
@@ -5140,6 +5149,9 @@ awg_is_installed() {
 # ------------------------------------------------ 交互式安装
 install_amneziawg() {
     check_root
+    # 流量超额停用期间不能拉起 AWG（2026-11-12 修，与门户 / WARP / gost 菜单一致）：安装、更新、
+    # 切协议线、resync 结尾都会 systemctl restart，终端里点一下停用就形同虚设。
+    refuse_if_suspended || return 1
     check_arch
     echo -e "\n${CYAN}------------------------------------------------------------${PLAIN}"
     echo -e "${GREEN}AmneziaWG (AWG) 安装配置：${PLAIN}"
@@ -5338,6 +5350,7 @@ awg_menu_del_peer() {
 
 awg_menu_switch_line() {
     check_root
+    refuse_if_suspended || return 1   # 同 install_amneziawg
     if ! awg_ensure_ctl; then return 1; fi
     if ! awg_is_installed; then
         log_err "AmneziaWG 尚未安装。"
@@ -5404,6 +5417,7 @@ status_amneziawg() {
 
 update_amneziawg() {
     check_root
+    refuse_if_suspended || return 1   # 同 install_amneziawg
     check_arch
     # 先把控制工具自身刷新到最新，否则引擎会被永久冻结在首次安装的版本上
     # （awg_ensure_ctl 默认看到文件已存在就直接返回）
@@ -5456,10 +5470,10 @@ menu_amneziawg() {
                 ;;
             6) awg_menu_switch_line || true ;;
             7)
-                if awg_is_installed; then
-                    "$AWG_CTL_BIN" resync || true
-                else
+                if ! awg_is_installed; then
                     log_err "AmneziaWG 尚未安装。"
+                elif refuse_if_suspended; then   # 同 install_amneziawg：resync 结尾会重启服务
+                    "$AWG_CTL_BIN" resync || true
                 fi
                 ;;
             8)
@@ -5511,6 +5525,9 @@ start_service() {
     require_installed || return 1
     refuse_if_suspended || return 1
     log_step "启动 Hysteria 2 服务..."
+    # 先清失败计数（2026-11-12 修）：单元是 StartLimitBurst=5 / 300 秒，配置写坏时崩溃重启约
+    # 50 秒就撞上限，修好配置后在菜单里启动 / 重启会被直接拒绝长达 5 分钟。
+    systemctl reset-failed hysteria-server 2>/dev/null || true
     systemctl start hysteria-server || return 1
     # 与 restart_service 同理（2026-11-06 修）：Type=simple 下 start 一 fork 就返回 0，
     # 配置坏 / 端口被占时核心 0.1 秒后就退出，旧实现照报「已启动」。
@@ -5538,6 +5555,7 @@ restart_service() {
     require_installed || return 1
     refuse_if_suspended || return 1
     log_step "重启 Hysteria 2 服务..."
+    systemctl reset-failed hysteria-server 2>/dev/null || true   # 同 start_service
     systemctl restart hysteria-server || return 1
     # 单元是 Type=simple：restart 在进程 fork 出来时就返回 0（2026-11-03 修）。
     # 新核心不认配置、绑不上端口时约 0.1 秒后就退出，旧实现照样报「已重启」，
@@ -5554,6 +5572,7 @@ restart_service() {
 restart_portal() {
     require_installed || return 1
     log_step "重启门户（私密信息页 / Hy2 鉴权后端 / 控制台 API）..."
+    systemctl reset-failed hysteria-portal 2>/dev/null || true   # 同 start_service
     systemctl restart hysteria-portal || return 1
     # 与 restart_service 同理确认还活着（2026-11-04 修）：Type=simple 下 restart 一 fork
     # 就返回成功，门户包半更新导致 import 失败时照报「已重启」—— 而门户是 Hy2 的
@@ -6291,6 +6310,7 @@ if [[ $# -gt 0 ]]; then
         #   ./install.sh awg-install --line 3 --endpoint vpn.example.com --client phone
         awg-install)
             check_root
+            refuse_if_suspended || exit 1   # 同 install_amneziawg：带参数时直接透传，也会拉起服务
             check_arch
             awg_ensure_ctl --refresh || exit 1
             shift
@@ -6315,6 +6335,10 @@ if [[ $# -gt 0 ]]; then
             # 任意底层命令透传，例如: ./install.sh awg peer-list --json
             awg_ensure_ctl || exit 1
             shift
+            # 会重启服务的底层命令同样受停用约束（同 install_amneziawg）；只读命令照常放行。
+            case "${1:-}" in
+                install|update|resync) refuse_if_suspended || exit 1 ;;
+            esac
             exec "$AWG_CTL_BIN" "$@"
             ;;
         *)

@@ -94,6 +94,28 @@ WARP_CHECK = r"""
 """
 
 
+VERSION_CHECK = r"""
+(async () => {
+  const shown = () => [coreVerDisplay, portalVerDisplay, awgVerDisplay];
+  for (const [mode, impl] of Object.entries(MODES)) {
+    coreVerDisplay = el('DIV', '检测中...');
+    portalVerDisplay = el('DIV', '检测中...');
+    awgVerDisplay = el('DIV', '检测中...');
+    globalThis.fetch = impl;
+    assert.strictEqual(await checkVersions(), false, mode);
+    for (const d of shown()) {
+      assert.ok(!d.textContent.includes('检测中'), mode + ': stuck at ' + d.textContent);
+      assert.ok(d.textContent.includes('检测失败'), mode + ': shows ' + d.textContent);
+    }
+  }
+  coreVerDisplay = el('DIV', '2.6.5（最新）');
+  globalThis.fetch = MODES.http500;
+  await checkVersions(true);
+  assert.strictEqual(coreVerDisplay.textContent, '2.6.5（最新）', 'a later failed check wiped a shown version');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+
+
 def _block(header):
     script = portal.SCRIPT
     if header not in script:
@@ -123,6 +145,16 @@ class ListLoadFailureTests(unittest.TestCase):
                  'let warpStatusSeq = 0;\n')
         source = (HARNESS + stubs + self.helpers() + _block('function markWarpRulesFailed(')
                   + _block('function renderWarpRules(') + _block('async function checkWarpStatus()') + WARP_CHECK)
+        r = run_node(source)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_version_check_reports_a_failed_check(self):
+        """版本检测失败时三栏不停在「检测中...」（2026-11-12 修）。"""
+        stubs = ('var coreVerDisplay = null, portalVerDisplay = null, awgVerDisplay = null;\n'
+                 'var btnUpdateCore = null, btnUpdatePortal = null, btnUpdateAwgEngine = null;\n'
+                 'function doUpgrade() {}\n')
+        source = (HARNESS + stubs + _block('function markVersionsUnknown(') + _block('function fmtVer(')
+                  + _block('async function checkVersions(') + VERSION_CHECK)
         r = run_node(source)
         self.assertEqual(r.returncode, 0, r.stderr)
 

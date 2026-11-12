@@ -104,6 +104,13 @@ def iplimit_routing_ready(cfg):
             bool(rules) and rules[0]==API_RULE)
 
 
+def _restart_xray(check=True):
+    # 先清失败计数，与门户其它重启 Xray 的地方一致：刚连续重启过、撞上 StartLimitBurst 时
+    # restart 会被直接拒绝，回滚那次同样起不来，Xray 一直停着（2026-11-12 修）。
+    subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=5)
+    return subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15,check=check)
+
+
 def enable_iplimit_routing(config_path, binary, address):
     """幂等开启设备上限所需的路由接口；预检后替换，重启失败恢复原配置。不触碰 clients。"""
     if not address.startswith('127.0.0.1:'):raise ValueError('stats endpoint must be loopback')
@@ -131,7 +138,7 @@ def enable_iplimit_routing(config_path, binary, address):
         if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
         shutil.copy2(path,backup)
         os.replace(candidate,path);replaced=True
-        subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15,check=True)
+        _restart_xray()
         subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
         for _ in range(10):
             probe=subprocess.run([binary,'api','lsrules','--server='+address],capture_output=True,timeout=5)
@@ -142,7 +149,7 @@ def enable_iplimit_routing(config_path, binary, address):
         if replaced:
             candidate.write_bytes(original)
             os.replace(candidate,path)
-            subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15)
+            _restart_xray(check=False)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -175,7 +182,7 @@ def enable_reality_online(config_path, binary, address):
             if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
             shutil.copy2(path,backup)
             os.replace(candidate,path);replaced=True
-            subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15,check=True)
+            _restart_xray()
             subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
             subprocess.run([binary,'api','statsgetallonlineusers','--server='+address],capture_output=True,timeout=5,check=True)
         except Exception:
@@ -183,7 +190,7 @@ def enable_reality_online(config_path, binary, address):
                 candidate.write_bytes(original)
                 os.replace(candidate,path)
                 # 回滚后的重启不带 check：它失败时抛出的异常会顶掉真正的失败原因。
-                subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15)
+                _restart_xray(check=False)
             raise
         finally:
             candidate.unlink(missing_ok=True)

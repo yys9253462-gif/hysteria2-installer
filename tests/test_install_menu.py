@@ -155,6 +155,40 @@ class MenuTest(unittest.TestCase):
 
 class RefreshPortalFailureTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
+    def test_portal_that_dies_right_after_restart_is_reported(self):
+        """刚换上的门户文件 import 失败、零点几秒后退出时，不能报「网页已更新」（2026-11-12 修）。
+
+        Type=simple 下 restart 一 fork 就返回，紧接着查 is-active 必然是 active；
+        桩里 is-active 在 sleep 之后才反映「进程已退出」。
+        """
+        for dies, expect_ok in ((True, False), (False, True)):
+            with self.subTest(dies=dies), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                hy2 = root / 'etc/hysteria'
+                hy2.mkdir(parents=True)
+                (hy2 / 'portal.json').write_text('{}', encoding='utf-8')
+                script = (
+                    'HY2_DIR="$TEST_ROOT/etc/hysteria"; HY2_META_FILE="$HY2_DIR/client_meta.json"\n'
+                    'log_err(){ printf "ERR:%s\\n" "$*"; }\n'
+                    'log_info(){ printf "INFO:%s\\n" "$*"; }\n'
+                    'log_warn(){ :; }\n'
+                    'portal_ensure_py(){ return 0; }; sync_cert_meta(){ return 0; }; setup_cert_selfheal(){ return 0; }\n'
+                    'python3(){ return 0; }; chmod(){ :; }; journalctl(){ echo "JOURNAL"; }\n'
+                    'slept=0; sleep(){ slept=1; }\n'
+                    'systemctl(){ [[ "$1" == is-active ]] || return 0; [[ "$DIES" == 1 && "$slept" == 1 ]] && return 3; return 0; }\n'
+                    + extract_shell_function('refresh_portal') + '\n'
+                    'refresh_portal; echo "RC=$?"\n')
+                run = subprocess.run([shutil.which('bash'), '-c', script],
+                                     env=dict(os.environ, TEST_ROOT=str(root), DIES='1' if dies else '0'),
+                                     capture_output=True, text=True, encoding='utf-8', errors='replace')
+                if expect_ok:
+                    self.assertIn('RC=0', run.stdout)
+                    self.assertIn('网页已更新', run.stdout)
+                else:
+                    self.assertIn('RC=1', run.stdout)
+                    self.assertNotIn('网页已更新', run.stdout)
+
+    @unittest.skipUnless(shutil.which('bash'), 'requires Bash')
     def test_portal_fetch_failure_stops_refresh_before_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
