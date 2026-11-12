@@ -21,6 +21,7 @@ const events = [];
 const location = {pathname: '/t/', reload() { events.push('reload'); }};
 globalThis.setTimeout = (fn, ms) => { events.push('timer:' + ms); fn(); return 0; };
 globalThis.confirm = () => true;
+globalThis.showConfirm = async () => true;
 globalThis.alert = msg => events.push('alert:' + msg);
 const updateStatusMsg = {textContent: ''};
 const coreVerDisplay = {textContent: '2.6.5（最新）'};

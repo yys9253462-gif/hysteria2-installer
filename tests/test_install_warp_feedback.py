@@ -20,6 +20,7 @@ const assert = require('assert');
 const toasts = [];
 globalThis.showToast = (msg, type) => toasts.push([type, msg]);
 globalThis.confirm = () => true;
+globalThis.showConfirm = async () => true;
 let handler;
 const btnInstallWarp = {disabled: false, textContent: '⚡ 一键安装 WARP',
                         addEventListener: (k, fn) => { handler = fn; }};

@@ -20,6 +20,7 @@ const BTN = {disabled: false, addEventListener: (k, fn) => { handler = fn; }};
 let awgCurrentLine = '2';
 globalThis.prompt = () => '3';
 globalThis.confirm = () => true;
+globalThis.showConfirm = async () => true;
 globalThis.alert = () => {};
 const showToast = () => {};
 const loadAwgState = () => {};

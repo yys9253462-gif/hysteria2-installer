@@ -384,7 +384,7 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .confirm-icon-box.danger { background: #fdf2f2; color: var(--danger); }
 .confirm-icon-box.warn { background: #fff8e6; color: #d46b08; }
 .confirm-title { font-size: 17px; font-weight: 800; color: var(--ink); margin-bottom: 8px; }
-.confirm-text { font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 22px; }
+.confirm-text { font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 22px; white-space: pre-line; }
 .confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
 .confirm-btn { height: 40px; padding: 0 18px; border-radius: 10px; font-size: 13px; font-weight: 700; cursor: pointer; transition: all .15s ease; border: 1px solid transparent; }
 .confirm-btn.cancel { background: #f3f7f6; color: var(--ink); border-color: #d8e5e2; }
@@ -499,6 +499,8 @@ function showToast(msg, type = 'info') {
   }, 2800);
 }
 
+// 所有二次确认都走这里（2026-11-13 修）：原生 confirm() 的默认按钮是「确定」，回车即执行，
+// 切换 AWG 协议线、重新生成 Reality 密钥这类操作一碰就生效；这里危险操作的焦点停在「取消」。
 let confirmOpen = false;
 function showConfirm(options = {}) {
   // 弹窗已经打开时忽略新的请求（返回 false）。
@@ -825,7 +827,14 @@ async function addWarpRule(domain) {
 }
 
 async function delWarpRule(domain) {
-  if (!confirm('确定将 ' + domain + ' 从 WARP 分流列表中移除吗？')) return;
+  const confirmed = await showConfirm({
+    title: '移除分流域名',
+    text: '确定将 ' + domain + ' 从 WARP 分流列表中移除吗？',
+    icon: '🗑️',
+    confirmText: '移除',
+    isDanger: true
+  });
+  if (!confirmed) return;
   try {
     const res = await fetch(location.pathname + 'manage-warp', {
       method: 'POST',
@@ -960,7 +969,13 @@ if (btnToggleWarp) {
 
 if (btnInstallWarp) {
   btnInstallWarp.addEventListener('click', async () => {
-    if (!confirm("确定要在服务器上一键部署 Cloudflare WARP 本地出口吗？将自动安装 wgcf + wireproxy，并启用 127.0.0.1:19898 的 socks5 出口。")) return;
+    const confirmed = await showConfirm({
+      title: '部署 Cloudflare WARP',
+      text: '确定要在服务器上一键部署 Cloudflare WARP 本地出口吗？将自动安装 wgcf + wireproxy，并启用 127.0.0.1:19898 的 socks5 出口。',
+      icon: '☁️',
+      confirmText: '开始部署'
+    });
+    if (!confirmed) return;
     btnInstallWarp.disabled = true;
     const origText = btnInstallWarp.textContent;
     btnInstallWarp.textContent = '⏳ 正在安装 WARP (耗时约 30 秒)...';
@@ -1004,7 +1019,14 @@ document.querySelectorAll('.preset-rule').forEach(el => {
 
 if (btnResetWarpRules) {
   btnResetWarpRules.addEventListener('click', async () => {
-    if (!confirm('确定重置为系统默认推荐的 AI 域名规则列表吗？')) return;
+    const confirmed = await showConfirm({
+      title: '重置分流规则',
+      text: '确定重置为系统默认推荐的 AI 域名规则列表吗？手动添加的 WARP 分流域名会被清掉，走其它出站的规则不受影响。',
+      icon: '♻️',
+      confirmText: '重置',
+      isDanger: true
+    });
+    if (!confirmed) return;
     try {
       const res = await fetch(location.pathname + 'manage-warp', {
         method: 'POST',
@@ -1589,7 +1611,14 @@ if (obEls.list) {
     if (del) {
       e.preventDefault();
       const name = del.getAttribute('data-ob-del');
-      if (!window.confirm('确认删除出站「' + name + '」？\n引用它的分流规则也会一并移除。')) return;
+      const confirmed = await showConfirm({
+        title: '删除出站',
+        text: '确认删除出站「' + name + '」？\n引用它的分流规则也会一并移除。',
+        icon: '🗑️',
+        confirmText: '删除',
+        isDanger: true
+      });
+      if (!confirmed) return;
       try {
         await obApi('delete', { name: name });
         await loadOutbounds();
@@ -1769,7 +1798,14 @@ if (btnToggleReality) {
 
 if (btnResetRealityKeys) {
   btnResetRealityKeys.addEventListener('click', async () => {
-    if (!confirm("确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。")) return;
+    const confirmed = await showConfirm({
+      title: '重新生成 Reality 密钥',
+      text: '确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。',
+      icon: '🔑',
+      confirmText: '重新生成',
+      isDanger: true
+    });
+    if (!confirmed) return;
     // 请求期间禁用（2026-11-04 修）：连点会连续重置两次，第一次导出的订阅随即失效。
     btnResetRealityKeys.disabled = true;
     try {
@@ -2886,7 +2922,16 @@ async function doUpgrade(target) {
   const btns = { core: btnUpdateCore, portal: btnUpdatePortal, awg: btnUpdateAwgEngine };
   const btn = btns[target];
   const custom = target === 'core' && coreVerDisplay?.textContent.includes('+');
-  if (!confirm('确定要升级 ' + (names[target] || target) + ' 吗？' + (custom ? '\\n当前含定制补丁，升级官方核心会替换补丁。' : ''))) return;
+  // SCRIPT 是 Python 原始字符串：换行写 \n。写成 \\n 到 JS 里是字面的反斜杠加 n，弹窗上显示「\n」（2026-11-13 修）。
+  const confirmed = await showConfirm({
+    title: '升级 ' + (names[target] || target),
+    text: '确定要升级 ' + (names[target] || target) + ' 吗？' + (custom ? '\n当前含定制补丁，升级官方核心会替换补丁。' : ''),
+    icon: '⬆️',
+    confirmText: '开始升级',
+    isDanger: custom,
+    isWarn: !custom
+  });
+  if (!confirmed) return;
   if (btn) { btn.disabled = true; btn.textContent = '升级中...'; }
   if (updateStatusMsg) updateStatusMsg.textContent = '正在下载并应用更新，请稍候...';
   try {
@@ -3141,7 +3186,13 @@ document.querySelectorAll('.btn-quick-proxy').forEach(btn => {
 
 if (btnInstallGost) {
   btnInstallGost.addEventListener('click', async () => {
-    if (!confirm("确定要一键安装或更新 GOST 代理服务吗？系统将自动匹配架构并配置自启。")) return;
+    const confirmed = await showConfirm({
+      title: '安装 GOST 代理服务',
+      text: '确定要一键安装或更新 GOST 代理服务吗？系统将自动匹配架构并配置自启。',
+      icon: '🧱',
+      confirmText: '开始安装'
+    });
+    if (!confirmed) return;
     btnInstallGost.disabled = true;
     const origText = btnInstallGost.textContent;
     btnInstallGost.textContent = '⏳ 正在安装 GOST...';
@@ -3240,7 +3291,14 @@ async function loadProxyServices() {
     });
     proxyTbody.querySelectorAll('[data-proxy-del]').forEach(btn => {
       btn.addEventListener('click', async () => {
-        if (!confirm('确定删除该代理服务？')) return;
+        const confirmed = await showConfirm({
+          title: '删除代理服务',
+          text: '确定删除该代理服务？',
+          icon: '🗑️',
+          confirmText: '删除',
+          isDanger: true
+        });
+        if (!confirmed) return;
         btn.disabled = true;
         try {
           const res = await fetch(location.pathname + 'manage-proxy', {
@@ -3565,7 +3623,14 @@ function renderAwgPeers(peers) {
   awgPeerTbody.querySelectorAll('[data-awg-del]').forEach(b => {
     b.addEventListener('click', async () => {
       const n = decodeURIComponent(b.getAttribute('data-awg-del'));
-      if (!confirm('确认删除客户端「' + n + '」？该客户端会立即断开连接。')) return;
+      const confirmed = await showConfirm({
+        title: '删除 AWG 客户端',
+        text: '确认删除客户端「' + n + '」？该客户端会立即断开连接。',
+        icon: '🗑️',
+        confirmText: '删除',
+        isDanger: true
+      });
+      if (!confirmed) return;
       // 请求期间禁用按钮（2026-11-04 修）：连点两次第二次必然报「不存在」。
       b.disabled = true;
       try {
@@ -3589,7 +3654,13 @@ if (btnDoInstallAwg) {
     const line = awgLineSelect ? awgLineSelect.value : '3';
     const endpoint = awgEndpointInput ? awgEndpointInput.value.trim() : '';
     if (!endpoint) { alert('请填写客户端连接地址（域名或公网 IP）'); return; }
-    if (!confirm('确认安装 AmneziaWG（协议线 AWG ' + line + '.x）？\n\n会下载自建静态二进制并启动独立服务，不影响现有的 Hysteria 2。')) return;
+    const confirmed = await showConfirm({
+      title: '安装 AmneziaWG',
+      text: '确认安装 AmneziaWG（协议线 AWG ' + line + '.x）？\n\n会下载自建静态二进制并启动独立服务，不影响现有的 Hysteria 2。',
+      icon: '🧱',
+      confirmText: '开始安装'
+    });
+    if (!confirmed) return;
     btnDoInstallAwg.disabled = true;
     const orig = btnDoInstallAwg.textContent;
     btnDoInstallAwg.textContent = '⏳ 安装中，请稍候...';
@@ -3643,7 +3714,14 @@ if (btnSwitchAwgLine) {
     const target = prompt('切换 AmneziaWG 协议线\n\n2 = AWG 2.x（参数体系稳定）\n3 = AWG 3.x（含头部保护与抗行为分析）\n\n⚠️ 切换会重新生成全部混淆参数，已发放的客户端配置会立即失效，必须重新导出。\n\n请输入目标协议线：', awgCurrentLine === '3' ? '2' : '3');
     if (target !== '2' && target !== '3') return;
     if (target === awgCurrentLine) { alert('已经是 AWG ' + awgCurrentLine + '.x，无需切换。'); return; }
-    if (!confirm('确认切换到 AWG ' + target + '.x？所有已发放的客户端配置都会失效。')) return;
+    const confirmed = await showConfirm({
+      title: '切换 AWG 协议线',
+      text: '确认切换到 AWG ' + target + '.x？所有已发放的客户端配置都会失效。',
+      icon: '⚠️',
+      confirmText: '切换',
+      isDanger: true
+    });
+    if (!confirmed) return;
     // 请求期间禁用（2026-11-04 修）：第二次提交会再生成一遍混淆参数，中间导出的配置随即失效。
     btnSwitchAwgLine.disabled = true;
     try {
@@ -3656,7 +3734,14 @@ if (btnSwitchAwgLine) {
 
 if (btnUpdateAwg) {
   btnUpdateAwg.addEventListener('click', async () => {
-    if (!confirm('确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。')) return;
+    const confirmed = await showConfirm({
+      title: '更新 AmneziaWG',
+      text: '确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。',
+      icon: '⬆️',
+      confirmText: '开始更新',
+      isWarn: true
+    });
+    if (!confirmed) return;
     btnUpdateAwg.disabled = true;
     try {
       const json = await awgPost('manage-amneziawg', { action: 'update' });
