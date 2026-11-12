@@ -1271,6 +1271,24 @@ class WebWorkflowTests(unittest.TestCase):
         status, body = self.invoke_api({'user_id': 'brokenx', 'ip_limit': 2}, endpoint='users/update')
         self.assertEqual(status, 404, body)
 
+    def test_web_user_form_errors_are_readable(self):
+        """页内提交后报错原样弹给管理员：写成中文并说明怎么改（2026-11-13 修）。"""
+        self.ns['user_id_shareable'] = portal.user_id_shareable
+        for params, want_status, hint in (
+                ({'action': 'create', 'user_id': '张三'}, 400, '字母、数字'),
+                ({'action': 'create', 'user_id': 'admin_master'}, 400, '保留名'),
+                ({'action': 'create', 'user_id': 'qa-user', 'duration_days': '0'}, 400, '1-36500 天'),
+                ({'action': 'delete', 'user_id': 'admin_master'}, 400, '机主账号不能删除'),
+                ({'action': 'delete', 'user_id': 'not-present'}, 404, '请刷新页面'),
+                ({'action': 'bogus', 'user_id': 'qa-user'}, 400, '刷新页面后重试')):
+            with self.subTest(params=params):
+                status, body = self.invoke('_h_post_manage_user', params)
+                text = body.decode('utf-8') if isinstance(body, bytes) else str(body)
+                self.assertEqual(status, want_status, text)
+                self.assertIn(hint, text)
+                for english in ('Invalid', 'Reserved', 'Cannot', 'not found', 'Bad request'):
+                    self.assertNotIn(english, text)
+
     def test_dot_only_user_ids_cannot_be_created(self):
         """'.' / '..' 开户会让分享链接被折叠成别的地址，开户时就拒绝（2026-11-04 修）。"""
         self.ns['user_id_shareable'] = portal.user_id_shareable

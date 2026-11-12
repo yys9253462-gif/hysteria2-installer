@@ -139,6 +139,8 @@ LEGACY_MASTER_EXPIRES_AT = 2085974400
 # user_id 的唯一格式定义。serve() 内沿用同名局部变量指向它，
 # 模块级辅助函数（撤销队列清洗等）也用它，避免两套规则漂移。
 USER_ID_RE = re.compile(r'^[a-zA-Z0-9_\-\.]{1,64}$')
+# 网页新建用户时数值超范围的提示，上下限与 REST API 的 users/create 相同。
+QUOTA_RANGE_ERROR = '有效期须为 1-36500 天，同时在线网络数 0-1000，流量限额 0-1000000 GB'.encode('utf-8')
 
 
 def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
@@ -13294,9 +13296,13 @@ if __name__ == '__main__':
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
         def _h_post_manage_user(self, prefix):
-            """POST /manage-user 的处理逻辑（从 do_POST 机械搬移而来）。"""
+            """POST /manage-user 的处理逻辑（从 do_POST 机械搬移而来）。
+
+            报错一律写成中文并说明怎么改（2026-11-13 修）：页内提交后这些文字原样弹给管理员，
+            旧实现一半是「Invalid user_id format」「User not found」这类英文。
+            """
             if not self.is_authenticated():
-                return self.reply(401, b'Unauthorized')
+                return self.reply(401, '登录已失效，请刷新页面重新登录'.encode('utf-8'))
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace')
@@ -13305,19 +13311,19 @@ if __name__ == '__main__':
                 user_id = form.get('user_id', [''])[0].strip()
                 now_ts = int(time.time())
                 if action not in ('create', 'delete'):
-                    return self.reply(400, b'Invalid action')
+                    return self.reply(400, '请求无效，请刷新页面后重试'.encode('utf-8'))
                 with data_lock:
                     previous_user = copy.deepcopy(data.get('users', {}).get(user_id))
 
 
                 if not VALID_USER_ID_RE.match(user_id):
-                    return self.reply(400, b'Invalid user_id format')
+                    return self.reply(400, '用户标识只能用字母、数字、点、下划线和连字符，长度 1-64'.encode('utf-8'))
                 # 与 REST API 同一条规则：保留名不能作为真实用户（placeholder 会和
                 # Xray 的占位 client 撞 email，admin_master 是机主账号）。
                 if action == 'create' and user_id in RESERVED_USER_IDS:
-                    return self.reply(400, b'Reserved user_id')
+                    return self.reply(400, 'admin_master 与 placeholder 是保留名，请换一个用户标识'.encode('utf-8'))
                 if action == 'create' and not user_id_shareable(user_id):
-                    return self.reply(400, 'user_id 不能只由点组成'.encode('utf-8'))
+                    return self.reply(400, '用户标识不能只由点组成'.encode('utf-8'))
 
                 if action == 'create' and user_id:
                     # 不再静默去掉首尾空白（2026-11-04 修）：「abc 」被存成「abc」，客户端按输入的
@@ -13332,12 +13338,12 @@ if __name__ == '__main__':
                         ip_limit = int(form.get('ip_limit', ['0'])[0] or 0)
                         traffic_gb = float(form.get('traffic_gb', ['0'])[0] or 0)
                     except (ValueError, TypeError, OverflowError):
-                        return self.reply(400, b'Invalid duration, IP limit or traffic quota')
+                        return self.reply(400, QUOTA_RANGE_ERROR)
                     # 上限 1e6 GB：没有上限时超大值会在 int() 处抛 OverflowError。
                     # 天数上限与 REST API 的 users/create 一致（1..36500）。
                     if (not 1 <= days <= 36500 or not 0 <= ip_limit <= 1000 or not math.isfinite(traffic_gb)
                             or not 0 <= traffic_gb <= 1000000):
-                        return self.reply(400, b'Invalid duration, IP limit or traffic quota')
+                        return self.reply(400, QUOTA_RANGE_ERROR)
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
                     note = form.get('note', [''])[0].strip()[:200]
                     # 🔴 2026-10-09 修：原来是无条件赋值，同名 id 会被**静默覆盖** ——
@@ -13396,7 +13402,7 @@ if __name__ == '__main__':
                     # "User not found" —— 机主自己都被踢下线、再也连不上节点，
                     # 只能重装。所以这里必须拒绝，UI 那边也不渲染删除按钮。
                     if user_id == MASTER_USER_ID:
-                        return self.reply(400, b'Cannot delete the master account')
+                        return self.reply(400, '机主账号不能删除'.encode('utf-8'))
                     delete_missing = False
                     with data_lock:
                         if user_id not in data.get('users', {}):
@@ -13417,7 +13423,7 @@ if __name__ == '__main__':
                             global_ip_deny.pop(user_id, None)
                     if delete_missing:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
-                        return self.reply(404, b'User not found')
+                        return self.reply(404, '该用户已不存在（可能已在别处删除），请刷新页面'.encode('utf-8'))
 
                 regenerate_page()
                 if not self._sync_reality_clients():
@@ -13434,7 +13440,8 @@ if __name__ == '__main__':
                     save_data()
                     if revoked_pending:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
-                        return self.reply(503, b'Access revocation pending; retry required')
+                        return self.reply(503, '用户已删除，但节点上的旧连接还没确认断开，后台会自动重试；请稍后刷新页面确认'
+                                          .encode('utf-8'))
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
                 regenerate_page()
@@ -13444,7 +13451,7 @@ if __name__ == '__main__':
                 self.end_headers()
                 return
             except (ValueError, TypeError, UnicodeDecodeError):
-                return self.reply(400, b'Bad request')
+                return self.reply(400, '请求无效，请刷新页面后重试'.encode('utf-8'))
             except Exception as exc:
                 # 保存 / 同步阶段的失败不是请求的错（2026-11-04 修）：旧实现一律回 400，
                 # 磁盘满时管理员看到「Bad request」，重试又撞「用户已存在」。
