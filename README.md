@@ -86,7 +86,7 @@ HY2_CERT_TYPE=3 HY2_DOMAIN=hy2.example.com HY2_EMAIL=me@example.com bash install
 | :--- | :--- |
 | `bash install.sh info` | 显示信息页地址与登录凭据 |
 | `bash install.sh refresh-page` | 刷新信息页与订阅，不改配置 |
-| `bash install.sh status` / `restart` | 查看状态 / 重启 Hysteria 2 |
+| `bash install.sh status` / `restart` | 查看 Hysteria 2 与门户的运行状态（任一不在运行时退出码非零，可直接用于监控）/ 重启 Hysteria 2 |
 | `bash install.sh update` | 更新 Hysteria 2 核心 |
 | `bash install.sh uninstall` | 彻底卸载 |
 | `bash install.sh awg-install --line 3 --endpoint vpn.example.com --client phone` | 免交互安装 AmneziaWG |

@@ -5497,8 +5497,14 @@ status_service() {
         log_err "Hysteria 2 未安装！"
         return 1   # 监控脚本靠退出码判断（2026-11-06 修：旧实现未安装也返回 0）
     fi
+    # 服务停着 / 失败时也返回非零，并一起看门户（2026-11-13 修）：旧实现照样返回 0，拿 status
+    # 做健康检查的脚本把挂掉的节点当成正常；门户是 Hy2 的鉴权后端，它挂了所有用户都连不上。
+    local rc=0
     echo -e "\n${CYAN}--- Hysteria 2 运行状态 ---${PLAIN}"
-    systemctl status hysteria-server --no-pager || true
+    systemctl status hysteria-server --no-pager || rc=1
+    echo -e "\n${CYAN}--- 门户（Hy2 鉴权后端）运行状态 ---${PLAIN}"
+    systemctl status hysteria-portal --no-pager || rc=1
+    return "$rc"
 }
 
 require_installed() {
