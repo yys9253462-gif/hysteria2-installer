@@ -3977,8 +3977,9 @@ def pin_sha256_of_file(cert_file):
 def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
     """Return the leaf/fullchain cert path that Hysteria actually serves with.
 
-    Reads `tls.cert:` from config.yaml. ACME caches are resolved separately
-    by _config_acme_cert_path; they are not the self-signed server.crt.
+    Reads `tls.cert:` from config.yaml (cert / key in any order). ACME caches
+    are resolved separately by _config_acme_cert_path; they are not the
+    self-signed server.crt.
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
@@ -3994,10 +3995,14 @@ def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
         if in_tls:
             stripped = raw.strip()
             if stripped.startswith('cert:'):
-                value = stripped.split(':', 1)[1].strip().strip('"').strip("'")
-                return value
-            if stripped.startswith('key:'):
-                in_tls = False
+                value = stripped.split(':', 1)[1]
+                # 引号与行尾注释按 _config_acme_cert_path 同一写法解析（2026-11-12 修）：旧实现
+                # 只剥首尾引号，`cert: /a.crt  # 注释` 读成带注释的路径，fix_cert_chain.sh 认
+                # 这种写法，门户却找不到证书；读到 key: 就停也让「key 写在前面」的配置取不到 cert。
+                try:
+                    return ' '.join(shlex.split(value, comments=True))
+                except ValueError:
+                    return value.strip().strip('"').strip("'")
     return ''
 
 
