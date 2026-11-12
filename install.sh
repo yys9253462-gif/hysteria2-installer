@@ -5140,6 +5140,9 @@ awg_is_installed() {
 # ------------------------------------------------ 交互式安装
 install_amneziawg() {
     check_root
+    # 流量超额停用期间不能拉起 AWG（2026-11-12 修，与门户 / WARP / gost 菜单一致）：安装、更新、
+    # 切协议线、resync 结尾都会 systemctl restart，终端里点一下停用就形同虚设。
+    refuse_if_suspended || return 1
     check_arch
     echo -e "\n${CYAN}------------------------------------------------------------${PLAIN}"
     echo -e "${GREEN}AmneziaWG (AWG) 安装配置：${PLAIN}"
@@ -5338,6 +5341,7 @@ awg_menu_del_peer() {
 
 awg_menu_switch_line() {
     check_root
+    refuse_if_suspended || return 1   # 同 install_amneziawg
     if ! awg_ensure_ctl; then return 1; fi
     if ! awg_is_installed; then
         log_err "AmneziaWG 尚未安装。"
@@ -5404,6 +5408,7 @@ status_amneziawg() {
 
 update_amneziawg() {
     check_root
+    refuse_if_suspended || return 1   # 同 install_amneziawg
     check_arch
     # 先把控制工具自身刷新到最新，否则引擎会被永久冻结在首次安装的版本上
     # （awg_ensure_ctl 默认看到文件已存在就直接返回）
@@ -5456,10 +5461,10 @@ menu_amneziawg() {
                 ;;
             6) awg_menu_switch_line || true ;;
             7)
-                if awg_is_installed; then
-                    "$AWG_CTL_BIN" resync || true
-                else
+                if ! awg_is_installed; then
                     log_err "AmneziaWG 尚未安装。"
+                elif refuse_if_suspended; then   # 同 install_amneziawg：resync 结尾会重启服务
+                    "$AWG_CTL_BIN" resync || true
                 fi
                 ;;
             8)
@@ -6296,6 +6301,7 @@ if [[ $# -gt 0 ]]; then
         #   ./install.sh awg-install --line 3 --endpoint vpn.example.com --client phone
         awg-install)
             check_root
+            refuse_if_suspended || exit 1   # 同 install_amneziawg：带参数时直接透传，也会拉起服务
             check_arch
             awg_ensure_ctl --refresh || exit 1
             shift
@@ -6320,6 +6326,10 @@ if [[ $# -gt 0 ]]; then
             # 任意底层命令透传，例如: ./install.sh awg peer-list --json
             awg_ensure_ctl || exit 1
             shift
+            # 会重启服务的底层命令同样受停用约束（同 install_amneziawg）；只读命令照常放行。
+            case "${1:-}" in
+                install|update|resync) refuse_if_suspended || exit 1 ;;
+            esac
             exec "$AWG_CTL_BIN" "$@"
             ;;
         *)
