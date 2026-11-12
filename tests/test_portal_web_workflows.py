@@ -1798,6 +1798,26 @@ class WebWorkflowTests(unittest.TestCase):
         states['hy2-anytls'] = 'failed'
         self.assertEqual(cores()['sing-box']['state'], 'failed')
 
+    def test_core_reinstall_says_running_services_still_use_the_old_binary(self):
+        """装上新二进制后，正在跑的进程仍是旧版本：要说清楚，不能只报「安装完成」（2026-11-13 修）。"""
+        self.handler._extend_deadline = lambda seconds, heavy=False: True
+        for name, running, expect_note in (('xray', {'xray'}, True), ('xray', set(), False),
+                                            ('sing-box', {'hy2-tuic'}, True)):
+            with self.subTest(name=name, running=running):
+                self.ns.update(
+                    install_xray_binary=lambda: (True, 'Xray-core 安装完成'),
+                    install_singbox=lambda: (True, 'sing-box 安装完成'),
+                    write_xray_unit=lambda: None, xray_unit_foreign=lambda: False,
+                    core_operation_lock=threading.Lock(),
+                    acquire_core_operation_lock=lambda: os.open(os.devnull, os.O_RDONLY),
+                    ANYTLS_SERVICE='hy2-anytls', TUIC_SERVICE='hy2-tuic',
+                    _systemd_state=lambda unit, up=frozenset(running): 'active' if unit in up else 'inactive')
+                status, body = self.invoke('_h_post_install_core', {'name': name})
+                self.assertEqual(status, 200, body)
+                self.assertEqual('仍是旧核心' in body['message'], expect_note, body['message'])
+                if expect_note:
+                    self.assertIn(sorted(running)[0], body['message'])
+
     def test_warp_toggle_does_not_destroy_global_custom_outbound_mode(self):
         state = {'warp_enabled': True, 'outbound_mode': 'global',
                  'warp_rules': ['openai.com'],

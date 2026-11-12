@@ -12530,6 +12530,13 @@ if __name__ == '__main__':
                             ok, msg = install_singbox()
                     finally:
                         os.close(core_lock_fd)
+                if ok:
+                    # 正在跑的进程还是旧二进制（2026-11-13 修）：卡片上的版本读的是磁盘上的新文件，
+                    # 旧提示只说「安装完成」，像是新核心已经在用。不替管理员重启，免得断开所有用户。
+                    units = ['xray'] if name == 'xray' else [ANYTLS_SERVICE, TUIC_SERVICE]
+                    running = [u for u in units if _systemd_state(u) == 'active']
+                    if running:
+                        msg += '；正在运行的 %s 仍是旧核心，下次重启该服务（或在协议页关闭再开启）后才换成新版本' % '、'.join(running)
                 return self.reply_json(200 if ok else 500, {'ok': ok, ('message' if ok else 'error'): msg})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
