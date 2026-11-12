@@ -1774,8 +1774,25 @@ async function checkRealityStatus() {
   } catch (_) { if (seq === realityStatusSeq) markStatusUnknown(realityBadge); }
 }
 
+// 协议开关按卡片显示的状态发送明确的 enable / disable（2026-11-13 修，同控制台）：toggle 由服务端翻转，
+// 页面停留久了或在别处改过时，卡片写着「已关闭（点击开启）」，点下去却把协议关掉。
+// 关闭前先确认：正在使用这个协议的用户会立即断开。卡片要状态查询成功才显示开关，class 一定是 on / off。
+async function protocolSwitchAction(btn, name) {
+  if (!btn.classList.contains('on')) return 'enable';
+  const confirmed = await showConfirm({
+    title: '关闭 ' + name,
+    text: '关闭后，正在使用 ' + name + ' 的用户会立即断开，直到重新开启。',
+    icon: '⏸️',
+    confirmText: '确定关闭',
+    isDanger: true
+  });
+  return confirmed ? 'disable' : '';
+}
+
 if (btnToggleReality) {
   btnToggleReality.addEventListener('click', async () => {
+    const action = await protocolSwitchAction(btnToggleReality, 'Reality');
+    if (!action) return;
     btnToggleReality.disabled = true;
     btnToggleReality.textContent = '切换中...';
     try {
@@ -1783,7 +1800,7 @@ if (btnToggleReality) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       const json = await res.json();
       if (!json.ok) alert(json.error || '切换失败');
@@ -1939,6 +1956,8 @@ if (btnToggleVmess) {
     // 双击防护：请求未返回前直接忽略后续点击。
     // 否则两次 toggle 会一开一关，最终状态与用户预期相反。
     if (btnToggleVmess.disabled) return;
+    const action = await protocolSwitchAction(btnToggleVmess, 'VMess');
+    if (!action) return;
     btnToggleVmess.disabled = true;
     btnToggleVmess.textContent = '切换中...';
     try {
@@ -1946,7 +1965,7 @@ if (btnToggleVmess) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       // 先看 HTTP 状态：反向代理出错时返回的是 HTML 错误页，
       // 直接 res.json() 会抛「Unexpected token <」，把真实原因盖掉。
@@ -2040,6 +2059,8 @@ async function checkVlessencStatus() {
 if (btnToggleVlessenc) {
   btnToggleVlessenc.addEventListener('click', async () => {
     if (btnToggleVlessenc.disabled) return;
+    const action = await protocolSwitchAction(btnToggleVlessenc, 'VLESS Encryption');
+    if (!action) return;
     btnToggleVlessenc.disabled = true;
     btnToggleVlessenc.textContent = '切换中...';
     try {
@@ -2047,7 +2068,7 @@ if (btnToggleVlessenc) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
@@ -2136,6 +2157,8 @@ async function checkAnytlsStatus() {
 if (btnToggleAnytls) {
   btnToggleAnytls.addEventListener('click', async () => {
     if (btnToggleAnytls.disabled) return;
+    const action = await protocolSwitchAction(btnToggleAnytls, 'AnyTLS');
+    if (!action) return;
     btnToggleAnytls.disabled = true;
     btnToggleAnytls.textContent = '切换中...';
     try {
@@ -2143,7 +2166,7 @@ if (btnToggleAnytls) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
@@ -2232,6 +2255,8 @@ async function checkTuicStatus() {
 if (btnToggleTuic) {
   btnToggleTuic.addEventListener('click', async () => {
     if (btnToggleTuic.disabled) return;
+    const action = await protocolSwitchAction(btnToggleTuic, 'TUIC');
+    if (!action) return;
     btnToggleTuic.disabled = true;
     btnToggleTuic.textContent = '切换中...';
     try {
@@ -2239,7 +2264,7 @@ if (btnToggleTuic) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
