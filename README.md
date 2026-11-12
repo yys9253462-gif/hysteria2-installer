@@ -84,6 +84,7 @@ HY2_CERT_TYPE=3 HY2_DOMAIN=hy2.example.com HY2_EMAIL=me@example.com bash install
 
 | 命令 | 功能 |
 | :--- | :--- |
+| `bash install.sh install` | 免交互安装 / 重装（参数见上方「免交互安装」的环境变量；已装机时默认沿用现有门户与证书） |
 | `bash install.sh info` | 显示信息页地址与登录凭据 |
 | `bash install.sh refresh-page` | 刷新信息页与订阅，不改配置 |
 | `bash install.sh status` / `restart` | 查看 Hysteria 2 与门户的运行状态（任一不在运行时退出码非零，可直接用于监控）/ 重启 Hysteria 2 |
@@ -91,6 +92,7 @@ HY2_CERT_TYPE=3 HY2_DOMAIN=hy2.example.com HY2_EMAIL=me@example.com bash install
 | `bash install.sh uninstall` | 彻底卸载 |
 | `bash install.sh awg-install --line 3 --endpoint vpn.example.com --client phone` | 免交互安装 AmneziaWG |
 | `bash install.sh awg-menu` / `awg-status` / `awg-update` / `awg-uninstall` | AmneziaWG 管理 |
+| `bash install.sh awg <子命令>` | 直接调用底层工具 `hy2-awgctl`，如 `bash install.sh awg peer-list --json`；会重启服务的 `install` / `update` / `resync` 在流量超额停用期间会被拒绝 |
 
 AmneziaWG 的底层工具是 `hy2-awgctl`（`peer-add`、`peer-del`、`qr`、`client-conf`、`update --line 2` 等）。注意：AWG 端口不能落在 20000-40000（会被端口跳跃规则劫持），默认从 50000-59000 选取；切换 2.x / 3.x 协议线会让已发放的客户端配置全部失效。
 
