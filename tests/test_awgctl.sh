@@ -384,6 +384,16 @@ if (
 check_eq "撞上启动频率上限后，热移除失败的兜底重启仍能成功" "$_limit_rc" "0"
 check_eq "兜底重启前先 reset-failed" "$(head -n1 "$_limit_calls")" "systemctl reset-failed ${AWG_SERVICE_NAME}"
 
+# status 的退出码要能用于监控（2026-11-13 修）：装了却没在运行返回 3；运行中与未安装返回 0。
+_status_rc() {
+    local _installed="$1" _active="$2"
+    if ( is_installed() { [[ "$_installed" == yes ]]; }; service_active() { [[ "$_active" == yes ]]; }
+         cmd_status ) >/dev/null 2>&1; then echo 0; else echo $?; fi
+}
+check_eq "status：装了但服务没在运行返回 3" "$(_status_rc yes no)" "3"
+check_eq "status：运行中返回 0" "$(_status_rc yes yes)" "0"
+check_eq "status：未安装返回 0" "$(_status_rc no no)" "0"
+
 # qr 与 client-conf 同一套检查：存下的坏地址不能编进二维码（2026-11-04 修）。
 _qr_out="$( (is_installed() { return 0; }; qrencode() { cat >/dev/null; echo QR-RENDERED; }
              meta_set endpoint "..."; cmd_qr one) 2>&1 || true)"
