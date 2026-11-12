@@ -68,6 +68,12 @@ set_tls_cert () {   # $1=config $2=new path
     chmod --reference="$1" "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$1"
 }
+# 重启前先清失败计数（2026-11-12 修，与 do_upgrade.sh 同理）：证书出问题时服务常已反复崩溃、
+# 撞上 StartLimitBurst，这时 restart 被直接拒绝，修好的链被当成「起不来」回滚。
+restart_hysteria () {
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    systemctl restart hysteria-server 2>/dev/null || true
+}
 # masquerade 的对外端口，与门户 read_masquerade_port 同一规则（2026-11-12 修）：
 # 跳过注释行，去掉引号与行尾注释，只取最后一个冒号后的数字。旧实现遇到
 # `0.0.0.0:8443` / `":8443"` 拿整串去连，修好的链被报成「验证未通过」。
@@ -170,13 +176,13 @@ fi
 
 if [[ "$CHANGED" == "1" ]]; then
     info "重启 hysteria-server ..."
-    systemctl restart hysteria-server 2>/dev/null || true
+    restart_hysteria
     sleep 3
     # 起不来就恢复原配置（2026-11-04 修）：旧实现留着改坏的配置，节点直接掉线。
     if ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
         err "新配置下 hysteria-server 未能启动，已恢复原配置：$BK"
         cp -a "$BK" "$CONFIG"
-        systemctl restart hysteria-server 2>/dev/null || true
+        restart_hysteria
         exit 1
     fi
 fi

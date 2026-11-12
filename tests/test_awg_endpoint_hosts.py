@@ -17,8 +17,11 @@ BASH = shutil.which('bash')
 TREE = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
 AWGCTL = (ROOT / 'awgctl.sh').read_text(encoding='utf-8').replace('\r\n', '\n')
 
-BAD = ('...', '-', '_', '[.]', '[:]', '[1.2.3.4]', 'a..b', '-host.example.com')
-GOOD = ('vpn.example.com', 'vpn.example.com:51820', '1.2.3.4', '[2001:db8::1]', '[2001:db8::1]:51820')
+BAD = ('...', '-', '_', '[.]', '[:]', '[1.2.3.4]', 'a..b', '-host.example.com',
+       # 末段全是数字却不是 IPv4（2026-11-12 修）：顶级域不会全是数字，客户端当域名解析必然失败。
+       '999.1.1.1', '1.2.3', '12345', '1.2.3.4.5', '01.2.3.4', '300.1.1.1:51820')
+GOOD = ('vpn.example.com', 'vpn.example.com:51820', '1.2.3.4', '[2001:db8::1]', '[2001:db8::1]:51820',
+        '10.0.0.1:51820', 'vpn')
 
 
 def portal_checker():

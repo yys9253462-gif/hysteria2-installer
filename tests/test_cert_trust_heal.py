@@ -288,6 +288,7 @@ class TestShellSyncCertMeta(unittest.TestCase):
             "log_warn(){ echo \"WARN: $*\" >&2; }\n"
             "log_info(){ echo \"INFO: $*\" >&2; }\n"
             "log_err(){ echo \"ERR: $*\" >&2; }\n"
+            + _extract_shell_fn("config_tls_cert") + "\n"
             + fn + "\n"
             'sync_cert_meta\n'
         )

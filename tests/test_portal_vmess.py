@@ -629,7 +629,8 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertGreater(active['peak'], 1, '并发执行时峰值应大于 1')
 
     def test_oversized_basic_header_is_rejected(self):
-        src = open(portal.__file__, encoding='utf-8').read()
+        with open(portal.__file__, encoding='utf-8') as f:
+            src = f.read()
         self.assertIn("if len(auth) > 1024", src)
 
 

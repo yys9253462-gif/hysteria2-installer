@@ -13,7 +13,6 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
@@ -37,7 +36,6 @@ HY2_LOG_DROPIN="/etc/systemd/system/hysteria-server.service.d/loglevel.conf"
 # ---- AmneziaWG (AWG) ----
 # 引擎逻辑全部在 awgctl.sh 里，本脚本只做交互封装。
 AWG_REPO="yys9253462-gif/hysteria2-installer"
-AWG_RELEASE_TAG="awg-binaries"
 AWG_CTL_BIN="/usr/local/bin/hy2-awgctl"
 AWG_DIR="/etc/amnezia/amneziawg"
 AWG_LINK="awg0"
@@ -2536,14 +2534,42 @@ setup_iptables_port_hopping() {
     local l_port="$1"
     local s_port="$2"
     local e_port="$3"
-    
+    local hop_skip=""
+
     # 没有 iptables 命令（极简镜像 / 纯 nftables 主机）时直接跳过：
     # 旧实现会在 set -e 下以 127 退出，安装停在「二进制与证书已就位、
     # 配置与门户还没写」的半成品状态，还会留下一个开机必失败的
     # hy2-iptables.service（2026-10-29 修）。
+    # 命令在、nat 表却不可用（OpenVZ / 部分 LXC 容器、内核缺 nat 模块），或加规则失败
+    # （缺 comment / addrtype 模块）同理（2026-11-12 修）：旧实现照样在 set -e 下退出，
+    # 停在同一个半成品状态，重跑每次都卡在这里。
     if ! command -v iptables >/dev/null 2>&1; then
-        log_warn "本机没有 iptables 命令，跳过端口跳跃（${s_port}-${e_port} -> ${l_port}）。"
-        log_warn "如需端口跳跃，请安装 iptables 后重新执行，或自行用 nftables 配置等价的 UDP 重定向。"
+        hop_skip="本机没有 iptables 命令"
+    elif ! iptables -t nat -S PREROUTING >/dev/null 2>&1; then
+        hop_skip="iptables 的 nat 表不可用（常见于 OpenVZ / LXC 容器）"
+    else
+        if [[ -e /etc/systemd/system/hy2-iptables.service ]] && ! _hy2_iptables_unit_owned; then
+            log_err "发现同名但不属于本安装器的 hy2-iptables.service，拒绝覆盖。"
+            return 1
+        fi
+
+        log_step "配置 iptables 端口跳跃转发规则 (${s_port}-${e_port} -> ${l_port})..."
+
+        clear_all_hopping_rules
+
+        # 注入新规则 (IPv4 + IPv6)
+        # BUGFIX #12: 同时加 PREROUTING + OUTPUT 链, 这样本机 loopback 拨测也能跳到主监听端口
+        # OUTPUT 只认目的为本机地址（2026-11-04 修）：不限目的时，代理替用户发往远端
+        # 20000-40000 端口的 UDP（游戏、WebRTC、VoIP）也被 REDIRECT 到本机监听口，直接断流。
+        if ! iptables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" \
+                || ! iptables -t nat -A OUTPUT -p udp -m addrtype --dst-type LOCAL --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"; then
+            clear_all_hopping_rules
+            hop_skip="iptables 添加 nat 转发规则失败"
+        fi
+    fi
+    if [[ -n "$hop_skip" ]]; then
+        log_warn "${hop_skip}，跳过端口跳跃（${s_port}-${e_port} -> ${l_port}）。"
+        log_warn "如需端口跳跃，请在 iptables（含 nat 表）可用的环境重新执行，或自行用 nftables 配置等价的 UDP 重定向。"
         log_warn "其余功能（Hy2 / Reality / VMess / AnyTLS 等）不受影响。"
         # 不把未配置转发的范围写入订阅元数据或交给防火墙放行。
         HOP_START=""
@@ -2556,21 +2582,6 @@ setup_iptables_port_hopping() {
         return 0
     fi
 
-    if [[ -e /etc/systemd/system/hy2-iptables.service ]] && ! _hy2_iptables_unit_owned; then
-        log_err "发现同名但不属于本安装器的 hy2-iptables.service，拒绝覆盖。"
-        return 1
-    fi
-
-    log_step "配置 iptables 端口跳跃转发规则 (${s_port}-${e_port} -> ${l_port})..."
-    
-    clear_all_hopping_rules
-    
-    # 注入新规则 (IPv4 + IPv6)
-    # BUGFIX #12: 同时加 PREROUTING + OUTPUT 链, 这样本机 loopback 拨测也能跳到主监听端口
-    # OUTPUT 只认目的为本机地址（2026-11-04 修）：不限目的时，代理替用户发往远端
-    # 20000-40000 端口的 UDP（游戏、WebRTC、VoIP）也被 REDIRECT 到本机监听口，直接断流。
-    iptables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
-    iptables -t nat -A OUTPUT     -p udp -m addrtype --dst-type LOCAL --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}"
     if command -v ip6tables >/dev/null 2>&1; then
         ip6tables -t nat -A PREROUTING -p udp --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
         ip6tables -t nat -A OUTPUT     -p udp -m addrtype --dst-type LOCAL --dport "${s_port}:${e_port}" -m comment --comment hy2-installer -j REDIRECT --to-ports "${l_port}" 2>/dev/null || true
@@ -3102,7 +3113,7 @@ METEREOF2
         # cert_type/server_name/is_insecure/pin_sha256 会与真实证书漂移，面板就会把
         # 错误的 sni 发给客户端（CRYPTO_ERROR 0x150）。以证书为唯一事实来源修正。
         if [[ -f "$HY2_DIR/client_meta.json" && -f "$HY2_DIR/config.yaml" ]] && command -v jq >/dev/null 2>&1; then
-            _cert="$(awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t]/{f=0}' "$HY2_DIR/config.yaml" 2>/dev/null || true)"
+            _cert="$(config_tls_cert "$HY2_DIR/config.yaml")"
             # config.yaml 里的 cert 是相对 /etc/hysteria 的路径，必须显式拼回 HY2_DIR。
             if [[ -n "$_cert" && "$_cert" != /* && ! -f "$_cert" ]]; then
                 [[ -f "$HY2_DIR/$_cert" ]] && _cert="$HY2_DIR/$_cert"
@@ -3203,7 +3214,7 @@ EOCS2
               'WantedBy=timers.target' \
               > /etc/systemd/system/hy2-cert-selfheal.timer
             _cwd="$HY2_DIR/cert"
-            _cc="$(awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t]/{f=0}' "$HY2_DIR/config.yaml" 2>/dev/null || true)"
+            _cc="$(config_tls_cert "$HY2_DIR/config.yaml")"
             if [[ -n "$_cc" ]]; then
                 case "$_cc" in
                     /*) _cwd="$(dirname "$_cc")" ;;
@@ -3696,7 +3707,7 @@ PORTAL_FETCH_ALL_VERIFY_FAILED=0
 portal_fetch_py() {
     local dir="$1"
     local repo="${AWG_REPO}"
-    local spec name base mode why m
+    local name base mode why m
     PORTAL_FETCH_ERR=""
     PORTAL_FETCH_FILES_ERR=""
     PORTAL_FETCH_ALL_VERIFY_FAILED=0
@@ -3987,6 +3998,14 @@ PYSECRET
 #    于是面板把 sni=www.bing.com 发给客户端 → CRYPTO_ERROR 0x150。
 #    portal.py 的 sync_cert_trust() 已能以证书为唯一事实来源自愈；这里做同样
 #    的事，保证「不通过 portal 初始化」的路径（refresh / 在线升级）也修得到。
+# config.yaml 里 tls.cert 的值，与门户 _config_tls_cert_path 同一规则（2026-11-12 抽出）：
+# cert / key 顺序任意，去掉引号与行尾注释，段内顶格注释不算段落结束。旧实现四处各抄
+# 一份 awk，`cert: /a.crt  # 注释` 读成带注释的路径，meta 自愈找不到证书、path 单元盯错目录。
+# 用法：config_tls_cert <config.yaml>
+config_tls_cert() {
+    awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");sub(/[ \t]+#.*$/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t#]/{f=0}' "$1" 2>/dev/null || true
+}
+
 sync_cert_meta() {
     [[ -f "$HY2_META_FILE" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
@@ -3997,7 +4016,7 @@ sync_cert_meta() {
     #    而 install.sh 可能从任意 CWD 被调起 —— 必须显式相对 $HY2_DIR 解析，
     #    否则 `-f` 判空一定失败，自愈会被静默跳过（2026-10-08 真实踩到）。
     local cert_file
-    cert_file="$(awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t]/{f=0}' "$HY2_CONFIG" 2>/dev/null || true)"
+    cert_file="$(config_tls_cert "$HY2_CONFIG")"
     if [[ -n "$cert_file" && "$cert_file" != /* && ! -f "$cert_file" ]]; then
         [[ -f "${HY2_DIR}/${cert_file}" ]] && cert_file="${HY2_DIR}/${cert_file}"
     fi
@@ -4238,7 +4257,7 @@ EOCT
     # 单文件 PathChanged 在 rename 场景下可能因 inode 变化而漏触发，盯目录更稳。
     local cert_watch_dir="$HY2_CERT_DIR"
     local _cc
-    _cc="$(awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t]/{f=0}' "$HY2_CONFIG" 2>/dev/null || true)"
+    _cc="$(config_tls_cert "$HY2_CONFIG")"
     if [[ -n "$_cc" ]]; then
         if [[ "$_cc" != /* ]]; then
             cert_watch_dir="$(dirname "${HY2_DIR}/${_cc}")"

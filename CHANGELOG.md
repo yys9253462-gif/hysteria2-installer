@@ -1,3 +1,16 @@
+## 2026-11-12 — 第二十七批十项修复，门户 2.37
+
+- iptables 在、nat 表却不可用（OpenVZ / 部分 LXC 容器），或加端口跳跃规则失败时，跳过端口跳跃继续安装：此前在 `set -e` 下直接退出，停在「二进制与证书已就位、配置与门户还没写」，重跑每次都卡在同一步。
+- 清理死代码：门户未使用的 `SimpleCookie` 导入与变量、`selfheal` 每 30 分钟白算两遍的证书哈希；`install.sh` 里不会传给 awgctl 的 `AWG_RELEASE_TAG`（改它不起作用）与未使用的变量；`awgctl.sh` 未使用的局部变量。
+- `reinstall-debian13.sh` 拒收会被 InstallNET 改写的 root 密码（空格、`* ? [`、`-` 开头等）：InstallNET 生成哈希时不给密码加引号，磁盘清空后新系统的 root 密码就不是输入的那个，SSH 登不上。
+- `reinstall-debian13.sh --help` 只打印开头说明：此前按写死的行号把后面的常量与默认值代码一起打出来。
+- 测试卫生：假 trafficStats 服务的 `shutdown()` 一并关闭监听 socket，两处子进程输出从「没人读的管道」改为文件，全量测试的 ResourceWarning 从 18 条降为 0；也消除了管道写满让门户卡在写日志上的偶发超时。
+- `portal.py` 命令行缺参数时报用法并以 2 退出，不再抛 `IndexError` 堆栈；未知子命令的提示补上漏掉的 `adopt`。
+- 门户读取 `config.yaml` 的 `tls.cert` 按 YAML 处理引号与行尾注释，cert / key 顺序任意：此前 `cert: /a.crt  # 注释` 读成带注释的路径，`key` 写在 `cert` 前面时取不到，证书状态、pin 与自愈都拿错证书。
+- `install.sh` 四处各抄一份的 `tls.cert` 解析合并为 `config_tls_cert`，与门户同一规则：此前带行尾注释时 `sync_cert_meta` 找不到证书、证书自愈的 path 单元盯错目录。
+- `fix_cert_chain.sh` 重启 hysteria-server 前先清失败计数：服务已撞上 StartLimitBurst 时 restart 会被直接拒绝，修好的证书链被当成「起不来」回滚。
+- AmneziaWG 连接地址拒收末段全是数字却不是 IPv4 的值（`999.1.1.1`、`1.2.3`、`12345`），门户与 awgctl 同一规则：此前写进客户端配置后被当成域名解析，永远握不上手。
+
 ## 2026-11-12 — 第二十六批十项修复，门户 2.36
 
 - `reinstall-debian13.sh` 下载 InstallNET 时 raw.githubusercontent.com 不通会退回 jsDelivr 镜像，并拒收错误页：此前「镜像」与主源是同一个地址且从未被使用，主源一断就只能失败。

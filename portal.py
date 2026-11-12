@@ -35,7 +35,6 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -203,7 +202,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.36'
+PORTAL_VERSION = '2.37'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -3978,8 +3977,9 @@ def pin_sha256_of_file(cert_file):
 def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
     """Return the leaf/fullchain cert path that Hysteria actually serves with.
 
-    Reads `tls.cert:` from config.yaml. ACME caches are resolved separately
-    by _config_acme_cert_path; they are not the self-signed server.crt.
+    Reads `tls.cert:` from config.yaml (cert / key in any order). ACME caches
+    are resolved separately by _config_acme_cert_path; they are not the
+    self-signed server.crt.
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
@@ -3995,10 +3995,14 @@ def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
         if in_tls:
             stripped = raw.strip()
             if stripped.startswith('cert:'):
-                value = stripped.split(':', 1)[1].strip().strip('"').strip("'")
-                return value
-            if stripped.startswith('key:'):
-                in_tls = False
+                value = stripped.split(':', 1)[1]
+                # 引号与行尾注释按 _config_acme_cert_path 同一写法解析（2026-11-12 修）：旧实现
+                # 只剥首尾引号，`cert: /a.crt  # 注释` 读成带注释的路径，fix_cert_chain.sh 认
+                # 这种写法，门户却找不到证书；读到 key: 就停也让「key 写在前面」的配置取不到 cert。
+                try:
+                    return ' '.join(shlex.split(value, comments=True))
+                except ValueError:
+                    return value.strip().strip('"').strip("'")
     return ''
 
 
@@ -4398,11 +4402,9 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         return False
     services = ('hysteria-server', 'xray', ANYTLS_SERVICE, TUIC_SERVICE, 'gost')
     failed = []
-    attempted = False
     for service in services:
         if _systemd_state(service) != 'active':
             continue
-        attempted = True
         try:
             result = subprocess.run(['systemctl', 'try-restart', service],
                                     capture_output=True, timeout=20)
@@ -7903,35 +7905,15 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
 
     before = dict(m)
     live_cert, _, _, _ = _resolve_live_cert(root, config_path)
-    cert_files = set()
-    tls_cert = _config_tls_cert_path(config_path)
-    if tls_cert:
-        cert_files.add(Path(tls_cert) if Path(tls_cert).is_absolute()
-                       else Path(config_path).parent / tls_cert)
-    cert_files.add(live_cert)
-    before_cert = {path: hashlib.sha256(path.read_bytes()).hexdigest()
-                   for path in cert_files if path.is_file()}
     changed = sync_cert_trust(m, root, meta_path, config_path=config_path)
     # sync_cert_trust 只在漂移时写盘；pin 的修正也一并在此处理（保持与 refresh 一致）。
     pin_before = m.get('pin_sha256')
     sync_pin(m, root, meta_path)
     if m.get('pin_sha256') != pin_before:
         changed = True
-    after_cert = {path: hashlib.sha256(path.read_bytes()).hexdigest()
-                  for path in cert_files if path.is_file()}
-    cert_changed = before_cert != after_cert
-    runtime_state = root / 'cert-selfheal.json'
-    has_runtime_fingerprint = False
-    if runtime_state.exists():
-        try:
-            _runtime_data = json.loads(runtime_state.read_text(encoding='utf-8'))
-            has_runtime_fingerprint = bool(_runtime_data.get('loaded_cert_sha256'))
-        except (OSError, ValueError, AttributeError):
-            pass
     # 每轮都交给 sync_cert_runtime 比对（2026-11-04 修）：它拿磁盘证书与上次重载时记下的
     # 指纹比，相同就直接返回，不会每 30 分钟重启一次。旧的门槛只看「本轮前后」两次快照，
     # 而本轮里根本不写证书：Caddy / 手工换证后服务一直握着旧证书，到期时 TLS 全挂。
-    del cert_changed, has_runtime_fingerprint
     runtime_reloaded = sync_cert_runtime(root, live_cert)
 
     if changed or runtime_reloaded:
@@ -8140,6 +8122,13 @@ def serve(path):
             if not re.fullmatch(r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
                                 r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
                 return '连接地址不是有效的域名或 IPv4'
+            # 末段全是数字只能是 IPv4（顶级域不会全是数字，2026-11-12 修）：旧规则放过
+            # 999.1.1.1 / 1.2.3 / 12345，客户端拿去当域名解析，永远握不上手。
+            if host.rsplit('.', 1)[-1].isdigit():
+                try:
+                    ipaddress.IPv4Address(host)
+                except ValueError:
+                    return '连接地址不是有效的域名或 IPv4'
         port_match = re.search(r':([0-9]+)$', endpoint)
         if port_match:
             raw_port = port_match.group(1)
@@ -15471,6 +15460,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
 if __name__ == '__main__':
     _cmd = sys.argv[1] if len(sys.argv) > 1 else ''
+    # 缺参数时报用法并以 2 退出（2026-11-12 修）：旧实现直接取 sys.argv[n]，抛 IndexError
+    # 堆栈，安装脚本日志或管理员手敲时看不出少了哪个参数。
+    _usage = {'prepare': (2, '<client_meta.json> <门户端口> [API Key]'),
+              'refresh': (1, '<client_meta.json>'),
+              'adopt': (2, '<client_meta.json> <门户端口> [API Key]'),
+              'selfheal': (1, '<client_meta.json> [config.yaml]'),
+              'serve': (1, '<portal.json>')}
+    if _cmd in _usage and len(sys.argv) - 2 < _usage[_cmd][0]:
+        print('[portal] 用法: python3 portal.py %s %s' % (_cmd, _usage[_cmd][1]), file=sys.stderr)
+        sys.exit(2)
     if _cmd == 'prepare':
         api_key = sys.argv[4] if len(sys.argv) > 4 else None
         prepare(sys.argv[2], sys.argv[3], api_key)
@@ -15494,8 +15493,7 @@ if __name__ == '__main__':
         #    于是「自愈」实际**启动了第二个门户进程**（或因参数不对报
         #    无关的 KeyError），而调用方看到的是「命令成功」——
         #    又是一次静默降级。这里必须显式报错并以非 0 退出。
-        print('[portal] 未知子命令: %r（可用: prepare / refresh / selfheal / serve）'
-              % _cmd, file=sys.stderr)
+        print('[portal] 未知子命令: %r（可用: %s）' % (_cmd, ' / '.join(_usage)), file=sys.stderr)
         sys.exit(2)
 
 

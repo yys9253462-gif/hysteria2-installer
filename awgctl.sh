@@ -347,6 +347,11 @@ validate_endpoint() {
         elif [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
             log_err "连接地址不是有效的域名或 IPv4: ${ep}"
             return 1
+        elif [[ "${host##*.}" =~ ^[0-9]+$ ]] \
+                && ! python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$host" 2>/dev/null; then
+            # 末段全是数字只能是 IPv4（顶级域不会全是数字，2026-11-12 修，与门户同一规则）。
+            log_err "连接地址不是有效的域名或 IPv4: ${ep}"
+            return 1
         fi
         # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置。
         if [[ -n "$port" ]]; then
@@ -453,7 +458,7 @@ download_binaries() {
     # 覆盖现役二进制前先备份，装完立刻验证新文件真的能执行；
     # 任一步失败就整组恢复。旧实现直接覆盖，新版架构不符或损坏时
     # 旧版本已经没了，AWG 直接不可用、只能重装（2026-10-29 修）。
-    local bakd dst f
+    local bakd f
     bakd="$(mktemp -d "${AWG_DIR}/.binbak.XXXXXX")"
     for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
         [[ -e "$f" ]] && cp -a "$f" "$bakd/$(basename "$f")"

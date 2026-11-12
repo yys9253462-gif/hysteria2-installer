@@ -39,7 +39,7 @@ class SyncCertMetaAcmeTests(unittest.TestCase):
             script = '\n'.join(['HY2_DIR=%s' % t, 'HY2_CERT_DIR=%s/cert' % t, 'HY2_CONFIG=%s/config.yaml' % t,
                                 'HY2_META_FILE=%s/client_meta.json' % t,
                                 'log_info() { :; }', 'log_warn() { :; }', 'log_step() { :; }',
-                                fn('sync_cert_meta'), 'sync_cert_meta; echo "RC=$?"'])
+                                fn('config_tls_cert'), fn('sync_cert_meta'), 'sync_cert_meta; echo "RC=$?"'])
             out = subprocess.run([BASH, '-c', script], capture_output=True, text=True, timeout=30)
             after = json.loads((t / 'client_meta.json').read_text())
         self.assertEqual(after['cert_type'], 'acme', out.stdout + out.stderr)

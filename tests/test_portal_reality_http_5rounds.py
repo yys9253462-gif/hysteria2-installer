@@ -159,9 +159,12 @@ env['_listening_ports'] = lambda: {443}
 env['enforce_node_access'] = lambda *args, **kwargs: True
 serve(sys.argv[2])
 '''
-    PROC = subprocess.Popen(
-        [sys.executable, '-c', bootstrap, str(ROOT / 'portal.py'), str(hdir / 'portal.json')],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # 输出写文件而不是 PIPE：没人读的管道写满后门户会卡在写日志上，且管道到退出都不关。
+    log_path = hdir / 'portal.out'
+    with open(log_path, 'wb') as log:
+        PROC = subprocess.Popen(
+            [sys.executable, '-c', bootstrap, str(ROOT / 'portal.py'), str(hdir / 'portal.json')],
+            env=env, stdout=log, stderr=subprocess.STDOUT)
 
     # 等端口起来
     for _ in range(80):
@@ -172,7 +175,8 @@ serve(sys.argv[2])
     out = ''
     try:
         PROC.kill()
-        out = PROC.stdout.read()[:800] if PROC.stdout else ''
+        PROC.wait(timeout=5)
+        out = log_path.read_text(encoding='utf-8', errors='replace')[:800]
     except Exception:
         pass
     raise RuntimeError('portal 未能启动: ' + out)
