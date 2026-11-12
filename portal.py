@@ -14131,8 +14131,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 无限流量、不过期。用低权限凭据换高权限凭据就是提权。
                     # 实测已确认 auth_password / obfs_password 都被返回。
                     # capabilities 早就是白名单的，这里对齐同一套做法。
-                    _secret_keys = {'auth_password', 'obfs_password', 'pin_sha256'}
-                    public_meta = {k: v for k, v in m.items() if k not in _secret_keys}
+                    # 真按白名单取（2026-11-13 修）：旧实现只剔除三个已知密钥，client_meta.json
+                    # 以后新增的任何字段（包括新的密钥）都会自动发给只持有低权限 api_key 的一方。
+                    # 控制台读的就是这几项（hy2-ops-console 的 portalMeta）。
+                    _public_keys = ('public_ip', 'server_name', 'listen_port', 'subscription_port',
+                                    'hop_port_range', 'cert_type', 'is_insecure')
+                    public_meta = {k: m[k] for k in _public_keys if k in m}
                     return self.reply_json(200, {'ok': True, 'meta': public_meta, 'users_count': users_count, 'time': int(time.time())})
                 if sub == 'users/list':
                     # BUGFIX #10: 商城节点对账用, 列出所有动态用户 (脱敏不返回 password)
