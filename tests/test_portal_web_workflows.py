@@ -2378,6 +2378,20 @@ class WebWorkflowTests(unittest.TestCase):
                 self.assertEqual(status, 200, payload)
                 self.assertEqual(calls[-1], ['systemctl', action, 'amneziawg-server'])
 
+    def test_user_extra_links_cover_enabled_protocols_and_skip_failures(self):
+        """分享页与管理弹窗共用的附加直链：只列已启用的协议，生成失败的一项跳过（2026-11-13）。"""
+        def broken(*args, **kwargs):
+            raise ValueError('bad vmess config')
+        self.ns.update(
+            _active_reality_config=lambda: {'port': 443}, _active_vmess_config=lambda: {'port': 2087},
+            _active_vlessenc_config=lambda: None, _active_anytls_config=lambda: None,
+            _active_tuic_config=lambda: None, _served_singbox_config=lambda cfg, service: cfg,
+            ANYTLS_SERVICE='hy2-anytls', TUIC_SERVICE='hy2-tuic',
+            reality_uri_for_user=lambda cfg, uid, ip, label=None: 'vless://%s@%s#%s' % (uid, ip, label),
+            vmess_uri_for_user=broken)
+        links = extract_method('_user_extra_links', self.ns)(self.handler, 'alice', '1.2.3.4')
+        self.assertEqual(links, [('Reality', 'vless://alice@1.2.3.4#Reality-alice')])
+
 
     def test_awg_peer_delete_extends_its_deadline(self):
         """peer_del 排队等 AWG 锁时不能被 30 秒死线掐断（2026-11-04 修）。"""

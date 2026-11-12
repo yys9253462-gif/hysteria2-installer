@@ -3294,6 +3294,16 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       // 与客户分享页一致也给 sing-box 订阅（2026-11-13 加）：接口一直回着 sing_box，旧弹窗只用了
       // Clash 那份，用 sing-box / Hiddify 的客户只能让管理员另开分享页去找。
       const singSubPath = '/' + token + '/u/' + encodeURIComponent(uid) + '/sing-box.json?k=' + userKey;
+      // 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）：UDP 不通的客户要靠 Reality / VMess
+      // 等 TCP 协议兜底，旧弹窗只有 Hy2 一条，管理员只能另开分享页去找。
+      const extraLinksHtml = (Array.isArray(json.extra_links) ? json.extra_links : [])
+        .filter(x => x && typeof x.uri === 'string' && x.uri)
+        .map((x, i) => `
+            <div>
+              <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">${obEsc(x.label)} 直链（UDP 不通时用）:</div>
+              <textarea id="um-extra-${i}" class="link" style="height:52px;font-size:11px" readonly>${obEsc(x.uri)}</textarea>
+              <div style="margin-top:6px"><button class="button" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-extra-${i}">复制 ${obEsc(x.label)} 直链</button></div>
+            </div>`).join('');
       
       // 统一用 fmtBytes：旧写法把已用强制成 MB、配额强制成 GB，
       // 小配额（如 500 MB）会显示成「0.5 GB」，大用量则是「1536.0 MB」。
@@ -3345,6 +3355,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
                 <button class="button primary" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-uri">复制直链</button>
               </div>
             </div>
+            ${extraLinksHtml}
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Clash / Mihomo 专属订阅链接:</div>
               <div class="input-with-action">

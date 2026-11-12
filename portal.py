@@ -14300,24 +14300,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     _insecure, server_name, _pub_clean, host = clean_node_identity(m)
                     listen_port = m.get('listen_port', 19984)
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
-                    # 其它已启用协议的直链，与 users/create 的回包同一组生成器（2026-11-04 加）
-                    _pub = _pub_clean
-                    _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
-                    _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
-                    _t = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
-                    extra = []
-                    for _label, _make in (
-                            ('Reality', lambda: reality_uri_for_user(_r, target_uid, _pub, label=f"Reality-{target_uid}") if _r else ''),
-                            ('VMess', lambda: vmess_uri_for_user(_v, target_uid, _pub, label=f"VMess-{target_uid}") if _v else ''),
-                            ('VLESS-Enc', lambda: vlessenc_uri_for_user(_e, target_uid, _pub, label=f"VLESS-Enc-{target_uid}") if _e else ''),
-                            ('AnyTLS', lambda: anytls_uri_for_user(_a, target_uid, label=f"AnyTLS-{target_uid}") if _a else ''),
-                            ('TUIC', lambda: tuic_uri_for_user(_t, target_uid, label=f"TUIC-{target_uid}") if _t else '')):
-                        try:
-                            extra.append((_label, _make()))
-                        except Exception as exc:
-                            _log_ignored('share_extra_uri', exc)
                     page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0],
-                                          extra_links=extra)
+                                          extra_links=self._user_extra_links(target_uid, _pub_clean))
                     return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
                 else:
                     return self.reply(404, b'Not found')
@@ -14412,6 +14396,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'user_id': target_uid,
                     'note': u_copy.get('note', ''),
                     'uri': uri,
+                    # 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）
+                    'extra_links': [{'label': label, 'uri': link} for label, link
+                                    in self._user_extra_links(target_uid, clean_node_identity(m)[2])],
                     'clash': clash_yaml,
                     'sing_box': sing_json,
                     'qr_svg': qr_svg,
@@ -14566,6 +14553,31 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 raw_content = data.get(key)
                 content = raw_content.encode() if isinstance(raw_content, str) else b''
             self.reply(200, content, mime)
+
+        def _user_extra_links(self, user_id, public_ip):
+            """该用户在其它已启用协议上的直链 [(名称, 直链)]，与 users/create 的回包同一组生成器。
+
+            分享页（2026-11-04 加）与管理员的「专属连接」弹窗（2026-11-13 加）共用：UDP 被封的
+            网络要靠 Reality / VMess 等 TCP 协议兜底。生成失败的一项只跳过、不影响其它。
+            """
+            _r, _v, _e = _active_reality_config(), _active_vmess_config(), _active_vlessenc_config()
+            _a = _served_singbox_config(_active_anytls_config(), ANYTLS_SERVICE)
+            _t = _served_singbox_config(_active_tuic_config(), TUIC_SERVICE)
+            links = []
+            for label, make in (
+                    ('Reality', lambda: reality_uri_for_user(_r, user_id, public_ip, label=f"Reality-{user_id}") if _r else ''),
+                    ('VMess', lambda: vmess_uri_for_user(_v, user_id, public_ip, label=f"VMess-{user_id}") if _v else ''),
+                    ('VLESS-Enc', lambda: vlessenc_uri_for_user(_e, user_id, public_ip, label=f"VLESS-Enc-{user_id}") if _e else ''),
+                    ('AnyTLS', lambda: anytls_uri_for_user(_a, user_id, label=f"AnyTLS-{user_id}") if _a else ''),
+                    ('TUIC', lambda: tuic_uri_for_user(_t, user_id, label=f"TUIC-{user_id}") if _t else '')):
+                try:
+                    link = make()
+                except Exception as exc:
+                    _log_ignored('share_extra_uri', exc)
+                    continue
+                if isinstance(link, str) and link:
+                    links.append((label, link))
+            return links
 
         def _render_index_page(self):
             """渲染首页 HTML（不落盘，portal.json 只存摘要）。
