@@ -792,6 +792,16 @@ async function delWarpRule(domain) {
   }
 }
 
+// 状态查询失败时徽章不能停在「检测中...」（2026-11-12 修，各卡片统一走这里）：旧实现
+// 接口报错、回 ok:false 或网络中断时直接 return，分不清是查询失败还是仍在加载。
+function markStatusUnknown(badge, detail) {
+  if (!badge) return;
+  badge.textContent = '● 状态未知（请求失败）';
+  badge.title = detail || '';
+  badge.style.background = '#f1efe8';
+  badge.style.color = '#5f5e5a';
+}
+
 // 只认最新一次请求（2026-11-04 修，与 VMess 卡片同一做法）：轮询回包比开关后的状态查询
 // 晚到时会把卡片刷回切换之前的状态，管理员再点一次就切反了。
 let warpStatusSeq = 0;
@@ -800,10 +810,10 @@ async function checkWarpStatus() {
   const seq = ++warpStatusSeq;
   try {
     const res = await fetch(location.pathname + 'warp-status', { credentials: 'same-origin' });
-    if (!res.ok) return;
+    if (!res.ok) { if (seq === warpStatusSeq) markStatusUnknown(warpBadge); return; }
     const json = await res.json();
     if (seq !== warpStatusSeq) return;
-    if (!json.ok) return;
+    if (!json.ok) { markStatusUnknown(warpBadge, json.error); return; }
 
     if (btnInstallWarp) {
       if (!json.installed) {
@@ -850,7 +860,7 @@ async function checkWarpStatus() {
     if (Array.isArray(json.rules)) {
       renderWarpRules(json.rules, json.enabled && json.applied && !json.overridden);
     }
-  } catch (_) {}
+  } catch (_) { if (seq === warpStatusSeq) markStatusUnknown(warpBadge); }
 }
 
 if (btnToggleWarp) {
@@ -932,12 +942,14 @@ if (btnResetWarpRules) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=reset_rules'
       });
-      const json = await res.json();
-      if (json.ok && Array.isArray(json.rules)) {
-        renderWarpRules(json.rules);
-      }
+      // 失败要说出来（2026-11-12 修）：旧实现只处理成功，保存 / 应用失败回 ok:false 时
+      // 点了「重置」毫无反应；也没刷新状态，WARP 生效中仍显示「N 个已配置」。
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || !json.ok) throw new Error(json.error || ('HTTP ' + res.status));
+      if (Array.isArray(json.rules)) renderWarpRules(json.rules);
+      await checkWarpStatus();
     } catch (e) {
-      alert('请求异常: ' + e.message);
+      alert('重置失败: ' + e.message);
     }
   });
 }
@@ -1599,10 +1611,10 @@ async function checkRealityStatus() {
   const seq = ++realityStatusSeq;
   try {
     const res = await fetch(location.pathname + 'reality-status', { credentials: 'same-origin' });
-    if (!res.ok) return;
+    if (!res.ok) { if (seq === realityStatusSeq) markStatusUnknown(realityBadge); return; }
     const json = await res.json();
     if (seq !== realityStatusSeq) return;
-    if (!json.ok) return;
+    if (!json.ok) { markStatusUnknown(realityBadge, json.error); return; }
     const portTag = document.getElementById('reality-port-tag');
     if (portTag) portTag.textContent = 'TCP ' + (json.config?.port || '--');
 
@@ -1647,7 +1659,7 @@ async function checkRealityStatus() {
       if (realityPubkeyVal) realityPubkeyVal.textContent = cfg.pub_key || '-';
       if (realityFlowVal) realityFlowVal.textContent = (cfg.short_id || '') + ' · ' + (cfg.flow || 'xtls-rprx-vision');
     }
-  } catch (_) {}
+  } catch (_) { if (seq === realityStatusSeq) markStatusUnknown(realityBadge); }
 }
 
 if (btnToggleReality) {
@@ -1757,10 +1769,10 @@ async function checkVmessStatus() {
   const seq = ++vmessStatusSeq;
   try {
     const res = await fetch(location.pathname + 'vmess-status', { credentials: 'same-origin' });
-    if (!res.ok) { if (seq === vmessStatusSeq) vmessBadge.textContent = '● 状态未知（请求失败）'; return; }
+    if (!res.ok) { if (seq === vmessStatusSeq) markStatusUnknown(vmessBadge); return; }
     const json = await res.json();
     if (seq !== vmessStatusSeq) return;   // 已有更新的请求，丢弃本次结果
-    if (!json.ok) return;
+    if (!json.ok) { markStatusUnknown(vmessBadge, json.error); return; }
     if (!json.installed) {
       // 没有 Xray 核心时不能显示「已关闭」—— 那会让人以为点一下就能开。
       vmessBadge.textContent = '● 未安装 Xray 核心';
@@ -1798,7 +1810,7 @@ async function checkVmessStatus() {
       btnToggleVmess.className = 'toggle-btn off';
       if (vmessContentBox) vmessContentBox.style.display = 'none';
     }
-  } catch (_) {}
+  } catch (_) { if (seq === vmessStatusSeq) markStatusUnknown(vmessBadge); }
 }
 
 if (btnToggleVmess) {
@@ -1861,10 +1873,10 @@ async function checkVlessencStatus() {
   const seq = ++vlessencStatusSeq;
   try {
     const res = await fetch(location.pathname + 'vlessenc-status', { credentials: 'same-origin' });
-    if (!res.ok) { if (seq === vlessencStatusSeq) vlessencBadge.textContent = '● 状态未知（请求失败）'; return; }
+    if (!res.ok) { if (seq === vlessencStatusSeq) markStatusUnknown(vlessencBadge); return; }
     const json = await res.json();
     if (seq !== vlessencStatusSeq) return;
-    if (!json.ok) return;
+    if (!json.ok) { markStatusUnknown(vlessencBadge, json.error); return; }
     if (!json.installed) {
       vlessencBadge.textContent = '● 未安装 Xray 核心';
       const gotoVlessenc = document.getElementById('vlessenc-goto-cores');
@@ -1901,7 +1913,7 @@ async function checkVlessencStatus() {
       btnToggleVlessenc.className = 'toggle-btn off';
       if (vlessencContentBox) vlessencContentBox.style.display = 'none';
     }
-  } catch (_) {}
+  } catch (_) { if (seq === vlessencStatusSeq) markStatusUnknown(vlessencBadge); }
 }
 
 if (btnToggleVlessenc) {
@@ -1959,9 +1971,10 @@ async function checkAnytlsStatus() {
   const seq = ++anytlsStatusSeq;
   try {
     const res = await fetch(location.pathname + 'anytls-status', { credentials: 'same-origin' });
-    if (!res.ok) { if (seq === anytlsStatusSeq) anytlsBadge.textContent = '● 状态未知（请求失败）'; return; }
+    if (!res.ok) { if (seq === anytlsStatusSeq) markStatusUnknown(anytlsBadge); return; }
     const json = await res.json();
-    if (seq !== anytlsStatusSeq || !json.ok) return;
+    if (seq !== anytlsStatusSeq) return;
+    if (!json.ok) { markStatusUnknown(anytlsBadge, json.error); return; }
     const gotoAnytls = document.getElementById('anytls-goto-cores');
     if (!json.installed) {
       setAnytlsBadge('● 未安装 sing-box 核心', '#fff1f0', '#cf3c3c');
@@ -1996,7 +2009,7 @@ async function checkAnytlsStatus() {
       btnToggleAnytls.className = json.enabled ? 'toggle-btn on' : 'toggle-btn off';
       if (anytlsContentBox) anytlsContentBox.style.display = 'none';
     }
-  } catch (_) {}
+  } catch (_) { if (seq === anytlsStatusSeq) markStatusUnknown(anytlsBadge); }
 }
 
 if (btnToggleAnytls) {
@@ -2054,9 +2067,10 @@ async function checkTuicStatus() {
   const seq = ++tuicStatusSeq;
   try {
     const res = await fetch(location.pathname + 'tuic-status', { credentials: 'same-origin' });
-    if (!res.ok) { if (seq === tuicStatusSeq) tuicBadge.textContent = '● 状态未知（请求失败）'; return; }
+    if (!res.ok) { if (seq === tuicStatusSeq) markStatusUnknown(tuicBadge); return; }
     const json = await res.json();
-    if (seq !== tuicStatusSeq || !json.ok) return;
+    if (seq !== tuicStatusSeq) return;
+    if (!json.ok) { markStatusUnknown(tuicBadge, json.error); return; }
     const gotoTuic = document.getElementById('tuic-goto-cores');
     if (!json.installed) {
       setTuicBadge('● 未安装 sing-box 核心', '#fff1f0', '#cf3c3c');
@@ -2091,7 +2105,7 @@ async function checkTuicStatus() {
       btnToggleTuic.className = json.enabled ? 'toggle-btn on' : 'toggle-btn off';
       if (tuicContentBox) tuicContentBox.style.display = 'none';
     }
-  } catch (_) {}
+  } catch (_) { if (seq === tuicStatusSeq) markStatusUnknown(tuicBadge); }
 }
 
 if (btnToggleTuic) {
@@ -2142,9 +2156,9 @@ async function checkBbrStatus() {
   if (!bbrBadge) return;
   try {
     const res = await fetch(location.pathname + 'bbr-status', { credentials: 'same-origin' });
-    if (!res.ok) return;
+    if (!res.ok) { markStatusUnknown(bbrBadge); return; }
     const json = await res.json();
-    if (!json.ok) return;
+    if (!json.ok) { markStatusUnknown(bbrBadge, json.error); return; }
 
     if (Array.isArray(json.available)) document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
       const algo = {v1:'bbr',v2:'bbr2',v3:'bbr3'}[btn.dataset.version];
@@ -2184,7 +2198,7 @@ async function checkBbrStatus() {
         btnRebootServer.style.display = 'none';
       }
     }
-  } catch (_) {}
+  } catch (_) { markStatusUnknown(bbrBadge); }
 }
 
 // ---------------------------------------------------------------------------
@@ -2986,9 +3000,9 @@ async function loadProxyServices() {
   if (!proxyTbody) return;
   try {
     const res = await fetch(location.pathname + 'proxy-services', { credentials: 'same-origin' });
-    if (!res.ok) return;
+    if (!res.ok) { markStatusUnknown(gostBadge); return; }
     const json = await res.json();
-    if (!json.ok) return;
+    if (!json.ok) { markStatusUnknown(gostBadge, json.error); return; }
 
     if (gostBadge) {
       if (!json.gost_installed) {
@@ -3063,7 +3077,7 @@ async function loadProxyServices() {
         } finally { btn.disabled = false; }
       });
     });
-  } catch (_) {}
+  } catch (_) { markStatusUnknown(gostBadge); }
 }
 
 // proxyForm replaced with instant buttons
@@ -3246,9 +3260,9 @@ async function loadAwgState() {
   if (!awgBadge) return;
   try {
     const res = await fetch(location.pathname + 'awg-state', { credentials: 'same-origin' });
-    if (!res.ok) return;
+    if (!res.ok) { markStatusUnknown(awgBadge); return; }
     const json = await res.json();
-    if (!json.ok) return;
+    if (!json.ok) { markStatusUnknown(awgBadge, json.error); return; }
 
     awgCurrentEndpoint = json.endpoint || '';
     awgCurrentLine = json.line || '3';
@@ -3281,7 +3295,7 @@ async function loadAwgState() {
     if (awgPanel) awgPanel.style.display = 'block';
 
     renderAwgPeers(json.peers || []);
-  } catch (e) { /* 静默失败，不打扰主界面 */ }
+  } catch (e) { markStatusUnknown(awgBadge); }   // 不弹窗，只在徽章上标出查询失败
 }
 
 function renderAwgPeers(peers) {
