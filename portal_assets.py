@@ -3343,13 +3343,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       
       // 统一用 fmtBytes：旧写法把已用强制成 MB、配额强制成 GB，
       // 小配额（如 500 MB）会显示成「0.5 GB」，大用量则是「1536.0 MB」。
-      const fmtBytes = v => {
-        let n = Number(v || 0), i = 0;
-        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        // 取整后到 1024 也要进位（2026-11-04 修，同后端 format_bytes）：否则显示「1024.00 KB」
-        while ((n >= 1024 || (i && Number(n.toFixed(2)) >= 1024)) && i < units.length - 1) { n /= 1024; i++; }
-        return (i ? n.toFixed(2) : n.toFixed(0)) + ' ' + units[i];
-      };
+      // 与用户表、后端 format_bytes 同一写法（2026-11-13 修）：此前 KB 显示两位小数，
+      // 同一个用量在表格里是「1.5 KB」、弹窗里是「1.50 KB」。
+      const fmtBytes = v => fmtUnits(v, ['B', 'KB', 'MB', 'GB', 'TB'], [0, 1, 2, 2, 2]);
       let trafficText = (json.traffic_limit > 0)
         ? (fmtBytes(json.traffic_used) + ' / ' + fmtBytes(json.traffic_limit))
         : (fmtBytes(json.traffic_used) + ' (不限)');
