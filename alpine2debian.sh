@@ -129,6 +129,15 @@ if [ -z "$SECURITY_MIRROR" ]; then
     esac
 fi
 
+# 提示里的版本跟着 --suite 走（2026-11-13 修）：旧实现写死 Debian 12，换成 trixie 时清盘确认
+# 说「安装 Debian 12（trixie）」，装完的核验说明还让人去对 bookworm，像是装错了。
+case "$DEBIAN_SUITE" in
+    bullseye) DEBIAN_LABEL="Debian GNU/Linux 11 (bullseye)" ;;
+    bookworm) DEBIAN_LABEL="Debian GNU/Linux 12 (bookworm)" ;;
+    trixie)   DEBIAN_LABEL="Debian GNU/Linux 13 (trixie)" ;;
+    *)        DEBIAN_LABEL="Debian GNU/Linux（${DEBIAN_SUITE}）" ;;
+esac
+
 # ── 第 1 步：环境检查 ────────────────────────────────────────────────────
 info "第 1/9 步：检查运行环境"
 
@@ -157,7 +166,7 @@ DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/
 if [ "$DISK_SIZE_MB" -gt 0 ]; then
     ok "磁盘容量：约 ${DISK_SIZE_MB} MB"
     if [ "$DISK_SIZE_MB" -lt 1500 ]; then
-        warn "磁盘小于 1.5GB，Debian 12 最小化可能装不下（官方建议 8GB+，勉强可跑约需 1GB）"
+        warn "磁盘小于 1.5GB，${DEBIAN_LABEL} 最小化可能装不下（官方建议 8GB+，勉强可跑约需 1GB）"
     fi
 fi
 
@@ -241,7 +250,7 @@ info "（这三个值会写进新系统的网络配置，务必记下）"
 
 # ── 确认执行 ─────────────────────────────────────────────────────────────
 printf '\n'
-warn "即将清空磁盘 ${DISK} 并安装 Debian 12（$DEBIAN_SUITE）"
+warn "即将清空磁盘 ${DISK} 并安装 ${DEBIAN_LABEL}"
 warn "磁盘上所有数据都会丢失，且不可恢复"
 printf '\n'
 if [ "$ASSUME_YES" != "1" ] && [ "$DRY_RUN" != "1" ]; then
@@ -768,7 +777,7 @@ info "接下来："
 printf '    1. 执行 reboot 重启\n'
 printf '    2. 等待 3~5 分钟\n'
 printf '    3. 用新密码 SSH 登录：ssh root@<公网IP>\n'
-printf '    4. 验证：cat /etc/os-release  应显示 Debian GNU/Linux 12 (bookworm)\n'
+printf '    4. 验证：cat /etc/os-release  应显示 %s\n' "$DEBIAN_LABEL"
 printf '\n'
 
 if [ "$DRY_RUN" = "1" ]; then
