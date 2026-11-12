@@ -2228,13 +2228,19 @@ const bbrKernelText = document.getElementById('bbr-kernel-text');
 const bbrRebootTip = document.getElementById('bbr-reboot-tip');
 const btnRebootServer = document.getElementById('btn-reboot-server');
 
+// 「当前内核拥塞控制」同样不能停在「读取中...」（2026-11-12 修，徽章已有 markStatusUnknown）。
+function markBbrFailed(detail) {
+  markStatusUnknown(bbrBadge, detail);
+  if (bbrCurrentText && /读取中/.test(bbrCurrentText.textContent || '')) bbrCurrentText.textContent = '读取失败';
+}
+
 async function checkBbrStatus() {
   if (!bbrBadge) return;
   try {
     const res = await fetch(location.pathname + 'bbr-status', { credentials: 'same-origin' });
-    if (!res.ok) { markStatusUnknown(bbrBadge); return; }
+    if (!res.ok) { markBbrFailed(); return; }
     const json = await res.json();
-    if (!json.ok) { markStatusUnknown(bbrBadge, json.error); return; }
+    if (!json.ok) { markBbrFailed(json.error); return; }
 
     if (Array.isArray(json.available)) document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
       const algo = {v1:'bbr',v2:'bbr2',v3:'bbr3'}[btn.dataset.version];
@@ -2274,7 +2280,7 @@ async function checkBbrStatus() {
         btnRebootServer.style.display = 'none';
       }
     }
-  } catch (_) { markStatusUnknown(bbrBadge); }
+  } catch (_) { markBbrFailed(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -2795,13 +2801,21 @@ function fmtVer(current, latest, hasUpdate, installed) {
   return current + '（最新）';
 }
 
+// 检测失败时版本栏不能停在「检测中...」（2026-11-12 修）：旧实现接口报错、回 ok:false 或网络中断时
+// 直接 return，三栏一直像是还在查。已经显示过的结果不被之后某次失败覆盖。
+function markVersionsUnknown() {
+  [coreVerDisplay, portalVerDisplay, awgVerDisplay].forEach(el => {
+    if (el && /检测中/.test(el.textContent || '')) el.textContent = '检测失败（可点「重新检测」重试）';
+  });
+}
+
 async function checkVersions(force = false) {
   if (!coreVerDisplay || !portalVerDisplay) return;
   try {
     const res = await fetch(location.pathname + 'check-version' + (force ? '?force=1' : ''), { credentials: 'same-origin' });
-    if (!res.ok) return false;
+    if (!res.ok) { markVersionsUnknown(); return false; }
     const json = await res.json();
-    if (!json.ok) return false;
+    if (!json.ok) { markVersionsUnknown(); return false; }
 
     // 核心展示
     coreVerDisplay.textContent = fmtVer(json.core_current, json.core_latest, json.core_has_update, true);
@@ -2828,7 +2842,7 @@ async function checkVersions(force = false) {
       }
     }
     return true;
-  } catch (_) { return false; }
+  } catch (_) { markVersionsUnknown(); return false; }
 }
 
 async function waitForCoreUpgrade() {
