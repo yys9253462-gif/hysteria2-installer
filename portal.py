@@ -10488,13 +10488,21 @@ if __name__ == '__main__':
                             # max(None, int) 会抛 TypeError，而这里在锁内、无兜底，
                             # 连接会被直接掐断（2026-10-29 修）。
                             try:
-                                base_time = max(int(u.get('expires_at') or 0), now_ts)
-                                new_expiry = int(base_time) + days * 86400
+                                # 永久账号（未设到期）续费只加流量（2026-11-12 修，与下面不限量同理）：
+                                # 旧实现 int(None or 0) 当成早已过期，写成「今天 + N 天」，extend_days
+                                # 缺省 30 —— 商城只想加流量时，永久用户被悄悄改成 30 天后停。
+                                raw_expiry = u.get('expires_at')
+                                if raw_expiry is None:
+                                    new_expiry = None
+                                else:
+                                    base_time = max(int(raw_expiry), now_ts)
+                                    new_expiry = int(base_time) + days * 86400
                                 # limit_bytes=0 表示不限量：加流量不能把它变成「只有本次加的量」，
                                 # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
                                 old_limit = int(u.get('limit_bytes', 0))
                                 new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
-                                if not 0 <= new_expiry <= 253402300799 or not 0 <= new_limit <= 2**63 - 1:
+                                if ((new_expiry is not None and not 0 <= new_expiry <= 253402300799)
+                                        or not 0 <= new_limit <= 2**63 - 1):
                                     raise ValueError()
                             except (ValueError, TypeError, OverflowError):
                                 conflict = (400, 'Renewal exceeds supported limits')
