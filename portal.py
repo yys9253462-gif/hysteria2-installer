@@ -7818,7 +7818,8 @@ def ensure_portal_access(root, meta, data):
         except (OSError, ValueError):
             pass
     username = secrets.token_hex(8)
-    password = secrets.token_urlsafe(18)
+    # 与首次安装（prepare）同样 256 位（2026-11-13 修）：旧实现重建时只有 144 位，README 写的是 256 位。
+    password = secrets.token_urlsafe(32)
     auth = base64.b64encode(f'{username}:{password}'.encode())
     data['auth_hash'] = hashlib.sha256(auth).hexdigest()
     host = meta['public_ip'] if meta.get('is_insecure') else meta.get('server_name', 'localhost')
