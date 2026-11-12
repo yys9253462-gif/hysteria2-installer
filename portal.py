@@ -11987,7 +11987,7 @@ if __name__ == '__main__':
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
 
-                if action == 'toggle':
+                if action in ('toggle', 'enable', 'disable'):
                     # 🔴 只动 Reality 自己的入站（2026-10-24 修）。
                     # 旧实现用 `systemctl stop xray` 关闭 Reality —— 那会把
                     # 同一进程里的 VMess / VLESS Encryption 一起停掉；
@@ -12002,9 +12002,17 @@ if __name__ == '__main__':
                         return self.reply_json(500, {'ok': False, 'error':
                             'xray.json 不是合法 JSON，未做任何修改'})
                     reality_on = bool(cfg_now) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)
+                    # 也接受明确的 enable / disable（2026-11-13 加，与 VMess 等协议一致）：调用方按自己看到的
+                    # 状态下指令，状态已经符合时什么都不动。页面停留久了或在别处改过时，toggle 会把「想开」变成关掉。
+                    if action == 'toggle':
+                        action = 'disable' if reality_on else 'enable'
+                    if action == 'disable' and not reality_on:
+                        return self.reply_json(200, {'ok': True, 'active': False, 'message': 'Reality 本来就没有启用'})
+                    if action == 'enable' and reality_on:
+                        return self.reply_json(200, {'ok': True, 'active': True, 'message': 'Reality 已经开启'})
                     with data_lock:
                         old_reality_port = _valid_port(config_section(data, 'reality_config').get('port')) or 0
-                    if reality_on:
+                    if action == 'disable':
                         with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                             try:
                                 current = json.loads(xray_path.read_text(encoding='utf-8'))

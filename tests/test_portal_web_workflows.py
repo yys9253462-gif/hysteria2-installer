@@ -448,6 +448,31 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.handler._generate_and_apply_reality.assert_called_once()
 
+    def test_reality_accepts_explicit_enable_and_disable(self):
+        """manage-reality 也接受明确的 enable / disable（2026-11-13 修，与 VMess 等一致）：状态已经符合时
+        什么都不动；只有 toggle 时，页面停留久了或在别处改过，「想开」会变成关掉。"""
+        apply = Mock()
+        self.ns.update(has_managed_inbound=portal.has_managed_inbound,
+                       REALITY_INBOUND_TAG=portal.REALITY_INBOUND_TAG, apply_xray_config_transaction=apply)
+        self.handler._generate_and_apply_reality = Mock()
+        xray = self.hdir / 'xray.json'
+        xray.write_text('{"inbounds": []}', encoding='utf-8')
+        status, body = self.invoke('_h_post_manage_reality', {'action': 'disable'})
+        self.assertEqual(status, 200, body)
+        self.assertIs(body['active'], False)
+        xray.write_text(json.dumps({'inbounds': [
+            {'tag': portal.REALITY_INBOUND_TAG, 'protocol': 'vless', 'port': 8444}]}), encoding='utf-8')
+        status, body = self.invoke('_h_post_manage_reality', {'action': 'enable'})
+        self.assertEqual(status, 200, body)
+        self.assertIs(body['active'], True)
+        apply.assert_not_called()
+        self.handler._generate_and_apply_reality.assert_not_called()
+        # 状态不符时照常执行：开着时 disable 会移除 Reality 入站。
+        self.invoke('_h_post_manage_reality', {'action': 'disable'})
+        apply.assert_called_once()
+        self.assertNotIn(portal.REALITY_INBOUND_TAG,
+                         [i.get('tag') for i in apply.call_args[0][0].get('inbounds', [])])
+
     def test_reality_keygen_failure_never_uses_a_shared_static_key(self):
         self.run.return_value = SimpleNamespace(returncode=1, stdout='', stderr='keygen failed')
         generate = extract_method('_generate_and_apply_reality', self.ns)
