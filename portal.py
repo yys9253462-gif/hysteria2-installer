@@ -8168,6 +8168,9 @@ def serve(path):
     # 上一次成功收回时的「被封禁用户集合」。过期用户不会从 data 里移走，
     # 不记这个的话 worker 每 5 秒都会重做一遍收回（查 /online、比对 xray）。
     last_enforced_blocked = None
+    # 上一次收回失败的（原因, 打印时刻）：收回确认不了时 worker 每 5 秒重试一次，
+    # 同一原因只在首次和此后每小时打一行，不然 journald 里每 5 秒一条且只有异常类名。
+    last_enforce_error = ('', 0.0)
 
     def blocked_user_ids():
         # users 容器损坏时按空表处理：这里每 5 秒被撤销 worker 调用一次，
@@ -8181,7 +8184,7 @@ def serve(path):
         # 收回期间（最长 4s 查询 + 12s 重启）会卡住所有 Hy2 新连接的鉴权。
         # 快照过期也安全：账号变更后调用方会再调 apply_access，被 access_apply_lock
         # 排在本轮之后，用新快照重新生效。
-        nonlocal last_enforced_blocked
+        nonlocal last_enforced_blocked, last_enforce_error
         with access_apply_lock:
             with data_lock:
                 pending=pending_revocations(data) | set(force_ids)
@@ -8198,9 +8201,17 @@ def serve(path):
                                     skip_anytls=False, skip_tuic=False)
             except Exception as exc:
                 with data_lock:
-                    data['_pending_revocations']=sorted(pending_revocations(data) | pending)
-                    save_data()
-                print('[expiry] access enforcement failed: '+type(exc).__name__,file=sys.stderr)
+                    queued = sorted(pending_revocations(data) | pending)
+                    # 队列没变就不重写：旧实现每次失败都整份重写 portal.json 并 fsync，
+                    # 只有到期用户、队列为空时也写一个空列表，等于每 5 秒落盘一次（2026-11-12 修）。
+                    if queued and data.get('_pending_revocations') != queued:
+                        data['_pending_revocations'] = queued
+                        save_data()
+                reason = type(exc).__name__ + ': ' + ' '.join(str(exc).split())[:300]
+                now = time.monotonic()
+                if reason != last_enforce_error[0] or now - last_enforce_error[1] >= 3600:
+                    print('[expiry] access enforcement failed: ' + reason, file=sys.stderr)
+                    last_enforce_error = (reason, now)
                 return False
             finally:
                 if acquired_core_lock:
@@ -8228,6 +8239,9 @@ def serve(path):
                     pass
                 return False
             last_enforced_blocked=blocked
+            if last_enforce_error[0]:
+                print('[expiry] access enforcement recovered', file=sys.stderr)
+                last_enforce_error = ('', 0.0)
             return True
     def expiry_access_worker():
         while True:

@@ -1641,7 +1641,8 @@ class WebWorkflowTests(unittest.TestCase):
                   enforce_node_access=Mock(return_value=True),
                   save_data=Mock(side_effect=[OSError('disk full'), None]),
                   core_lock_fd=None, portal_path=self.hdir / 'portal.json')
-        wrapper = ast.parse('def outer():\n    last_enforced_blocked = None\n    def apply_access(force_ids=(), core_lock_fd=None):\n        pass\n    return apply_access')
+        wrapper = ast.parse('def outer():\n    last_enforced_blocked = None\n    last_enforce_error = ("", 0.0)\n'
+                            '    def apply_access(force_ids=(), core_lock_fd=None):\n        pass\n    return apply_access')
         wrapper_fn = wrapper.body[0]
         inner = next(n for n in ast.walk(wrapper_fn)
                      if isinstance(n, ast.FunctionDef) and n.name == 'apply_access')
