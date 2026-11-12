@@ -12407,6 +12407,15 @@ if __name__ == '__main__':
                     return 'none'
                 return _systemd_state(unit) or 'unknown'
 
+            def combined_state(units):
+                # sing-box 一个核心承载 AnyTLS / TUIC 两个单元（2026-11-12 修）：旧实现只看
+                # hy2-anytls，只开 TUIC 时卡片显示「无服务」。有一个失败就报失败，最需要人处理。
+                states = [state_of(u) for u in units]
+                for wanted in ('failed', 'activating', 'active', 'inactive', 'unknown'):
+                    if wanted in states:
+                        return wanted
+                return next((s for s in states if s != 'none'), 'none')
+
             singbox = _singbox_version()
             cores = [
                 {'id': 'hysteria', 'name': 'Hysteria 2', 'used_by': ['Hysteria 2 主协议'],
@@ -12418,7 +12427,8 @@ if __name__ == '__main__':
                  'service': 'xray', 'installable': True, 'manage': 'reality/reality-node'},
                 {'id': 'sing-box', 'name': 'sing-box', 'used_by': ['AnyTLS', 'TUIC'],
                  'version': '.'.join(map(str, singbox)) if singbox else '',
-                 'service': ANYTLS_SERVICE, 'installable': True, 'manage': 'reality/anytls'},
+                 'service': '%s / %s' % (ANYTLS_SERVICE, TUIC_SERVICE),
+                 'units': [ANYTLS_SERVICE, TUIC_SERVICE], 'installable': True, 'manage': 'reality/anytls'},
                 {'id': 'gost', 'name': 'GOST', 'used_by': ['SOCKS5 / HTTP 入站代理'],
                  'version': version_of('/usr/local/bin/gost', ['-V'], r'gost\s+v?([\w.\-]+)'),
                  'service': 'gost', 'installable': False, 'manage': 'proxies/ingress',
@@ -12434,7 +12444,7 @@ if __name__ == '__main__':
             ]
             for core in cores:
                 core['installed'] = bool(core['version'])
-                core['state'] = state_of(core['service'])
+                core['state'] = combined_state(core.pop('units', None) or [core['service']])
             return self.reply_json(200, {'ok': True, 'cores': cores})
 
         def _h_post_install_core(self, prefix):
