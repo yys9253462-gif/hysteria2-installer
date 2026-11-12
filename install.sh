@@ -1719,8 +1719,9 @@ EOF
 #   **完全不碰任何端口**，因此与端口占用彻底解耦。
 #
 # 代价：需要 DNS 服务商的 API 凭据。凭据从环境变量读，不落仓库：
-#   HY2_CF_TOKEN + HY2_CF_EMAIL   （Cloudflare）
-#   HY2_ALICLOUD_KEY              （阿里云）
+#   HY2_CF_TOKEN                  （Cloudflare API Token，推荐；邮箱可不填）
+#   HY2_CF_KEY + HY2_CF_EMAIL     （Cloudflare Global API Key）
+#   HY2_ALICLOUD_KEY + HY2_ALICLOUD_SECRET（阿里云）
 #   HY2_DP_TOKEN                  （DuckDNS，交给 acme.sh 的 DuckDNS_Token）
 # 拿不到凭据就明确告诉用户怎么办，而不是静默退回自签。
 setup_cert_via_dns_api() {
@@ -1737,10 +1738,20 @@ setup_cert_via_dns_api() {
     #      把「没有凭据」误报成「acme.sh 安装失败」——
     #      用户会去查网络/目录权限，而真正该做的是导出凭据。2026-10-08 实测命中。
     local provider="" prov_env=""
-    if [[ -n "${HY2_CF_TOKEN:-}" && -n "${HY2_CF_EMAIL:-}" ]]; then
-        provider="Cloudflare"; prov_env="HY2_CF_TOKEN + HY2_CF_EMAIL"
+    # Cloudflare 两种凭据分开认（2026-11-12 修）：API Token 不需要邮箱，旧实现却要求
+    # HY2_CF_EMAIL 才认 Cloudflare，只有 Token（官方推荐）的用户被当成「没有凭据」；
+    # Global API Key 要走 CF_Key + CF_Email，旧实现只能塞进 CF_Token，被当成 Bearer 认证失败。
+    if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
+        provider="Cloudflare"; prov_env="HY2_CF_TOKEN"
+    elif [[ -n "${HY2_CF_KEY:-}" && -n "${HY2_CF_EMAIL:-}" ]]; then
+        provider="Cloudflare"; prov_env="HY2_CF_KEY + HY2_CF_EMAIL"
     elif [[ -n "${HY2_ALICLOUD_KEY:-}" ]]; then
-        provider="阿里云";    prov_env="HY2_ALICLOUD_KEY"
+        # 缺 Secret 时直接说清楚，旧实现照样去签发，最后只报一句看不出原因的认证失败。
+        if [[ -z "${HY2_ALICLOUD_SECRET:-}" ]]; then
+            log_err "阿里云 DNS API 需要 HY2_ALICLOUD_KEY 与 HY2_ALICLOUD_SECRET 两项，缺 HY2_ALICLOUD_SECRET。"
+            return 1
+        fi
+        provider="阿里云";    prov_env="HY2_ALICLOUD_KEY + HY2_ALICLOUD_SECRET"
     elif [[ -n "${HY2_DP_TOKEN:-}" ]]; then
         provider="DuckDNS";   prov_env="HY2_DP_TOKEN"
     else
@@ -1762,11 +1773,16 @@ setup_cert_via_dns_api() {
         # 之类的参数，acme.sh 不认识，直接报 Unknown parameter 退出，DNS API 签发从未成功过。
         # DuckDNS 的插件是 dns_duckdns（旧实现写成了 DNSPod 的 dns_dp）。
         Cloudflare)
-            CF_Token="$HY2_CF_TOKEN" CF_Email="$HY2_CF_EMAIL" \
-                "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+            if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
+                CF_Token="$HY2_CF_TOKEN" CF_Email="${HY2_CF_EMAIL:-}" \
+                    "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+            else
+                CF_Key="$HY2_CF_KEY" CF_Email="$HY2_CF_EMAIL" \
+                    "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+            fi
             ;;
         阿里云)
-            Ali_Key="$HY2_ALICLOUD_KEY" Ali_Secret="${HY2_ALICLOUD_SECRET:-}" \
+            Ali_Key="$HY2_ALICLOUD_KEY" Ali_Secret="$HY2_ALICLOUD_SECRET" \
                 "$acct" --issue --dns dns_ali -d "$domain" || ok=1
             ;;
         DuckDNS)
@@ -1938,7 +1954,8 @@ setup_acme_certificate() {
             log_err " 借 Caddy 签发也未成功 → 剩下唯一自动可行的路是 DNS API。"
             log_err ""
             log_err " 三选一（按你的 DNS 服务商）："
-            log_err "   Cloudflare : export HY2_CF_TOKEN=xxx HY2_CF_EMAIL=xxx@yyy.com"
+            log_err "   Cloudflare : export HY2_CF_TOKEN=xxx                 （API Token，推荐）"
+            log_err "                或 export HY2_CF_KEY=xxx HY2_CF_EMAIL=xxx@yyy.com（Global API Key）"
             log_err "   阿里云     : export HY2_ALICLOUD_KEY=xxx HY2_ALICLOUD_SECRET=xxx"
             log_err "   DuckDNS    : export HY2_DP_TOKEN=xxx"
             log_err " 然后重新运行本脚本即可。"
