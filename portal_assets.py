@@ -3029,8 +3029,24 @@ const btnCopyPFmt = document.getElementById('btn-copy-pfmt');
 
 let curProxyServerHost = location.hostname;
 
+// 弹窗打开时把焦点放到关闭按钮、关闭后还回去（2026-11-13 修，同确认框）：旧实现焦点留在背后的
+// 触发按钮上，读屏与纯键盘用户不知道弹窗已经打开，关掉后焦点也丢了。
+let modalReturnFocus = null;
+function focusModal(closeBtn) {
+  if (modalReturnFocus === null) modalReturnFocus = document.activeElement || null;
+  if (closeBtn && typeof closeBtn.focus === 'function') closeBtn.focus();
+}
+function restoreModalFocus() {
+  const target = modalReturnFocus;
+  modalReturnFocus = null;
+  if (target && typeof target.focus === 'function') target.focus();
+}
+
 function closeProxyModal() {
-  if (proxyModal) proxyModal.classList.remove('show');
+  if (proxyModal && proxyModal.classList.contains('show')) {
+    proxyModal.classList.remove('show');
+    restoreModalFocus();
+  }
 }
 if (pmClose) pmClose.addEventListener('click', closeProxyModal);
 if (proxyModal) {
@@ -3084,6 +3100,7 @@ function showProxyResult(data) {
   });
 
   proxyModal.classList.add('show');
+  focusModal(pmClose);
 }
 
 // 绑定秒级一键生成按钮
@@ -3250,7 +3267,10 @@ async function loadProxyServices() {
 loadProxyServices();
 
 function closeUserModal() {
-  if (uModal) uModal.classList.remove('show');
+  if (uModal && uModal.classList.contains('show')) {
+    uModal.classList.remove('show');
+    restoreModalFocus();
+  }
 }
 // Esc 关闭专属连接 / 代理详情弹窗（2026-11-06 加）：确认框已支持 Esc，这两个此前只能点 × 或遮罩。
 // 确认框开着时它自己的 Esc 处理优先，这里不抢。
@@ -3290,6 +3310,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
     uModalSub.textContent = '正在获取专属配置与独立连接页...';
     uModalBody.innerHTML = '<div style="text-align:center;padding:36px;color:var(--muted)">加载专属数据中...</div>';
     uModal.classList.add('show');
+    focusModal(uModalClose);
     
     try {
       const res = await fetch('/' + token + '/user-config?user_id=' + encodeURIComponent(uid), { credentials: 'same-origin' });

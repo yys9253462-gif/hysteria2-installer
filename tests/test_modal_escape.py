@@ -20,6 +20,7 @@ globalThis.document = {
   querySelector: sel => (sel === '#custom-confirm-modal.show' && confirmModal.classList.contains('show')) ? confirmModal : null,
 };
 function closeProxyModal() { proxyModal.classList.remove('show'); }
+function restoreModalFocus() {}
 """
 
 

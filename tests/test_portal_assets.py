@@ -363,11 +363,19 @@ globalThis.fetch = async () => reply;
         start = script.index('let userModalSeq = 0;')
         end = script.index('\n});\n', start) + 5
         prelude = script[:script.index('// 全局高颜值 Promise 确认框与 Toast 机制')]
+        # 点击处理用到、却定义在 prelude 之后的公用函数（2026-11-13 起：焦点辅助与 fmtUnits，旧版本没有）
+        helpers = ''
+        if 'let modalReturnFocus = null;' in script:
+            h = script.index('let modalReturnFocus = null;')
+            helpers = script[h:script.index('\n}\n', script.index('function restoreModalFocus(', h)) + 3]
+        if 'function fmtUnits(' in script:
+            h = script.index('function fmtUnits(')
+            helpers += script[h:script.index('\n}\n', h) + 3]
         harness = r"""
 const assert = require('assert');
 const el = () => ({style: {}, textContent: '', innerHTML: '', dataset: {}, classList: {add(){}, remove(){}},
                    querySelectorAll: () => [], addEventListener(){}});
-const uModal = el(), uModalTitle = el(), uModalSub = el(), uModalBody = el();
+const uModal = el(), uModalTitle = el(), uModalSub = el(), uModalBody = el(), uModalClose = el();
 const handlers = {};
 const mk = uid => ({dataset: {uid, token: 't', key: 'k'}, addEventListener: (k, fn) => { handlers[uid] = fn; }});
 globalThis.document = {querySelectorAll: sel => sel === '.btn-user-connect' ? [mk('A'), mk('B')] : [],
@@ -389,7 +397,7 @@ const reply = uid => new Response(JSON.stringify({ok: true, uri: 'hy2://' + uid 
   assert(!uModalBody.innerHTML.includes('A-SECRET'), 'A 的晚到回包覆盖了 B');
 })().catch(e => {console.error(e); process.exitCode = 1;});
 """
-        result = subprocess.run([NODE, '-e', harness + prelude + script[start:end] + checks],
+        result = subprocess.run([NODE, '-e', harness + prelude + helpers + script[start:end] + checks],
                                 capture_output=True, text=True, encoding='utf-8')
         self.assertEqual(result.returncode, 0, result.stderr)
 

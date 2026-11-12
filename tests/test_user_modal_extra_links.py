@@ -29,7 +29,7 @@ class UserModalExtraLinksTest(unittest.TestCase):
     def test_enabled_protocol_links_are_listed_and_escaped(self):
         js = r"""
 const mk = () => ({textContent: '', innerHTML: '', classList: {add() {}, remove() {}}, querySelectorAll: () => []});
-const uModal = mk(), uModalBody = mk(), uModalTitle = mk(), uModalSub = mk();
+const uModal = mk(), uModalBody = mk(), uModalTitle = mk(), uModalSub = mk(), uModalClose = mk();
 const location = {origin: 'https://h.example.com:8443'};
 const btn = {dataset: {uid: 'alice', token: 'tok', key: 'kkk'}, addEventListener(type, fn) { this.onclick = fn; }};
 const document = {querySelectorAll: sel => (sel === '.btn-user-connect' ? [btn] : [])};

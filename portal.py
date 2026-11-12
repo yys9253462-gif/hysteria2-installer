@@ -3602,16 +3602,16 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 <p id="copy-status" class="status" role="status" aria-live="polite"></p>
 
 <!-- 入站代理创建成功高颜值模态框 (现代轻奢 + 二维码) -->
-<div class="modal-backdrop" id="proxy-modal">
+<div class="modal-backdrop" id="proxy-modal" role="dialog" aria-modal="true" aria-labelledby="pm-title">
   <div class="pm-card">
     <div class="modal-head">
       <div>
-        <h2 style="margin:0;font-size:19px;color:var(--accent);display:flex;align-items:center;gap:6px">
+        <h2 id="pm-title" style="margin:0;font-size:19px;color:var(--accent);display:flex;align-items:center;gap:6px">
           <span>🎉 入站代理服务创建成功</span>
         </h2>
         <p style="font-size:12px;margin-top:2px;color:var(--muted)">GOST 核心已秒级热载入并监听，可直接配置或扫码导入使用</p>
       </div>
-      <button class="modal-close" type="button" id="pm-close">&times;</button>
+      <button class="modal-close" type="button" id="pm-close" aria-label="关闭">&times;</button>
     </div>
 
     <!-- 顶部主连接节点 Banner -->
@@ -3683,17 +3683,17 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     </div>
   </div>
 </div>
-<div class="toast-container" id="toast-container"></div>
+<div class="toast-container" id="toast-container" role="status" aria-live="polite"></div>
 
 <!-- 专属用户连接模态框 -->
-<div class="modal-backdrop" id="user-modal">
+<div class="modal-backdrop" id="user-modal" role="dialog" aria-modal="true" aria-labelledby="um-title">
   <div class="modal-card">
     <div class="modal-head">
       <div>
         <h2 id="um-title" style="margin:0;font-size:18px">专属用户连接</h2>
         <p id="um-sub" style="font-size:12px;margin-top:2px;color:var(--muted)"></p>
       </div>
-      <button class="modal-close" type="button" id="um-close">&times;</button>
+      <button class="modal-close" type="button" id="um-close" aria-label="关闭">&times;</button>
     </div>
     <div id="um-body"></div>
   </div>
