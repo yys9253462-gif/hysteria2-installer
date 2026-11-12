@@ -285,6 +285,46 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertTrue(extend.called, 'AWG 配置下载没有延长死线')
         self.assertGreaterEqual(extend.call_args[0][0], 60)
 
+    def test_awg_conf_and_qr_errors_are_readable(self):
+        """「下载配置」「二维码」在新标签页里直接打开，报错原样显示给管理员：要中文并说明怎么办（2026-11-13 修）。"""
+        self.data.setdefault('token', 'test-token')
+        self.handler._extend_deadline = lambda *a: True
+        self.handler.headers = {}
+        self.handler.is_authenticated = lambda: True
+        self.handler.check_rate_limit = lambda **k: True
+        replies = []
+        self.handler.reply = lambda status, body=b'', *a, **k: replies.append((status, body.decode('utf-8')))
+        self.ns.update(VALID_AWG_NAME_RE=portal.re.compile(r'^[A-Za-z0-9_.\-]{1,32}$'),
+                       awg_installed=lambda: True, ensure_awgctl=lambda: True,
+                       awg_peers=lambda: [{'name': 'c1', 'endpoint': ''}], awg_state=lambda: {'endpoint': ''},
+                       awg_endpoint_error=lambda endpoint: '',
+                       awg_run=lambda args, timeout=60: (0, '[Interface]\nPrivateKey = test-only\n', ''),
+                       subprocess=SimpleNamespace(run=Mock(side_effect=FileNotFoundError('qrencode')),
+                                                  TimeoutExpired=subprocess.TimeoutExpired))
+        do_get = extract_method('do_GET', self.ns)
+
+        def get(route, **overrides):
+            saved = {k: self.ns[k] for k in overrides}
+            self.ns.update(overrides)
+            try:
+                replies.clear()
+                self.handler.path = '/test-token/' + route
+                do_get(self.handler)
+                return replies[-1]
+            finally:
+                self.ns.update(saved)
+
+        cases = [(get('awg-conf?name=bad%20name'), 400, '客户端名称不合法'),
+                 (get('awg-conf?name=c1', awg_installed=lambda: False), 404, '未安装'),
+                 (get('awg-conf?name=c1', ensure_awgctl=lambda: False), 500, 'journalctl -u hysteria-portal'),
+                 (get('awg-conf?name=ghost'), 404, '不存在'),
+                 (get('awg-conf?name=c1'), 400, '连接地址'),
+                 (get('awg-qr.svg?name=c1&endpoint=vpn.example.com'), 500, '下载配置')]
+        for (status, body), want, phrase in cases:
+            with self.subTest(phrase=phrase):
+                self.assertEqual(status, want, body)
+                self.assertIn(phrase, body)
+
     def test_admin_qr_falls_back_to_a_readable_image(self):
         """生成不出二维码（qrencode 是可选依赖）时给一张说明图，而不是空内容（2026-11-13 修）。"""
         self.data.setdefault('token', 'test-token')
@@ -407,6 +447,31 @@ class WebWorkflowTests(unittest.TestCase):
         status, body = self.invoke('_h_post_manage_reality', {'action': 'reset'})
         self.assertEqual(status, 200, body)
         self.handler._generate_and_apply_reality.assert_called_once()
+
+    def test_reality_accepts_explicit_enable_and_disable(self):
+        """manage-reality 也接受明确的 enable / disable（2026-11-13 修，与 VMess 等一致）：状态已经符合时
+        什么都不动；只有 toggle 时，页面停留久了或在别处改过，「想开」会变成关掉。"""
+        apply = Mock()
+        self.ns.update(has_managed_inbound=portal.has_managed_inbound,
+                       REALITY_INBOUND_TAG=portal.REALITY_INBOUND_TAG, apply_xray_config_transaction=apply)
+        self.handler._generate_and_apply_reality = Mock()
+        xray = self.hdir / 'xray.json'
+        xray.write_text('{"inbounds": []}', encoding='utf-8')
+        status, body = self.invoke('_h_post_manage_reality', {'action': 'disable'})
+        self.assertEqual(status, 200, body)
+        self.assertIs(body['active'], False)
+        xray.write_text(json.dumps({'inbounds': [
+            {'tag': portal.REALITY_INBOUND_TAG, 'protocol': 'vless', 'port': 8444}]}), encoding='utf-8')
+        status, body = self.invoke('_h_post_manage_reality', {'action': 'enable'})
+        self.assertEqual(status, 200, body)
+        self.assertIs(body['active'], True)
+        apply.assert_not_called()
+        self.handler._generate_and_apply_reality.assert_not_called()
+        # 状态不符时照常执行：开着时 disable 会移除 Reality 入站。
+        self.invoke('_h_post_manage_reality', {'action': 'disable'})
+        apply.assert_called_once()
+        self.assertNotIn(portal.REALITY_INBOUND_TAG,
+                         [i.get('tag') for i in apply.call_args[0][0].get('inbounds', [])])
 
     def test_reality_keygen_failure_never_uses_a_shared_static_key(self):
         self.run.return_value = SimpleNamespace(returncode=1, stdout='', stderr='keygen failed')

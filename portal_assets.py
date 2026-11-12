@@ -384,7 +384,7 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .confirm-icon-box.danger { background: #fdf2f2; color: var(--danger); }
 .confirm-icon-box.warn { background: #fff8e6; color: #d46b08; }
 .confirm-title { font-size: 17px; font-weight: 800; color: var(--ink); margin-bottom: 8px; }
-.confirm-text { font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 22px; }
+.confirm-text { font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 22px; white-space: pre-line; }
 .confirm-actions { display: flex; gap: 10px; justify-content: flex-end; }
 .confirm-btn { height: 40px; padding: 0 18px; border-radius: 10px; font-size: 13px; font-weight: 700; cursor: pointer; transition: all .15s ease; border: 1px solid transparent; }
 .confirm-btn.cancel { background: #f3f7f6; color: var(--ink); border-color: #d8e5e2; }
@@ -450,13 +450,15 @@ SCRIPT = r"""
 (function () {
   const parseJson = Response.prototype.json;
   Response.prototype.json = async function () {
+    // 页面请求只靠 Cookie 鉴权，401 只能是登录过期（2026-11-13 修）：多数端点的 401 回的是
+    // JSON {"error":"Unauthorized"}，解析得出来，旧实现就把这个英文单词原样弹给管理员。
+    if (this.status === 401) return { ok: false, error: '登录已过期，请刷新页面重新登录' };
     const copy = this.clone();
     try {
       return await parseJson.call(this);
     } catch (err) {
       let text = '';
       try { text = (await copy.text()).trim().slice(0, 200); } catch (_) {}
-      if (this.status === 401) return { ok: false, error: '登录已过期，请刷新页面重新登录' };
       if (this.status === 429) return { ok: false, error: '请求太频繁，请稍后再试' };
       return { ok: false, error: text ? ('服务器返回 ' + this.status + '：' + text) : ('服务器返回 ' + this.status) };
     }
@@ -499,6 +501,8 @@ function showToast(msg, type = 'info') {
   }, 2800);
 }
 
+// 所有二次确认都走这里（2026-11-13 修）：原生 confirm() 的默认按钮是「确定」，回车即执行，
+// 切换 AWG 协议线、重新生成 Reality 密钥这类操作一碰就生效；这里危险操作的焦点停在「取消」。
 let confirmOpen = false;
 function showConfirm(options = {}) {
   // 弹窗已经打开时忽略新的请求（返回 false）。
@@ -825,7 +829,14 @@ async function addWarpRule(domain) {
 }
 
 async function delWarpRule(domain) {
-  if (!confirm('确定将 ' + domain + ' 从 WARP 分流列表中移除吗？')) return;
+  const confirmed = await showConfirm({
+    title: '移除分流域名',
+    text: '确定将 ' + domain + ' 从 WARP 分流列表中移除吗？',
+    icon: '🗑️',
+    confirmText: '移除',
+    isDanger: true
+  });
+  if (!confirmed) return;
   try {
     const res = await fetch(location.pathname + 'manage-warp', {
       method: 'POST',
@@ -938,6 +949,9 @@ async function checkWarpStatus() {
 
 if (btnToggleWarp) {
   btnToggleWarp.addEventListener('click', async () => {
+    // 按卡片显示的状态发送明确的 enable / disable（2026-11-13 修，同协议开关）；开关要等状态查询
+    // 成功才显示，旧页面一加载就显示「切换中...」且可点，查询失败时点下去是盲翻。
+    const action = btnToggleWarp.classList.contains('on') ? 'disable' : 'enable';
     btnToggleWarp.disabled = true;
     btnToggleWarp.textContent = '切换中...';
     try {
@@ -945,7 +959,7 @@ if (btnToggleWarp) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       const json = await res.json();
       if (!json.ok) alert(json.error || '切换失败');
@@ -960,7 +974,13 @@ if (btnToggleWarp) {
 
 if (btnInstallWarp) {
   btnInstallWarp.addEventListener('click', async () => {
-    if (!confirm("确定要在服务器上一键部署 Cloudflare WARP 本地出口吗？将自动安装 wgcf + wireproxy，并启用 127.0.0.1:19898 的 socks5 出口。")) return;
+    const confirmed = await showConfirm({
+      title: '部署 Cloudflare WARP',
+      text: '确定要在服务器上一键部署 Cloudflare WARP 本地出口吗？将自动安装 wgcf + wireproxy，并启用 127.0.0.1:19898 的 socks5 出口。',
+      icon: '☁️',
+      confirmText: '开始部署'
+    });
+    if (!confirmed) return;
     btnInstallWarp.disabled = true;
     const origText = btnInstallWarp.textContent;
     btnInstallWarp.textContent = '⏳ 正在安装 WARP (耗时约 30 秒)...';
@@ -1004,7 +1024,14 @@ document.querySelectorAll('.preset-rule').forEach(el => {
 
 if (btnResetWarpRules) {
   btnResetWarpRules.addEventListener('click', async () => {
-    if (!confirm('确定重置为系统默认推荐的 AI 域名规则列表吗？')) return;
+    const confirmed = await showConfirm({
+      title: '重置分流规则',
+      text: '确定重置为系统默认推荐的 AI 域名规则列表吗？手动添加的 WARP 分流域名会被清掉，走其它出站的规则不受影响。',
+      icon: '♻️',
+      confirmText: '重置',
+      isDanger: true
+    });
+    if (!confirmed) return;
     try {
       const res = await fetch(location.pathname + 'manage-warp', {
         method: 'POST',
@@ -1536,7 +1563,30 @@ function obFillForm(o) {
   obOpenForm();
 }
 
+// 每次切换都要重启服务（2026-11-13 修）：请求期间两个按钮都禁用，点当前模式不发请求；全局模式下
+// 所有网站都走列表里的第一个出站，它不通时所有人断网，切过去前先确认。
+let obModeBusy = false;
 async function setOutboundMode(mode) {
+  if (obModeBusy) return;
+  const label = mode === 'global' ? '全局出口' : '按域名分流';
+  const target = mode === 'global' ? obEls.btnGlobal : obEls.btnRules;
+  if (target && target.classList.contains('active')) {
+    obMsg('当前已经是' + label, 'ok');
+    return;
+  }
+  if (mode === 'global') {
+    const confirmed = await showConfirm({
+      title: '切到全局出口',
+      text: '切到全局后，所有客户端访问任何网站都从出站列表里的第一个出站出去；它不通时所有人都会断网。'
+        + '建议先用「按域名分流」确认出站可用。',
+      icon: '🌐',
+      confirmText: '切到全局',
+      isDanger: true
+    });
+    if (!confirmed) return;
+  }
+  obModeBusy = true;
+  [obEls.btnGlobal, obEls.btnRules].forEach(b => { if (b) b.disabled = true; });
   try {
     obMsg('切换中，正在重启服务...', '');
     const result = await obApi('mode', { mode: mode });
@@ -1546,6 +1596,9 @@ async function setOutboundMode(mode) {
     await loadOutbounds();
   } catch (e) {
     obMsg('切换失败：' + (e.message || e), 'err');
+  } finally {
+    obModeBusy = false;
+    [obEls.btnGlobal, obEls.btnRules].forEach(b => { if (b) b.disabled = false; });
   }
 }
 
@@ -1589,7 +1642,14 @@ if (obEls.list) {
     if (del) {
       e.preventDefault();
       const name = del.getAttribute('data-ob-del');
-      if (!window.confirm('确认删除出站「' + name + '」？\n引用它的分流规则也会一并移除。')) return;
+      const confirmed = await showConfirm({
+        title: '删除出站',
+        text: '确认删除出站「' + name + '」？\n引用它的分流规则也会一并移除。',
+        icon: '🗑️',
+        confirmText: '删除',
+        isDanger: true
+      });
+      if (!confirmed) return;
       try {
         await obApi('delete', { name: name });
         await loadOutbounds();
@@ -1745,8 +1805,25 @@ async function checkRealityStatus() {
   } catch (_) { if (seq === realityStatusSeq) markStatusUnknown(realityBadge); }
 }
 
+// 协议开关按卡片显示的状态发送明确的 enable / disable（2026-11-13 修，同控制台）：toggle 由服务端翻转，
+// 页面停留久了或在别处改过时，卡片写着「已关闭（点击开启）」，点下去却把协议关掉。
+// 关闭前先确认：正在使用这个协议的用户会立即断开。卡片要状态查询成功才显示开关，class 一定是 on / off。
+async function protocolSwitchAction(btn, name) {
+  if (!btn.classList.contains('on')) return 'enable';
+  const confirmed = await showConfirm({
+    title: '关闭 ' + name,
+    text: '关闭后，正在使用 ' + name + ' 的用户会立即断开，直到重新开启。',
+    icon: '⏸️',
+    confirmText: '确定关闭',
+    isDanger: true
+  });
+  return confirmed ? 'disable' : '';
+}
+
 if (btnToggleReality) {
   btnToggleReality.addEventListener('click', async () => {
+    const action = await protocolSwitchAction(btnToggleReality, 'Reality');
+    if (!action) return;
     btnToggleReality.disabled = true;
     btnToggleReality.textContent = '切换中...';
     try {
@@ -1754,7 +1831,7 @@ if (btnToggleReality) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       const json = await res.json();
       if (!json.ok) alert(json.error || '切换失败');
@@ -1769,7 +1846,14 @@ if (btnToggleReality) {
 
 if (btnResetRealityKeys) {
   btnResetRealityKeys.addEventListener('click', async () => {
-    if (!confirm("确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。")) return;
+    const confirmed = await showConfirm({
+      title: '重新生成 Reality 密钥',
+      text: '确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。',
+      icon: '🔑',
+      confirmText: '重新生成',
+      isDanger: true
+    });
+    if (!confirmed) return;
     // 请求期间禁用（2026-11-04 修）：连点会连续重置两次，第一次导出的订阅随即失效。
     btnResetRealityKeys.disabled = true;
     try {
@@ -1903,6 +1987,8 @@ if (btnToggleVmess) {
     // 双击防护：请求未返回前直接忽略后续点击。
     // 否则两次 toggle 会一开一关，最终状态与用户预期相反。
     if (btnToggleVmess.disabled) return;
+    const action = await protocolSwitchAction(btnToggleVmess, 'VMess');
+    if (!action) return;
     btnToggleVmess.disabled = true;
     btnToggleVmess.textContent = '切换中...';
     try {
@@ -1910,7 +1996,7 @@ if (btnToggleVmess) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       // 先看 HTTP 状态：反向代理出错时返回的是 HTML 错误页，
       // 直接 res.json() 会抛「Unexpected token <」，把真实原因盖掉。
@@ -2004,6 +2090,8 @@ async function checkVlessencStatus() {
 if (btnToggleVlessenc) {
   btnToggleVlessenc.addEventListener('click', async () => {
     if (btnToggleVlessenc.disabled) return;
+    const action = await protocolSwitchAction(btnToggleVlessenc, 'VLESS Encryption');
+    if (!action) return;
     btnToggleVlessenc.disabled = true;
     btnToggleVlessenc.textContent = '切换中...';
     try {
@@ -2011,7 +2099,7 @@ if (btnToggleVlessenc) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
@@ -2100,6 +2188,8 @@ async function checkAnytlsStatus() {
 if (btnToggleAnytls) {
   btnToggleAnytls.addEventListener('click', async () => {
     if (btnToggleAnytls.disabled) return;
+    const action = await protocolSwitchAction(btnToggleAnytls, 'AnyTLS');
+    if (!action) return;
     btnToggleAnytls.disabled = true;
     btnToggleAnytls.textContent = '切换中...';
     try {
@@ -2107,7 +2197,7 @@ if (btnToggleAnytls) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
@@ -2196,6 +2286,8 @@ async function checkTuicStatus() {
 if (btnToggleTuic) {
   btnToggleTuic.addEventListener('click', async () => {
     if (btnToggleTuic.disabled) return;
+    const action = await protocolSwitchAction(btnToggleTuic, 'TUIC');
+    if (!action) return;
     btnToggleTuic.disabled = true;
     btnToggleTuic.textContent = '切换中...';
     try {
@@ -2203,7 +2295,7 @@ if (btnToggleTuic) {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'action=toggle'
+        body: 'action=' + action
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
@@ -2886,7 +2978,16 @@ async function doUpgrade(target) {
   const btns = { core: btnUpdateCore, portal: btnUpdatePortal, awg: btnUpdateAwgEngine };
   const btn = btns[target];
   const custom = target === 'core' && coreVerDisplay?.textContent.includes('+');
-  if (!confirm('确定要升级 ' + (names[target] || target) + ' 吗？' + (custom ? '\\n当前含定制补丁，升级官方核心会替换补丁。' : ''))) return;
+  // SCRIPT 是 Python 原始字符串：换行写 \n。写成 \\n 到 JS 里是字面的反斜杠加 n，弹窗上显示「\n」（2026-11-13 修）。
+  const confirmed = await showConfirm({
+    title: '升级 ' + (names[target] || target),
+    text: '确定要升级 ' + (names[target] || target) + ' 吗？' + (custom ? '\n当前含定制补丁，升级官方核心会替换补丁。' : ''),
+    icon: '⬆️',
+    confirmText: '开始升级',
+    isDanger: custom,
+    isWarn: !custom
+  });
+  if (!confirmed) return;
   if (btn) { btn.disabled = true; btn.textContent = '升级中...'; }
   if (updateStatusMsg) updateStatusMsg.textContent = '正在下载并应用更新，请稍候...';
   try {
@@ -3141,7 +3242,13 @@ document.querySelectorAll('.btn-quick-proxy').forEach(btn => {
 
 if (btnInstallGost) {
   btnInstallGost.addEventListener('click', async () => {
-    if (!confirm("确定要一键安装或更新 GOST 代理服务吗？系统将自动匹配架构并配置自启。")) return;
+    const confirmed = await showConfirm({
+      title: '安装 GOST 代理服务',
+      text: '确定要一键安装或更新 GOST 代理服务吗？系统将自动匹配架构并配置自启。',
+      icon: '🧱',
+      confirmText: '开始安装'
+    });
+    if (!confirmed) return;
     btnInstallGost.disabled = true;
     const origText = btnInstallGost.textContent;
     btnInstallGost.textContent = '⏳ 正在安装 GOST...';
@@ -3240,7 +3347,14 @@ async function loadProxyServices() {
     });
     proxyTbody.querySelectorAll('[data-proxy-del]').forEach(btn => {
       btn.addEventListener('click', async () => {
-        if (!confirm('确定删除该代理服务？')) return;
+        const confirmed = await showConfirm({
+          title: '删除代理服务',
+          text: '确定删除该代理服务？',
+          icon: '🗑️',
+          confirmText: '删除',
+          isDanger: true
+        });
+        if (!confirmed) return;
         btn.disabled = true;
         try {
           const res = await fetch(location.pathname + 'manage-proxy', {
@@ -3565,7 +3679,14 @@ function renderAwgPeers(peers) {
   awgPeerTbody.querySelectorAll('[data-awg-del]').forEach(b => {
     b.addEventListener('click', async () => {
       const n = decodeURIComponent(b.getAttribute('data-awg-del'));
-      if (!confirm('确认删除客户端「' + n + '」？该客户端会立即断开连接。')) return;
+      const confirmed = await showConfirm({
+        title: '删除 AWG 客户端',
+        text: '确认删除客户端「' + n + '」？该客户端会立即断开连接。',
+        icon: '🗑️',
+        confirmText: '删除',
+        isDanger: true
+      });
+      if (!confirmed) return;
       // 请求期间禁用按钮（2026-11-04 修）：连点两次第二次必然报「不存在」。
       b.disabled = true;
       try {
@@ -3589,7 +3710,13 @@ if (btnDoInstallAwg) {
     const line = awgLineSelect ? awgLineSelect.value : '3';
     const endpoint = awgEndpointInput ? awgEndpointInput.value.trim() : '';
     if (!endpoint) { alert('请填写客户端连接地址（域名或公网 IP）'); return; }
-    if (!confirm('确认安装 AmneziaWG（协议线 AWG ' + line + '.x）？\n\n会下载自建静态二进制并启动独立服务，不影响现有的 Hysteria 2。')) return;
+    const confirmed = await showConfirm({
+      title: '安装 AmneziaWG',
+      text: '确认安装 AmneziaWG（协议线 AWG ' + line + '.x）？\n\n会下载自建静态二进制并启动独立服务，不影响现有的 Hysteria 2。',
+      icon: '🧱',
+      confirmText: '开始安装'
+    });
+    if (!confirmed) return;
     btnDoInstallAwg.disabled = true;
     const orig = btnDoInstallAwg.textContent;
     btnDoInstallAwg.textContent = '⏳ 安装中，请稍候...';
@@ -3640,10 +3767,19 @@ if (btnAddAwgPeer) {
 
 if (btnSwitchAwgLine) {
   btnSwitchAwgLine.addEventListener('click', async () => {
-    const target = prompt('切换 AmneziaWG 协议线\n\n2 = AWG 2.x（参数体系稳定）\n3 = AWG 3.x（含头部保护与抗行为分析）\n\n⚠️ 切换会重新生成全部混淆参数，已发放的客户端配置会立即失效，必须重新导出。\n\n请输入目标协议线：', awgCurrentLine === '3' ? '2' : '3');
-    if (target !== '2' && target !== '3') return;
-    if (target === awgCurrentLine) { alert('已经是 AWG ' + awgCurrentLine + '.x，无需切换。'); return; }
-    if (!confirm('确认切换到 AWG ' + target + '.x？所有已发放的客户端配置都会失效。')) return;
+    // 只有两条协议线，直接切到另一条（2026-11-13 修，同终端菜单）：旧实现先弹原生输入框让人手打 2 / 3，
+    // 打成当前线还要再弹一次「无需切换」。
+    const target = awgCurrentLine === '3' ? '2' : '3';
+    const confirmed = await showConfirm({
+      title: '切换 AWG 协议线',
+      text: '确认从 AWG ' + awgCurrentLine + '.x 切换到 AWG ' + target + '.x？\n'
+        + (target === '3' ? 'AWG 3.x 含头部保护与抗行为分析。' : 'AWG 2.x 参数体系稳定。') + '\n'
+        + '切换会重新生成全部混淆参数，所有已发放的客户端配置都会立即失效，必须重新导出。',
+      icon: '⚠️',
+      confirmText: '切换到 AWG ' + target + '.x',
+      isDanger: true
+    });
+    if (!confirmed) return;
     // 请求期间禁用（2026-11-04 修）：第二次提交会再生成一遍混淆参数，中间导出的配置随即失效。
     btnSwitchAwgLine.disabled = true;
     try {
@@ -3656,7 +3792,14 @@ if (btnSwitchAwgLine) {
 
 if (btnUpdateAwg) {
   btnUpdateAwg.addEventListener('click', async () => {
-    if (!confirm('确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。')) return;
+    const confirmed = await showConfirm({
+      title: '更新 AmneziaWG',
+      text: '确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。',
+      icon: '⬆️',
+      confirmText: '开始更新',
+      isWarn: true
+    });
+    if (!confirmed) return;
     btnUpdateAwg.disabled = true;
     try {
       const json = await awgPost('manage-amneziawg', { action: 'update' });

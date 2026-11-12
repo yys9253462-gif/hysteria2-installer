@@ -219,6 +219,7 @@ const assert = require('assert');
 const alerts = [];
 globalThis.alert = m => alerts.push(m);
 globalThis.confirm = () => true;
+globalThis.showConfirm = async () => true;
 const location = {pathname: '/fixture/'};
 let handler;
 const btnResetRealityKeys = {addEventListener: (k, fn) => { handler = fn; }};

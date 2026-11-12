@@ -46,6 +46,7 @@ RESET_CHECK = r"""
 const alerts = [];
 globalThis.alert = m => alerts.push(String(m));
 globalThis.confirm = () => true;
+globalThis.showConfirm = async () => true;
 let handler = null;
 var btnResetWarpRules = {addEventListener: (ev, fn) => { handler = fn; }};
 let statusChecks = 0, rendered = null;

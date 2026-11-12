@@ -212,7 +212,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.43'
+PORTAL_VERSION = '2.44'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2771,7 +2771,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       <div style="display:flex;gap:10px;align-items:center">
         <span class="status-pill" id="warp-badge" style="background:#eaf3de;color:#27500a">检测中...</span>
         <button class="button primary" id="btn-install-warp" type="button" style="padding:6px 14px;font-size:12px;display:none">⚡ 一键安装 WARP</button>
-        <button class="toggle-btn off" id="btn-toggle-warp" type="button">切换中...</button>
+        <button class="toggle-btn off" id="btn-toggle-warp" type="button" style="display:none">切换中...</button>
       </div>
     </div>
 
@@ -3533,7 +3533,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <details class="card" style="padding:16px;box-shadow:none;border-color:#d7e5e2">
           <summary style="font-size:13px;color:#1e4c56"><strong>4. 节点健康状态与用户数</strong> <code>GET /api/v1/node/meta</code></summary>
           <div style="margin-top:12px;font-size:12px;color:var(--muted)">
-            <p>返回当前节点的端口、公网 IP/域名、混淆模式以及当前有效用户数与总流量统计。</p>
+            <p>返回节点对外参数 <code>meta</code>（<code>public_ip</code>、<code>server_name</code>、<code>listen_port</code>、<code>subscription_port</code>、<code>hop_port_range</code>、<code>cert_type</code>、<code>is_insecure</code>，不含任何密钥）、账号总数 <code>users_count</code>（包括机主账号与已停用、已过期的账号）和服务器时间 <code>time</code>。各用户的用量见 <code>GET /api/v1/users/list</code>。</p>
           </div>
         </details>
       </div>
@@ -11987,7 +11987,7 @@ if __name__ == '__main__':
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
 
-                if action == 'toggle':
+                if action in ('toggle', 'enable', 'disable'):
                     # 🔴 只动 Reality 自己的入站（2026-10-24 修）。
                     # 旧实现用 `systemctl stop xray` 关闭 Reality —— 那会把
                     # 同一进程里的 VMess / VLESS Encryption 一起停掉；
@@ -12002,9 +12002,17 @@ if __name__ == '__main__':
                         return self.reply_json(500, {'ok': False, 'error':
                             'xray.json 不是合法 JSON，未做任何修改'})
                     reality_on = bool(cfg_now) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)
+                    # 也接受明确的 enable / disable（2026-11-13 加，与 VMess 等协议一致）：调用方按自己看到的
+                    # 状态下指令，状态已经符合时什么都不动。页面停留久了或在别处改过时，toggle 会把「想开」变成关掉。
+                    if action == 'toggle':
+                        action = 'disable' if reality_on else 'enable'
+                    if action == 'disable' and not reality_on:
+                        return self.reply_json(200, {'ok': True, 'active': False, 'message': 'Reality 本来就没有启用'})
+                    if action == 'enable' and reality_on:
+                        return self.reply_json(200, {'ok': True, 'active': True, 'message': 'Reality 已经开启'})
                     with data_lock:
                         old_reality_port = _valid_port(config_section(data, 'reality_config').get('port')) or 0
-                    if reality_on:
+                    if action == 'disable':
                         with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
                             try:
                                 current = json.loads(xray_path.read_text(encoding='utf-8'))
@@ -14473,18 +14481,22 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 self._extend_deadline(120)
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 name = (query.get('name', [''])[0] or '').strip()
+                # 这两个地址由「下载配置」「二维码」在新标签页里直接打开，报错原样显示给管理员，
+                # 所以写中文并说明怎么办（2026-11-13 修）；状态码不变，控制台按状态码判断。
                 if not VALID_AWG_NAME_RE.match(name):
-                    return self.reply(400, b'Invalid client name')
+                    return self.reply(400, '客户端名称不合法：只允许字母、数字、点、下划线、连字符，最长 32 个字符'
+                                      .encode('utf-8'))
                 if not awg_installed():
-                    return self.reply(404, b'AmneziaWG is not installed')
+                    return self.reply(404, 'AmneziaWG 未安装'.encode('utf-8'))
                 if not ensure_awgctl():
-                    return self.reply(500, b'hy2-awgctl unavailable')
+                    return self.reply(500, 'AmneziaWG 管理脚本 hy2-awgctl 不可用，原因见门户日志：'
+                                           'journalctl -u hysteria-portal -e'.encode('utf-8'))
 
                 # 客户端不存在时给 404，而不是让底层命令失败后统一报 500 ——
                 # 前端需要能区分「查无此人」与「服务端出错」。
                 peers_now = awg_peers()
                 if not any(p.get('name') == name for p in peers_now):
-                    return self.reply(404, b'Client not found')
+                    return self.reply(404, ('客户端「%s」不存在，可能已被删除，请刷新页面' % name).encode('utf-8'))
 
                 # 连接地址优先用查询参数，其次用安装时记录的 endpoint
                 endpoint = ((query.get('endpoint', [''])[0] or '').strip()
@@ -14492,7 +14504,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                      if p.get('name') == name and p.get('endpoint')), '')
                             or awg_state()['endpoint'])
                 if not endpoint:
-                    return self.reply(400, b'Endpoint not configured; re-run install with an endpoint')
+                    return self.reply(400, '没有可用的连接地址：请在新增客户端时填写连接地址，'
+                                           '或重新安装 AmneziaWG 时设置默认地址'.encode('utf-8'))
                 endpoint_error = awg_endpoint_error(endpoint)
                 if endpoint_error:
                     return self.reply(400, endpoint_error.encode('utf-8'))
@@ -14500,7 +14513,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 try:
                     rc, out, err = awg_run(['client-conf', name, '--endpoint', endpoint], timeout=60)
                 except Exception as exc:
-                    return self.reply(500, ('error: ' + str(exc)).encode('utf-8'))
+                    return self.reply(500, ('生成客户端配置失败：' + str(exc)).encode('utf-8'))
                 if rc != 0 or not out.strip():
                     return self.reply(500, awg_err_tail(rc, out, err, 400).encode('utf-8'))
 
@@ -14537,7 +14550,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                               input=out.encode('utf-8'),
                                               capture_output=True, check=True, timeout=20).stdout
                 except Exception:
-                    return self.reply(500, b'qrencode is not available on this server')
+                    return self.reply(500, '二维码生成失败（服务器可能未安装 qrencode），请改用「下载配置」导入'
+                                      .encode('utf-8'))
                 return self.reply(200, qr_bytes, 'image/svg+xml')
 
             if not self.is_authenticated():
