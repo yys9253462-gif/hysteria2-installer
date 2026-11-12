@@ -54,6 +54,26 @@ class MasqueradePortTests(unittest.TestCase):
                 self.assertEqual(self.port_of(body), '')
 
 
+@unittest.skipUnless(BASH, 'requires bash')
+class RestartAfterRepairTests(unittest.TestCase):
+    """重启前先 reset-failed（2026-11-12 修）：撞上 StartLimitBurst 的服务直接 restart 会被拒绝，
+    修好的链被当成「起不来」回滚。systemctl 打桩：没先 reset-failed 就拒绝启动。"""
+
+    STUB = ('systemctl() { echo "$*" >> "$LOG"; case "$1" in reset-failed) : > "$CLEARED";; '
+            'restart) [ -f "$CLEARED" ] || return 1; echo started > "$STATE";; esac; }\n')
+
+    def test_restart_clears_the_start_limit_first(self):
+        with tempfile.TemporaryDirectory() as td:
+            env = 'LOG=%s/log CLEARED=%s/cleared STATE=%s/state\n' % (td, td, td)
+            r = run(env + self.STUB + _func('restart_hysteria') + 'restart_hysteria\ncat %s/state\n' % td)
+        self.assertIn('started', r.stdout, 'restart refused: reset-failed was not issued first')
+
+    def test_both_restarts_in_the_repair_path_use_it(self):
+        body = SRC[SRC.index('if [[ "$CHANGED" == "1" ]]; then'):SRC.index('SUB_PORT="$(masq_https_port')]
+        self.assertEqual(body.count('restart_hysteria'), 2)
+        self.assertNotIn('systemctl restart hysteria-server', body)
+
+
 @unittest.skipUnless(BASH and OPENSSL, 'requires bash and openssl')
 class CertSniTests(unittest.TestCase):
     def sni_of(self, subject, san=None):
