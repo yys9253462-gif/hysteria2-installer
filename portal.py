@@ -24,6 +24,7 @@ import select
 import shlex
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -4329,20 +4330,13 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
     except Exception as exc:
         _log_ignored('cert_info.openssl', exc)
 
-    # notAfter 形如 'Oct  9 00:00:00 2027 GMT' —— 用 dateutil 之类会引入依赖，
-    # 直接交给 openssl 换算成 epoch（-checkend 是相对秒数，但我们要绝对到期时刻，
-    # 所以这里解析文本更稳）。解析失败就留 None，前端只显示「未知」。
+    # notAfter 形如 'Oct  9 00:00:00 2027 GMT'。解析失败就留 None，前端只显示「未知」。
     if info['not_after']:
         try:
-            # ⚠️ LC_ALL=C 是必需的（2026-10-09 修）：not_after 来自 openssl，
-            # 永远是英文月份（Oct  9 ...），但 GNU date 解析 'Oct' 要过 LC_TIME。
-            # 在 zh_CN.UTF-8 下解析失败 -> int('') -> ValueError -> 静默留 None ->
-            # warn_level 变 'unknown'，而卡片没有 unknown 分支，会显示成
-            # 「● 正常 · null 天后到期」的**绿色安慰性假象**，恰好毁掉这张卡片的用途。
-            ts = subprocess.run(['date', '-d', info['not_after'], '+%s'],
-                                capture_output=True, text=True, timeout=5,
-                                env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
-            epoch = int(ts.stdout.strip())
+            # 标准库按证书时间格式解析，与 locale 无关（2026-11-12 改）：旧实现起 GNU
+            # `date -d` 子进程并钉 LC_ALL=C（zh_CN 下曾解析失败，卡片显示「正常 · null
+            # 天后到期」）；busybox 等非 GNU date 根本不认这个格式，同样退化成「未知」。
+            epoch = int(ssl.cert_time_to_seconds(info['not_after']))
             now = int(time.time())
             info['expires_in_days'] = int((epoch - now) // 86400)
             info['expires_at'] = epoch

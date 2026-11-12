@@ -717,10 +717,11 @@ class TestRepoInvariants(unittest.TestCase):
                           f"{fn} 必须调用 sync_download_artifacts，否则下载产物会陈旧")
 
     def test_locale_is_pinned_for_external_parsers(self):
-        """症状：ping / date 的输出被正则解析，不钉 C locale 就按本地化格式解析失败
-        —— 测速永远「未测得」、证书倒计时退化成绿色的假象。"""
+        """症状：ping 的输出被正则解析，不钉 C locale 就按本地化格式解析失败，测速永远「未测得」。
+        证书倒计时已改用 ssl.cert_time_to_seconds，与 locale 无关（2026-11-12），不再起 date。"""
         text = PORTAL.read_text(encoding="utf-8")
-        for marker in ("['ping', '-n'", "['date', '-d'"):
+        self.assertNotIn("['date', '-d'", text)
+        for marker in ("['ping', '-n'",):
             i = text.index(marker)
             window = text[i:i + 400]
             self.assertIn("LC_ALL", window,
