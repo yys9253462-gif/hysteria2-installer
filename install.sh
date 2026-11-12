@@ -5705,6 +5705,8 @@ uninstall_all() {
             fi
         done
         clear_all_hopping_rules
+        # 机主自己的 gost 保留了配置，它的代理端口也照旧放行。
+        if [[ "$preserve_gost_config" == 1 ]]; then close_installer_ports 0; else close_installer_ports 1; fi
         rm -f "$HY2_SERVICE"
         if [[ -f "$HY2_LOG_DROPIN" ]] && grep -qF '由 hysteria2-installer 生成' "$HY2_LOG_DROPIN"; then
             rm -f "$HY2_LOG_DROPIN"
@@ -5974,6 +5976,44 @@ close_replaced_ports() {
     [[ -n "$old_tcp" && "$old_tcp" != "$HY2_SUB_PORT" ]] && _close_one "$old_tcp" tcp
     unset -f _close_one
     return 0
+}
+
+# 卸载时收回本工具放行过的防火墙端口（2026-11-12 修）：此前只有「改端口」会收回旧端口，
+# 卸载后 UDP 主端口、跳跃区间、TCP 订阅端口与各协议 / 代理端口一直开着，之后谁绑上去谁就暴露。
+# TCP 80 / 443 不收：它们多半也是机主网站在用的端口；nft / 裸 iptables 规则同样不动（无法证明归属）。
+# 用法：close_installer_ports <代理端口是否一起收 1/0>；读 meta 与 portal.json，须在删除配置目录前调用。
+close_installer_ports() {
+    local with_proxies="${1:-1}" ufw_on=0 fwd_on=0 listen range lo hi p tcp_ports
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw_on=1; fi
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then fwd_on=1; fi
+    [[ "$ufw_on" == 1 || "$fwd_on" == 1 ]] || return 0
+    _fw_close() {   # $1=端口或「起-止」 $2=协议
+        if [[ "$ufw_on" == 1 ]]; then ufw delete allow "${1/-/:}/$2" >/dev/null 2>&1 || true; fi
+        if [[ "$fwd_on" == 1 ]]; then firewall-cmd --remove-port="$1/$2" --permanent >/dev/null 2>&1 || true; fi
+    }
+    listen="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    range="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    if is_valid_port "$listen"; then _fw_close "$listen" udp; fi
+    # 先存下捕获组：is_valid_port 自己也用 =~，会覆盖 BASH_REMATCH。
+    if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
+        if is_valid_port "$lo" && is_valid_port "$hi"; then _fw_close "$range" udp; fi
+    fi
+    tcp_ports="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    tcp_ports+=$'\n'"$(jq -r --argjson px "$with_proxies" '
+        ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config] | map(select(type == "object") | .port | numbers))
+        + (if $px == 1 then ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | numbers) else [] end) else [] end)
+        | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    while IFS= read -r p; do
+        is_valid_port "$p" || continue
+        [[ "$p" == 80 || "$p" == 443 ]] && continue
+        _fw_close "$p" tcp
+    done <<<"$tcp_ports"
+    p="$(jq -r '.tuic_config | if type == "object" then (.port | numbers) else empty end' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    if is_valid_port "$p"; then _fw_close "$p" udp; fi
+    if [[ "$fwd_on" == 1 ]]; then firewall-cmd --reload >/dev/null 2>&1 || true; fi
+    unset -f _fw_close
+    log_info "已收回本工具放行的防火墙端口（TCP 80 / 443 保留）。"
 }
 
 # 流量超额停用期间不能走这些菜单（2026-11-04 修）：它们会 restart hysteria-server /
