@@ -619,6 +619,14 @@ function switchSubtab(paneId, subId) {
   }
 }
 
+function panelVisible(paneId, subId) {
+  const pane = document.getElementById('pane-' + paneId);
+  if (!pane || !pane.classList.contains('active')) return false;
+  if (!subId) return true;
+  const sub = document.getElementById('sub-' + subId);
+  return !!(sub && sub.classList.contains('active'));
+}
+
 // 顶层标签：默认打开组内第一个子页；也支持 #proxies/awg 这种直达写法。
 function switchTab(tabId, subId) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
@@ -659,6 +667,7 @@ document.querySelectorAll('[data-tab]').forEach(btn => {
       checkTuicStatus();
     }
     if (btn.dataset.tab === 'cores') loadCores();
+    if (btn.dataset.tab === 'users') pollTrafficSpeed();
   });
 });
 
@@ -674,6 +683,7 @@ document.querySelectorAll('.subtab-btn').forEach(btn => {
     if (btn.dataset.subtab === 'anytls') checkAnytlsStatus();
     if (btn.dataset.subtab === 'tuic') checkTuicStatus();
     if (btn.dataset.subtab === 'reality-node') checkRealityStatus();
+    if (btn.dataset.subtab === 'warp') checkWarpStatus();
     history.replaceState(null, null, '#' + paneId + '/' + btn.dataset.subtab);
   });
 });
@@ -1006,7 +1016,12 @@ if (btnResetWarpRules) {
 }
 
 checkWarpStatus();
-setInterval(() => { if (!document.hidden && !portalSessionExpired) checkWarpStatus(); }, 10000);
+// 后台轮询只在对应页面可见时进行（2026-11-12 修）：旧实现不论停在哪一页，WARP 状态每 10 秒、
+// 网速每 2 秒各请求一次。/warp-status 每次都要 systemctl show、把出站配置重渲染一遍比对，
+// 30 秒一次还要经 WARP 探测出口；/traffic-speed 在 data_lock 内给每个用户算用量摘要，会拖慢鉴权。
+setInterval(() => {
+  if (!document.hidden && !portalSessionExpired && panelVisible('proxies', 'warp')) checkWarpStatus();
+}, 10000);
 
 // ============================================================================
 // 自定义出站（Custom Outbounds）
@@ -2727,6 +2742,8 @@ function gotoTarget(target) {
   const [tabId, subId] = String(target).split('/');
   switchTab(tabId, subId);
   if (tabId === 'cores') loadCores();
+  if (tabId === 'users') pollTrafficSpeed();
+  if (panelVisible('proxies', 'warp')) checkWarpStatus();
   if (tabId === 'reality') {
     checkRealityStatus();
     checkVmessStatus();
@@ -2948,7 +2965,7 @@ async function pollTrafficSpeed() {
   } catch (_) {} finally { trafficPollPending = false; }
 }
 
-setInterval(pollTrafficSpeed, 2000);
+setInterval(() => { if (panelVisible('users')) pollTrafficSpeed(); }, 2000);
 pollTrafficSpeed();
 
 // 入站代理服务管理 (gost 驱动)
