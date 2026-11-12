@@ -188,7 +188,7 @@ const go = async hash => {
   }
   if (AFTER) {
     report.after = await AFTER({forms, els, requests, alerts, nativeSubmits, location, tick, go, intervals,
-                                state, tabBtns, subBtns: allSubBtns,
+                                state, tabBtns, subBtns: allSubBtns, sandbox,
                                 setRespond: fn => { respond = fn; }, reloads: () => reloads});
   }
   report.errors = errors;
