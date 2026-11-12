@@ -4352,6 +4352,16 @@ EOCP
 }
 
 # 7. 服务状态与管理命令
+# 旧版 WARP 出站（官方客户端代理模式的 127.0.0.1:40000）改指 wireproxy。只在确实有旧地址时
+# 才改并重启 Hysteria（2026-11-13 修）：旧实现装 WARP 时无条件重启，新装机根本没有这一行，
+# 装一次 WARP 就把所有在线用户断开一次。
+warp_migrate_legacy_outbound() {
+    [[ -f "$HY2_CONFIG" ]] && grep -qF 'addr: 127.0.0.1:40000' "$HY2_CONFIG" || return 0
+    sed -i "s|addr: 127.0.0.1:40000|addr: $1|g" "$HY2_CONFIG"
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    systemctl restart hysteria-server 2>/dev/null || true
+}
+
 install_warp_local_proxy() {
     # BUGFIX #7/#8: Cloudflare 官方 cloudflare-warp 包在 Debian 12 / bookworm 因 signed-by
     # apt keyring 解析 bug 永远装不上，且失败会残留无效 apt 源。改为直接从 GitHub release
@@ -4596,10 +4606,7 @@ EOF
     fi
 
     # 7. 把 hysteria config.yaml 的 outbound warp_socks 端口同步到 19898
-    if [[ -f "$HY2_CONFIG" ]]; then
-        sed -i "s|addr: 127.0.0.1:40000|addr: ${WARP_SOCKS_ADDR}|g" "$HY2_CONFIG"
-        systemctl restart hysteria-server 2>/dev/null || true
-    fi
+    warp_migrate_legacy_outbound "$WARP_SOCKS_ADDR"
 
     # 8. Watchdog (走 WARP socks5 探活, 失败则重启 wireproxy)
     cat > /usr/local/bin/hy2-warp-watchdog.sh <<EOWD
