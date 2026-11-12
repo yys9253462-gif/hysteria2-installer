@@ -8122,6 +8122,13 @@ def serve(path):
             if not re.fullmatch(r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
                                 r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
                 return '连接地址不是有效的域名或 IPv4'
+            # 末段全是数字只能是 IPv4（顶级域不会全是数字，2026-11-12 修）：旧规则放过
+            # 999.1.1.1 / 1.2.3 / 12345，客户端拿去当域名解析，永远握不上手。
+            if host.rsplit('.', 1)[-1].isdigit():
+                try:
+                    ipaddress.IPv4Address(host)
+                except ValueError:
+                    return '连接地址不是有效的域名或 IPv4'
         port_match = re.search(r':([0-9]+)$', endpoint)
         if port_match:
             raw_port = port_match.group(1)
