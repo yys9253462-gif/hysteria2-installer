@@ -1561,7 +1561,30 @@ function obFillForm(o) {
   obOpenForm();
 }
 
+// 每次切换都要重启服务（2026-11-13 修）：请求期间两个按钮都禁用，点当前模式不发请求；全局模式下
+// 所有网站都走列表里的第一个出站，它不通时所有人断网，切过去前先确认。
+let obModeBusy = false;
 async function setOutboundMode(mode) {
+  if (obModeBusy) return;
+  const label = mode === 'global' ? '全局出口' : '按域名分流';
+  const target = mode === 'global' ? obEls.btnGlobal : obEls.btnRules;
+  if (target && target.classList.contains('active')) {
+    obMsg('当前已经是' + label, 'ok');
+    return;
+  }
+  if (mode === 'global') {
+    const confirmed = await showConfirm({
+      title: '切到全局出口',
+      text: '切到全局后，所有客户端访问任何网站都从出站列表里的第一个出站出去；它不通时所有人都会断网。'
+        + '建议先用「按域名分流」确认出站可用。',
+      icon: '🌐',
+      confirmText: '切到全局',
+      isDanger: true
+    });
+    if (!confirmed) return;
+  }
+  obModeBusy = true;
+  [obEls.btnGlobal, obEls.btnRules].forEach(b => { if (b) b.disabled = true; });
   try {
     obMsg('切换中，正在重启服务...', '');
     const result = await obApi('mode', { mode: mode });
@@ -1571,6 +1594,9 @@ async function setOutboundMode(mode) {
     await loadOutbounds();
   } catch (e) {
     obMsg('切换失败：' + (e.message || e), 'err');
+  } finally {
+    obModeBusy = false;
+    [obEls.btnGlobal, obEls.btnRules].forEach(b => { if (b) b.disabled = false; });
   }
 }
 
