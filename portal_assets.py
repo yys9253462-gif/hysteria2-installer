@@ -3452,6 +3452,16 @@ async function loadAwgState() {
   } catch (e) { markStatusUnknown(awgBadge); }   // 不弹窗，只在徽章上标出查询失败
 }
 
+// 创建时间按浏览器本地时间显示（2026-11-13 修）：awgctl 存的是 UTC（…Z），旧实现原样显示，
+// 国内看到的钟点差 8 小时。原文留在悬停提示里；解析不了的值照原样显示。
+function fmtAwgCreated(value) {
+  const d = typeof value === 'string' && value ? new Date(value) : null;
+  if (!d || isNaN(d.getTime())) return value || '-';
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
 function renderAwgPeers(peers) {
   if (!awgPeerTbody) return;
   if (!peers.length) {
@@ -3465,7 +3475,8 @@ function renderAwgPeers(peers) {
       // 名称/地址虽受后端正则限制，仍统一走 obEsc —— 与其他表格保持同一套转义习惯。
       + '<td><strong>' + obEsc(p.name) + '</strong></td>'
       + '<td>' + obEsc(p.address) + '</td>'
-      + '<td style="color:var(--muted);font-size:11.5px">' + obEsc(p.created_at || '-') + '</td>'
+      + '<td style="color:var(--muted);font-size:11.5px" title="' + obEsc(p.created_at || '') + '">'
+      + obEsc(fmtAwgCreated(p.created_at)) + '</td>'
       + '<td style="white-space:nowrap">'
       + '<button class="button" type="button" data-awg-conf="' + enc + '" style="' + bs + '">下载配置</button> '
       + '<button class="button" type="button" data-awg-qr="' + enc + '" style="' + bs + '">二维码</button> '
