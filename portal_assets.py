@@ -552,22 +552,59 @@ function showConfirm(options = {}) {
   });
 }
 
+// 用户表单在页内提交（2026-11-12 修）：原生提交时，重名、密码已被占用、收回未完成等错误
+// 让浏览器跳到一张只有一行纯文本的错误页，填好的表单也跟着没了。成功时服务端回 302，
+// 整页刷新看新列表；没有 JS 时表单照旧原生提交。
+async function submitUserForm(form) {
+  const btn = form.querySelector('[type="submit"]');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(form.getAttribute('action'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      redirect: 'manual',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(new FormData(form)).toString()
+    });
+    if (res.type === 'opaqueredirect' || res.ok) {
+      location.hash = '#users';
+      location.reload();
+      return;
+    }
+    const text = (await res.text()).trim();
+    alert(text || ('操作失败（HTTP ' + res.status + '）'));
+  } catch (e) {
+    alert('请求异常: ' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 // 🔴 删除用户的二次确认不能写成内联的 onsubmit="return confirm(...)"：
 // CSP 的 script-src 只允许带哈希的脚本、没有 'unsafe-inline'，内联事件处理器
 // 会被浏览器直接拒绝 —— 表现为点了「删除」毫无提示、用户被静默删掉。
 // 必须在这里用 addEventListener 绑定。
-document.querySelectorAll('form.js-confirm-delete').forEach(form => {
-  form.addEventListener('submit', (e) => {
-    e.preventDefault();
-    showConfirm({
-      title: '注销用户',
-      text: form.dataset.confirm || '确定注销此用户？此操作不可撤销。',
-      icon: '⚠️',
-      isDanger: true,
-      confirmText: '确定注销'
-    }).then(ok => { if (ok) form.submit(); });
+function bindUserForms() {
+  document.querySelectorAll('form.js-confirm-delete').forEach(form => {
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      showConfirm({
+        title: '注销用户',
+        text: form.dataset.confirm || '确定注销此用户？此操作不可撤销。',
+        icon: '⚠️',
+        isDanger: true,
+        confirmText: '确定注销'
+      }).then(ok => { if (ok) submitUserForm(form); });
+    });
   });
-});
+  document.querySelectorAll('form.js-user-form').forEach(form => {
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      submitUserForm(form);
+    });
+  });
+}
+bindUserForms();
 
 function switchSubtab(paneId, subId) {
   const pane = document.getElementById('pane-' + paneId);
@@ -580,6 +617,14 @@ function switchSubtab(paneId, subId) {
     btn.classList.add('active');
     sub.classList.add('active');
   }
+}
+
+function panelVisible(paneId, subId) {
+  const pane = document.getElementById('pane-' + paneId);
+  if (!pane || !pane.classList.contains('active')) return false;
+  if (!subId) return true;
+  const sub = document.getElementById('sub-' + subId);
+  return !!(sub && sub.classList.contains('active'));
 }
 
 // 顶层标签：默认打开组内第一个子页；也支持 #proxies/awg 这种直达写法。
@@ -622,6 +667,7 @@ document.querySelectorAll('[data-tab]').forEach(btn => {
       checkTuicStatus();
     }
     if (btn.dataset.tab === 'cores') loadCores();
+    if (btn.dataset.tab === 'users') pollTrafficSpeed();
   });
 });
 
@@ -637,25 +683,17 @@ document.querySelectorAll('.subtab-btn').forEach(btn => {
     if (btn.dataset.subtab === 'anytls') checkAnytlsStatus();
     if (btn.dataset.subtab === 'tuic') checkTuicStatus();
     if (btn.dataset.subtab === 'reality-node') checkRealityStatus();
+    if (btn.dataset.subtab === 'warp') checkWarpStatus();
     history.replaceState(null, null, '#' + paneId + '/' + btn.dataset.subtab);
   });
 });
 
+// 这里只切页、不拉状态：脚本还没执行到各状态卡片的 const 声明，此时调用 check*Status
+// 只会抛「Cannot access … before initialization」；各卡片在定义处已各自拉过一次。
 if (location.hash) {
   const hash = location.hash.substring(1);
   const [tabId, subId] = hash.split('/');
-  if (document.getElementById('pane-' + tabId)) {
-    switchTab(tabId, subId);
-    // 直达链接同样要刷新：否则从书签/外部链接进来时看到的是页面加载瞬间的旧状态。
-    if (tabId === 'reality') {
-      checkRealityStatus();
-      checkVmessStatus();
-      checkVlessencStatus();
-      // 深链接路径此前漏了 AnyTLS：书签进入时卡片会停在首屏旧状态。
-      checkAnytlsStatus();
-      checkTuicStatus();
-    }
-  }
+  if (document.getElementById('pane-' + tabId)) switchTab(tabId, subId);
 }
 
 function genRandom(targetId, prefix='') {
@@ -805,7 +843,7 @@ function markStatusUnknown(badge, detail) {
 // 列表 / 表格加载失败时同样不能停在「加载中」（2026-11-12 修）。只替换仍是加载占位的
 // 元素：已经渲染过的数据不因之后某次刷新失败被清空。
 function markLoadFailed(el, text) {
-  if (!el || !/加载中|正在加载/.test(el.textContent || '')) return;
+  if (!el || !/加载中|正在加载|正在拉取/.test(el.textContent || '')) return;
   if (el.tagName === 'TBODY') {
     const cell = el.querySelector('td');
     const cols = (cell && cell.getAttribute('colspan')) || '1';
@@ -821,15 +859,26 @@ function markLoadFailed(el, text) {
 // 只认最新一次请求（2026-11-04 修，与 VMess 卡片同一做法）：轮询回包比开关后的状态查询
 // 晚到时会把卡片刷回切换之前的状态，管理员再点一次就切反了。
 let warpStatusSeq = 0;
+function markWarpRulesFailed() {
+  markLoadFailed(warpRulesCount, '数量未知');
+  markLoadFailed(warpTagsCloud, '分流规则读取失败，请刷新页面重试');
+}
+
 async function checkWarpStatus() {
   if (!warpBadge) return;
   const seq = ++warpStatusSeq;
   try {
     const res = await fetch(location.pathname + 'warp-status', { credentials: 'same-origin' });
-    if (!res.ok) { if (seq === warpStatusSeq) markStatusUnknown(warpBadge); return; }
+    if (!res.ok) { if (seq === warpStatusSeq) { markStatusUnknown(warpBadge); markWarpRulesFailed(); } return; }
     const json = await res.json();
     if (seq !== warpStatusSeq) return;
-    if (!json.ok) { markStatusUnknown(warpBadge, json.error); return; }
+    if (!json.ok) { markStatusUnknown(warpBadge, json.error); markWarpRulesFailed(); return; }
+
+    // 分流名单与 WARP 装没装无关（门户里一直有默认名单，未安装时也能增删）：先渲染。
+    // 旧实现在「未安装」分支提前 return，数量与列表永远停在「加载中…」（2026-11-12 修）。
+    if (Array.isArray(json.rules)) {
+      renderWarpRules(json.rules, json.installed && json.enabled && json.applied && !json.overridden);
+    }
 
     if (btnInstallWarp) {
       if (!json.installed) {
@@ -872,11 +921,7 @@ async function checkWarpStatus() {
         btnToggleWarp.className = 'toggle-btn off';
       }
     }
-
-    if (Array.isArray(json.rules)) {
-      renderWarpRules(json.rules, json.enabled && json.applied && !json.overridden);
-    }
-  } catch (_) { if (seq === warpStatusSeq) markStatusUnknown(warpBadge); }
+  } catch (_) { if (seq === warpStatusSeq) { markStatusUnknown(warpBadge); markWarpRulesFailed(); } }
 }
 
 if (btnToggleWarp) {
@@ -971,7 +1016,12 @@ if (btnResetWarpRules) {
 }
 
 checkWarpStatus();
-setInterval(() => { if (!document.hidden && !portalSessionExpired) checkWarpStatus(); }, 10000);
+// 后台轮询只在对应页面可见时进行（2026-11-12 修）：旧实现不论停在哪一页，WARP 状态每 10 秒、
+// 网速每 2 秒各请求一次。/warp-status 每次都要 systemctl show、把出站配置重渲染一遍比对，
+// 30 秒一次还要经 WARP 探测出口；/traffic-speed 在 data_lock 内给每个用户算用量摘要，会拖慢鉴权。
+setInterval(() => {
+  if (!document.hidden && !portalSessionExpired && panelVisible('proxies', 'warp')) checkWarpStatus();
+}, 10000);
 
 // ============================================================================
 // 自定义出站（Custom Outbounds）
@@ -1742,10 +1792,12 @@ if (btnResetRealityKeys) {
 // 旧实现只有 .then 没有 .catch，失败时按钮毫无反应，看起来像点坏了。
 // 失败时退回「选中文本」并提示手动复制（与页面通用 [data-copy] 处理器一致）。
 function copyWithFeedback(text, button, doneText) {
-  const orig = button.textContent;
+  // 原文只记第一次（同用户页，2026-11-12 修）：恢复前再点一下会把「已复制 ✓」当成原文。
+  const orig = button.dataset.orig || (button.dataset.orig = button.textContent);
   const ok = () => {
     button.textContent = doneText;
-    setTimeout(() => { button.textContent = orig; }, 1500);
+    clearTimeout(button._restoreTimer);
+    button._restoreTimer = setTimeout(() => { button.textContent = orig; }, 1500);
   };
   const fallback = () => {
     const ta = document.createElement('textarea');
@@ -2692,6 +2744,8 @@ function gotoTarget(target) {
   const [tabId, subId] = String(target).split('/');
   switchTab(tabId, subId);
   if (tabId === 'cores') loadCores();
+  if (tabId === 'users') pollTrafficSpeed();
+  if (panelVisible('proxies', 'warp')) checkWarpStatus();
   if (tabId === 'reality') {
     checkRealityStatus();
     checkVmessStatus();
@@ -2708,6 +2762,14 @@ document.querySelectorAll('.js-goto').forEach(btn => {
 const btnRefreshCores = document.getElementById('btn-refresh-cores');
 if (btnRefreshCores) btnRefreshCores.addEventListener('click', loadCores);
 if (location.hash.startsWith('#cores')) loadCores();
+
+// 门户开着时改地址栏哈希、打开同页书签不会重新加载页面，只触发 hashchange；
+// 旧实现没监听，地址栏写着 #cores，页面还停在原来的标签（2026-11-12 修）。
+function routeFromHash() {
+  const target = location.hash.substring(1);
+  if (document.getElementById('pane-' + target.split('/')[0])) gotoTarget(target);
+}
+window.addEventListener('hashchange', routeFromHash);
 
 
 // 版本检测与一键更新交互
@@ -2905,7 +2967,7 @@ async function pollTrafficSpeed() {
   } catch (_) {} finally { trafficPollPending = false; }
 }
 
-setInterval(pollTrafficSpeed, 2000);
+setInterval(() => { if (panelVisible('users')) pollTrafficSpeed(); }, 2000);
 pollTrafficSpeed();
 
 // 入站代理服务管理 (gost 驱动)
@@ -3165,6 +3227,15 @@ if (uModal) {
 // 只认最后一次点击的回包（2026-11-04 修）：先点慢的 A、关掉再点 B，A 的回包晚到会把
 // B 标题下的内容换成 A 的链接与二维码，管理员复制出去就把 A 的凭据发给了 B 的客户。
 let userModalSeq = 0;
+// 账号当前连不上时在弹窗顶部说清楚（2026-11-12 修）：旧弹窗只列到期时间，停用 / 到期 /
+// 超额的账号也照样给出「可直接发给客户」的链接。
+function userStatusBanner(statusText) {
+  if (!statusText) return '';
+  return '<div style="background:#fff1f0;border:1px solid #ffccc7;color:#cf3c3c;border-radius:12px;'
+    + 'padding:10px 14px;font-size:13px;font-weight:600">⚠️ 该账号当前不可用（' + obEsc(statusText)
+    + '）：客户端现在连不上，发链接前请先续期、启用或调整流量。</div>';
+}
+
 document.querySelectorAll('.btn-user-connect').forEach(btn => {
   btn.addEventListener('click', async () => {
     const mySeq = ++userModalSeq;
@@ -3214,7 +3285,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         : new Date(json.expires_at * 1000).toLocaleString());
       let ipText = (json.ip_limit > 0) ? (json.ip_limit + ' IP') : '不限';
       
-      uModalBody.innerHTML = `
+      uModalBody.innerHTML = `${userStatusBanner(json.status_text)}
         <div class="user-meta-bar">
           <span>📅 到期: <b>${expireText}</b></span>
           <span>📊 流量: <b>${trafficText}</b></span>
@@ -3537,7 +3608,9 @@ document.querySelectorAll('[data-copy]').forEach(button => {
     const field = document.getElementById(button.dataset.copy);
     if (!field) return;
     const val = field.value || field.textContent || '';
-    const orig = button.textContent;
+    // 原文只在第一次点击时记下（2026-11-12 修）：旧实现每次都读当前文字，恢复前再点一下，
+    // 「已复制 ✓」/「已选中，请按 Ctrl+C」就被当成原文，按钮永远停在那句话上。
+    const orig = button.dataset.orig || (button.dataset.orig = button.textContent);
     // 同管理页（2026-11-06 修）：http 下 navigator.clipboard 不存在，旧实现静默失败，
     // 按钮不变也没有提示。先试 execCommand 兜底，都不行再选中并明确告诉用户按 Ctrl+C。
     let copied = false;
@@ -3563,7 +3636,8 @@ document.querySelectorAll('[data-copy]').forEach(button => {
       if (field.select) { field.focus(); field.select(); }
       button.textContent = '已选中，请按 Ctrl+C';
     }
-    setTimeout(() => { button.textContent = orig; }, copied ? 1800 : 4000);
+    clearTimeout(button._restoreTimer);
+    button._restoreTimer = setTimeout(() => { button.textContent = orig; }, copied ? 1800 : 4000);
   });
 });
 """

@@ -3,8 +3,10 @@ import ast
 import copy
 import importlib.util
 from pathlib import Path
+import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -148,6 +150,56 @@ class MeterAccountingTest(unittest.TestCase):
         self.meter.read = self.meter._read
         self.meter.config['reality'] = {'binary': str(ROOT / 'nonexistent-xray')}
         self.assertEqual(self.meter.enabled_sources(), ['hysteria'])
+
+    def test_installed_but_stopped_xray_does_not_mark_measurement_unhealthy(self):
+        """装了 Xray 却没在跑：reality 不采样、不算失败，Hy2 照常判健康（2026-11-12 修）。
+
+        旧实现照样每 5 秒读 Xray、每次都失败：所有用户 measurement_ok 一直是 false，
+        Xray 从没启动过时 measured_bytes 还是 null（页面「计量未就绪」）。
+        """
+        state = {'xray': 'inactive'}
+
+        def epoch(service):
+            if service == 'xray' and state['xray'] != 'active':
+                raise RuntimeError('missing InvocationID')
+            return 'epoch-' + service
+
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / 'xray'
+            binary.write_bytes(b'')
+            with patch.object(runtime.readers, 'read_hysteria', return_value=self.counters['hysteria']), \
+                 patch.object(runtime.readers, 'read_hysteria_online', return_value={}), \
+                 patch.object(runtime.readers, 'read_live_connections', return_value={'users': {}}), \
+                 patch.object(runtime.readers, 'read_xray', return_value={}), \
+                 patch.object(runtime.readers, 'service_running', create=True,
+                              side_effect=lambda service: state[service] == 'active'):
+                meter = runtime.PortalMeter(self.data, threading.RLock(), lambda: None,
+                    {'hysteria': {'url': 'http://127.0.0.1:19996', 'secret': 'test'},
+                     'reality': {'binary': str(binary), 'address': '127.0.0.1:10085'}}, epoch=epoch)
+                meter.poll()
+                meter.poll()
+                stopped = meter.summary('admin_master')
+                health = dict(self.data['usage_meter'].get('health', {}))
+                state['xray'] = 'active'
+                meter.poll()
+                running = meter.summary('admin_master')
+        self.assertTrue(stopped['measurement_ok'])
+        self.assertEqual(stopped['measured_bytes'], 0)
+        self.assertNotIn('reality', stopped['measurement_sources'])
+        self.assertNotIn('reality', health, 'a stopped Xray was recorded as a failed sample')
+        self.assertTrue(running['measurement_ok'])
+        self.assertTrue(running['measurement_sources']['reality']['ok'])
+
+    def test_service_running_reads_systemctl_is_active(self):
+        for output, expected in ((b'active\n', True), (b'activating\n', True), (b'', True),
+                                 (b'inactive\n', False), (b'failed\n', False)):
+            with self.subTest(output=output), \
+                 patch.object(runtime.readers.subprocess, 'run',
+                              return_value=SimpleNamespace(stdout=output, returncode=0)) as run:
+                self.assertIs(runtime.readers.service_running('xray'), expected)
+                self.assertEqual(run.call_args.args[0], ['systemctl', 'is-active', 'xray'])
+        with self.assertRaises(ValueError):
+            runtime.readers.service_running('sshd')
 
     def test_upgrade_preserves_existing_totals_without_requiring_absent_xray(self):
         # 真实旧部署：Hy2 已采集累计，Reality 未安装，used_bytes 却仍为 0。

@@ -1641,7 +1641,8 @@ class WebWorkflowTests(unittest.TestCase):
                   enforce_node_access=Mock(return_value=True),
                   save_data=Mock(side_effect=[OSError('disk full'), None]),
                   core_lock_fd=None, portal_path=self.hdir / 'portal.json')
-        wrapper = ast.parse('def outer():\n    last_enforced_blocked = None\n    def apply_access(force_ids=(), core_lock_fd=None):\n        pass\n    return apply_access')
+        wrapper = ast.parse('def outer():\n    last_enforced_blocked = None\n    last_enforce_error = ("", 0.0)\n'
+                            '    def apply_access(force_ids=(), core_lock_fd=None):\n        pass\n    return apply_access')
         wrapper_fn = wrapper.body[0]
         inner = next(n for n in ast.walk(wrapper_fn)
                      if isinstance(n, ast.FunctionDef) and n.name == 'apply_access')
@@ -1700,6 +1701,51 @@ class WebWorkflowTests(unittest.TestCase):
         self.invoke('_h_post_manage_warp', {'action': 'reset_rules'})
         self.assertEqual([r for r in self.data['warp_rules'] if r['domain'] == 'openai.com'],
                          [{'domain': 'openai.com', 'outbound': 'direct'}])
+
+    def _fresh_warp(self, enabled=False):
+        self.data.pop('warp_rules', None)
+        self.data['warp_enabled'] = enabled
+
+    def test_warp_rule_edits_start_from_the_list_the_page_shows(self):
+        """WARP 关着、没保存过名单时页面显示空表；加一个域名不能冒出整套默认名单（2026-11-12 修）。"""
+        self._fresh_warp()
+        self.assertEqual(portal.routing_state(self.data)['warp_rules'], [])
+        status, body = self.invoke('_h_post_manage_warp', {'action': 'add_rule', 'domain': 'netflix.com'})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.data['warp_rules'], [{'domain': 'netflix.com', 'outbound': 'warp_socks'}])
+        self.assertEqual(body['rules'], ['netflix.com'])
+        # 开着 WARP 时页面显示的就是默认名单，在它上面加。
+        self._fresh_warp(enabled=True)
+        status, body = self.invoke('_h_post_manage_warp', {'action': 'add_rule', 'domain': 'netflix.com'})
+        self.assertEqual(body['rules'], list(portal.DEFAULT_WARP_DOMAINS) + ['netflix.com'])
+        # 「恢复预设」照旧补齐默认名单。
+        self._fresh_warp()
+        status, body = self.invoke('_h_post_manage_warp', {'action': 'reset_rules'})
+        self.assertEqual(body['rules'], list(portal.DEFAULT_WARP_DOMAINS))
+
+    def test_warp_switches_materialise_the_default_list_only_when_warp_is_on(self):
+        self.ns['warp_backend_installed'] = lambda: True
+        for action in ('disable', 'apply'):
+            with self.subTest(action=action):
+                self._fresh_warp()
+                status, body = self.invoke('_h_post_manage_warp', {'action': action})
+                self.assertEqual(status, 200, body)
+                self.assertNotIn('warp_rules', self.data, 'WARP was off: the default list must stay implicit')
+                self.assertEqual(body['rules'], [])
+        expected = list(portal.DEFAULT_WARP_DOMAINS)
+        for action, enabled in (('enable', False), ('toggle', False), ('disable', True)):
+            with self.subTest(action=action, enabled=enabled):
+                self._fresh_warp(enabled)
+                status, body = self.invoke('_h_post_manage_warp', {'action': action})
+                self.assertEqual(status, 200, body)
+                self.assertEqual([r['domain'] for r in self.data['warp_rules']], expected)
+                self.assertEqual(body['rules'], expected)
+
+    def test_bad_warp_domain_leaves_memory_untouched(self):
+        self._fresh_warp()
+        status, _ = self.invoke('_h_post_manage_warp', {'action': 'add_rule', 'domain': 'bad domain!'})
+        self.assertEqual(status, 400)
+        self.assertNotIn('warp_rules', self.data)
 
     def test_warp_toggle_does_not_destroy_global_custom_outbound_mode(self):
         state = {'warp_enabled': True, 'outbound_mode': 'global',

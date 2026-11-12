@@ -73,6 +73,27 @@ PROXY_CHECK = r"""
 """
 
 
+WARP_CHECK = r"""
+(async () => {
+  const fresh = () => {
+    warpRulesCount = el('SPAN', '加载中...');
+    warpTagsCloud = el('DIV', '正在拉取规则...');
+  };
+  fresh();
+  globalThis.fetch = () => Promise.resolve(new Response(JSON.stringify(
+    {ok: true, installed: false, enabled: false, rules: ['openai.com', 'claude.ai']})));
+  await checkWarpStatus();
+  assert.strictEqual(warpRulesCount.textContent, '2 个已配置', 'count stuck at ' + warpRulesCount.textContent);
+  assert.ok(warpTagsCloud.innerHTML.includes('openai.com'), 'rules not listed: ' + warpTagsCloud.textContent);
+  fresh();
+  globalThis.fetch = MODES.http500;
+  await checkWarpStatus();
+  assert.strictEqual(warpRulesCount.textContent, '数量未知');
+  assert.ok(warpTagsCloud.textContent.includes('分流规则读取失败'), warpTagsCloud.textContent);
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+
+
 def _block(header):
     script = portal.SCRIPT
     if header not in script:
@@ -94,6 +115,15 @@ class ListLoadFailureTests(unittest.TestCase):
         stubs = ('var obEls = {}; var OB_STATE = {}; function obSetModeUI() {} function renderOutboundList() {}\n'
                  'function renderOutboundRules() {} function obMsg() {}\n')
         r = run_node(HARNESS + stubs + self.helpers() + _block('async function loadOutbounds()') + OUTBOUND_CHECK)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_warp_rules_render_when_not_installed_and_report_a_failed_load(self):
+        stubs = ('var warpBadge = el("SPAN", "检测中..."); var btnInstallWarp = el("BUTTON", "");\n'
+                 'var btnToggleWarp = el("BUTTON", ""); var warpRulesCount = null; var warpTagsCloud = null;\n'
+                 'let warpStatusSeq = 0;\n')
+        source = (HARNESS + stubs + self.helpers() + _block('function markWarpRulesFailed(')
+                  + _block('function renderWarpRules(') + _block('async function checkWarpStatus()') + WARP_CHECK)
+        r = run_node(source)
         self.assertEqual(r.returncode, 0, r.stderr)
 
     def test_proxy_table_reports_a_failed_load(self):

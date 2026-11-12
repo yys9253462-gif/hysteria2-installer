@@ -29,6 +29,8 @@ RUNTIME_TREE = ast.parse(RUNTIME_SRC)
 
 import sys
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_hash_routing import NODE, page_model, run_portal_page  # noqa: E402
 
 
 class HotSummaryTest(unittest.TestCase):
@@ -166,9 +168,19 @@ class HotSummaryBehaviorTest(unittest.TestCase):
 class FrontendStaticGuarantees(unittest.TestCase):
     """R2 前端实测结论的静态钉子。"""
 
+    @unittest.skipUnless(NODE, 'requires node')
     def test_traffic_speed_poll_is_2s(self):
-        assets = (ROOT / 'portal_assets.py').read_text(encoding='utf-8')
-        self.assertIn('setInterval(pollTrafficSpeed, 2000)', assets)
+        """停在用户页时网速每 2 秒轮询一次（2026-11-12 起只在用户页可见时轮询）。"""
+        report = run_portal_page(page_model(), '#users', after=r"""
+async ctx => {
+  ctx.requests.splice(0);
+  const polls = ctx.intervals.filter(it => it.ms === 2000);
+  polls.forEach(it => it.fn());
+  await ctx.tick();
+  return {count: polls.length, urls: ctx.requests.map(r => r.url)};
+}""")
+        self.assertEqual(report['after']['count'], 1)
+        self.assertIn('/t/traffic-speed', report['after']['urls'])
 
     def test_frontend_consumes_only_scalar_fields(self):
         """前端 traffic-speed 消费面（防止未来有人依赖被删字段而不自知）：

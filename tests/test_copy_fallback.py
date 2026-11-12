@@ -32,6 +32,29 @@ globalThis.document = {
 };
 """
 
+TIMERS = r"""
+const assert = require('assert');
+let handler;
+let nextTimer = 0;
+const timers = new Map();
+globalThis.setTimeout = fn => { timers.set(++nextTimer, fn); return nextTimer; };
+globalThis.clearTimeout = id => { timers.delete(id); };
+const flush = () => { const due = [...timers.values()]; timers.clear(); due.forEach(fn => fn()); };
+// node 自带只读的 navigator 访问器，直接赋值不生效。
+const setClipboard = clipboard => Object.defineProperty(globalThis, 'navigator',
+  {value: {clipboard}, configurable: true, writable: true});
+globalThis.alert = () => {};
+const button = {dataset: {copy: 'f'}, textContent: '复制直链', addEventListener: (k, fn) => { handler = fn; }};
+const field = {value: 'hysteria2://fixture', select() {}, focus() {}};
+globalThis.document = {
+  querySelectorAll: sel => sel === '[data-copy]' ? [button] : [],
+  getElementById: id => id === 'f' ? field : null,
+  createElement: () => ({style: {}, value: '', select() {}, remove() {}}),
+  body: {appendChild() {}},
+  execCommand: () => false,
+};
+"""
+
 CHECKS = r"""
 (async () => {
   await handler();
@@ -56,6 +79,44 @@ class CopyFallbackTests(unittest.TestCase):
 
     def test_user_page_copy_falls_back(self):
         r = self.run_block(portal.USER_SCRIPT)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_clicking_again_before_the_label_resets_does_not_stick(self):
+        """恢复前再点一下，按钮文字最后仍回到原文（2026-11-12 修）。
+
+        旧实现每次点击都把当前文字当原文：第二下记成「已复制 ✓」/「已选中，请按 Ctrl+C」，
+        两个恢复定时器先后触发后，按钮永远停在那句话上。用户分享页与管理弹窗各验一次。
+        """
+        user_start = portal.USER_SCRIPT.index("document.querySelectorAll('[data-copy]').forEach(button => {")
+        user_block = portal.USER_SCRIPT[user_start:portal.USER_SCRIPT.index('\n});\n', user_start) + 5]
+        helper_start = portal.SCRIPT.index('function copyWithFeedback(')
+        helper = portal.SCRIPT[helper_start:portal.SCRIPT.index('\n}\n', helper_start) + 3]
+        source = TIMERS + user_block + helper + r"""
+(async () => {
+  const settle = () => new Promise(r => setImmediate(r));
+  const cases = [[{writeText: async () => {}}, '已复制 ✓'],
+                 [{writeText: async () => { throw new Error('denied'); }}, '已选中，请按 Ctrl+C']];
+  for (const [clip, pressed] of cases) {
+    setClipboard(clip);
+    button.textContent = '复制直链';
+    delete button.dataset.orig;
+    await handler();
+    assert.strictEqual(button.textContent, pressed);
+    await handler();
+    flush();
+    assert.strictEqual(button.textContent, '复制直链', 'user page label stuck');
+  }
+  setClipboard({writeText: async () => {}});
+  const modalBtn = {dataset: {}, textContent: '复制订阅'};
+  copyWithFeedback('x', modalBtn, '已复制 ✓');
+  await settle();
+  copyWithFeedback('x', modalBtn, '已复制 ✓');
+  await settle();
+  flush();
+  assert.strictEqual(modalBtn.textContent, '复制订阅', 'modal label stuck');
+})().catch(e => { console.error(e); process.exitCode = 1; });
+"""
+        r = subprocess.run([NODE, '-e', source], capture_output=True, text=True, encoding='utf-8', timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
 
 

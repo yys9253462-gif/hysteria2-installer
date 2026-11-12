@@ -136,11 +136,14 @@ def _rollback_sample(current, before, applied):
 
 
 class PortalMeter:
-    def __init__(self, data, lock, save, config, read=None, epoch=None, on_speed=None):
+    def __init__(self, data, lock, save, config, read=None, epoch=None, on_speed=None, running=None):
         self.data, self.lock, self.save, self.config=data,lock,save,config
         self.read=read or self._read
         self.user_allowed = None
         self.epoch=epoch or readers.service_epoch
+        self.running=running
+        # Xray 装了但没在跑时 reality 记在这里，由 poll() 每轮刷新。
+        self.idle_sources=set()
         self.stop=threading.Event()
         # 速率采样回调（2026-10-08）：on_speed(uid, tx, rx, elapsed, source)
         # 由 portal.py 注入，把本轮真实字节增量写进 speed_tracker。
@@ -156,7 +159,7 @@ class PortalMeter:
         self.live_sampled_at=0
         self.live_next_at=0
 
-    def enabled_sources(self):
+    def configured_sources(self):
         sources=[s for s in ("hysteria", "reality") if self.config.get(s)]
         # 默认安装会写 Reality 配置，但未安装 xray 时不应阻塞 Hy2 计量。
         cfg=self.config.get("reality", {})
@@ -165,6 +168,17 @@ class PortalMeter:
             if isinstance(binary, str) and binary and not pathlib.Path(binary).is_file():
                 sources.remove("reality")
         return sources
+
+    def enabled_sources(self):
+        # 装了 Xray 但没在跑同理（2026-11-12 修）：旧实现照样每 5 秒去读、每次都失败，
+        # 所有用户的 measurement_ok 一直是 false；从没启动过时 measured_bytes 还是 null，
+        # 页面显示「计量未就绪」。没在跑就没有流量可计，再启动时按换 epoch 正常衔接。
+        idle=getattr(self, 'idle_sources', ())
+        return [s for s in self.configured_sources() if s not in idle]
+
+    def _xray_running(self):
+        check=self.running or (readers.service_running if self.read == self._read else None)
+        return check is None or bool(check('xray'))
 
     def _read(self, source, cfg):
         if source=='hysteria':
@@ -193,12 +207,23 @@ class PortalMeter:
                 with self.lock:
                     self.live_snapshot=None
                     self.live_sampled_at=0
-        for source in self.enabled_sources():
+        for source in self.configured_sources():
             cfg=self.config.get(source)
             now=datetime.now(timezone.utc).isoformat()
             try:
                 if not cfg: raise RuntimeError('source_not_configured')
                 service='hysteria-server' if source=='hysteria' else 'xray'
+                # 配置本身损坏时照旧去读并记失败：那是要人处理的问题，不能当成「没在跑」吞掉。
+                if source=='reality' and isinstance(cfg, dict) and isinstance(cfg.get('binary'), str) and cfg['binary']:
+                    idle=not self._xray_running()
+                    with self.lock:
+                        if idle:
+                            self.idle_sources.add(source)
+                            self.failed_sources.discard(source)
+                        else:
+                            self.idle_sources.discard(source)
+                    if idle:
+                        continue
                 before=self.epoch(service)
                 counters=self.read(source,cfg)
                 if self.epoch(service)!=before: raise RuntimeError('service_changed_during_read')

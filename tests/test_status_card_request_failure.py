@@ -89,7 +89,10 @@ def _block(header):
     return script[start:script.index('\n}\n', start) + 3]
 
 
-SHARED_HELPERS = ('function markStatusUnknown(', 'function markLoadFailed(', 'function obEsc(')
+SHARED_HELPERS = ('function markStatusUnknown(', 'function markLoadFailed(', 'function obEsc(',
+                  'function markWarpRulesFailed(')
+# 卡片函数在失败路径上还会碰到的页面元素（只声明，内容为空即不触发替换）。
+EXTRA_ELEMENTS = ('proxyTbody', 'warpRulesCount', 'warpTagsCloud')
 
 
 def _helpers():
@@ -107,8 +110,8 @@ class StatusCardRequestFailureTests(unittest.TestCase):
             with self.subTest(card=fname):
                 body = _block('async function %s()' % fname)
                 decl = 'var %s = mk();\n' % badge
-                if 'proxyTbody' in body:
-                    decl += 'var proxyTbody = mk();\n'
+                decl += ''.join('var %s = mk();\n' % name for name in EXTRA_ELEMENTS
+                                if name in body or name in _helpers())
                 if seq:
                     decl += 'let %s = 0;\n' % seq
                 check = CARD_CHECK.replace('BADGE', badge).replace('FN', fname)

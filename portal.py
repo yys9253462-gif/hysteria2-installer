@@ -203,7 +203,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.38'
+PORTAL_VERSION = '2.39'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2624,7 +2624,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     <details style="margin-bottom:18px">
       <summary class="button" style="margin-bottom:12px;list-style:none">＋ 手动添加/开通新用户</summary>
-      <form class="modal-form" method="POST" action="/{token}/manage-user">
+      <form class="modal-form js-user-form" method="POST" action="/{token}/manage-user">
         <input type="hidden" name="action" value="create">
         
         <div class="form-field">
@@ -8168,6 +8168,9 @@ def serve(path):
     # 上一次成功收回时的「被封禁用户集合」。过期用户不会从 data 里移走，
     # 不记这个的话 worker 每 5 秒都会重做一遍收回（查 /online、比对 xray）。
     last_enforced_blocked = None
+    # 上一次收回失败的（原因, 打印时刻）：收回确认不了时 worker 每 5 秒重试一次，
+    # 同一原因只在首次和此后每小时打一行，不然 journald 里每 5 秒一条且只有异常类名。
+    last_enforce_error = ('', 0.0)
 
     def blocked_user_ids():
         # users 容器损坏时按空表处理：这里每 5 秒被撤销 worker 调用一次，
@@ -8181,7 +8184,7 @@ def serve(path):
         # 收回期间（最长 4s 查询 + 12s 重启）会卡住所有 Hy2 新连接的鉴权。
         # 快照过期也安全：账号变更后调用方会再调 apply_access，被 access_apply_lock
         # 排在本轮之后，用新快照重新生效。
-        nonlocal last_enforced_blocked
+        nonlocal last_enforced_blocked, last_enforce_error
         with access_apply_lock:
             with data_lock:
                 pending=pending_revocations(data) | set(force_ids)
@@ -8198,9 +8201,17 @@ def serve(path):
                                     skip_anytls=False, skip_tuic=False)
             except Exception as exc:
                 with data_lock:
-                    data['_pending_revocations']=sorted(pending_revocations(data) | pending)
-                    save_data()
-                print('[expiry] access enforcement failed: '+type(exc).__name__,file=sys.stderr)
+                    queued = sorted(pending_revocations(data) | pending)
+                    # 队列没变就不重写：旧实现每次失败都整份重写 portal.json 并 fsync，
+                    # 只有到期用户、队列为空时也写一个空列表，等于每 5 秒落盘一次（2026-11-12 修）。
+                    if queued and data.get('_pending_revocations') != queued:
+                        data['_pending_revocations'] = queued
+                        save_data()
+                reason = type(exc).__name__ + ': ' + ' '.join(str(exc).split())[:300]
+                now = time.monotonic()
+                if reason != last_enforce_error[0] or now - last_enforce_error[1] >= 3600:
+                    print('[expiry] access enforcement failed: ' + reason, file=sys.stderr)
+                    last_enforce_error = (reason, now)
                 return False
             finally:
                 if acquired_core_lock:
@@ -8228,6 +8239,9 @@ def serve(path):
                     pass
                 return False
             last_enforced_blocked=blocked
+            if last_enforce_error[0]:
+                print('[expiry] access enforcement recovered', file=sys.stderr)
+                last_enforce_error = ('', 0.0)
             return True
     def expiry_access_worker():
         while True:
@@ -11734,7 +11748,6 @@ if __name__ == '__main__':
                     previous_warp_rules_exists = 'warp_rules' in data
                     previous_warp_state = copy.deepcopy(data.get('warp_enabled', False))
                     previous_warp_rules = copy.deepcopy(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
-                    rules = normalize_route_rules(data.get('warp_rules', DEFAULT_WARP_DOMAINS))
                     if action == 'toggle':
                         data['warp_enabled'] = not bool(data.get('warp_enabled'))
                     elif action in ('enable', 'disable'):
@@ -11746,7 +11759,13 @@ if __name__ == '__main__':
                                           and not warp_backend_installed())
                     if warp_not_installed:
                         data['warp_enabled'] = previous_warp_state
-                    elif action == 'add_rule':
+                    # 没保存过名单时与页面显示同一口径（routing_state）：WARP 开着、或这次被打开 /
+                    # 关掉，才落成默认名单。旧实现无条件从默认名单起步 —— WARP 关着时页面显示
+                    # 「0 个已配置」，点「+ Netflix」后却冒出整套默认域名（2026-11-12 修）。
+                    defaults_apply = bool(previous_warp_state) or bool(data.get('warp_enabled'))
+                    rules = normalize_route_rules(
+                        routing_state(dict(data, warp_enabled=defaults_apply))['warp_rules'])
+                    if action == 'add_rule':
                         raw = form.get('domain', [''])[0].strip().lower()
                         domain = re.sub(r'^[a-zA-Z]+://', '', raw).split('/')[0].split(':')[0].strip('.')
                         if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
@@ -11761,7 +11780,9 @@ if __name__ == '__main__':
                         rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
                         keep = {r['domain'] for r in rules}
                         rules.extend({'domain': d, 'outbound': 'warp_socks'} for d in DEFAULT_WARP_DOMAINS if d not in keep)
-                    data['warp_rules'] = rules
+                    # 域名不合法时直接回 400、不落盘，内存里也不能先改（否则与磁盘不一致到重启）。
+                    if not bad_domain and (rules or previous_warp_rules_exists):
+                        data['warp_rules'] = rules
                     new_state = bool(data.get('warp_enabled'))
                     current_rules = [r['domain'] for r in rules if r['outbound'] in ('warp', 'warp_socks')]
 
@@ -14299,6 +14320,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
 
+                denial = user_access_denial(u_copy)
                 return self.reply_json(200, {
                     'ok': True,
                     'user_id': target_uid,
@@ -14317,6 +14339,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'traffic_used': _safe_int(u_copy.get('used_bytes', 0)),
                     'traffic_limit': _safe_int(u_copy.get('limit_bytes', 0)),
                     'ip_limit': _display_ip_limit(u_copy),
+                    # 与用户表同一判据（2026-11-12 修）：旧响应没有账号状态，停用 / 到期 / 超额的
+                    # 账号在弹窗里照样是「可直接发给客户」的链接，发出去客户也连不上。
+                    'status_text': (None if denial is None
+                                    else _STATUS_PILL_TEXT.get(denial, ('不可用', ''))[0]),
                 })
 
             # ---------------- AmneziaWG (AWG) ----------------
