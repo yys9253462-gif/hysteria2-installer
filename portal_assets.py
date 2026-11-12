@@ -2887,6 +2887,17 @@ async function doUpgrade(target) {
         if (job && job.message) json.message = job.message;
       }
       const msg = json.message || '升级已触发';
+      if (target === 'portal') {
+        // 面板更新会重启门户，新版本起不来时 20 秒后自动回滚再重启：等门户真正恢复再刷新
+        // （2026-11-12 修，同「重启服务器」）。旧实现固定 5 秒后刷新，重启稍慢或走了回滚
+        // 就落到浏览器的「无法访问此网站」。先等 3 秒，让旧进程退出，免得马上被它应答。
+        if (updateStatusMsg) updateStatusMsg.textContent = msg + '，正在等待面板重启完成...';
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        const back = await waitPortalBack();
+        if (updateStatusMsg) updateStatusMsg.textContent = back ? '面板已恢复，正在刷新...' : '面板长时间未恢复，请稍后手动刷新页面';
+        if (back) location.reload();
+        return;
+      }
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
       setTimeout(() => location.reload(), 5000);
     } else {
