@@ -65,7 +65,9 @@ set -u
 
 # ── 常量 ─────────────────────────────────────────────────────────────────
 INSTALLNET_URL="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
-INSTALLNET_MIRROR="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/InstallNET.sh"
+# raw.githubusercontent.com 不通或被限速时退回 jsDelivr：同一份文件，同样校验 HTTPS 证书。
+# 旧值与主源是同一个 raw 地址且从未被使用，主源一断就只能失败（2026-11-12 修）。
+INSTALLNET_MIRROR="https://cdn.jsdelivr.net/gh/leitbogioro/Tools@master/Linux_reinstall/InstallNET.sh"
 WORKDIR="$(pwd)"
 
 # ── 默认值 ───────────────────────────────────────────────────────────────
@@ -261,13 +263,21 @@ else
     warn "DNS 仍解析不了，但继续尝试（有些环境 nslookup 不可用）"
 fi
 
-# 连通性：能下到 InstallNET 才算真的通
+# 连通性：能下到 InstallNET 才算真的通（主源不通时再试镜像）
+installnet_reachable() {
+    for _u in "$INSTALLNET_URL" "$INSTALLNET_MIRROR"; do
+        if wget -q --spider --timeout=15 "$_u" 2>/dev/null || \
+           curl -fsI --max-time 15 "$_u" >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
 info "测试到 GitHub 的连通性"
-if wget -q --spider --timeout=15 "$INSTALLNET_URL" 2>/dev/null || \
-   curl -fsI --max-time 15 "$INSTALLNET_URL" >/dev/null 2>&1; then
+if installnet_reachable; then
     ok "可以访问安装脚本源"
 else
-    warn "访问 GitHub 失败。若在国内网络，可能需要换镜像或代理"
+    warn "GitHub 与 jsDelivr 镜像都访问失败。若在国内网络，可能需要代理"
 fi
 
 # ── 第 3 步：提取网络配置（★ 防失联关键）─────────────────────────────────
@@ -524,16 +534,27 @@ info "第 6/6 步：下载并执行重装程序"
 
 IN_FILE="$WORKDIR/InstallNET.sh"
 
+# 拿到的必须像个脚本：够大且以 #! 开头。被劫持或拿到报错网页时
+# 可能也有几十 KB，只看大小会把一个网页当成脚本以 root 执行。
+installnet_looks_valid() {
+    _got="$(wc -c < "$IN_FILE" 2>/dev/null | tr -d ' ')"
+    [ -n "$_got" ] && [ "$_got" -ge 50000 ] && head -n 1 "$IN_FILE" 2>/dev/null | grep -q '^#!'
+}
+
 download_installnet() {
+    for _u in "$INSTALLNET_URL" "$INSTALLNET_MIRROR"; do
+        rm -f "$IN_FILE"
+        if command -v wget >/dev/null 2>&1; then
+            # 不能 --no-check-certificate：下载的脚本随后以 root 执行并重装整个系统，
+            # 跳过证书校验等于把机器交给任何能做中间人的人。
+            wget -qO "$IN_FILE" "$_u" && installnet_looks_valid && return 0
+        fi
+        rm -f "$IN_FILE"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --max-time 120 -o "$IN_FILE" "$_u" && installnet_looks_valid && return 0
+        fi
+    done
     rm -f "$IN_FILE"
-    if command -v wget >/dev/null 2>&1; then
-        # 不能 --no-check-certificate：下载的脚本随后以 root 执行并重装整个系统，
-        # 跳过证书校验等于把机器交给任何能做中间人的人。
-        wget -qO "$IN_FILE" "$INSTALLNET_URL" && return 0
-    fi
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 120 -o "$IN_FILE" "$INSTALLNET_URL" && return 0
-    fi
     return 1
 }
 
