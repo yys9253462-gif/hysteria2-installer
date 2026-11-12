@@ -547,6 +547,31 @@ class TestPortalRuntime(unittest.TestCase):
         self.assertEqual(meta["public_ip"], meta_now["public_ip"])
         self.assertEqual(meta["is_insecure"], meta_now["is_insecure"])
 
+    def test_node_meta_docs_list_only_fields_the_api_returns(self):
+        """管理页 API 文档写的字段，接口都要真的返回（2026-11-13 修）：旧文档写「混淆模式以及当前有效
+        用户数与总流量统计」，接口既不给混淆模式也不给流量，按文档对接的商城只会拿到空值。"""
+        access = json.loads((Path(self.tmp) / "portal-access.json").read_text())
+        original = self.meta_path.read_text(encoding="utf-8")
+        meta_now = dict(json.loads(original), listen_port=443, subscription_port=8443,
+                        hop_port_range="20000-40000")
+        self.meta_path.write_text(json.dumps(meta_now), encoding="utf-8")
+        try:
+            st, data = self._req("/api/v1/node/meta",
+                                 headers={"Authorization": "Bearer " + access["api_key"]})
+        finally:
+            self.meta_path.write_text(original, encoding="utf-8")
+        self.assertEqual(st, 200)
+        obj = json.loads(data)
+        page = self.portal.page_html(meta_now, "hysteria2://x@h:1/", "#s", "c", "{}", users={},
+                                     api_key="k", token="t", session_secret="s")
+        block = page[page.index("GET /api/v1/node/meta"):]
+        block = block[:block.index("</details>")]
+        documented = set(re.findall(r"<code>([a-z_]+)</code>", block))
+        self.assertIn("users_count", documented)
+        self.assertLessEqual(documented, set(obj) | set(obj["meta"]), "文档列出了接口不返回的字段")
+        for claim in ("混淆", "流量统计"):
+            self.assertNotIn(claim, block)
+
     # ---- 症状：换证后二维码/下载配置仍是旧节点 ----
     def test_refresh_syncs_download_artifacts(self):
         """改**订阅端口**再 refresh，验证 clash/sing/qr 三者都跟着变。

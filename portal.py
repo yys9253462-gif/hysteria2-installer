@@ -3533,7 +3533,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <details class="card" style="padding:16px;box-shadow:none;border-color:#d7e5e2">
           <summary style="font-size:13px;color:#1e4c56"><strong>4. 节点健康状态与用户数</strong> <code>GET /api/v1/node/meta</code></summary>
           <div style="margin-top:12px;font-size:12px;color:var(--muted)">
-            <p>返回当前节点的端口、公网 IP/域名、混淆模式以及当前有效用户数与总流量统计。</p>
+            <p>返回节点对外参数 <code>meta</code>（<code>public_ip</code>、<code>server_name</code>、<code>listen_port</code>、<code>subscription_port</code>、<code>hop_port_range</code>、<code>cert_type</code>、<code>is_insecure</code>，不含任何密钥）、账号总数 <code>users_count</code>（包括机主账号与已停用、已过期的账号）和服务器时间 <code>time</code>。各用户的用量见 <code>GET /api/v1/users/list</code>。</p>
           </div>
         </details>
       </div>
