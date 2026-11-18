@@ -15146,14 +15146,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 if not 0 <= length <= 8192:
-                    return self.reply_json(413, {'ok': False, 'error': 'Probe request exceeds 8 KiB'})
+                    return self.reply_json(413, {'ok': False, 'error': '探测请求过大，请刷新页面后重试'})
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
             except (ValueError, TypeError, OSError):
-                return self.reply_json(400, {'ok': False, 'error': 'Invalid probe request'})
+                return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
             kind = (form.get('kind', ['direct'])[0] or 'direct').strip().lower()
             addr = (form.get('addr', [''])[0] or '').strip()
-            if kind not in ('direct', 'auto', 'warp', 'socks5', 'http') or (kind in ('socks5', 'http') and not addr):
-                return self.reply_json(400, {'ok': False, 'error': 'Invalid outbound probe type or missing address'})
+            # 报错直接显示在探测结果下面，写中文（2026-11-13 修）。
+            if kind not in ('direct', 'auto', 'warp', 'socks5', 'http'):
+                return self.reply_json(400, {'ok': False, 'error': '未知的出站类型，请刷新页面后重试'})
+            if kind in ('socks5', 'http') and not addr:
+                return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})

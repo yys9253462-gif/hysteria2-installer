@@ -183,6 +183,16 @@ class EndpointAuthTest(unittest.TestCase):
             status, body = self.request('POST', self.prefix + 'outbounds/probe', form, auth=auth)
             self.assertEqual(status, 400, body)
 
+    def test_probe_errors_explain_what_to_do(self):
+        """探测报错直接显示在探测结果下面，要中文并说明怎么办（2026-11-13 修）。"""
+        auth = 'Basic ' + base64.b64encode((self.access['username'] + ':' + self.access['password']).encode()).decode()
+        for form, phrase in (({'kind': 'unrecognized'}, '未知的出站类型'),
+                             ({'kind': 'http', 'addr': ''}, '代理地址')):
+            with self.subTest(form=form):
+                status, body = self.request('POST', self.prefix + 'outbounds/probe', form, auth=auth)
+                self.assertEqual(status, 400, body)
+                self.assertIn(phrase, json.loads(body)['error'])
+
     def test_invalid_api_payloads_return_json_not_a_broken_connection(self):
         auth = 'Bearer ' + self.data['api_key']
         for payload in ([], {'user_id':42}, {'user_id':'qa-invalid', 'duration_days':-1}):

@@ -1317,6 +1317,13 @@ async function loadOutbounds() {
 
 async function probeOutbound(kind, addr, insecure = false) {
   if (!obEls.ip) return;
+  // 代理地址没填就不发请求（2026-11-13 修）：旧实现照发，换回一行英文报错。
+  if ((kind === 'socks5' || kind === 'http') && !addr) {
+    obEls.ip.textContent = '未探测';
+    if (obEls.ipNote) obEls.ipNote.textContent = '请先填写要探测的代理地址';
+    if (obEls.probeAddr && typeof obEls.probeAddr.focus === 'function') obEls.probeAddr.focus();
+    return;
+  }
   obEls.ip.textContent = '探测中...';
   if (obEls.ipNote) obEls.ipNote.textContent = '只检测所选出站端点的可达性，不代表已配置分流规则的实际出口';
   try {
