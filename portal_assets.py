@@ -2688,19 +2688,21 @@ if (btnRebootServer) {
       const b = document.createElement('button');
       b.type = 'button';
       b.textContent = label;
-      if (opts.active) b.className = 'active';
+      // 读屏念的是名称（2026-11-13 修）：「‹」「›」念出来是符号名，页码按钮也听不出哪页是当前页。
+      b.setAttribute('aria-label', opts.name || ('第 ' + label + ' 页'));
+      if (opts.active) { b.className = 'active'; b.setAttribute('aria-current', 'page'); }
       b.disabled = !!opts.disabled;
       b.addEventListener('click', () => { page = target; render(); });
       pager.appendChild(b);
     };
-    btn('‹', page - 1, { disabled: page === 1 });
+    btn('‹', page - 1, { disabled: page === 1, name: '上一页' });
     for (let i = 1; i <= pages; i++) {
       if (i === 1 || i === pages || Math.abs(i - page) <= 2) btn(String(i), i, { active: i === page });
       else if (Math.abs(i - page) === 3) {
         const s = document.createElement('span'); s.className = 'pager-info'; s.textContent = '…'; pager.appendChild(s);
       }
     }
-    btn('›', page + 1, { disabled: page === pages });
+    btn('›', page + 1, { disabled: page === pages, name: '下一页' });
   }
 
   if (search) search.addEventListener('input', () => { page = 1; render(); });
