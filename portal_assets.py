@@ -3447,15 +3447,11 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
     
     try {
       const res = await fetch('/' + token + '/user-config?user_id=' + encodeURIComponent(uid), { credentials: 'same-origin' });
-      if (res.status === 401) {
-        throw new Error('登录状态已失效，请刷新页面重新登录');
-      }
-      if (!res.ok) {
-        throw new Error('网络请求异常 (HTTP ' + res.status + ')');
-      }
+      // 先经 Response.prototype.json 解析：401/429/404/503 都带有明确中文原因，
+      // 旧实现一见 !res.ok 就抛「网络请求异常 (HTTP N)」，把密码已损坏、用户已删除等真因全吞掉了。
       const json = await res.json();
       if (mySeq !== userModalSeq) return;
-      if (!json.ok) throw new Error(json.error || '加载失败');
+      if (!res.ok || !json.ok) throw new Error((json && json.error) || ('网络请求异常 (HTTP ' + res.status + ')'));
       
       uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
       
@@ -3524,9 +3520,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Clash / Mihomo 专属订阅链接:</div>
               <div class="input-with-action">
-                <input type="text" id="um-clash-sub" aria-label="Clash 订阅链接" value="${location.origin}/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" readonly style="font-size:11px;height:36px">
+                <input type="text" id="um-clash-sub" aria-label="Clash 订阅链接" value="${obEsc(location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '/clash.yaml?k=' + userKey)}" readonly style="font-size:11px;height:36px">
                 <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-clash-sub">复制订阅</button>
-                <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" download="clash-${uid}.yaml">下载 ↓</a>
+                <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="${obEsc('/' + token + '/u/' + encodeURIComponent(uid) + '/clash.yaml?k=' + userKey)}" download="clash-${obEsc(uid)}.yaml">下载 ↓</a>
               </div>
               <details style="margin-top:6px">
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>

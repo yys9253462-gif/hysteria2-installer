@@ -156,7 +156,7 @@ class EndpointAuthTest(unittest.TestCase):
             'POST', self.prefix + 'manage-outbounds',
             {'action': 'rule-add', 'domain': 'example.com', 'outbound': 'not-configured'}, auth)
         self.assertEqual(status, 400, body)
-        self.assertIn(b'Unknown outbound target', body)
+        self.assertIn('出站不存在', json.loads(body)['error'])
 
     def test_query_bearing_management_gets_keep_working(self):
         auth = 'Basic ' + base64.b64encode((self.access['username'] + ':' + self.access['password']).encode()).decode()
