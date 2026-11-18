@@ -122,6 +122,39 @@ def parse_simple_yaml(text):
     return out
 
 
+def acme_first_domain(text):
+    """只从 config.yaml 的 acme.domains 段取首个域名，不跨段误认其它列表项。
+
+    旧实现在 acme 段排在文件末尾或末尾无换行时匹配不到 acme_block，退回全文首个 `- xxx`，
+    会把 acl 里的 `- direct` 等列表项当成节点对外域名拼进 api_url。
+    """
+    in_acme = False
+    domains_indent = None
+    item_re = re.compile(r'^\s*-\s*["\']?([A-Za-z0-9._-]+)["\']?\s*(?:#.*)?$')
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        if indent == 0:
+            in_acme = stripped.startswith("acme:")
+            domains_indent = None
+            continue
+        if not in_acme:
+            continue
+        if domains_indent is not None:
+            if indent < domains_indent or (indent == domains_indent and not stripped.startswith("-")):
+                domains_indent = None
+            else:
+                m = item_re.match(raw)
+                if m:
+                    return m.group(1)
+                continue
+        if re.match(r"^domains:\s*(?:#.*)?$", stripped):
+            domains_indent = indent
+    return ""
+
+
 def main():
     ap = argparse.ArgumentParser(description="生成本节点接入 hy2-ops-console 所需的信息")
     ap.add_argument("--config", default=CONFIG)
@@ -149,6 +182,9 @@ def main():
     except Exception as e:
         print(f"portal.json 解析失败：{e}", file=sys.stderr)
         return 2
+    if not isinstance(meta, dict):
+        print("portal.json 格式损坏：顶层必须是 JSON 对象。", file=sys.stderr)
+        return 2
 
     api_key = meta.get("api_key") or ""
     portal_port = meta.get("port")
@@ -161,23 +197,8 @@ def main():
     masq = cfg.get("masquerade", {})
 
     # 域名：优先 client_meta.json（门户发订阅用的同一个地址），
-    # 再退回 acme.domains 的第一项（列表在 YAML 里是 "- xxx" 行，简单解析拿不到，
-    # 所以退回到正则扫）
-    domain = meta_host(read(args.meta_file))
-    # 列表项可能带引号：安装脚本写的就是 `- "域名"`。旧正则不认引号、也不锚定行首，
-    # 从域名中间的连字符起匹配，`my-node.example.com` 被截成 `node.example.com`
-    # 登记到面板；不带连字符的域名则取不到（2026-11-12 修）。
-    item = r"^\s*-\s*[\"']?([A-Za-z0-9._-]+)[\"']?\s*(?:#.*)?$"
-    m = re.search(item, cfg_text, re.M)
-    acme_block = re.search(r"^acme:(.*?)(?=^[a-z])", cfg_text, re.M | re.S)
-    if not domain and acme_block:
-        dm = re.search(r"domains:\s*\n((?:\s*-\s*[^\n]+\n)+)", acme_block.group(1))
-        if dm:
-            first = re.search(item, dm.group(1), re.M)
-            if first:
-                domain = first.group(1)
-    if not domain and m:
-        domain = m.group(1)
+    # 再退回 acme.domains 的第一项（绝不跨段抓 acl 等无关段落里的列表项）。
+    domain = meta_host(read(args.meta_file)) or acme_first_domain(cfg_text)
 
     # 对外可达端口 = masquerade.listenHTTPS
     # 可能写成 `:8443` 或 `0.0.0.0:8443`：只取最后一个冒号后的数字（2026-11-04 修），

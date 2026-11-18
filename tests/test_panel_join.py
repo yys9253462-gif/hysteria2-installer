@@ -109,6 +109,31 @@ class PanelJoinApiUrlTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(self.api_url(INSTALLER_ACME_CONFIG % name), 'https://%s:8443' % name)
 
+    def test_non_acme_list_items_are_not_mistaken_for_domain(self):
+        """tls 模式且缺 client_meta.json 时，不能把 acl 里的列表项当成节点域名。"""
+        cfg = TLS_CONFIG + '\nacl:\n  inline:\n    - direct\n    - reject\n'
+        result = self.run_join(cfg, None)
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        self.assertNotIn('https://direct:', result.stdout)
+
+    def test_acme_block_at_eof_without_trailing_newline_is_found(self):
+        """acme 段排在文件最末尾（前面还有 acl 列表项、末尾无换行）时仍准确取 acme.domains。"""
+        cfg = ('listen: :443\nacl:\n  inline:\n    - direct\nmasquerade:\n  listenHTTPS: :8443\n'
+               'acme:\n  domains:\n    - "tail-node.example.org"')
+        self.assertEqual(self.api_url(cfg, None), 'https://tail-node.example.org:8443')
+
+    def test_corrupt_portal_json_top_level_returns_2_without_traceback(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'config.yaml').write_text(ACME_CONFIG, encoding='utf-8')
+            (root / 'portal.json').write_text('[]', encoding='utf-8')
+            r = subprocess.run(
+                [sys.executable, str(SCRIPT), '--config', str(root / 'config.yaml'),
+                 '--portal', str(root / 'portal.json'), '--meta', str(root / 'missing.json')],
+                capture_output=True, text=True, encoding='utf-8', timeout=20)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertNotIn('Traceback', r.stderr)
+
 
 class PanelJoinConfigValuesTest(unittest.TestCase):
     """config.yaml 里合法但非默认的写法（2026-11-12 修）。"""
