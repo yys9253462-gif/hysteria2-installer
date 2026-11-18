@@ -2641,7 +2641,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="form-field">
           <label for="f_uid">用户标识 (User ID) <span>必填</span></label>
           <div class="input-with-action">
-            <input id="f_uid" name="user_id" placeholder="例如: user_01" required>
+            <input id="f_uid" name="user_id" placeholder="例如: user_01" required maxlength="64" pattern="[A-Za-z0-9_.\-]{{1,64}}" title="只能用字母、数字、点、下划线和连字符，长度 1-64" autocomplete="off" spellcheck="false">
             <button type="button" class="btn-mini" data-gen="f_uid" data-prefix="user">🎲 随机生成</button>
           </div>
           <small>客户端节点命名或用户唯一标识</small>
@@ -2650,7 +2650,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="form-field">
           <label for="f_pwd">连接认证密码 <span>留空随机</span></label>
           <div class="input-with-action">
-            <input id="f_pwd" name="password" placeholder="留空提交时自动生成">
+            <input id="f_pwd" name="password" placeholder="留空提交时自动生成" pattern="\S(?:.*\S)?" title="密码首尾不能有空白字符" autocomplete="off" spellcheck="false">
             <button type="button" class="btn-mini" data-gen="f_pwd">🎲 随机密码</button>
           </div>
           <small>买家或客户端用于握手的秘密连接密钥</small>
@@ -2664,7 +2664,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
         <div class="form-field">
           <label for="f_traffic">流量限额 (GB) <span>0 为不限</span></label>
-          <input id="f_traffic" name="traffic_gb" type="number" step="0.5" min="0" value="0" placeholder="输入例如 100">
+          <input id="f_traffic" name="traffic_gb" type="number" step="any" min="0" max="1000000" value="0" placeholder="输入例如 100">
           <small>达到限额后系统将自动阻断连接</small>
         </div>
 
@@ -2676,7 +2676,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
         <div class="form-field">
           <label for="f_note">备注信息 <span>选填</span></label>
-          <input id="f_note" name="note" placeholder="例如: 客户小明 / 微信购买">
+          <input id="f_note" name="note" placeholder="例如: 客户小明 / 微信购买" maxlength="200">
           <small>便于你在控制台快速区分订单来源</small>
         </div>
 
