@@ -2598,12 +2598,14 @@ async function waitPortalBack(timeoutMs = 300000, intervalMs = 3000) {
 
 if (btnRebootServer) {
   btnRebootServer.addEventListener('click', async () => {
+    // 按危险操作处理（2026-11-13 修）：重启期间所有连接都会中断，旧实现焦点停在「确定」，回车就重启。
     const confirmed = await showConfirm({
       title: '安全重启服务器',
-      text: '确定要立即重启服务器以完成新 BBR 内核网络参数生效吗？服务器将在 10 秒内安全完成重启，页面将自动发起 25 秒倒计时并在就绪后重连。',
+      text: '确定要立即重启服务器以完成新 BBR 内核网络参数生效吗？服务器将在 10 秒内安全完成重启，页面将自动发起 25 秒倒计时并在就绪后重连。\n'
+        + '重启期间所有用户的连接都会中断，直到服务器重新启动完成。',
       icon: '🔄',
       confirmText: '确定立即重启',
-      isWarn: true
+      isDanger: true
     });
     if (!confirmed) return;
     btnRebootServer.disabled = true;
