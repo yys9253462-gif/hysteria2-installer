@@ -473,7 +473,15 @@ let portalSessionExpired = false;
   if (typeof globalThis.fetch !== 'function') return;
   const realFetch = globalThis.fetch;
   globalThis.fetch = async function (...args) {
-    const res = await realFetch.apply(this, args);
+    let res;
+    try {
+      res = await realFetch.apply(this, args);
+    } catch (err) {
+      // 网络层失败（断网、服务器正在重启）时浏览器只给「Failed to fetch」「Load failed」这类英文，
+      // 各按钮照「请求异常: + 原文」弹出（2026-11-13 修）。只换这一类，中止请求（AbortError）原样抛出。
+      if (err && err.name === 'TypeError') throw new TypeError('无法连接服务器（网络中断，或服务器正在重启）');
+      throw err;
+    }
     if (res && res.status === 401 && !portalSessionExpired) {
       portalSessionExpired = true;
       try {

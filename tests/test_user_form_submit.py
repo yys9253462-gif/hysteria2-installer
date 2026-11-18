@@ -66,7 +66,7 @@ class UserFormSubmitTests(unittest.TestCase):
         self.assertEqual(conflict['reloads'], 0)
         self.assertFalse(conflict['disabled'], 'the submit button stays disabled after a failure')
 
-        self.assertEqual(after['network']['alerts'], ['请求异常: Failed to fetch'])
+        self.assertEqual(after['network']['alerts'], ['请求异常: 无法连接服务器（网络中断，或服务器正在重启）'])
         self.assertEqual(after['network']['reloads'], 0)
         self.assertFalse(after['network']['disabled'])
 
