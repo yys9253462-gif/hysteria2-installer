@@ -166,6 +166,9 @@ port_should_pass 51820      # 允许但会告警（WireGuard 默认端口是弱�
 port_should_fail 0
 port_should_fail 65536
 port_should_fail "abc"
+port_should_fail "020000"
+port_should_fail "08080"
+port_should_fail "050000"
 
 # 自动选端口：不得落在跳跃区间，也不得等于 Hysteria2 的端口
 hy2_port=51234
