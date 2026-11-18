@@ -268,6 +268,22 @@ class WebWorkflowTests(unittest.TestCase):
         self.assertEqual(status, 409, body)
         reload_gost.assert_not_called()
 
+    def test_proxy_errors_are_readable(self):
+        """代理增删的报错在页面上原样弹给管理员，要中文并说明怎么办（2026-11-13 修）。"""
+        operate = extract_method('_manage_proxy_operation', self.ns)
+        cases = [('rename', {}, 400, '请求无效'),
+                 ('create', {'type': 'ftp'}, 400, '代理类型只能是'),
+                 ('create', {'type': 'socks5', 'port': 'abc'}, 400, '1-65535'),
+                 ('create', {'type': 'socks5', 'port': '70000'}, 400, '1-65535'),
+                 ('delete', {}, 400, '代理编号'),
+                 ('delete', {'id': 'proxy_gone'}, 404, '已经不存在')]
+        for action, params, want, phrase in cases:
+            with self.subTest(action=action, params=params):
+                status, body = operate(self.handler, action, params)
+                self.assertEqual(status, want, body)
+                self.assertIn(phrase, body['error'])
+        self.reload.assert_not_called()
+
     def test_awg_conf_download_extends_the_deadline(self):
         """AWG 配置下载要延长死线，否则 AWG 更新持锁时 30 秒就被掐断（2026-11-06 修）。"""
         extend = self.handler._extend_deadline = Mock(return_value=True)

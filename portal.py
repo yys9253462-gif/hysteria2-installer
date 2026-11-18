@@ -11220,8 +11220,9 @@ if __name__ == '__main__':
                     os.close(update_lock_fd)
 
         def _manage_proxy_operation(self, action, params):
+            # 报错在页面上原样弹给管理员（控制台也原样转给操作者），一律中文并说明怎么办（2026-11-13 修）。
             if action not in ('create', 'delete'):
-                return 400, {'ok': False, 'error': 'Invalid action'}
+                return 400, {'ok': False, 'error': '请求无效，请刷新页面后重试'}
             with gost_operation_lock:
                 if not Path('/usr/local/bin/gost').exists():
                     return 409, {'ok': False, 'error': '请先安装 GOST，再创建代理服务'}
@@ -11236,14 +11237,14 @@ if __name__ == '__main__':
                 if action == 'create':
                     ptype = str(params.get('protocol') or params.get('type') or 'socks5').lower()
                     if ptype not in ('socks5', 'http', 'https'):
-                        return 400, {'ok': False, 'error': 'Invalid proxy type'}
+                        return 400, {'ok': False, 'error': '代理类型只能是 SOCKS5、HTTP 或 HTTPS'}
                     raw_port = str(params.get('port') or '').strip()
                     try:
                         port = int(raw_port) if raw_port else 0
                     except (TypeError, ValueError):
-                        return 400, {'ok': False, 'error': 'Invalid port'}
+                        port = -1
                     if raw_port and not 1 <= port <= 65535:
-                        return 400, {'ok': False, 'error': 'Port must be in 1..65535'}
+                        return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
                     if ptype == 'https':
                         # 没有可用证书时给 400 + 可读原因，而不是 500 的
                         # 「proxy add failed: ...」（2026-10-30 修）。
@@ -11304,10 +11305,10 @@ if __name__ == '__main__':
                 else:
                     proxy_id = str(params.get('id') or '').strip()
                     if not proxy_id:
-                        return 400, {'ok': False, 'error': 'Missing id'}
+                        return 400, {'ok': False, 'error': '请求缺少代理编号，请刷新页面后重试'}
                     remaining = [item for item in working if item.get('id') != proxy_id]
                     if len(remaining) == len(working):
-                        return 404, {'ok': False, 'error': 'Proxy service not found'}
+                        return 404, {'ok': False, 'error': '这个代理服务已经不存在（可能已被删除），请刷新页面'}
                     with data_lock:
                         data['proxy_services'] = remaining
                 try:
