@@ -58,4 +58,49 @@ class BackupAndErrorTests(unittest.TestCase):
    with patch.object(m.subprocess,'run',side_effect=run):
     with self.assertRaisesRegex(RuntimeError,'stats api unreachable'):m.enable_reality_online(str(p),'xray','127.0.0.1:19997')
    self.assertEqual(p.read_bytes(),old)
+
+ def test_online_stats_probe_retries_transient_startup_failure(self):
+  """Xray 刚重启时 gRPC 统计监听尚未就绪，单次探测易误触发回滚；应短暂重试。"""
+  with tempfile.TemporaryDirectory() as d:
+   p=Path(d)/'xray.json';p.write_text('{"inbounds": [], "outbounds": []}')
+   attempts=[]
+   def run(args,**kwargs):
+    if args[:2]==['xray','api']:
+     attempts.append(1)
+     if len(attempts)<3:
+      raise subprocess.CalledProcessError(1,args)
+    return subprocess.CompletedProcess(args,0)
+   with patch.object(m.subprocess,'run',side_effect=run), patch.object(m.time,'sleep'):
+    result=m.enable_reality_online(str(p),'xray','127.0.0.1:19997')
+   self.assertTrue(result['enabled']);self.assertTrue(result['changed'])
+   self.assertEqual(len(attempts),3)
+
+ def test_rollback_restores_original_permissions_in_both_helpers(self):
+  """回滚写回原配置前必须恢复原文件权限，避免 0600 的 xray.json 退化为默认 umask。"""
+  for fn_name,cfg in (
+   ('enable_reality_online',{'inbounds':[],'outbounds':[]}),
+   ('enable_iplimit_routing',{'api':{'tag':'usage-meter-api','services':['StatsService']},'inbounds':[],'outbounds':[{'protocol':'freedom','tag':'direct'}]}),
+  ):
+   with self.subTest(fn=fn_name), tempfile.TemporaryDirectory() as d:
+    p=Path(d)/'xray.json';raw=json.dumps(cfg).encode();p.write_bytes(raw)
+    if hasattr(m.os,'chmod') and m.os.name!='nt':
+     m.os.chmod(p,0o600)
+    expected_mode=p.stat().st_mode & 0o777
+    chmod_calls=[]
+    real_chmod=m.os.chmod
+    def spy_chmod(path,mode,*a,**kw):
+     chmod_calls.append((Path(path).name,mode))
+     return real_chmod(path,mode,*a,**kw)
+    def run(args,**kwargs):
+     if args[:2]==['xray','api']:raise RuntimeError('api fail')
+     return subprocess.CompletedProcess(args,0)
+    with patch.object(m.subprocess,'run',side_effect=run), patch.object(m.os,'chmod',side_effect=spy_chmod):
+     with self.assertRaisesRegex(RuntimeError,'api fail'):
+      getattr(m,fn_name)(str(p),'xray','127.0.0.1:19997')
+    self.assertEqual(p.read_bytes(),raw)
+    # 正常替换前 1 次 + 回滚替换前 1 次，共 2 次 chmod 且均恢复为原权限
+    self.assertEqual(len(chmod_calls),2,chmod_calls)
+    self.assertEqual(chmod_calls[-1][1],expected_mode)
+    if m.os.name!='nt':
+     self.assertEqual(p.stat().st_mode & 0o777,0o600)
 if __name__=='__main__':unittest.main()
