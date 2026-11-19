@@ -3196,8 +3196,9 @@ function showProxyResult(data) {
   if (resPUrl) resPUrl.value = url;
   if (resPFmt) resPFmt.value = fmt;
 
-  if (resPQr && data.qr) {
-    resPQr.innerHTML = data.qr;
+  if (resPQr) {
+    // 没生成出二维码时必须覆盖掉初始「生成中...」或上一次创建的旧二维码，避免扫码连错代理。
+    resPQr.innerHTML = data.qr || '<p style="color:var(--muted);font-size:12px;margin:0;text-align:center">二维码生成失败（服务器可能未安装 qrencode），请复制右侧代理链接导入</p>';
   }
 
   // 代理详情的复制按钮都走统一兜底（2026-11-03 修）：剪贴板接口不可用时旧写法
