@@ -212,7 +212,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.44'
+PORTAL_VERSION = '2.45'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2641,7 +2641,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="form-field">
           <label for="f_uid">用户标识 (User ID) <span>必填</span></label>
           <div class="input-with-action">
-            <input id="f_uid" name="user_id" placeholder="例如: user_01" required>
+            <input id="f_uid" name="user_id" placeholder="例如: user_01" required maxlength="64" pattern="[A-Za-z0-9_.\\-]{{1,64}}" title="只能用字母、数字、点、下划线和连字符，长度 1-64" autocomplete="off" spellcheck="false">
             <button type="button" class="btn-mini" data-gen="f_uid" data-prefix="user">🎲 随机生成</button>
           </div>
           <small>客户端节点命名或用户唯一标识</small>
@@ -2650,7 +2650,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
         <div class="form-field">
           <label for="f_pwd">连接认证密码 <span>留空随机</span></label>
           <div class="input-with-action">
-            <input id="f_pwd" name="password" placeholder="留空提交时自动生成">
+            <input id="f_pwd" name="password" placeholder="留空提交时自动生成" pattern="\\S(?:.*\\S)?" title="密码首尾不能有空白字符" autocomplete="off" spellcheck="false">
             <button type="button" class="btn-mini" data-gen="f_pwd">🎲 随机密码</button>
           </div>
           <small>买家或客户端用于握手的秘密连接密钥</small>
@@ -2664,7 +2664,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
         <div class="form-field">
           <label for="f_traffic">流量限额 (GB) <span>0 为不限</span></label>
-          <input id="f_traffic" name="traffic_gb" type="number" step="0.5" min="0" value="0" placeholder="输入例如 100">
+          <input id="f_traffic" name="traffic_gb" type="number" step="any" min="0" max="1000000" value="0" placeholder="输入例如 100">
           <small>达到限额后系统将自动阻断连接</small>
         </div>
 
@@ -2676,7 +2676,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
         <div class="form-field">
           <label for="f_note">备注信息 <span>选填</span></label>
-          <input id="f_note" name="note" placeholder="例如: 客户小明 / 微信购买">
+          <input id="f_note" name="note" placeholder="例如: 客户小明 / 微信购买" maxlength="200">
           <small>便于你在控制台快速区分订单来源</small>
         </div>
 
@@ -11220,8 +11220,9 @@ if __name__ == '__main__':
                     os.close(update_lock_fd)
 
         def _manage_proxy_operation(self, action, params):
+            # 报错在页面上原样弹给管理员（控制台也原样转给操作者），一律中文并说明怎么办（2026-11-13 修）。
             if action not in ('create', 'delete'):
-                return 400, {'ok': False, 'error': 'Invalid action'}
+                return 400, {'ok': False, 'error': '请求无效，请刷新页面后重试'}
             with gost_operation_lock:
                 if not Path('/usr/local/bin/gost').exists():
                     return 409, {'ok': False, 'error': '请先安装 GOST，再创建代理服务'}
@@ -11236,14 +11237,14 @@ if __name__ == '__main__':
                 if action == 'create':
                     ptype = str(params.get('protocol') or params.get('type') or 'socks5').lower()
                     if ptype not in ('socks5', 'http', 'https'):
-                        return 400, {'ok': False, 'error': 'Invalid proxy type'}
+                        return 400, {'ok': False, 'error': '代理类型只能是 SOCKS5、HTTP 或 HTTPS'}
                     raw_port = str(params.get('port') or '').strip()
                     try:
                         port = int(raw_port) if raw_port else 0
                     except (TypeError, ValueError):
-                        return 400, {'ok': False, 'error': 'Invalid port'}
+                        port = -1
                     if raw_port and not 1 <= port <= 65535:
-                        return 400, {'ok': False, 'error': 'Port must be in 1..65535'}
+                        return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
                     if ptype == 'https':
                         # 没有可用证书时给 400 + 可读原因，而不是 500 的
                         # 「proxy add failed: ...」（2026-10-30 修）。
@@ -11304,10 +11305,10 @@ if __name__ == '__main__':
                 else:
                     proxy_id = str(params.get('id') or '').strip()
                     if not proxy_id:
-                        return 400, {'ok': False, 'error': 'Missing id'}
+                        return 400, {'ok': False, 'error': '请求缺少代理编号，请刷新页面后重试'}
                     remaining = [item for item in working if item.get('id') != proxy_id]
                     if len(remaining) == len(working):
-                        return 404, {'ok': False, 'error': 'Proxy service not found'}
+                        return 404, {'ok': False, 'error': '这个代理服务已经不存在（可能已被删除），请刷新页面'}
                     with data_lock:
                         data['proxy_services'] = remaining
                 try:
@@ -14411,14 +14412,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
                 target_uid = query.get('user_id', [''])[0].strip()
                 if not VALID_USER_ID_RE.match(target_uid):
-                    return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
+                    return self.reply_json(400, {'ok': False, 'error': '用户标识格式不合法'})
                 with data_lock:
                     u = data.get('users', {}).get(target_uid)
                     # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
                     u_copy = dict(u) if isinstance(u, dict) else None
                 if not u_copy:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
-                    return self.reply_json(404, {'ok': False, 'error': 'User not found'})
+                    return self.reply_json(404, {'ok': False, 'error': '该用户不存在（可能已被删除），请刷新页面'})
 
                 m = read_meta_file(meta_path)
                 pwd = u_copy.get('password')
@@ -15145,14 +15146,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 if not 0 <= length <= 8192:
-                    return self.reply_json(413, {'ok': False, 'error': 'Probe request exceeds 8 KiB'})
+                    return self.reply_json(413, {'ok': False, 'error': '探测请求过大，请刷新页面后重试'})
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
             except (ValueError, TypeError, OSError):
-                return self.reply_json(400, {'ok': False, 'error': 'Invalid probe request'})
+                return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
             kind = (form.get('kind', ['direct'])[0] or 'direct').strip().lower()
             addr = (form.get('addr', [''])[0] or '').strip()
-            if kind not in ('direct', 'auto', 'warp', 'socks5', 'http') or (kind in ('socks5', 'http') and not addr):
-                return self.reply_json(400, {'ok': False, 'error': 'Invalid outbound probe type or missing address'})
+            # 报错直接显示在探测结果下面，写中文（2026-11-13 修）。
+            if kind not in ('direct', 'auto', 'warp', 'socks5', 'http'):
+                return self.reply_json(400, {'ok': False, 'error': '未知的出站类型，请刷新页面后重试'})
+            if kind in ('socks5', 'http') and not addr:
+                return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})
@@ -15166,7 +15170,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
             except Exception:
-                return self.reply_json(400, {'ok': False, 'error': 'Bad request'})
+                return self.reply_json(400, {'ok': False, 'error': '请求格式无效，请刷新页面后重试'})
             action = (form.get('action', [''])[0] or '').strip().lower()
             if not action:
                 return self.reply_json(400, {'ok': False, 'error': '缺少 action 参数'})
@@ -15242,13 +15246,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(400, {
                         'ok': False,
                         'error': '模式只能是 rules（按域名分流）或 global（全局出口）'})
-                if mode == 'global' and not data.get('custom_outbounds'):
-                    return self.reply_json(400, {'ok': False, 'error': '请先新增一个出站，再切换全局出口'})
+                no_valid_outbounds = False
                 with data_lock:
-                    # 🔴 不在这里拦"全局模式但没有出站"：
-                    #    apply_outbounds_config 会自动退回rules，
-                    #    由那一层统一处理，避免两处规则不一致。
-                    data['outbound_mode'] = mode
+                    valid_outs = [o for o in routing_state(data)['custom_outbounds']
+                                  if isinstance(o, dict) and o.get('name')]
+                    if mode == 'global' and not valid_outs:
+                        no_valid_outbounds = True
+                    else:
+                        data['outbound_mode'] = mode
+                if no_valid_outbounds:
+                    return self.reply_json(400, {'ok': False, 'error': '请先新增一个出站，再切换全局出口'})
                 msg = '已切换到' + ('全局出口' if mode == 'global' else '按域名分流')
 
             # ---------- 分流规则增删 ----------
@@ -15260,14 +15267,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 with data_lock:
                     # 与 render_egress_config 同一套归一化：缺 domain 的对象、数字等坏条目
                     # 在这里 r['domain'] 抛 KeyError，所有规则增删都 500（2026-11-03 修）。
-                    rules = normalize_route_rules(routing_state(data)['warp_rules'])
+                    state = routing_state(data)
+                    rules = normalize_route_rules(state['warp_rules'])
                     if action == 'rule-add':
                         cleaned = re.sub(r'^[a-zA-Z]+://', '', dom).split('/')[0].split(':')[0].strip('.')
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()
                         if not cleaned or not re.match(r'^[a-zA-Z0-9.\-]+$', cleaned):
                             rule_error = '域名格式不正确'
-                        elif not outbound_target_exists(target, data.get('custom_outbounds', [])):
-                            rule_error = 'Unknown outbound target; refresh and select a configured outbound'
+                        elif not outbound_target_exists(target, state['custom_outbounds']):
+                            rule_error = '所选出站不存在，请刷新页面后重新选择已配置的出站'
                         else:
                             rules = [r for r in rules if r['domain'] != cleaned]
                             rules.append({'domain': cleaned, 'outbound': target})
@@ -15281,7 +15289,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': rule_error})
             else:
-                return self.reply_json(400, {'ok': False, 'error': '未知 action: ' + action})
+                return self.reply_json(400, {'ok': False, 'error': '未知的操作类型：' + action})
 
             try:
                 save_data()
@@ -15295,7 +15303,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         else:
                             data.pop(key, None)
                 return self.reply_json(500, {'ok': False, 'error':
-                    'Unable to save outbound settings: %s' % exc})
+                    '保存出站设置失败：%s' % exc})
             return self._reply_with_egress_apply({'message': msg}, kind='outbound')
 
         def _h_get_warp_status(self, subpath):

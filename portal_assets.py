@@ -473,7 +473,15 @@ let portalSessionExpired = false;
   if (typeof globalThis.fetch !== 'function') return;
   const realFetch = globalThis.fetch;
   globalThis.fetch = async function (...args) {
-    const res = await realFetch.apply(this, args);
+    let res;
+    try {
+      res = await realFetch.apply(this, args);
+    } catch (err) {
+      // 网络层失败（断网、服务器正在重启）时浏览器只给「Failed to fetch」「Load failed」这类英文，
+      // 各按钮照「请求异常: + 原文」弹出（2026-11-13 修）。只换这一类，中止请求（AbortError）原样抛出。
+      if (err && err.name === 'TypeError') throw new TypeError('无法连接服务器（网络中断，或服务器正在重启）');
+      throw err;
+    }
     if (res && res.status === 401 && !portalSessionExpired) {
       portalSessionExpired = true;
       try {
@@ -1317,6 +1325,13 @@ async function loadOutbounds() {
 
 async function probeOutbound(kind, addr, insecure = false) {
   if (!obEls.ip) return;
+  // 代理地址没填就不发请求（2026-11-13 修）：旧实现照发，换回一行英文报错。
+  if ((kind === 'socks5' || kind === 'http') && !addr) {
+    obEls.ip.textContent = '未探测';
+    if (obEls.ipNote) obEls.ipNote.textContent = '请先填写要探测的代理地址';
+    if (obEls.probeAddr && typeof obEls.probeAddr.focus === 'function') obEls.probeAddr.focus();
+    return;
+  }
   obEls.ip.textContent = '探测中...';
   if (obEls.ipNote) obEls.ipNote.textContent = '只检测所选出站端点的可达性，不代表已配置分流规则的实际出口';
   try {
@@ -2591,12 +2606,14 @@ async function waitPortalBack(timeoutMs = 300000, intervalMs = 3000) {
 
 if (btnRebootServer) {
   btnRebootServer.addEventListener('click', async () => {
+    // 按危险操作处理（2026-11-13 修）：重启期间所有连接都会中断，旧实现焦点停在「确定」，回车就重启。
     const confirmed = await showConfirm({
       title: '安全重启服务器',
-      text: '确定要立即重启服务器以完成新 BBR 内核网络参数生效吗？服务器将在 10 秒内安全完成重启，页面将自动发起 25 秒倒计时并在就绪后重连。',
+      text: '确定要立即重启服务器以完成新 BBR 内核网络参数生效吗？服务器将在 10 秒内安全完成重启，页面将自动发起 25 秒倒计时并在就绪后重连。\n'
+        + '重启期间所有用户的连接都会中断，直到服务器重新启动完成。',
       icon: '🔄',
       confirmText: '确定立即重启',
-      isWarn: true
+      isDanger: true
     });
     if (!confirmed) return;
     btnRebootServer.disabled = true;
@@ -2671,19 +2688,21 @@ if (btnRebootServer) {
       const b = document.createElement('button');
       b.type = 'button';
       b.textContent = label;
-      if (opts.active) b.className = 'active';
+      // 读屏念的是名称（2026-11-13 修）：「‹」「›」念出来是符号名，页码按钮也听不出哪页是当前页。
+      b.setAttribute('aria-label', opts.name || ('第 ' + label + ' 页'));
+      if (opts.active) { b.className = 'active'; b.setAttribute('aria-current', 'page'); }
       b.disabled = !!opts.disabled;
       b.addEventListener('click', () => { page = target; render(); });
       pager.appendChild(b);
     };
-    btn('‹', page - 1, { disabled: page === 1 });
+    btn('‹', page - 1, { disabled: page === 1, name: '上一页' });
     for (let i = 1; i <= pages; i++) {
       if (i === 1 || i === pages || Math.abs(i - page) <= 2) btn(String(i), i, { active: i === page });
       else if (Math.abs(i - page) === 3) {
         const s = document.createElement('span'); s.className = 'pager-info'; s.textContent = '…'; pager.appendChild(s);
       }
     }
-    btn('›', page + 1, { disabled: page === pages });
+    btn('›', page + 1, { disabled: page === pages, name: '下一页' });
   }
 
   if (search) search.addEventListener('input', () => { page = 1; render(); });
@@ -3428,15 +3447,11 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
     
     try {
       const res = await fetch('/' + token + '/user-config?user_id=' + encodeURIComponent(uid), { credentials: 'same-origin' });
-      if (res.status === 401) {
-        throw new Error('登录状态已失效，请刷新页面重新登录');
-      }
-      if (!res.ok) {
-        throw new Error('网络请求异常 (HTTP ' + res.status + ')');
-      }
+      // 先经 Response.prototype.json 解析：401/429/404/503 都带有明确中文原因，
+      // 旧实现一见 !res.ok 就抛「网络请求异常 (HTTP N)」，把密码已损坏、用户已删除等真因全吞掉了。
       const json = await res.json();
       if (mySeq !== userModalSeq) return;
-      if (!json.ok) throw new Error(json.error || '加载失败');
+      if (!res.ok || !json.ok) throw new Error((json && json.error) || ('网络请求异常 (HTTP ' + res.status + ')'));
       
       uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
       
@@ -3505,9 +3520,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Clash / Mihomo 专属订阅链接:</div>
               <div class="input-with-action">
-                <input type="text" id="um-clash-sub" aria-label="Clash 订阅链接" value="${location.origin}/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" readonly style="font-size:11px;height:36px">
+                <input type="text" id="um-clash-sub" aria-label="Clash 订阅链接" value="${obEsc(location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '/clash.yaml?k=' + userKey)}" readonly style="font-size:11px;height:36px">
                 <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-clash-sub">复制订阅</button>
-                <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="/${token}/u/${encodeURIComponent(uid)}/clash.yaml?k=${userKey}" download="clash-${uid}.yaml">下载 ↓</a>
+                <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="${obEsc('/' + token + '/u/' + encodeURIComponent(uid) + '/clash.yaml?k=' + userKey)}" download="clash-${obEsc(uid)}.yaml">下载 ↓</a>
               </div>
               <details style="margin-top:6px">
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>

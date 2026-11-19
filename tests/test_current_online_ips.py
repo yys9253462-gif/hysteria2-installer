@@ -108,5 +108,20 @@ class MappedIpTests(unittest.TestCase):
   self.assertEqual(m._addr_ip('[2001:db8::1]:1'),'2001:db8::1')
  def test_core_live_ip_is_unmapped(self):
   self.assertEqual(m._norm_ip('::ffff:203.0.113.8'),'203.0.113.8')
+ def test_reality_online_ip_is_unmapped(self):
+  """双栈监听时 Xray statsonlineiplist 同样报 ::ffff:a.b.c.d，必须与 Hy2 一致还原成 IPv4。"""
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test-secret'},'reality':{'binary':'/usr/local/bin/xray','address':'127.0.0.1:19997'}}
+  def read(path,*args,**kwargs):
+   if path.name=='usage-meter-config.json':return json.dumps(cfg)
+   if path.name=='xray.json':return json.dumps({'policy':{'levels':{'0':{'statsUserOnline':True}}}})
+   return json.dumps({'users':{'active':{}}})
+  def command(args):
+   if 'statsgetallonlineusers' in args:return json.dumps({'users':['user>>>active>>>online']})
+   if 'statsonlineiplist' in args:return json.dumps({'ips':{'::ffff:203.0.113.12':12345,'2001:db8::9':12346}})
+   raise AssertionError(args)
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
+   result=m.read_live_connections()['users']['active']
+  self.assertTrue(result['reality_ok'])
+  self.assertEqual([item['ip'] for item in result['ips']],['203.0.113.12','2001:db8::9'])
 
 if __name__=='__main__':unittest.main()

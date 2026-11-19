@@ -316,15 +316,17 @@ print(free[secrets.randbelow(len(free))])
 # 端口合规校验。返回 0 通过；非 0 时把原因打到 stderr。
 validate_port() {
     local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] || { log_err "端口必须是数字: ${port}"; return 1; }
-    [[ "$port" -ge 1 && "$port" -le 65535 ]] || { log_err "端口超出范围 1-65535: ${port}"; return 1; }
-    if [[ "$port" -ge 20000 && "$port" -le 40000 ]]; then
+    # 拒绝前导零：bash 算术把 020000 当八进制 8192，会绕过 20000-40000 跳跃区间检查，
+    # 而 amneziawg-go 按十进制解析成 20000 监听；08080 / 09000 则直接触发算术进制错误。
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || { log_err "端口必须是 1-65535 的十进制整数（不含前导零）: ${port}"; return 1; }
+    (( 10#$port >= 1 && 10#$port <= 65535 )) || { log_err "端口超出范围 1-65535: ${port}"; return 1; }
+    if (( 10#$port >= 20000 && 10#$port <= 40000 )); then
         log_err "端口 ${port} 落在 Hysteria2 的端口跳跃区间 20000-40000 内。"
         log_err "该区间的 UDP 已被 iptables REDIRECT 到 Hysteria 主端口，AmneziaWG 将收不到任何握手包。"
         log_err "请改用区间外的端口（推荐 50000-59000）。"
         return 1
     fi
-    if [[ "$port" -eq 51820 ]]; then
+    if (( 10#$port == 51820 )); then
         log_warn "端口 51820 是 WireGuard 的默认端口，本身就是一个弱指纹，建议改用其他端口。"
     fi
     return 0

@@ -5218,11 +5218,11 @@ install_amneziawg() {
     read -rp "请输入监听 UDP 端口 [回车自动选择 ${AWG_PORT_MIN}-${AWG_PORT_MAX} 内的空闲端口]: " port || true
     port="${port// /}"
     if [[ -n "$port" ]]; then
-        if ! [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" -lt 1 || "$port" -gt 65535 ]]; then
-            log_err "端口必须是 1-65535 的数字。"
+        if ! is_valid_port "$port"; then
+            log_err "端口必须是 1-65535 的十进制整数（不含前导零）。"
             return 1
         fi
-        if [[ "$port" -ge 20000 && "$port" -le 40000 ]]; then
+        if (( 10#$port >= 20000 && 10#$port <= 40000 )); then
             log_err "端口 ${port} 落在 Hysteria2 端口跳跃区间 20000-40000 内，会导致 AWG 无法收到握手包。"
             log_err "请改用区间外的端口，推荐 ${AWG_PORT_MIN}-${AWG_PORT_MAX}。"
             return 1

@@ -262,7 +262,9 @@ def read_live_connections():
                 result=json.loads(cmd([binary,'api','statsonlineiplist','--server='+address,'--email='+uid]))
                 ips=result.get('ips',{})
                 if not isinstance(ips,dict):raise ValueError('invalid_online_ips')
-                for ip,seen in ips.items():out['ips'].append({'ip':str(ipaddress.ip_address(ip)),'protocol':'Reality','last_seen':int(seen)})
+                # 双栈监听时 Xray 同样可能报 ::ffff:a.b.c.d，必须与 Hy2 一致还原成纯 IPv4，
+                # 否则同一设备同时测速 Hy2 与 Reality 时会被当成两个在线 IP，也对不上跨节点拦截名单。
+                for ip,seen in ips.items():out['ips'].append({'ip':_norm_ip(ip),'protocol':'Reality','last_seen':int(seen)})
         except Exception as exc:
             for out in output['users'].values():
                 out['reality_ok']=False
