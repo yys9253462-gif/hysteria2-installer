@@ -13,17 +13,23 @@ import portal  # noqa: E402
 
 class ReservedPortsKeepDisabledTests(unittest.TestCase):
     DATA = {'vlessenc_config': {'enabled': False, 'port': 2053},
-            'vmess_config': {'enabled': False, 'port': 2087}}
+            'vmess_config': {'enabled': False, 'port': 2087},
+            'anytls_config': {'enabled': False, 'port': 2096}}
 
     def test_picking_a_port_avoids_disabled_siblings(self):
         got = portal.managed_reserved_ports({}, self.DATA, exclude_key='reality_config', keep_disabled=True)
         self.assertIn(2053, got)
         self.assertIn(2087, got)
+        self.assertIn(2096, got)
 
     def test_own_kept_port_is_still_excluded(self):
         got = portal.managed_reserved_ports({}, self.DATA, exclude_key='vlessenc_config', keep_disabled=True)
         self.assertNotIn(2053, got)
         self.assertIn(2087, got)
+        self.assertIn(2096, got)
+        got_anytls = portal.managed_reserved_ports({}, self.DATA, exclude_key='anytls_config', keep_disabled=True)
+        self.assertNotIn(2096, got_anytls)
+        self.assertIn(2053, got_anytls)
 
     def test_in_use_check_still_ignores_disabled_sections(self):
         self.assertEqual(portal.managed_reserved_ports({}, self.DATA), set())

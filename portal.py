@@ -6756,15 +6756,11 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None, keep_disab
         except (TypeError, ValueError):
             pass
     for key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
-        # AnyTLS 停用后保留 secret 与端口记录（再启用要沿用），但那个端口已经空出来了。
-        # VMess / VLESS Encryption 停用后同样保留配置段并标 enabled=False（2026-11-03）。
+        # AnyTLS / Reality / VMess / VLESS Encryption 停用后都会保留端口、再启用要沿用：
+        # 选新端口的调用方传 keep_disabled=True 时全部都要避开；只问「此刻谁占着」时停用段不算。
         section = data.get(key)
-        if key == 'anytls_config' and not (isinstance(section, dict) and section.get('enabled')):
+        if key == 'anytls_config' and not keep_disabled and not (isinstance(section, dict) and section.get('enabled')):
             continue
-        # Reality / VMess / VLESS Encryption 停用后保留端口、再启用要沿用它：别的协议选端口时
-        # 也要避开（2026-11-06 修）。旧实现跳过停用段，VMess / Reality 可能占走 VLESS
-        # Encryption 停用期间保留的端口，后者再启用只能换端口，已发的订阅全部指错。
-        # 选新端口的调用方传 keep_disabled=True；只问「此刻谁占着」的调用方停用段不算。
         if isinstance(section, dict) and section.get('enabled') is False and not keep_disabled:
             continue
         if key == exclude_key:
