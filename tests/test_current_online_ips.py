@@ -49,7 +49,7 @@ class LiveTests(unittest.TestCase):
    if 'statsgetallonlineusers' in args:return json.dumps({'users':['a','b']})
    if '--email=a' in args:return json.dumps({'ips':{'203.0.113.1':1}})
    raise OSError('query failed')
-  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m,'service_running',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
    users=m.read_live_connections()['users']
   for result in users.values():
    self.assertFalse(result['reality_ok']);self.assertEqual(result['ips'],[])
@@ -63,9 +63,26 @@ class LiveTests(unittest.TestCase):
    if 'statsgetallonlineusers' in args:return json.dumps({'users':['user>>>active>>>online']})
    if 'statsonlineiplist' in args:return json.dumps({'ips':{'203.0.113.12':12345}})
    raise AssertionError(args)
-  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m,'service_running',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
    result=m.read_live_connections()['users']['active']
   self.assertTrue(result['reality_ok']);self.assertEqual(result['ips'][0]['protocol'],'Reality');self.assertEqual(result['ips'][0]['ip'],'203.0.113.12')
+ def test_installed_but_stopped_xray_skips_reality_online_query(self):
+  """已装 Xray 但服务未运行时按空闲处理，不查统计接口也不给全员标 reality_ok=False。"""
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test-secret'},'reality':{'binary':'/usr/local/bin/xray','address':'127.0.0.1:19997'}}
+  def read(path,*args,**kwargs):
+   if path.name=='usage-meter-config.json':return json.dumps(cfg)
+   if path.name=='xray.json':return json.dumps({'policy':{'levels':{'0':{'statsUserOnline':True}}}})
+   return json.dumps({'users':{'u1':{}}})
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m,'service_running',return_value=False),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=AssertionError('Xray 停用时不应调用在线查询')):
+   result=m.read_live_connections()['users']['u1']
+  self.assertTrue(result['reality_ok'])
+  self.assertNotIn('reality_error',result)
+ def test_service_running_treats_systemd_errors_as_running(self):
+  """systemd 缺失或超时时按在跑处理，符合函数约定并交给后续读取报错。"""
+  import subprocess
+  for exc in (FileNotFoundError('systemctl'), subprocess.TimeoutExpired(['systemctl'], 5)):
+   with self.subTest(exc=type(exc).__name__), patch.object(m.subprocess,'run',side_effect=exc):
+    self.assertTrue(m.service_running('xray'))
  def test_long_connection_does_not_expire(self):self.assertEqual(m.parse_events([row('client connected')]),{('user','203.0.113.8'):1})
  def test_core_zero_removes_ghost(self):self.assertEqual(m.confirmed_ips({('user','203.0.113.8'):1},'user',0),[])
  def test_count_mismatch_unknown(self):self.assertIsNone(m.confirmed_ips({},'user',1))
@@ -119,7 +136,7 @@ class MappedIpTests(unittest.TestCase):
    if 'statsgetallonlineusers' in args:return json.dumps({'users':['user>>>active>>>online']})
    if 'statsonlineiplist' in args:return json.dumps({'ips':{'::ffff:203.0.113.12':12345,'2001:db8::9':12346}})
    raise AssertionError(args)
-  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m,'service_running',return_value=True),patch.object(m.urllib.request,'urlopen',side_effect=HTTPError('http://127.0.0.1:19996/online/ips',404,'missing',{},None)),patch.object(m,'read_hysteria_online',return_value={}),patch.object(m,'cmd',side_effect=command):
    result=m.read_live_connections()['users']['active']
   self.assertTrue(result['reality_ok'])
   self.assertEqual([item['ip'] for item in result['ips']],['203.0.113.12','2001:db8::9'])
