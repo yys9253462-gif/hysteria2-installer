@@ -6677,6 +6677,7 @@ def _apply_xray_access_snapshot(root, xj, snapshot, blocked, cfg_path, meter_con
 def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, meter_config,
                                        force_ids, wanted_by_tag):
     original=xj.read_bytes()
+    orig_mode=xj.stat().st_mode & 0o777
     xcfg=json.loads(original)
     # wanted_by_tag 是锁外读 xray.json 时算的；拿到锁之前可能有协议被停用、
     # 入站被删（2026-11-03 修）。旧实现照旧 tag 集合取下标：找不到时下标是 -1，
@@ -6702,7 +6703,7 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         xcfg['inbounds'][idx].setdefault('settings',{})['clients']=wanted
     candidate=xj.with_name('xray.expiry-candidate.json')
     candidate.write_text(json.dumps(xcfg,indent=2),encoding='utf-8')
-    candidate.chmod(xj.stat().st_mode & 0o777)
+    candidate.chmod(orig_mode)
     reality_cfg=meter_config.get('reality') if isinstance(meter_config, dict) else None
     reality_cfg=reality_cfg if isinstance(reality_cfg, dict) else {}
     binary=reality_cfg.get('binary','/usr/local/bin/xray')
@@ -6726,7 +6727,10 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     except Exception:
         if replaced:
-            candidate.write_bytes(original);candidate.replace(xj)
+            candidate.write_bytes(original)
+            candidate.chmod(orig_mode)
+            candidate.replace(xj)
+            subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
             subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
         raise
     finally:
