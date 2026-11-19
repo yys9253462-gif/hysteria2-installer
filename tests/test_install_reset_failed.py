@@ -87,6 +87,7 @@ run_snippet
         block_start = SRC.rindex('\n    fi\n', 0, main_start) + 1
         main_snippet = SRC[block_start:main_end]
 
+        main_body = main_snippet.split('    fi\n', 1)[1]
         script_main = f"""
 log_err() {{ echo "ERR:$*" >&2; }}
 _restore_gost_install() {{ echo "RESTORED"; }}
@@ -99,7 +100,7 @@ systemctl() {{
     esac
 }}
 run_main() {{
-{main_snippet.split('    fi\n', 1)[1]}
+{main_body}
 }}
 run_main
 """

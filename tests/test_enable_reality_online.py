@@ -98,9 +98,10 @@ class BackupAndErrorTests(unittest.TestCase):
      with self.assertRaisesRegex(RuntimeError,'api fail'):
       getattr(m,fn_name)(str(p),'xray','127.0.0.1:19997')
     self.assertEqual(p.read_bytes(),raw)
-    # 正常替换前 1 次 + 回滚替换前 1 次，共 2 次 chmod 且均恢复为原权限
-    self.assertEqual(len(chmod_calls),2,chmod_calls)
-    self.assertEqual(chmod_calls[-1][1],expected_mode)
+    # 正常替换前 1 次 + 回滚替换前 1 次（过滤掉 shutil.copy2 给备份文件做的 chmod）
+    cand_chmods=[c for c in chmod_calls if 'candidate' in c[0]]
+    self.assertEqual(len(cand_chmods),2,chmod_calls)
+    self.assertEqual(cand_chmods[-1][1],expected_mode)
     if m.os.name!='nt':
      self.assertEqual(p.stat().st_mode & 0o777,0o600)
 if __name__=='__main__':unittest.main()

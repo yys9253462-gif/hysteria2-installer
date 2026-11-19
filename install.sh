@@ -2784,9 +2784,7 @@ CONFIG="/etc/hysteria/config.yaml"
 [[ -f "$CONFIG" ]] || exit 1
 
 # 仅提取顶格 acl 块本身（不含排在后面的 obfs 等段落），供收尾判断是否需要重启
-extract_acl() {
-    awk 'BEGIN{f=0} /^acl:/{f=1;print;next} f && /^[^ \t#]/{f=0} f' "$1"
-}
+extract_acl() { awk 'BEGIN{f=0} /^acl:/{f=1;print;next} f && /^[^ \t#]/{f=0} f' "$1"; }
 BEFORE_ACL=$(extract_acl "$CONFIG")
 
 # 清理旧 acl 段：只删 acl 块本身，obfs 等排在其后的顶格段落必须保留

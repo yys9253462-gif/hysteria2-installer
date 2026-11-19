@@ -12378,14 +12378,14 @@ if __name__ == '__main__':
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
+                if action not in ('toggle', 'enable', 'disable'):
+                    return self.reply_json(400, {'ok': False, 'error': '未知的 VMess 操作类型，请刷新页面后重试'})
                 xray_path = Path('/etc/hysteria/xray.json')
                 config = (json.loads(xray_path.read_text(encoding='utf-8'))
                           if xray_path.exists() else None)
                 enabled = bool(config) and has_managed_inbound(config, VMESS_INBOUND_TAG)
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
-                if action not in ('enable', 'disable'):
-                    return self.reply_json(400, {'ok': False, 'error': '未知的 VMess 操作类型，请刷新页面后重试'})
                 if action == 'enable':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
@@ -13106,14 +13106,14 @@ if __name__ == '__main__':
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
+                if action not in ('toggle', 'enable', 'disable'):
+                    return self.reply_json(400, {'ok': False, 'error': '未知的 VLESS Encryption 操作类型，请刷新页面后重试'})
                 xray_path = Path('/etc/hysteria/xray.json')
                 config = (json.loads(xray_path.read_text(encoding='utf-8'))
                           if xray_path.exists() else None)
                 enabled = bool(config) and has_managed_inbound(config, VLESSENC_INBOUND_TAG)
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
-                if action not in ('enable', 'disable'):
-                    return self.reply_json(400, {'ok': False, 'error': '未知的 VLESS Encryption 操作类型，请刷新页面后重试'})
                 if action == 'enable':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
