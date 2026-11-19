@@ -3459,6 +3459,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable hysteria-server >/dev/null 2>&1
+    systemctl reset-failed hysteria-server >/dev/null 2>&1 || true
     # 必须 || true：restart 失败时若被 set -e 直接终止，下面那段
     # 「请看 journalctl」的提示永远到不了用户眼前（2026-10-29 修）。
     systemctl restart hysteria-server || true
@@ -4250,6 +4251,7 @@ EOF
     chmod 600 "$HY2_DIR/portal.json" "$HY2_DIR/portal-access.json" "$HY2_META_FILE" "$HY2_CONFIG"
     systemctl daemon-reload
     systemctl enable hysteria-portal >/dev/null
+    systemctl reset-failed hysteria-portal >/dev/null 2>&1 || true
     systemctl restart hysteria-portal
     sleep 1
     systemctl is-active --quiet hysteria-portal || { log_err "信息页服务启动失败"; return 1; }
@@ -4726,6 +4728,7 @@ install_gost() {
             systemctl disable gost >/dev/null 2>&1 || true
         fi
         if [[ "$had_gost" == 1 && "$old_active" == 1 ]]; then
+            systemctl reset-failed gost >/dev/null 2>&1 || true
             systemctl restart gost >/dev/null 2>&1 || true
         else
             systemctl stop gost >/dev/null 2>&1 || true
@@ -4935,6 +4938,7 @@ EOF
         log_err "GOST 所有权标记写入失败，已恢复原部署。"
         return 1
     fi
+    systemctl reset-failed gost >/dev/null 2>&1 || true
     if ! systemctl daemon-reload || ! systemctl enable gost >/dev/null 2>&1 \
             || ! systemctl restart gost; then
         _restore_gost_install
