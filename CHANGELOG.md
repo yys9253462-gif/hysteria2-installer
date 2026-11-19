@@ -1,3 +1,16 @@
+## 2026-11-19 — 第三十六批十项修复，门户 2.46
+
+- 计量核心（`usage-meter-core-20261007-v1.py`）在清理已删除用户累计流量（`totals`）时同步清除平级流量偏移（`adjustments[uid]`），同时保留暂未删除的停用用户偏移：此前仅遍历废弃的嵌套结构，导致带负偏移的已删用户被同名重建后 `adjusted_bytes` 算得负值并触发整机计量循环持续失败。
+- Xray 计量配置助手（`usage-meter-xray-config-20261007-v1.py`）在 `enable_iplimit_routing` 与 `enable_reality_online` 失败回滚时恢复原 `xray.json` 文件权限（避免 `0600` 退化为默认掩码泄露私钥与用户列表）；同时 `enable_reality_online` 重启后轮询等待统计接口就绪（最多 10 次 × 0.5 秒），不再因单次立即探测连接被拒而误触回滚。
+- 门户核心准入同步（`portal.py` 的 `_apply_xray_access_snapshot_locked`）失败回滚时同样恢复原 `xray.json` 权限，并在回滚重启 `xray` 前先执行 `systemctl reset-failed xray`：此前若重启刚撞上启动频率上限，回滚重启也会被 systemd 拒绝导致服务持续停机。
+- 实时在线 IP 采集（`usage-meter-readers-20261007-v1.py` 的 `read_live_connections`）在 Xray 已安装但服务未运行时按空闲处理，不再每 15 秒报「Reality在线IP读取失败」；同时 `service_running` 捕获 `systemctl` 缺失或超时异常按约定返回在跑，不再在受限环境抛出未捕获异常。
+- 门户选新端口避让（`managed_reserved_ports` 在 `keep_disabled=True` 时）同步避开已停用 AnyTLS 保留的端口：此前对 `anytls_config` 的提前跳过位于 `keep_disabled` 判断之前，停用 AnyTLS 后启用其它 TCP 协议或入站代理会抢走其保留端口，导致 AnyTLS 重新启用时被迫换端口、旧订阅失效。
+- `install.sh` 内嵌的 `toggle_warp.sh` 改为按顶格缩进仅提取 `acl:` 块本身对比变更：此前用 `sed -n '/^acl:/,$p'` 连带读入排在后面的 `obfs:` 段，删旧 `acl:` 并追加新 `acl:` 到末尾后两者必然不等，导致规则无实质变化也误重启 `hysteria-server` 掐断全部在线连接。
+- GOST 入站代理创建成功弹窗（`portal_assets.py` 的 `showProxyResult`）在服务器未安装 `qrencode` 或生成失败时，覆盖掉初始「生成中...」或上一次创建的旧二维码，并展示中文复制指引：此前保留旧二维码会导致扫码连错代理。
+- `reinstall-debian13.sh` 为七个带值选项补齐参数个数校验（缺值直接中文报错退出，不再在 bash 下死循环或 sh 下裸崩），并将 `/proc/mounts` 匹配收敛为精确整盘或分区（`disk_mounts`），避免 `/dev/nvme0n1` 误命中 `/dev/nvme0n10p1` 或 `/dev/sda` 误命中 `/dev/sdaa1`。
+- `install.sh` 重启核心服务（主服务 `hysteria-server`、门户 `hysteria-portal`、入站代理 `gost` 及其失败回滚）前统一先执行 `systemctl reset-failed`：此前服务刚撞上 `StartLimitBurst` 时，即便重装已写入完好配置仍会被 systemd 拒绝启动。
+- 网页管理接口残余英文参数报错与代理删除提示统一中文化，覆盖 `do-upgrade`（更新目标、版本标识）、五个协议管理接口（Reality / VMess / AnyTLS / TUIC / VLESS Encryption）、BBR 版本切换及入站代理删除响应（`/api/v1/*` 外部接口契约与状态码保持不变）。
+
 ## 2026-11-18 — 第三十五批十项修复，门户 2.45
 
 - 新建用户表单在浏览器里即按服务端规则校验：用户标识限制 1–64 位合法字符，连接密码首尾禁止空白，流量限额步长改为任意小数并设上限 1000000 GB，备注限长 200 字符。此前填了含空格的标识要提交后才被拒，填 0.3 GB 反被原步长 0.5 拦下，超长备注则被无声截断。
