@@ -31,16 +31,16 @@ obfs:
 
 @unittest.skipUnless(BASH, 'requires bash')
 class ToggleWarpTests(unittest.TestCase):
-    def run_toggle(self, action, suspended=False):
+    def run_toggle(self, action, suspended=False, config_text=BASE):
         with tempfile.TemporaryDirectory() as td:
             t = Path(td)
             cfg = t / 'config.yaml'
-            cfg.write_text(BASE)
+            cfg.write_text(config_text, encoding='utf-8')
             (t / 'portal.json').write_text('{"traffic_suspend": {"suspended": %s}}' % ('true' if suspended else 'false'))
-            script = (TOGGLE.replace('/etc/hysteria/config.yaml', str(cfg))
-                            .replace('/etc/hysteria/portal.json', str(t / 'portal.json')))
+            script = (TOGGLE.replace('/etc/hysteria/config.yaml', cfg.as_posix())
+                            .replace('/etc/hysteria/portal.json', (t / 'portal.json').as_posix()))
             stubs = ('systemctl() { echo "SYS $*" >> %s/calls; }\n'
-                     'curl() { return 0; }\n') % t
+                     'curl() { return 0; }\n') % t.as_posix()
             if not shutil.which('jq'):
                 stubs += 'jq() { grep -q \'"suspended": true\' "$3" && echo true || echo false; }\n'
             subprocess.run([BASH, '-c', stubs + script.replace('#!/usr/bin/env bash\n', '', 1), 'x', action],
@@ -64,6 +64,32 @@ class ToggleWarpTests(unittest.TestCase):
     def test_suspended_node_is_not_started(self):
         _, calls = self.run_toggle('1', suspended=True)
         self.assertNotIn('start hysteria-server', calls)
+
+    def test_noop_disable_with_obfs_after_acl_does_not_restart(self):
+        """obfs 段排在 acl 段之后时，规则本身无变化不应因为段落顺序变化而误重启。"""
+        unchanged = """listen: :443
+outbounds:
+  - name: direct_ipv4
+    type: direct
+acl:
+  inline:
+    - reject(127.0.0.0/8)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(169.254.0.0/16)
+    - reject(100.64.0.0/10)
+    - reject(0.0.0.0/8)
+    - reject(::1/128)
+    - reject(fc00::/7)
+    - reject(fe80::/10)
+    - direct_ipv4(all)
+obfs:
+  type: salamander
+"""
+        text, calls = self.run_toggle('0', config_text=unchanged)
+        self.assertIn('obfs:', text)
+        self.assertEqual(calls.strip(), '', f'规则无变化却触发了重启：{calls}')
 
 
 if __name__ == '__main__':

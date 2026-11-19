@@ -2783,8 +2783,11 @@ ACTION="$1" # 1: enable, 0: disable
 CONFIG="/etc/hysteria/config.yaml"
 [[ -f "$CONFIG" ]] || exit 1
 
-# 记录改动前的 acl 段，供收尾判断是否需要重启
-BEFORE_ACL=$(sed -n '/^acl:/,$p' "$CONFIG")
+# 仅提取顶格 acl 块本身（不含排在后面的 obfs 等段落），供收尾判断是否需要重启
+extract_acl() {
+    awk 'BEGIN{f=0} /^acl:/{f=1;print;next} f && /^[^ \t#]/{f=0} f' "$1"
+}
+BEFORE_ACL=$(extract_acl "$CONFIG")
 
 # 清理旧 acl 段：只删 acl 块本身，obfs 等排在其后的顶格段落必须保留
 awk 'BEGIN{d=0} /^acl:/{d=1;next} d && /^[^ \t#]/{d=0} !d' "$CONFIG" > "$CONFIG.tmp" && cat "$CONFIG.tmp" > "$CONFIG" && rm -f "$CONFIG.tmp"
@@ -2845,7 +2848,7 @@ EOF
 fi
 
 # acl 段无实际变化时不重启，避免无谓掐断所有在线用户
-if [[ "${BEFORE_ACL:-}" != "$(sed -n '/^acl:/,$p' "$CONFIG")" ]]; then
+if [[ "${BEFORE_ACL:-}" != "$(extract_acl "$CONFIG")" ]]; then
     # 流量超额停用期间只改配置不拉起服务（2026-11-04 修），否则手动跑一次本脚本就绕过限额；
     # 重启前清失败计数，连续切换几次不会撞上 StartLimitBurst 把服务锁死。
     if [[ "$(jq -r '.traffic_suspend.suspended // false' /etc/hysteria/portal.json 2>/dev/null)" != "true" ]]; then
