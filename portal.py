@@ -10995,7 +10995,7 @@ if __name__ == '__main__':
                 form = parse_qs(body)
                 target = form.get('target', [''])[0]
                 if target not in ('core', 'portal', 'awg', 'reality-online'):
-                    return self.reply_json(400, {'ok': False, 'error': 'Invalid target'})
+                    return self.reply_json(400, {'ok': False, 'error': '不支持的更新目标，请刷新页面后重试'})
 
                 if target == 'reality-online':
                     # 开启在线统计要重启 xray；流量超额停用期间重启等于替 Reality 解除停用。
@@ -11013,7 +11013,7 @@ if __name__ == '__main__':
                 if target == 'portal':
                     ref = form.get('ref', ['main'])[0]
                     if ref != 'main' and not re.fullmatch(r'[0-9a-f]{40}', ref):
-                        return self.reply_json(400, {'ok': False, 'error': 'Invalid immutable ref'})
+                        return self.reply_json(400, {'ok': False, 'error': '更新版本标识不合法（仅支持 main 或 40 位提交哈希）'})
                     try:
                         update_lock_fd = portal_update_process_lock(PORTAL_SELF.parent)
                     except BlockingIOError:
@@ -11333,7 +11333,7 @@ if __name__ == '__main__':
                             if not firewall_port(item.get('port'), 'tcp', open_=False):
                                 return 500, {'ok': False, 'applied': True,
                                     'error': '代理已删除，但端口防火墙规则未能回收'}
-                    return 200, {'ok': True, 'applied': True, 'message': 'Proxy service deleted'}
+                    return 200, {'ok': True, 'applied': True, 'message': '代理服务已删除'}
                 # 开着防火墙的机器，端口放行失败时不能报成服务完全可用。
                 if not firewall_port(port, 'tcp', open_=True):
                     with data_lock:
@@ -12066,7 +12066,7 @@ if __name__ == '__main__':
                             '已重置密钥；节点因流量超额停用中，新密钥将在控制台恢复节点时生效'})
                     return self.reply_json(200, {'ok': True, 'message': '已重置密钥并重启生效'})
 
-                return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                return self.reply_json(400, {'ok': False, 'error': '未知的 Reality 操作类型，请刷新页面后重试'})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
@@ -12385,7 +12385,7 @@ if __name__ == '__main__':
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
-                    return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                    return self.reply_json(400, {'ok': False, 'error': '未知的 VMess 操作类型，请刷新页面后重试'})
                 if action == 'enable':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
@@ -12793,7 +12793,7 @@ if __name__ == '__main__':
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
-                    return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                    return self.reply_json(400, {'ok': False, 'error': '未知的 AnyTLS 操作类型，请刷新页面后重试'})
                 if action == 'disable' and not enabled:
                     # anytls.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
                     # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉，
@@ -12991,7 +12991,7 @@ if __name__ == '__main__':
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
-                    return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                    return self.reply_json(400, {'ok': False, 'error': '未知的 TUIC 操作类型，请刷新页面后重试'})
                 if action == 'disable' and not enabled:
                     # tuic.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
                     # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉。
@@ -13113,7 +13113,7 @@ if __name__ == '__main__':
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
-                    return self.reply_json(400, {'ok': False, 'error': 'Invalid action'})
+                    return self.reply_json(400, {'ok': False, 'error': '未知的 VLESS Encryption 操作类型，请刷新页面后重试'})
                 if action == 'enable':
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error':
@@ -13231,7 +13231,7 @@ if __name__ == '__main__':
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
                 ver = form.get('version', ['v1'])[0].lower()
                 if ver not in ('v1', 'v2', 'v3'):
-                    return self.reply_json(400, {'ok': False, 'error': 'Invalid BBR version'})
+                    return self.reply_json(400, {'ok': False, 'error': '不支持的 BBR 版本（仅支持 v1、v2 或 v3）'})
                 target = {'v1': 'bbr', 'v2': 'bbr2', 'v3': 'bbr3'}[ver]
                 subprocess.run(['modprobe', 'tcp_' + target], capture_output=True, timeout=5)
                 available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
