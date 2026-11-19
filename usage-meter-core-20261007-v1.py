@@ -74,6 +74,10 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
         totals.pop(uid, None)
     adjustments = new.get('adjustments')
     if isinstance(adjustments, dict):
+        # 账户删除并清空 totals 时，必须一并清掉平级 adjustments[uid]；
+        # 否则残留的负偏移会在同名重建后让 adjusted_bytes 算出负值，导致整机计量循环持续失败。
+        for uid in retired:
+            adjustments.pop(uid, None)
         for adjustment in adjustments.values():
             if isinstance(adjustment, dict) and isinstance(adjustment.get('users'), dict):
                 for uid in ignored:

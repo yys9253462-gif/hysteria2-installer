@@ -116,6 +116,7 @@ def enable_iplimit_routing(config_path, binary, address):
     if not address.startswith('127.0.0.1:'):raise ValueError('stats endpoint must be loopback')
     path=pathlib.Path(config_path)
     original=path.read_bytes()
+    orig_mode=path.stat().st_mode & 0o777
     config=json.loads(original)
     if iplimit_routing_ready(config):
         return {'enabled':True,'changed':False,'backup':None}
@@ -133,7 +134,7 @@ def enable_iplimit_routing(config_path, binary, address):
     replaced=False
     try:
         candidate.write_text(json.dumps(config,indent=2),encoding='utf-8')
-        os.chmod(candidate,path.stat().st_mode & 0o777)
+        os.chmod(candidate,orig_mode)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
         if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
         shutil.copy2(path,backup)
@@ -148,6 +149,7 @@ def enable_iplimit_routing(config_path, binary, address):
     except Exception:
         if replaced:
             candidate.write_bytes(original)
+            os.chmod(candidate,orig_mode)
             os.replace(candidate,path)
             _restart_xray(check=False)
         raise
@@ -160,6 +162,7 @@ def enable_reality_online(config_path, binary, address):
     """只开启在线统计；校验后替换，失败恢复原配置，不触碰用户或 Reality 参数。"""
     path=pathlib.Path(config_path)
     original=path.read_bytes()
+    orig_mode=path.stat().st_mode & 0o777
     config=json.loads(original)
     levels=config.setdefault('policy',{}).setdefault('levels',{})
     used={'0'}
@@ -175,7 +178,7 @@ def enable_reality_online(config_path, binary, address):
     if not address.startswith('127.0.0.1:'):raise ValueError('stats endpoint must be loopback')
     if changed:
         candidate.write_text(json.dumps(config,indent=2),encoding='utf-8')
-        os.chmod(candidate,path.stat().st_mode & 0o777)
+        os.chmod(candidate,orig_mode)
         replaced=False
         try:
             subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
@@ -184,10 +187,20 @@ def enable_reality_online(config_path, binary, address):
             os.replace(candidate,path);replaced=True
             _restart_xray()
             subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
-            subprocess.run([binary,'api','statsgetallonlineusers','--server='+address],capture_output=True,timeout=5,check=True)
+            # 重启后等待 gRPC 统计接口就绪再判失败，与 enable_iplimit_routing 一致；
+            # 单次立刻探测在负载较高机器上会误触回滚。
+            for attempt in range(10):
+                try:
+                    subprocess.run([binary,'api','statsgetallonlineusers','--server='+address],capture_output=True,timeout=5,check=True)
+                    break
+                except subprocess.CalledProcessError:
+                    if attempt == 9:
+                        raise
+                    time.sleep(0.5)
         except Exception:
             if replaced:
                 candidate.write_bytes(original)
+                os.chmod(candidate,orig_mode)
                 os.replace(candidate,path)
                 # 回滚后的重启不带 check：它失败时抛出的异常会顶掉真正的失败原因。
                 _restart_xray(check=False)

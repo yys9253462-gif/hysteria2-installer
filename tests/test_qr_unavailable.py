@@ -52,5 +52,35 @@ btn.onclick().then(() => console.log(uModalBody.innerHTML));
         self.assertNotIn('生成中', run.stdout)
 
 
+@unittest.skipUnless(NODE, 'requires node')
+class ProxyResultModalQrTest(unittest.TestCase):
+    def test_missing_qr_clears_previous_qr_and_explains_fallback(self):
+        script = portal.SCRIPT
+        start = script.index('function showProxyResult(data) {')
+        end = script.index('// 绑定秒级一键生成按钮', start)
+        fn_src = script[start:end]
+        js = r"""
+const mk = () => ({textContent: '', value: '', innerHTML: '<span>生成中...</span>', className: '', classList: {add() {}, remove() {}}});
+const proxyModal = mk(), resPTypeBadge = mk(), resPHost = mk(), resPPort = mk(), resPUser = mk(), resPPass = mk(), resPUrl = mk(), resPFmt = mk(), resPQr = mk(), btnCopyPUrl = mk(), btnCopyPFmt = mk(), pmClose = mk();
+let curProxyServerHost = '1.2.3.4';
+const focusModal = () => {};
+const copyWithFeedback = () => {};
+const document = {querySelectorAll: () => [], getElementById: () => null};
+%s
+showProxyResult({type: 'socks5', host: '1.2.3.4', port: 12001, username: 'u1', password: 'p1', qr: '<svg id="first-qr"></svg>'});
+const firstHtml = resPQr.innerHTML;
+showProxyResult({type: 'http', host: '1.2.3.4', port: 12002, username: 'u2', password: 'p2', qr: ''});
+const secondHtml = resPQr.innerHTML;
+console.log(JSON.stringify({firstHtml, secondHtml}));
+""" % fn_src
+        run = subprocess.run([NODE, '-e', js], capture_output=True, text=True, encoding='utf-8', timeout=30)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        out = json.loads(run.stdout)
+        self.assertEqual(out['firstHtml'], '<svg id="first-qr"></svg>')
+        self.assertNotIn('first-qr', out['secondHtml'])
+        self.assertNotIn('生成中', out['secondHtml'])
+        self.assertIn('二维码生成失败', out['secondHtml'])
+
+
 if __name__ == '__main__':
     unittest.main()

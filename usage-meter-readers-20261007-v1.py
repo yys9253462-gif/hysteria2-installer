@@ -20,8 +20,11 @@ def service_running(service):
     """inactive / failed 视为没在跑；systemd 不可用等读不出状态时按在跑处理，交给后续读取报错。"""
     if service not in ('hysteria-server', 'xray'):
         raise ValueError('unsupported service')
-    r = subprocess.run(['systemctl', 'is-active', service], capture_output=True, timeout=5)
-    return r.stdout.decode().strip() not in ('inactive', 'failed')
+    try:
+        r = subprocess.run(['systemctl', 'is-active', service], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return r.stdout.decode(errors='replace').strip() not in ('inactive', 'failed')
 
 
 def read_hysteria(url, secret):
@@ -241,10 +244,11 @@ def read_live_connections():
             else:
                 out.update(ok=False,hysteria_ok=False,error='Hy2在线IP采集失败：'+type(exc).__name__)
                 out['ips']=[ip for ip in out['ips'] if ip['protocol']!='Hy2']
-    # Reality 若已启用核心在线统计则读取；未启用时明确说明，不用历史access日志猜。
+    # Reality 若已启用核心在线统计且服务正在运行则读取；装了 Xray 但未运行时按空闲处理，
+    # 避免每 15 秒报「Reality在线IP读取失败」。未启用时明确说明，不用历史 access 日志猜。
     rcfg=cfg.get('reality',{})
     binary=rcfg.get('binary','')
-    if binary and pathlib.Path(binary).is_file():
+    if binary and pathlib.Path(binary).is_file() and service_running('xray'):
         try:
             xcfg=json.loads(pathlib.Path('/etc/hysteria/xray.json').read_text())
             enabled=xcfg.get('policy',{}).get('levels',{}).get('0',{}).get('statsUserOnline',False)

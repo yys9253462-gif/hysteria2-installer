@@ -164,6 +164,17 @@ is_whole_disk() {
     [ -d "${SYS_BLOCK:-/sys/block}/$(basename "$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")")" ]
 }
 
+# 从挂载表精确找出目标整盘或其分区，避免 /dev/nvme0n1 误命中 /dev/nvme0n10p1 或 /dev/sda 误命中 /dev/sdaa1
+disk_mounts() {
+    _dm_d="$1"
+    _dm_file="${2:-/proc/mounts}"
+    [ -r "$_dm_file" ] || return 0
+    awk -v d="$_dm_d" '
+        BEGIN { pat = (d ~ /[0-9]$/) ? ("^" d "p[0-9]+$") : ("^" d "[0-9]+$") }
+        $1 == d || $1 ~ pat { print $2 }
+    ' "$_dm_file" 2>/dev/null
+}
+
 # 打印开头整段注释：写死行号会把后面的常量与默认值代码一起打出来（2026-11-12 修）。
 print_help() {
     for _f in "$0" rd13.sh; do
@@ -175,17 +186,17 @@ print_help() {
 # ── 参数解析 ─────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
-        --yes|-y)      ASSUME_YES=1; shift ;;
+        --yes|-y)         ASSUME_YES=1; shift ;;
         --check|--dry-run) CHECK_ONLY=1; shift ;;
-        --port)        PORT="${2:-}";     shift 2 ;;
-        --pwd|--password) PASSWORD="${2:-}"; shift 2 ;;
-        --disk)        DISK="${2:-}";     shift 2 ;;
-        --mirror)      MIRROR="${2:-}";   shift 2 ;;
-        --release)     RELEASE="${2:-}";  shift 2 ;;
-        --swap)        SWAP_MB="${2:-}";  shift 2 ;;
-        --net)         NET_MODE="${2:-}"; shift 2 ;;
+        --port)           [ $# -ge 2 ] || die "--port 缺少取值"; PORT="$2"; shift 2 ;;
+        --pwd|--password) [ $# -ge 2 ] || die "$1 缺少取值"; PASSWORD="$2"; shift 2 ;;
+        --disk)           [ $# -ge 2 ] || die "--disk 缺少取值"; DISK="$2"; shift 2 ;;
+        --mirror)         [ $# -ge 2 ] || die "--mirror 缺少取值"; MIRROR="$2"; shift 2 ;;
+        --release)        [ $# -ge 2 ] || die "--release 缺少取值"; RELEASE="$2"; shift 2 ;;
+        --swap)           [ $# -ge 2 ] || die "--swap 缺少取值"; SWAP_MB="$2"; shift 2 ;;
+        --net)            [ $# -ge 2 ] || die "--net 缺少取值"; NET_MODE="$2"; shift 2 ;;
         --force-rescue-disk) FORCE_RESCUE=1; shift ;;
-        -h|--help)     print_help; exit 0 ;;
+        -h|--help)        print_help; exit 0 ;;
         *) die "未知参数：$1（用 --help 看用法）" ;;
     esac
 done
@@ -370,10 +381,7 @@ if [ "$DISK_SIZE_MB" -gt 0 ] && [ "$DISK_SIZE_MB" -lt 4000 ]; then
 fi
 
 # 特征 B：正被挂载（尤其挂在 /media 下 —— Alpine 救援系统的典型行为）
-_mounted_at=""
-if [ -r /proc/mounts ]; then
-    _mounted_at="$(awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts 2>/dev/null | head -n1)"
-fi
+_mounted_at="$(disk_mounts "$DISK" | head -n1)"
 _mounted_suspicious=0
 [ -n "$_mounted_at" ] && _mounted_suspicious=1
 
@@ -462,12 +470,9 @@ release_disk() {
         [ -b "$_p" ] && { umount "$_p" >/dev/null 2>&1 || true; }
     done
     # 2) 按挂载点卸（关键：umount /dev/vda1 有时会漏，得按挂载点来）
-    if [ -r /proc/mounts ]; then
-        awk -v d="$_d" '$1 ~ "^"d || $1 ~ "^"d"[0-9p]" {print $2}' /proc/mounts 2>/dev/null \
-            | sort -r | while IFS= read -r _mp; do
-                [ -n "$_mp" ] && umount "$_mp" >/dev/null 2>&1 || true
-            done
-    fi
+    disk_mounts "$_d" | sort -r | while IFS= read -r _mp; do
+        [ -n "$_mp" ] && umount "$_mp" >/dev/null 2>&1 || true
+    done
     swapoff -a >/dev/null 2>&1 || true
     command -v vgchange >/dev/null 2>&1 && { vgchange -an >/dev/null 2>&1 || true; }
     command -v mdadm    >/dev/null 2>&1 && { mdadm --stop --scan >/dev/null 2>&1 || true; }
@@ -546,10 +551,7 @@ if [ "$CHECK_ONLY" != "1" ] && [ "$DRY_RUN" != "1" ]; then
             info "释放磁盘占用 / 清除残留签名（第 $_round 轮）"
             release_disk "$DISK"
             wipe_disk "$DISK" || true
-            _left=""
-            if [ -r /proc/mounts ]; then
-                _left="$(awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts 2>/dev/null)"
-            fi
+            _left="$(disk_mounts "$DISK")"
             if [ -z "$_left" ]; then _clean_ok=1; break; fi
             warn "仍被挂载：$(printf '%s' "$_left" | tr '\n' ' ') —— 延迟卸载后重试"
             printf '%s\n' "$_left" | sort -r | while IFS= read -r _mp; do

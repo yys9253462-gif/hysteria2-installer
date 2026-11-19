@@ -2783,8 +2783,9 @@ ACTION="$1" # 1: enable, 0: disable
 CONFIG="/etc/hysteria/config.yaml"
 [[ -f "$CONFIG" ]] || exit 1
 
-# 记录改动前的 acl 段，供收尾判断是否需要重启
-BEFORE_ACL=$(sed -n '/^acl:/,$p' "$CONFIG")
+# 仅提取顶格 acl 块本身（不含排在后面的 obfs 等段落），供收尾判断是否需要重启
+extract_acl() { awk 'BEGIN{f=0} /^acl:/{f=1;print;next} f && /^[^ \t#]/{f=0} f' "$1"; }
+BEFORE_ACL=$(extract_acl "$CONFIG")
 
 # 清理旧 acl 段：只删 acl 块本身，obfs 等排在其后的顶格段落必须保留
 awk 'BEGIN{d=0} /^acl:/{d=1;next} d && /^[^ \t#]/{d=0} !d' "$CONFIG" > "$CONFIG.tmp" && cat "$CONFIG.tmp" > "$CONFIG" && rm -f "$CONFIG.tmp"
@@ -2845,7 +2846,7 @@ EOF
 fi
 
 # acl 段无实际变化时不重启，避免无谓掐断所有在线用户
-if [[ "${BEFORE_ACL:-}" != "$(sed -n '/^acl:/,$p' "$CONFIG")" ]]; then
+if [[ "${BEFORE_ACL:-}" != "$(extract_acl "$CONFIG")" ]]; then
     # 流量超额停用期间只改配置不拉起服务（2026-11-04 修），否则手动跑一次本脚本就绕过限额；
     # 重启前清失败计数，连续切换几次不会撞上 StartLimitBurst 把服务锁死。
     if [[ "$(jq -r '.traffic_suspend.suspended // false' /etc/hysteria/portal.json 2>/dev/null)" != "true" ]]; then
@@ -3456,6 +3457,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable hysteria-server >/dev/null 2>&1
+    systemctl reset-failed hysteria-server >/dev/null 2>&1 || true
     # 必须 || true：restart 失败时若被 set -e 直接终止，下面那段
     # 「请看 journalctl」的提示永远到不了用户眼前（2026-10-29 修）。
     systemctl restart hysteria-server || true
@@ -4247,6 +4249,7 @@ EOF
     chmod 600 "$HY2_DIR/portal.json" "$HY2_DIR/portal-access.json" "$HY2_META_FILE" "$HY2_CONFIG"
     systemctl daemon-reload
     systemctl enable hysteria-portal >/dev/null
+    systemctl reset-failed hysteria-portal >/dev/null 2>&1 || true
     systemctl restart hysteria-portal
     sleep 1
     systemctl is-active --quiet hysteria-portal || { log_err "信息页服务启动失败"; return 1; }
@@ -4723,6 +4726,7 @@ install_gost() {
             systemctl disable gost >/dev/null 2>&1 || true
         fi
         if [[ "$had_gost" == 1 && "$old_active" == 1 ]]; then
+            systemctl reset-failed gost >/dev/null 2>&1 || true
             systemctl restart gost >/dev/null 2>&1 || true
         else
             systemctl stop gost >/dev/null 2>&1 || true
@@ -4932,6 +4936,7 @@ EOF
         log_err "GOST 所有权标记写入失败，已恢复原部署。"
         return 1
     fi
+    systemctl reset-failed gost >/dev/null 2>&1 || true
     if ! systemctl daemon-reload || ! systemctl enable gost >/dev/null 2>&1 \
             || ! systemctl restart gost; then
         _restore_gost_install

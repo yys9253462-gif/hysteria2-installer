@@ -420,6 +420,37 @@ class MeterAccountingTest(unittest.TestCase):
             with self.subTest(container=invalid), self.assertRaises(ValueError):
                 runtime.core.adjusted_bytes({'adjustments': invalid}, 'u')
 
+    def test_retired_user_flat_adjustment_cleared_and_inactive_preserved(self):
+        """已删用户进入 retired_users 后，平级 adjustments[uid] 必须同步清理，
+        否则同名重建时 0 + 负偏移触发 negative adjusted usage；暂未删除的停用用户保留偏移。"""
+        state = {
+            'sources': {
+                'hysteria': {
+                    'epoch': 'ep1',
+                    'counters': {'old_u': {'tx': 100, 'rx': 0}, 'paused_u': {'tx': 50, 'rx': 0}},
+                    'sampled_at': '2026-11-19T00:00:00+00:00',
+                    'sampled_users': ['old_u', 'paused_u'],
+                }
+            },
+            'totals': {'old_u': {'hysteria': 100}, 'paused_u': {'hysteria': 50}},
+            'adjustments': {'old_u': -100, 'paused_u': -20},
+            'retired_users': ['old_u'],
+        }
+        runtime.core.apply_sample(
+            state,
+            'hysteria',
+            'ep1',
+            {'old_u': {'tx': 120, 'rx': 0}, 'paused_u': {'tx': 60, 'rx': 0}},
+            '2026-11-19T00:00:05+00:00',
+            active_users=set(),
+        )
+        self.assertNotIn('old_u', state['totals'])
+        self.assertNotIn('old_u', state['adjustments'])
+        # 停用但未删除的用户不清理 totals，也不应丢失原有偏移
+        self.assertEqual(state['adjustments']['paused_u'], -20)
+        self.assertEqual(runtime.core.adjusted_bytes(state, 'old_u'), 0)
+        self.assertEqual(runtime.core.adjusted_bytes(state, 'paused_u'), 30)
+
     def test_service_epoch_and_counter_regression(self):
         self.meter.poll()
         self.counters['hysteria']['admin_master']['tx'] = 10
