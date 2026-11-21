@@ -489,11 +489,25 @@ def validate_outbound(entry):
     if otype == 'socks5':
         raw_addr = entry.get('addr')
         addr = raw_addr.strip() if isinstance(raw_addr, str) else ''
-        # 必须带端口；只给域名或IP 是不够的
-        if not re.match(r'^[^\s:]+:\d{1,5}$', addr):
-            return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
-        host, port = addr.rsplit(':', 1)
-        if not (0 < int(port) < 65536):
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in addr):
+            return False, None, "SOCKS5 地址不能包含控制字符"
+        # 支持 host:port 与 [IPv6]:port 两种形式，且必须带合法端口
+        if addr.startswith('['):
+            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:(\d{1,5})', addr)
+            if not m_v6:
+                return False, None, "SOCKS5 IPv6 地址格式应为 [IPv6]:port，例如 [::1]:1080"
+            try:
+                ip_obj = ipaddress.ip_address(m_v6.group(1))
+            except ValueError:
+                return False, None, "SOCKS5 方括号内不是合法 IPv6 地址"
+            if ip_obj.version != 6:
+                return False, None, "SOCKS5 方括号内必须是 IPv6 地址"
+            port_str = m_v6.group(2)
+        else:
+            if not re.fullmatch(r'[^\s:\[\]]+:\d{1,5}', addr):
+                return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
+            _, port_str = addr.rsplit(':', 1)
+        if not (0 < int(port_str) < 65536):
             return False, None, "端口超出范围"
         cleaned['addr'] = addr
         # 账号密码会**逐字拼进 YAML**（render_outbound_yaml），
@@ -515,10 +529,21 @@ def validate_outbound(entry):
     elif otype == 'http':
         raw_url = entry.get('url')
         url = raw_url.strip() if isinstance(raw_url, str) else ''
-        # 路径里也不允许空白：旧正则的 `.*` 允许空格，带空格的 URL
-        # curl 会直接拒绝，而配置照样写进 YAML（2026-10-30 修）。
-        if not re.match(r'^https?://[^\s/]+(?:/.*)?$', url, re.I) or re.search(r'\s', url):
-            return False, None, "HTTP 代理地址格式应为 http://host:port 或 https://host:port（不能含空格）"
+        # 路径与主机里不允许空白或控制字符，并用 urlsplit 校验主机与端口合法性。
+        if (not re.match(r'^https?://[^\s/]+(?:/.*)?$', url, re.I)
+                or re.search(r'\s', url)
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url)):
+            return False, None, "HTTP 代理地址格式应为 http://host:port 或 https://host:port（不能含空格或控制字符）"
+        try:
+            parsed_url = urlsplit(url)
+            parsed_host = parsed_url.hostname
+            parsed_port = parsed_url.port
+        except ValueError:
+            return False, None, "HTTP 代理地址或端口格式无效"
+        if not parsed_host:
+            return False, None, "HTTP 代理地址缺少主机名"
+        if parsed_port is not None and not (0 < parsed_port < 65536):
+            return False, None, "HTTP 代理端口超出范围"
         cleaned['url'] = url
         # insecure 只接受明确的一串真值，其他一律当false（别把 "no" 当 true）
         cleaned['insecure'] = str(entry.get('insecure', '')).strip().lower() in ('1', 'true', 'yes', 'on')
