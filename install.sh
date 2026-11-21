@@ -4764,28 +4764,50 @@ install_gost() {
     local had_gost=0 old_gost="" old_unit="" old_check="" old_owner="" had_unit=0 had_check=0 had_owner=0
     local old_config="" old_cert="" old_key="" had_config=0 had_cert=0 had_key=0
     local old_active=0 old_enabled=0 active_state
-    [[ -f "$GOST_BIN" ]] && { had_gost=1; old_gost="$(mktemp)"; cp -p "$GOST_BIN" "$old_gost" || return 1; }
-    [[ -f "$GOST_UNIT" ]] && { had_unit=1; old_unit="$(mktemp)"; cp -p "$GOST_UNIT" "$old_unit" || return 1; }
-    [[ -f /usr/local/lib/hy2-gost-selfcheck ]] && { had_check=1; old_check="$(mktemp)"; cp -p /usr/local/lib/hy2-gost-selfcheck "$old_check" || return 1; }
-    [[ -f "$HY2_DIR/.hy2-gost-owned" ]] && { had_owner=1; old_owner="$(mktemp)"; cp -p "$HY2_DIR/.hy2-gost-owned" "$old_owner" || return 1; }
+    _finish_gost_install() {
+        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+    }
+    _backup_gost_asset() {
+        local _src="$1" _out_var="$2" _tmp=""
+        _tmp="$(umask 077; mktemp)" || { _finish_gost_install; return 1; }
+        if ! cp -p "$_src" "$_tmp"; then
+            rm -f "$_tmp"
+            _finish_gost_install
+            return 1
+        fi
+        printf -v "$_out_var" '%s' "$_tmp"
+    }
+    [[ -f "$GOST_BIN" ]] && { had_gost=1; _backup_gost_asset "$GOST_BIN" old_gost || return 1; }
+    [[ -f "$GOST_UNIT" ]] && { had_unit=1; _backup_gost_asset "$GOST_UNIT" old_unit || return 1; }
+    [[ -f /usr/local/lib/hy2-gost-selfcheck ]] && { had_check=1; _backup_gost_asset /usr/local/lib/hy2-gost-selfcheck old_check || return 1; }
+    [[ -f "$HY2_DIR/.hy2-gost-owned" ]] && { had_owner=1; _backup_gost_asset "$HY2_DIR/.hy2-gost-owned" old_owner || return 1; }
     active_state="$(systemctl is-active gost 2>/dev/null || true)"
     [[ "$active_state" == active ]] && old_active=1
     active_state="$(systemctl is-enabled gost 2>/dev/null || true)"
     [[ "$active_state" == enabled ]] && old_enabled=1
-    [[ -f "$GOST_CONFIG" ]] && { had_config=1; old_config="$(mktemp)"; cp -p "$GOST_CONFIG" "$old_config" || return 1; }
-    [[ -f "$HY2_DIR/gost-cert/cert.pem" ]] && { had_cert=1; old_cert="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/cert.pem" "$old_cert" || return 1; }
-    [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; old_key="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/key.pem" "$old_key" || return 1; }
+    [[ -f "$GOST_CONFIG" ]] && { had_config=1; _backup_gost_asset "$GOST_CONFIG" old_config || return 1; }
+    [[ -f "$HY2_DIR/gost-cert/cert.pem" ]] && { had_cert=1; _backup_gost_asset "$HY2_DIR/gost-cert/cert.pem" old_cert || return 1; }
+    [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; _backup_gost_asset "$HY2_DIR/gost-cert/key.pem" old_key || return 1; }
     log_info "目标版本: ${GOST_LATEST} (${GOST_ASSET})"
     log_step "下载并解压 gost 二进制..."
     TMP_DIR=$(mktemp -d)
+    _restore_gost_asset() {
+        local _bak="$1" _dst="$2" _rb_tmp=""
+        _rb_tmp="$(umask 077; mktemp "${_dst}.rb.XXXXXX")" || return 1
+        if ! cp -p "$_bak" "$_rb_tmp" || ! mv -f "$_rb_tmp" "$_dst"; then
+            rm -f "$_rb_tmp"
+            return 1
+        fi
+    }
     _restore_gost_install() {
-        if [[ "$had_gost" == 1 ]]; then cp -p "$old_gost" "$GOST_BIN"; else rm -f "$GOST_BIN"; fi
-        if [[ "$had_unit" == 1 ]]; then cp -p "$old_unit" "$GOST_UNIT"; else rm -f "$GOST_UNIT"; fi
-        if [[ "$had_check" == 1 ]]; then cp -p "$old_check" /usr/local/lib/hy2-gost-selfcheck; else rm -f /usr/local/lib/hy2-gost-selfcheck; fi
-        if [[ "$had_owner" == 1 ]]; then cp -p "$old_owner" "$HY2_DIR/.hy2-gost-owned"; else rm -f "$HY2_DIR/.hy2-gost-owned"; fi
-        if [[ "$had_config" == 1 ]]; then cp -p "$old_config" "$GOST_CONFIG"; else rm -f "$GOST_CONFIG"; fi
-        if [[ "$had_cert" == 1 ]]; then cp -p "$old_cert" "$HY2_DIR/gost-cert/cert.pem"; else rm -f "$HY2_DIR/gost-cert/cert.pem"; fi
-        if [[ "$had_key" == 1 ]]; then cp -p "$old_key" "$HY2_DIR/gost-cert/key.pem"; else rm -f "$HY2_DIR/gost-cert/key.pem"; fi
+        # 同目录临时文件原子替换：避免覆写运行中 gost 二进制报 ETXTBSY，并防止中途失败中断后续恢复。
+        if [[ "$had_gost" == 1 ]]; then _restore_gost_asset "$old_gost" "$GOST_BIN" || true; else rm -f "$GOST_BIN"; fi
+        if [[ "$had_unit" == 1 ]]; then _restore_gost_asset "$old_unit" "$GOST_UNIT" || true; else rm -f "$GOST_UNIT"; fi
+        if [[ "$had_check" == 1 ]]; then _restore_gost_asset "$old_check" /usr/local/lib/hy2-gost-selfcheck || true; else rm -f /usr/local/lib/hy2-gost-selfcheck; fi
+        if [[ "$had_owner" == 1 ]]; then _restore_gost_asset "$old_owner" "$HY2_DIR/.hy2-gost-owned" || true; else rm -f "$HY2_DIR/.hy2-gost-owned"; fi
+        if [[ "$had_config" == 1 ]]; then _restore_gost_asset "$old_config" "$GOST_CONFIG" || true; else rm -f "$GOST_CONFIG"; fi
+        if [[ "$had_cert" == 1 ]]; then _restore_gost_asset "$old_cert" "$HY2_DIR/gost-cert/cert.pem" || true; else rm -f "$HY2_DIR/gost-cert/cert.pem"; fi
+        if [[ "$had_key" == 1 ]]; then _restore_gost_asset "$old_key" "$HY2_DIR/gost-cert/key.pem" || true; else rm -f "$HY2_DIR/gost-cert/key.pem"; fi
         systemctl daemon-reload >/dev/null 2>&1 || true
         if [[ "$old_enabled" == 1 ]]; then
             systemctl enable gost >/dev/null 2>&1 || true
@@ -4798,10 +4820,7 @@ install_gost() {
         else
             systemctl stop gost >/dev/null 2>&1 || true
         fi
-        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
-    }
-    _finish_gost_install() {
-        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+        _finish_gost_install
     }
     # 先从该版本的官方 checksums.txt 取摘要，再下载校验；取不到就不装。
     if ! GOST_SUM="$(hy2_expected_sha256 \
@@ -4851,6 +4870,7 @@ install_gost() {
     fi
     rm -rf "$TMP_DIR"
     if ! mv -f "${GOST_BIN}.new" "$GOST_BIN"; then
+        rm -f "${GOST_BIN}.new"
         _restore_gost_install
         log_err "gost 二进制替换失败，已恢复原部署。"
         return 1
