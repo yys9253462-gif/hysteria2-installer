@@ -1,3 +1,16 @@
+## 2026-11-21 — 第三十九批十项修复，门户 2.49
+
+- 计量配置更新助手（`usage-meter-xray-config-20261007-v1.py`）新增 `_write_private_bytes` 直接以目标权限创建并落盘候选与备份配置，消除 `enable_iplimit_routing` 与 `enable_reality_online` 默认掩码暴露私钥窗口及非原子 `shutil.copy2` 备份问题；将候选文件写入移入 `try` 块确保失败必清理，并隔离回滚重启超时异常避免覆盖原始失败原因。
+- 计量核心与运行时边界加固（`usage-meter-core-20261007-v1.py` 与 `usage-meter-runtime-20261007-v1.py`）：`apply_sample` 在空采样周期同样校验 `totals` 容器类型并显式报 `ValueError('invalid totals')`；`poll` 遇到损坏的非对象 `usage_meter` 容器时将对应来源记入 `failed_sources`；`summary` 对 `live_snapshot`、`online_counts` 增加结构校验与时钟回拨下界检查，防止异常快照报错或未来时间戳缓存永久判鲜。
+- 门户敏感候选配置私有化与回滚加固（`portal.py` 新增 `_write_private_bytes`）：覆盖 `apply_xray_config_transaction`、`apply_anytls_config`、`_apply_xray_access_snapshot_locked` 与 `record_cert_heal`，消除明文候选文件默认掩码创建窗口与 `chmod` 失败残留，原子替换 `xray.expiry-last-good.json` 备份，并在回滚服务重启时隔离 `OSError` / 超时异常不掩盖原错。
+- 入站代理重载与凭据修复加固（`portal.py` 的 `reload_gost` 与 `repair_missing_api_key`）：`reload_gost` 走 `systemctl restart gost` 兜底前先执行 `systemctl reset-failed gost`，防止触发重启频率上限后永久拉不起来；移除 `gost_ports_ready` 末尾不可达死代码；`repair_missing_api_key` 校验 `portal-access.json` 顶层必为对象。
+- 门户前端脚本健壮性与安全修复（`portal_assets.py`）：`Response.prototype.json` 拦截器将合法但非对象的 JSON 负载（如 `null`、数字、字符串、布尔）统一包装成可读中文错误对象，防止调用点读取 `.ok` 抛出 `TypeError`；入站代理列表移除对 `fullUrl` 的双重 HTML 转义避免破坏复制链接；用户专属弹窗到期时间、流量与 IP 限制字段补齐 `obEsc` 转义。
+- 证书链修复脚本加固（`fix_cert_chain.sh`）：`set_tls_cert` 在未实际匹配到 `tls.cert` 行时返回非零退出码而非静默成功并重启服务，临时文件在 `umask 077` 下创建；`masq_https_port` 去除端口前导零；新增 `restore_config_file` 通过同目录临时文件原子回滚原配置。
+- 混淆隧道控制脚本原子替换改造（`awgctl.sh`）：新增 `awg_atomic_copy_file` 与 `awg_atomic_install_bin`，使 `awg_transaction_restore`、`download_binaries` 与 `restore_peer_files` 均通过同目录临时文件原子替换目标文件，避免覆写运行中 `amneziawg-go` 触发 `ETXTBSY` 导致回滚或更新失败；`download_binaries` 改为先在临时目录对新 `awg` 做冒烟校验再替换现役二进制。
+- 设备上限守护线程容错与单调时钟改造（`portal.py` 的 `reality_iplimit_worker`）：安全校验 `usage-meter-config.json` 顶层与 `reality` 子段类型；`enable_retry_at` 10 分钟退避改用单调时钟 `time.monotonic()` 防系统时间回拨拉长退避；遍历 `ip_tracker` 时校验容器类型、数值时间戳与时钟回拨下界，避免单条坏记录触发全节点拦截规则清空放行。
+- 拥塞控制切换原子写入与回滚隔离（`portal.py` 的 `_set_bbr_locked`）：`/etc/modules-load.d/bbr.conf` 与 `/etc/sysctl.d/99-bbr.conf` 的写入与回滚均改用同目录临时文件原子替换；`save_data()` 失败时优先恢复内存 `bbr_target_version` 并逐项隔离文件与 `sysctl -w` 回滚异常，防止某次内核参数恢复超时导致内存版本永久脏留。
+- 整机网卡流量采集与鉴权追踪边界防护（`portal.py` 的 `node_default_ifaces`、`node_traffic_counters` 与 `/auth`）：读取 `/proc/net/route`、`/proc/net/ipv6_route`、`/proc/net/dev` 与 `boot_id` 统一采用 `utf-8` 容错解码并跳过列数不足或非法计数行，避免容器非 ASCII 网卡名引发 500；`/auth` 清洗非对象 `ip_tracker` 条目并过滤时钟回拨产生的未来时间戳，防止合法用户被异常阻断。
+
 ## 2026-11-21 — 第三十八批十项修复，门户 2.48
 
 - 独立生成的升级与自愈脚本（`install.sh` 产出的 `do_upgrade.sh` 与 `repair-config.sh`）内联 `config_tls_cert()` 证书路径解析函数定义：此前两处调用了仅存在于 `install.sh` 运行时的未定义函数，导致自定义证书或反向代理证书节点在门户在线升级或自愈时回退为自签模式，且证书监控路径单元盯错目录。
