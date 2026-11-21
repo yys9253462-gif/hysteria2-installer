@@ -8699,12 +8699,20 @@ def serve(path):
     # 必需字段缺失时给出明确中文错误再退出。旧行为是在后面的 data['port']
     # 处抛 KeyError，日志里只有一段 traceback —— 而门户是 Hysteria 的鉴权后端，
     # 它起不来等于全部用户连不上（2026-10-29 加）。
+    if not isinstance(data, dict):
+        raise SystemExit('[portal] portal.json 顶层必须是 JSON 对象（当前是 %s）。'
+                         '请从备份恢复 portal.json 或重新执行安装。' % type(data).__name__)
     _required = ('port', 'token', 'auth_hash', 'users')
     _missing = [k for k in _required if k not in data]
     if _missing:
         raise SystemExit('[portal] portal.json 缺少必需字段: %s。'
                          '请从备份恢复 portal.json 或重新执行安装。'
                          % ', '.join(_missing))
+    _bind_port = _valid_port(data.get('port'))
+    if not _bind_port:
+        raise SystemExit('[portal] portal.json 的 port 无效: %r。'
+                         '请从备份恢复 portal.json 或重新执行安装。' % (data.get('port'),))
+    data['port'] = _bind_port
     # users 必须是对象（2026-11-06 修）：被写成列表 / 字符串时旧实现照常启动，随后十几处
     # data.get('users', {}).get(...) 全部抛 AttributeError，开户、改密、续费、分享页一律 500。
     # 与缺字段同样处理：给出明确错误并退出，不拿空表顶替（那会让所有用户静默失效）。
@@ -17043,19 +17051,23 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             # （自愈单元没装 / 装的是旧版 / 证书刚换还没跑到）。
             live_sn = ''
             meta_sn = str(info.get('server_name') or '')
-            if certificate_covers_domain(meta_sn, info.get('sans') or [],
-                                         info.get('common_name') or ''):
+            _raw_sans = info.get('sans')
+            _clean_sans = [s for s in (_raw_sans if isinstance(_raw_sans, (list, tuple)) else [])
+                           if isinstance(s, str)]
+            _raw_cn = info.get('common_name')
+            _clean_cn = _raw_cn if isinstance(_raw_cn, str) else ''
+            if certificate_covers_domain(meta_sn, _clean_sans, _clean_cn):
                 live_sn = meta_sn
             else:
-                for san in info.get('sans') or []:
+                for san in _clean_sans:
                     if not san.startswith('*.') and _is_dns_name(san):
                         live_sn = san
                         break
-                if not live_sn and _is_dns_name(info.get('common_name') or ''):
-                    live_sn = info['common_name']
+                if not live_sn and _is_dns_name(_clean_cn):
+                    live_sn = _clean_cn
             info['live_server_name'] = live_sn
             info['meta_matches_cert'] = bool(meta_sn) and certificate_covers_domain(
-                meta_sn, info.get('sans') or [], info.get('common_name') or '')
+                meta_sn, _clean_sans, _clean_cn)
             info['warn_days'] = CERT_EXPIRY_WARN_DAYS
             info['critical_days'] = CERT_EXPIRY_CRITICAL_DAYS
             return self.reply_json(200, info)
@@ -17161,6 +17173,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             覆盖自己的最长操作时长。死线防的是「连接挂着不动」的
             slow-loris 行为，不是防「服务端正在干活」。
             """
+            # 拦截布尔、非数值、非有限（nan/inf）与非正数，避免 nan 写坏死线导致连接逃逸看门狗。
+            # 不依赖 math 模块，兼容隔离单测命名空间。
+            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+                return
+            seconds = float(seconds)
+            if not (seconds > 0 and seconds < float('inf')):
+                return
             with self.deadline_lock:
                 if request in self.deadlines:
                     self.deadlines[request] = max(self.deadlines[request],
@@ -17220,7 +17239,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
 
 
-    server = ThreadingHTTPServer(('127.0.0.1', data['port']), Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', _bind_port), Handler)
     server.requests, server.failures, server.api_requests = [], [], []
     server.api_anon_requests = []
     # 每来源 60 秒 60 次失败；全局速率由 requests 桶管，这里不再设兜底。
@@ -17300,10 +17319,28 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         with data_lock:
             _susp = suspend_state(data)
         if _susp.get('suspended'):
-            for _u in _susp.get('units') or []:
-                subprocess.run(['systemctl', 'stop', _u], capture_output=True, timeout=20)
-            print('[portal] 流量超额停用中，已重新停止: %s' % ','.join(_susp.get('units') or []),
-                  file=sys.stderr)
+            _raw_units = _susp.get('units')
+            _units = [
+                _u.strip() for _u in (_raw_units if isinstance(_raw_units, (list, tuple)) else [])
+                if isinstance(_u, str)
+                and _u.strip()
+                and not _u.strip().startswith('-')
+                and not any(_c.isspace() or ord(_c) < 32 for _c in _u.strip())
+            ]
+            _stopped_units = []
+            _failed_units = []
+            for _u in _units:
+                try:
+                    subprocess.run(['systemctl', 'stop', _u], capture_output=True, timeout=20)
+                    _stopped_units.append(_u)
+                except Exception as _u_err:
+                    _failed_units.append('%s(%s)' % (_u, type(_u_err).__name__))
+            if _stopped_units:
+                print('[portal] 流量超额停用中，已重新停止: %s' % ','.join(_stopped_units),
+                      file=sys.stderr)
+            if _failed_units:
+                print('[portal] 流量超额停用中，部分服务停止失败: %s' % ','.join(_failed_units),
+                      file=sys.stderr)
     except Exception as e:
         print('[portal] 重新应用超额停用失败: %s' % str(e)[:120], file=sys.stderr)
 
@@ -17315,7 +17352,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # systemd 停止 / 重启 / 关机时先把内存里的计量落盘（2026-11-04 修）：计量每 60 秒
     # 才写一次，旧实现收到 SIGTERM 直接退出，最多丢一分钟流量；关机时 Hy2 / Xray
     # 也一起重启换了 epoch，这段流量再也补算不回来，used_bytes 永久偏低。
+    _exiting = {'flag': False}
+
     def _flush_and_exit(signum, frame):
+        if _exiting['flag']:
+            return
+        _exiting['flag'] = True
         try:
             save_data()
         except Exception as exc:
@@ -17324,6 +17366,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # 只有主线程能装信号处理器；测试里在线程中跑 serve() 时跳过，不能让门户因此起不来。
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, _flush_and_exit)
+        signal.signal(signal.SIGINT, _flush_and_exit)
     server.serve_forever()
 
 
