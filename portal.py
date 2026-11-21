@@ -8225,9 +8225,11 @@ def restore_egress_into_config(root, config_path=None):
     if not isinstance(data, dict):
         return False
     state = routing_state(data)
-    # 没保存过任何出口设置就不动：渲染总会顺带重排 ACL 头部，不该无故改写刚生成的配置。
-    if not (state['warp_enabled'] or state['custom_outbounds'] or state['warp_rules']
-            or state['outbound_mode'] == 'global'):
+    # 没保存过任何有效出口设置就不动：渲染总会顺带重排 ACL 头部，不该无故改写刚生成的配置。
+    has_outbounds = bool(clean_outbounds(state['custom_outbounds']))
+    has_rules = bool(normalize_route_rules(state['warp_rules']))
+    if not (state['warp_enabled'] or has_outbounds or has_rules
+            or (state['outbound_mode'] == 'global' and has_outbounds)):
         return False
     rendered = render_egress_config(original, state)
     if rendered == original:
@@ -8261,6 +8263,18 @@ def adopt(meta_path, port, node_api_key=None):
 
 
 def _adopt_locked(meta_path, port, node_api_key=None):
+    if isinstance(port, bool):
+        raise ValueError('门户端口不能是布尔值')
+    try:
+        port_int = int(port)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError('门户端口必须是整数') from exc
+    if not (1 <= port_int <= 65535):
+        raise ValueError('门户端口必须在 1-65535 之间')
+    if node_api_key is not None and node_api_key != '':
+        if (not isinstance(node_api_key, str) or not node_api_key.isascii()
+                or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in node_api_key)):
+            raise ValueError('node_api_key 必须是不含空白和控制字符的纯 ASCII 字符串')
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     if not isinstance(m, dict):
@@ -8271,7 +8285,7 @@ def _adopt_locked(meta_path, port, node_api_key=None):
         raise ValueError('portal.json 顶层必须是 JSON 对象')
     access_path = root / 'portal-access.json'
     access, _rebuilt = ensure_portal_access(root, m, data)
-    data['port'] = int(port)
+    data['port'] = port_int
     # users 为 null / 列表、机主条目不是 dict 时按空处理，与 user_table 一致；
     # 旧实现直接 AttributeError / TypeError，保留门户的重装中途失败（2026-11-04 修）。
     if not isinstance(data.get('users'), dict):
@@ -9905,7 +9919,7 @@ if __name__ == '__main__':
                 u for u, tr in ip_tracker.items()
                 if not isinstance(tr, dict)
                 or not any(isinstance(t, (int, float)) and not isinstance(t, bool)
-                           and 0 <= now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())
+                           and math.isfinite(t) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())
             ]
             for du in dead_uids:
                 ip_tracker.pop(du, None)
@@ -9920,14 +9934,17 @@ if __name__ == '__main__':
                 u_copy['online_ips'] = (
                     {ip: t for ip, t in tracked.items()
                      if isinstance(t, (int, float)) and not isinstance(t, bool)
-                     and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                     and math.isfinite(t) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                     if isinstance(tracked, dict) else {}
                 )
                 display_users[uid] = u_copy
             _api_key = data.get('api_key')
-            _token = data['token']
+            raw_token = data.get('token')
+            _token = raw_token if isinstance(raw_token, str) else ''
 
-        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{_token}/clash.yaml"
+        _sub_user = quote(str(access.get('username', '')), safe='')
+        _sub_pass = quote(str(access.get('password', '')), safe='')
+        subscription = f"https://{_sub_user}:{_sub_pass}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{_token}/clash.yaml"
 
         # 渲染与二维码都在锁外做（2026-10-29 修，注释此前与实现不符）：
         # page_html 在上千用户时约 27 ms，qrencode 最坏 20 秒，而 /auth
@@ -12639,6 +12656,8 @@ if __name__ == '__main__':
 
                 bad_domain = False
                 warp_not_installed = False
+                # 文件系统探测放在 data_lock 外执行，避免磁盘抖动时阻塞 /auth 鉴权。
+                warp_installed = warp_backend_installed() if action in ('toggle', 'enable') else True
                 with data_lock:
                     previous_warp_state_exists = 'warp_enabled' in data
                     previous_warp_rules_exists = 'warp_rules' in data
@@ -12652,7 +12671,7 @@ if __name__ == '__main__':
                     # 127.0.0.1:19898 的 warp_socks 出站，AI 等默认分流域名全部发往一个没人
                     # 监听的端口，用户只看到这些网站打不开。关闭始终允许。
                     warp_not_installed = (data.get('warp_enabled') and not previous_warp_state
-                                          and not warp_backend_installed())
+                                          and not warp_installed)
                     if warp_not_installed:
                         if previous_warp_state_exists:
                             data['warp_enabled'] = previous_warp_state
