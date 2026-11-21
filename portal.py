@@ -40,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 try:
     import fcntl
@@ -212,7 +212,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.46'
+PORTAL_VERSION = '2.47'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1128,23 +1128,29 @@ def _unreachable_outbounds(outs, timeout=2):
         if not isinstance(ob, dict):
             continue
         name = ob.get('name')
-        target = None
+        host = ''
+        port = None
         if ob.get('type') == 'socks5':
             addr = ob.get('addr')
-            target = addr if isinstance(addr, str) else ''
+            target = addr.strip() if isinstance(addr, str) else ''
+            if ':' in target:
+                raw_host, raw_port = target.rsplit(':', 1)
+                if raw_host.startswith('[') and raw_host.endswith(']'):
+                    raw_host = raw_host[1:-1]
+                try:
+                    host, port = raw_host, int(raw_port)
+                except ValueError:
+                    continue
         elif ob.get('type') == 'http':
             url = ob.get('url')
-            m = re.match(r'^[a-zA-Z]+://([^/:]+)(?::(\d+))?', url) if isinstance(url, str) else None
-            if m:
-                target = '%s:%s' % (m.group(1), m.group(2) or '80')
-        if not target or ':' not in target:
-            continue
-        host, port = target.rsplit(':', 1)
-        try:
-            port = int(port)
-        except ValueError:
-            continue
-        if not (0 < port < 65536):
+            if isinstance(url, str) and url.strip():
+                try:
+                    parsed = urlsplit(url.strip())
+                    host = parsed.hostname or ''
+                    port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+                except ValueError:
+                    continue
+        if not host or port is None or not (0 < port < 65536):
             continue
         sock = None
         try:
@@ -1173,7 +1179,8 @@ def _rollback_outbounds(cfg, original):
     """
     state = 'unknown'
     try:
-        cfg.write_text(original, encoding='utf-8')
+        # 原子写回并保持 0600 私有权限，避免断电半写或权限退化泄露混淆与鉴权密码。
+        atomic_write_private(cfg, original.encode('utf-8'))
         # 🔴 必须走 _restart_hy2（内含 reset-failed），
         #    这里原来直接 restart，会被 start-limit 挡住 ——
         #    后果是「回滚也失败」，用户彻底没救（真实事故）。
@@ -1441,10 +1448,14 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20,
     # 下次启动 / 人工排查能直接看到。
     # 新版本起来了就清掉上一次留下的失败标记（2026-11-04 修）：旧脚本只写不删，
     # 一次双重失败之后标记永远留着，谁读它都会把早已过去的故障当成当前状态。
-    return ('sleep 1; systemctl restart hysteria-portal; '
+    # 升级重启与自动回滚重启前都先清理失败计数：若新版本反复崩溃触发 StartLimitBurst，
+    # 不清理计数会导致自动回滚的那次 restart 同样被 systemd 拒绝，节点鉴权后端彻底离线。
+    return ('sleep 1; systemctl reset-failed hysteria-portal >/dev/null 2>&1 || true; '
+            'systemctl restart hysteria-portal; '
             'for i in $(seq 1 %d); do sleep 1; python3 -c %s && { rm -f %s; exit 0; }; done; '
             'logger -t hysteria-portal "面板更新后未能启动，已自动回滚到旧版本"; '
-            '%s %s systemctl restart hysteria-portal; '
+            '%s %s systemctl reset-failed hysteria-portal >/dev/null 2>&1 || true; '
+            'systemctl restart hysteria-portal; '
             'for i in $(seq 1 10); do sleep 1; python3 -c %s && '
             '{ logger -t hysteria-portal "回滚后已恢复"; exit 0; }; done; '
             'logger -t hysteria-portal "回滚后仍未启动，需要人工介入"; '
@@ -4639,7 +4650,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         changed = True
 
     if changed:
-        Path(meta_path).write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
         print(f"[portal] 证书信任模型已自愈: cert_type={new_type} "
               f"is_insecure={new_insecure} server_name={new_sn} "
               f"pin={'<set>' if new_pin else '<empty>'} (证书={cert_file})",
@@ -5232,7 +5243,8 @@ def _restore_config_atomically(config_path, original):
                                      suffix='.tmp', dir=str(config_path.parent))
     temp_path = Path(temp_name)
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, 'fchmod'):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, 'wb') as stream:
             fd = None
             stream.write(original)
@@ -6326,9 +6338,17 @@ def _restore_systemd_service_state(unit, snapshot):
                 results.append(subprocess.run(
                     ['systemctl', action, unit], capture_output=True, timeout=30))
         if enabled != 'not-found':
-            results.append(subprocess.run(
-                ['systemctl', 'start' if active == 'active' else 'stop', unit],
-                capture_output=True, timeout=30))
+            if active == 'active':
+                # 回滚恢复运行态前先清理失败计数并执行 restart（而非 start）：
+                # 1) 刚因新配置崩溃撞上 StartLimitBurst 时，直接 start 会被 systemd 拒绝；
+                # 2) 服务若正跑着新配置（同为 active），start 会静默空操作而不会重新加载刚回滚的旧配置。
+                subprocess.run(['systemctl', 'reset-failed', unit],
+                               capture_output=True, timeout=15)
+                results.append(subprocess.run(
+                    ['systemctl', 'restart', unit], capture_output=True, timeout=30))
+            else:
+                results.append(subprocess.run(
+                    ['systemctl', 'stop', unit], capture_output=True, timeout=30))
     except (OSError, subprocess.SubprocessError):
         return False
     if any(result.returncode != 0 for result in results):
@@ -7508,10 +7528,10 @@ def sync_pin(m, root, meta_path):
             new = pin_sha256_of_file(live) if Path(live).exists() else get_cert_pin_sha256(root)
             if new != m.get('pin_sha256'):
                 m['pin_sha256'] = new
-                Path(meta_path).write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
+                atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
     elif m.get('pin_sha256'):
         m['pin_sha256'] = ''
-        Path(meta_path).write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
 
 
 def prepare(meta_path, port, node_api_key=None):
@@ -7542,7 +7562,7 @@ def prepare(meta_path, port, node_api_key=None):
     sub_port, sub_port_src = resolve_subscription_port(m)
     if m.get('subscription_port') != sub_port:
         m['subscription_port'] = sub_port
-        Path(meta_path).write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding='utf-8')
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, indent=2).encode('utf-8'))
         print(f'[portal] 订阅端口已自愈为 {sub_port}（来源: {sub_port_src}）', file=sys.stderr)
     base = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
     subscription = f"https://{user}:{password}@{_host_for_url(host)}:{sub_port}/{token}/clash.yaml"
@@ -11532,14 +11552,22 @@ if __name__ == '__main__':
                         else:
                             data.pop('proxy_services', None)
                     subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
-                    if old_assets[gost_binary] is not None and old_gost_active:
-                        subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
-                        subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
-                    elif not old_gost_enabled or old_assets[gost_binary] is None:
+                    if old_assets[gost_binary] is None:
                         subprocess.run(['systemctl', 'disable', '--now', 'gost'],
                                        capture_output=True, timeout=30)
                         subprocess.run(['systemctl', 'stop', 'gost'],
                                        capture_output=True, timeout=30)
+                    else:
+                        # 独立还原原有开机自启与运行状态，重启前先清理失败计数防撞上限。
+                        if old_gost_enabled:
+                            subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
+                        else:
+                            subprocess.run(['systemctl', 'disable', 'gost'], capture_output=True, timeout=30)
+                        if old_gost_active:
+                            subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=15)
+                            subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
+                        else:
+                            subprocess.run(['systemctl', 'stop', 'gost'], capture_output=True, timeout=30)
 
                 if not installed:
                     # 把【每个源】的错误都报出来。
@@ -12761,7 +12789,7 @@ if __name__ == '__main__':
                     if previous_file is None:
                         cfg_path.unlink(missing_ok=True)
                     else:
-                        cfg_path.write_bytes(previous_file)
+                        _restore_config_atomically(cfg_path, previous_file)
                     if unit_changed:
                         _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
@@ -12845,12 +12873,13 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    with data_lock:
-                        data['anytls_config'] = old_acfg
-                    if previous_file is not None:
-                        cfg_path.write_bytes(previous_file)
-                    if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
-                        raise RuntimeError('AnyTLS 停用保存失败，且原服务状态未能完整恢复')
+                    with anytls_apply_lock:
+                        with data_lock:
+                            data['anytls_config'] = old_acfg
+                        if previous_file is not None:
+                            _restore_config_atomically(cfg_path, previous_file)
+                        if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                            raise RuntimeError('AnyTLS 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
@@ -12961,7 +12990,7 @@ if __name__ == '__main__':
                         if previous_file is None:
                             cfg_path.unlink(missing_ok=True)
                         else:
-                            cfg_path.write_bytes(previous_file)
+                            _restore_config_atomically(cfg_path, previous_file)
                         if unit_changed:
                             _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
                             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
@@ -13042,15 +13071,16 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    with data_lock:
-                        data['tuic_config'] = old_tcfg
-                    cfg_path = portal_path.parent / TUIC_CONFIG_NAME
-                    if previous_file is None:
-                        cfg_path.unlink(missing_ok=True)
-                    else:
-                        cfg_path.write_bytes(previous_file)
-                    if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
-                        raise RuntimeError('TUIC 停用保存失败，且原服务状态未能完整恢复')
+                    with tuic_apply_lock:
+                        with data_lock:
+                            data['tuic_config'] = old_tcfg
+                        cfg_path = portal_path.parent / TUIC_CONFIG_NAME
+                        if previous_file is None:
+                            cfg_path.unlink(missing_ok=True)
+                        else:
+                            _restore_config_atomically(cfg_path, previous_file)
+                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                            raise RuntimeError('TUIC 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 regenerate_page()
                 if closed_port and not close_protocol_port(closed_port, 'udp', 'tuic_config'):

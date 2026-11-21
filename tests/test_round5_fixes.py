@@ -116,6 +116,14 @@ class SelfUpdateRollbackTest(unittest.TestCase):
         self.assertEqual(mode, 0o600)
         self.assertFalse(added_exists)
         self.assertEqual(calls.count('systemctl restart hysteria-portal'), 2)
+        self.assertEqual(calls.count('systemctl reset-failed hysteria-portal'), 2)
+        lines = [line.strip() for line in calls.splitlines() if line.strip().startswith('systemctl ')]
+        self.assertEqual(lines, [
+            'systemctl reset-failed hysteria-portal',
+            'systemctl restart hysteria-portal',
+            'systemctl reset-failed hysteria-portal',
+            'systemctl restart hysteria-portal',
+        ])
         self.assertIn('logger', calls)
 
     def test_healthy_update_is_kept(self):
@@ -124,6 +132,7 @@ class SelfUpdateRollbackTest(unittest.TestCase):
         self.assertEqual(mode, 0o644)
         self.assertTrue(added_exists)
         self.assertEqual(calls.count('systemctl restart hysteria-portal'), 1)
+        self.assertEqual(calls.count('systemctl reset-failed hysteria-portal'), 1)
 
 
 @unittest.skipIf(os.name != 'posix', '需要 POSIX shell 与可执行桩')
@@ -152,6 +161,12 @@ class SelfUpdateScriptShapeTest(unittest.TestCase):
         self.assertIn('portal.py.bak', script)
         self.assertIn('new.py', script)
         self.assertIn('&& { rm -f', script)  # 健康后清掉旧的回滚失败标记再退出
+        # 升级重启与自动回滚重启前都必须先清理失败计数，避免撞上 StartLimitBurst 导致回滚也被拒。
+        self.assertEqual(script.count('systemctl reset-failed hysteria-portal'), 2)
+        parts = script.split('systemctl restart hysteria-portal')
+        self.assertEqual(len(parts), 3)
+        self.assertIn('systemctl reset-failed hysteria-portal', parts[0])
+        self.assertIn('systemctl reset-failed hysteria-portal', parts[1])
 
     def test_update_handler_uses_rollback_script(self):
         src = (ROOT / 'portal.py').read_text(encoding='utf-8')

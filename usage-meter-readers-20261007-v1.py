@@ -149,11 +149,14 @@ def parse_events(rows):
         event=None
         try:
             if clean.startswith('{'):
-                fields=json.loads(clean);event=fields.get('msg') or fields.get('message')
+                fields=json.loads(clean)
+                if not isinstance(fields,dict):raise ValueError('invalid_connection_event')
+                event=fields.get('msg') or fields.get('message')
             else:
                 match=re.search(r'(?:^|\t)(client connected|client disconnected)\t',clean)
                 if not match:continue
                 event=match.group(1);fields=json.loads(clean[match.end():])
+                if not isinstance(fields,dict):raise ValueError('invalid_connection_event')
         except (ValueError,TypeError):raise ValueError('invalid_connection_event') from None
         if event not in ('client connected','client disconnected'):continue
         uid,addr=fields.get('id'),fields.get('addr')
@@ -186,7 +189,7 @@ def cmd(args):
 def read_live_connections():
     cfg=json.loads(pathlib.Path('/etc/hysteria/usage-meter-config.json').read_text())
     portal=json.loads(pathlib.Path('/etc/hysteria/portal.json').read_text())
-    users=portal.get('users',{})
+    users=portal.get('users') if isinstance(portal,dict) and isinstance(portal.get('users'),dict) else {}
     output={'users':{},'sampled_at':int(time.time())}
     for uid in users:output['users'][uid]={'ips':[],'ok':False,'error':'Hy2 online IP unavailable','hysteria_ok':False,'reality_ok':False}
     core_counts=None
@@ -196,16 +199,23 @@ def read_live_connections():
         if parsed.scheme!='http' or parsed.hostname not in ('127.0.0.1','::1') or parsed.path not in ('','/'):raise ValueError('stats_not_loopback')
         live_req=urllib.request.Request(h['url'].rstrip('/')+'/online/ips',headers={'Authorization':h['secret']})
         try:
-            with urllib.request.urlopen(live_req,timeout=4) as response:live=json.load(response)
+            with urllib.request.urlopen(live_req,timeout=4) as response:
+                raw=response.read(4*1024*1024+1)
+            if len(raw)>4*1024*1024:raise ValueError('live_ips_response_too_large')
+            live=json.loads(raw)
         except urllib.error.HTTPError as exc:
             if exc.code!=404:raise
             live=None
         if live is not None:
-            if live.get('revision')!='teyir-live-ips-v1' or not isinstance(live.get('users'),dict):raise ValueError('invalid_core_live_response')
+            if not isinstance(live,dict) or live.get('revision')!='teyir-live-ips-v1' or not isinstance(live.get('users'),dict):raise ValueError('invalid_core_live_response')
             for uid,out in output['users'].items():
                 row=live['users'].get(uid,{'connections':0,'ips':[]})
-                if type(row.get('connections'))!=int or row['connections']<0 or not isinstance(row.get('ips'),list):raise ValueError('invalid_core_live_user')
-                ips=[{'ip':_norm_ip(ip),'protocol':'Hy2','last_seen':output['sampled_at']} for ip in row['ips']]
+                if not isinstance(row,dict):raise ValueError('invalid_core_live_user')
+                # Go 序列化空切片可能产出 null，按空列表处理，避免误判全机采集失败。
+                raw_ips=[] if row.get('ips') is None else row.get('ips')
+                if type(row.get('connections'))!=int or row['connections']<0 or not isinstance(raw_ips,list):raise ValueError('invalid_core_live_user')
+                dedup_ips=list(dict.fromkeys(_norm_ip(ip) for ip in raw_ips))
+                ips=[{'ip':ip,'protocol':'Hy2','last_seen':output['sampled_at']} for ip in dedup_ips]
                 out.update(ok=True,hysteria_ok=True,error='',hysteria_count=row['connections'],ips=ips)
         else:
             online=read_hysteria_online(h['url'],h['secret'])
@@ -221,11 +231,7 @@ def read_live_connections():
                 if len(rows)>20000:raise ValueError('journal_history_truncated')
                 connections=parse_events(rows)
                 h=cfg['hysteria']
-                parsed=urlparse(h['url'])
-                if parsed.scheme!='http' or parsed.hostname not in ('127.0.0.1','::1') or parsed.path not in ('','/'):raise ValueError('stats_not_loopback')
-                req=urllib.request.Request(h['url'].rstrip('/')+'/online',headers={'Authorization':h['secret']})
-                with urllib.request.urlopen(req,timeout=4) as r:online=json.load(r)
-                if not isinstance(online,dict) or any(type(x)!=int or x<0 for x in online.values()):raise ValueError('invalid_online_counts')
+                online=read_hysteria_online(h['url'],h['secret'])
                 after=cmd(['systemctl','show','hysteria-server','--property=InvocationID','--value']).strip()
                 if after!=epoch:raise ValueError('service_changed_during_sample')
                 for uid,out in output['users'].items():
@@ -256,7 +262,8 @@ def read_live_connections():
             address=rcfg['address']
             if not address.startswith('127.0.0.1:'):raise ValueError('stats_not_loopback')
             allusers=json.loads(cmd([binary,'api','statsgetallonlineusers','--server='+address]))
-            names=allusers.get('users',[]) if isinstance(allusers,dict) else allusers
+            # Go 序列化空切片或空映射时常返回 null，仅把 None 视为缺省空集合，其它非法类型仍拒绝。
+            names=([] if allusers.get('users') is None else allusers.get('users')) if isinstance(allusers,dict) else allusers
             if not isinstance(names,list):raise ValueError('invalid_online_users')
             if any(not isinstance(name,str) for name in names):raise ValueError('invalid_online_user_name')
             names=[name.split('>>>')[1] if name.startswith('user>>>') and name.endswith('>>>online') and len(name.split('>>>'))==3 else name for name in names]
@@ -264,11 +271,20 @@ def read_live_connections():
                 out['reality_ok']=True
                 if uid not in names:continue
                 result=json.loads(cmd([binary,'api','statsonlineiplist','--server='+address,'--email='+uid]))
-                ips=result.get('ips',{})
+                if not isinstance(result,dict):raise ValueError('invalid_online_ips')
+                ips={} if result.get('ips') is None else result.get('ips')
                 if not isinstance(ips,dict):raise ValueError('invalid_online_ips')
-                # 双栈监听时 Xray 同样可能报 ::ffff:a.b.c.d，必须与 Hy2 一致还原成纯 IPv4，
+                # 双栈监听时 Xray 同样可能报 ::ffff:a.b.c.d，必须与 Hy2 一致还原成纯 IPv4 并去重，
                 # 否则同一设备同时测速 Hy2 与 Reality 时会被当成两个在线 IP，也对不上跨节点拦截名单。
-                for ip,seen in ips.items():out['ips'].append({'ip':_norm_ip(ip),'protocol':'Reality','last_seen':int(seen)})
+                merged={}
+                for ip,seen in ips.items():
+                    if isinstance(seen,bool):raise ValueError('invalid_online_seen')
+                    norm=_norm_ip(ip)
+                    ts=int(seen)
+                    if norm not in merged or ts>merged[norm]:
+                        merged[norm]=ts
+                for norm,ts in merged.items():
+                    out['ips'].append({'ip':norm,'protocol':'Reality','last_seen':ts})
         except Exception as exc:
             for out in output['users'].values():
                 out['reality_ok']=False

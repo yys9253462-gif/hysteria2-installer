@@ -105,6 +105,47 @@ is_whole_disk() {
     [ -d "${SYS_BLOCK:-/sys/block}/$(basename "$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")")" ]
 }
 
+# 从挂载表精确找出目标整盘或其分区，避免 /dev/nvme0n1 误命中 /dev/nvme0n10p1 或 /dev/sda 误命中 /dev/sdaa1
+disk_mounts() {
+    _dm_d="$1"
+    _dm_file="${2:-/proc/mounts}"
+    [ -r "$_dm_file" ] || return 0
+    awk -v d="$_dm_d" '
+        BEGIN { pat = (d ~ /[0-9]$/) ? ("^" d "p[0-9]+$") : ("^" d "[0-9]+$") }
+        $1 == d || $1 ~ pat { print $2 }
+    ' "$_dm_file" 2>/dev/null
+}
+
+# 精确列出目标整盘及其分区设备，不用 "${d}"* 模糊前缀，防止多盘环境下误卸载其它磁盘分区
+disk_devices() {
+    _dd_d="$1"
+    [ -e "$_dd_d" ] && printf '%s\n' "$_dd_d"
+    case "$_dd_d" in
+        *[0-9])
+            for _dd_p in "${_dd_d}p"[0-9]*; do
+                case "$_dd_p" in
+                    "${_dd_d}p"[0-9]*)
+                        _dd_num="${_dd_p#"${_dd_d}p"}"
+                        case "$_dd_num" in ''|*[!0-9]*) continue ;; esac
+                        [ -e "$_dd_p" ] && printf '%s\n' "$_dd_p"
+                        ;;
+                esac
+            done
+            ;;
+        *)
+            for _dd_p in "${_dd_d}"[0-9]*; do
+                case "$_dd_p" in
+                    "${_dd_d}"[0-9]*)
+                        _dd_num="${_dd_p#"${_dd_d}"}"
+                        case "$_dd_num" in ''|*[!0-9]*) continue ;; esac
+                        [ -e "$_dd_p" ] && printf '%s\n' "$_dd_p"
+                        ;;
+                esac
+            done
+            ;;
+    esac
+}
+
 # ── 参数解析 ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -301,20 +342,17 @@ info "第 5/9 步：分区并格式化 $DISK"
 release_disk() {
     _d="$1"
 
-    # (1) 先按分区设备名卸
-    for _p in "${_d}"*; do
+    # (1) 先按精确分区设备名卸（避免 "${_d}"* 误伤其它磁盘）
+    disk_devices "$_d" | while IFS= read -r _p; do
         [ -b "$_p" ] && { umount "$_p" >/dev/null 2>&1 || true; }
     done
 
     # (2) 再**按挂载点**卸 —— 关键补充！`umount /dev/vda1` 在设备节点
     #     和挂载源不完全一致时（比如通过 loop / udev 别名挂的）会漏掉，
     #     必须从 /proc/mounts 里把这些设备的所有挂载点全捞出来卸干净。
-    if [ -r /proc/mounts ]; then
-        awk -v d="$_d" '$1 ~ "^"d || $1 ~ "^"d"[0-9p]" {print $2}' /proc/mounts 2>/dev/null \
-            | sort -r | while IFS= read -r _mp; do
-                [ -n "$_mp" ] && umount "$_mp" >/dev/null 2>&1 || true
-            done
-    fi
+    disk_mounts "$_d" | sort -r | while IFS= read -r _mp; do
+        [ -n "$_mp" ] && umount "$_mp" >/dev/null 2>&1 || true
+    done
 
     # (3) 关 swap（救援模式常把磁盘当 swap 用，会让设备一直"忙"）
     swapoff -a >/dev/null 2>&1 || true
@@ -377,10 +415,7 @@ else
         wipe_disk "$DISK" || true
 
         # 复查：还有挂载吗？
-        _mnt_left=""
-        if [ -r /proc/mounts ]; then
-            _mnt_left="$(awk -v d="$DISK" '$1 ~ "^"d {print $2}' /proc/mounts 2>/dev/null)"
-        fi
+        _mnt_left="$(disk_mounts "$DISK")"
 
         if [ -z "$_mnt_left" ]; then
             _clean_ok=1

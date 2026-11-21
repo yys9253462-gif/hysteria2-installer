@@ -721,7 +721,8 @@ render_client_config() {
     # endpoint 允许自带端口（validate_endpoint 接受 host:port）；
     # 无脑再拼一次会得到 host:51820:54321，客户端直接握手失败（2026-10-29 修）。
     if endpoint_has_port "$endpoint"; then
-        echo "Endpoint = ${endpoint}"
+        local ep_host="${endpoint%:*}" ep_port="${endpoint##*:}"
+        echo "Endpoint = ${ep_host}:$((10#$ep_port))"
     else
         echo "Endpoint = ${endpoint}:${port}"
     fi
@@ -1329,7 +1330,8 @@ cmd_uninstall() {
     local self
     self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     if [[ "$self" == "$AWG_CTL_INSTALLED" ]]; then
-        nohup bash -c "sleep 2; rm -f '${AWG_CTL_INSTALLED}'" >/dev/null 2>&1 &
+        # 关闭继承的锁描述符 fd 9，避免卸载退出后后台子进程仍占住 /run/hy2-awgctl.lock 阻塞后续操作。
+        nohup bash -c "sleep 2; rm -f '${AWG_CTL_INSTALLED}'" >/dev/null 2>&1 9>&- &
         log_info "控制工具 ${AWG_CTL_INSTALLED} 将在本进程退出后自动移除"
     fi
 

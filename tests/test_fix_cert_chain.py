@@ -12,46 +12,65 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'fix_cert_chain.sh'
-PEM = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n'
+BAD_PEM = '-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n'
+BASH = shutil.which('bash')
+OPENSSL = shutil.which('openssl')
 
 
-@unittest.skipUnless(shutil.which('bash'), 'needs bash')
+@unittest.skipUnless(BASH and OPENSSL, 'needs bash + openssl')
 class FixCertChainPathTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.leaf = self.root / 'node.example.com.cer'
-        self.leaf.write_text(PEM, encoding='utf-8')
+        key = self.root / 'node.key'
+        subprocess.run(
+            [OPENSSL, 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1',
+             '-nodes', '-keyout', str(key), '-out', str(self.leaf), '-days', '1',
+             '-subj', '/CN=fixture.test'],
+            check=True, capture_output=True, timeout=30,
+        )
+        pem = self.leaf.read_text(encoding='utf-8')
         self.full = self.root / 'fullchain.cer'
-        self.full.write_text(PEM * 2, encoding='utf-8')
+        self.full.write_text(pem + pem, encoding='utf-8')
 
-    def dry_run(self, cert_line):
+    def dry_run(self, cert_line, tls_header='tls:'):
         config = self.root / 'config.yaml'
-        config.write_text('listen: :443\ntls:\n  %s\n  key: "%s/node.key"\n\n'
-                          'masquerade:\n  listenHTTPS: :8443\n' % (cert_line, self.root),
+        config.write_text('listen: :443\n%s\n  %s\n  key: "%s/node.key"\n\n'
+                          'masquerade:\n  listenHTTPS: :8443\n' % (tls_header, cert_line, self.root.as_posix()),
                           encoding='utf-8')
-        result = subprocess.run(['bash', str(SCRIPT), '--dry-run', '--config', str(config)],
-                                capture_output=True, text=True, timeout=30)
-        return result.returncode, result.stdout + result.stderr
+        result = subprocess.run([BASH, str(SCRIPT), '--dry-run', '--config', str(config)],
+                                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30)
+        return result.returncode, (result.stdout or '') + (result.stderr or '')
 
-    def assert_finds_fullchain(self, cert_line):
-        code, out = self.dry_run(cert_line)
+    def assert_finds_fullchain(self, cert_line, tls_header='tls:'):
+        code, out = self.dry_run(cert_line, tls_header=tls_header)
         self.assertEqual(code, 0, out)
         self.assertNotIn('证书文件不存在', out)
-        self.assertIn('找到完整链文件：%s' % self.full, out)
+        self.assertIn('找到完整链文件：%s' % self.full.as_posix(), out)
 
     def test_double_quoted_path_from_installer(self):
-        self.assert_finds_fullchain('cert: "%s"' % self.leaf)
+        self.assert_finds_fullchain('cert: "%s"' % self.leaf.as_posix())
 
     def test_single_quoted_path(self):
-        self.assert_finds_fullchain("cert: '%s'" % self.leaf)
+        self.assert_finds_fullchain("cert: '%s'" % self.leaf.as_posix())
 
     def test_unquoted_path_with_trailing_comment(self):
-        self.assert_finds_fullchain('cert: %s   # leaf only' % self.leaf)
+        self.assert_finds_fullchain('cert: %s   # leaf only' % self.leaf.as_posix())
+
+    def test_tls_heading_with_inline_comment_is_parsed(self):
+        self.assert_finds_fullchain('cert: "%s"' % self.leaf.as_posix(), tls_header='tls:  # 自定义证书段')
+
+    def test_corrupt_leaf_and_corrupt_fullchain_do_not_false_match(self):
+        self.leaf.write_text(BAD_PEM, encoding='utf-8')
+        self.full.write_text(BAD_PEM * 2, encoding='utf-8')
+        code, out = self.dry_run('cert: "%s"' % self.leaf.as_posix())
+        self.assertNotEqual(code, 0, out)
+        self.assertIn('未找到可用的 fullchain', out)
 
     def test_full_chain_needs_no_change(self):
-        code, out = self.dry_run('cert: "%s"' % self.full)
+        code, out = self.dry_run('cert: "%s"' % self.full.as_posix())
         self.assertEqual(code, 0, out)
         self.assertIn('已包含完整链', out)
 
