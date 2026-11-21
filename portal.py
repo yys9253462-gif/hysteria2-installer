@@ -10122,8 +10122,14 @@ if __name__ == '__main__':
                 # token 的人刷 10 次错误密码就把管理员锁在门外。全局保留 200 次作
                 # 兜底，换来源爆破的总尝试次数仍然有界。
                 source = self._web_source_key()
-                per_source = self.server.login_source_failures.get(source, [])
-                per_source[:] = [t for t in per_source if now - t < 600]
+                per_source = self.server.login_source_failures.get(source)
+                if per_source is not None:
+                    per_source[:] = [t for t in per_source if now - t < 600]
+                    if not per_source:
+                        self.server.login_source_failures.pop(source, None)
+                        per_source = []
+                else:
+                    per_source = []
                 global_locked = len(self.server.login_failures) >= 200
                 if len(per_source) >= 10 or global_locked:
                     # 🔴 2026-10-31：锁定必须留痕。旧实现静默返回 True，
@@ -10138,6 +10144,10 @@ if __name__ == '__main__':
                     if now - logged.get(key, now - 600) >= 600:
                         for old_key in [k for k, t in logged.items() if now - t >= 600]:
                             del logged[old_key]
+                        # 同步限制锁定日志去重表容量，防止海量来源在同一窗口撑爆内存。
+                        while len(logged) >= 4096:
+                            oldest_key = min(logged, key=logged.get)
+                            del logged[oldest_key]
                         logged[key] = now
                         print('[portal] 登录失败达上限，%s已锁定 600 秒（该来源 %d 次、全局 %d 次失败）'
                               % ('所有来源' if global_locked else '来源 %s ' % source,
@@ -10148,10 +10158,14 @@ if __name__ == '__main__':
         def record_login_failure(self):
             now = time.monotonic()
             with data_lock:
+                self.server.login_failures[:] = [
+                    t for t in self.server.login_failures if now - t < 600]
                 self.server.login_failures.append(now)
                 table = self.server.login_source_failures
                 key = self._web_source_key()
-                table.setdefault(key, []).append(now)
+                bucket = [t for t in table.get(key, []) if now - t < 600]
+                bucket.append(now)
+                table[key] = bucket
                 table.move_to_end(key)
                 while len(table) > 4096:
                     table.popitem(last=False)
@@ -15354,8 +15368,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if conf_path.exists():
                     c_text = conf_path.read_text(encoding='utf-8')
                     for line in c_text.splitlines():
-                        if 'tcp_congestion_control' in line and '=' in line:
-                            configured_bbr = line.split('=')[1].strip()
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith('#') or stripped.startswith(';'):
+                            continue
+                        if '=' not in stripped:
+                            continue
+                        k_part, v_part = stripped.split('=', 1)
+                        if k_part.strip() == 'net.ipv4.tcp_congestion_control':
+                            configured_bbr = v_part.split('#', 1)[0].split(';', 1)[0].strip()
 
                 need_reboot = False
                 if configured_bbr and configured_bbr != cc_out:
