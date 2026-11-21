@@ -56,6 +56,15 @@ PORTAL = "/etc/hysteria/portal.json"
 META = "/etc/hysteria/client_meta.json"
 
 
+def _safe_host(value):
+    if not isinstance(value, str):
+        return ""
+    host = value.strip()
+    if not host or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() or ch in "/\\@?#" for ch in host):
+        return ""
+    return host
+
+
 def meta_host(meta_text):
     """与门户同一条规则取对外地址：自签用 public_ip，可信证书用 server_name。
 
@@ -73,17 +82,20 @@ def meta_host(meta_text):
     is_insecure = flag is True or (isinstance(flag, str) and flag.strip().lower() == "true")
     primary, fallback = ("public_ip", "server_name") if is_insecure else ("server_name", "public_ip")
     for key in (primary, fallback):
-        host = meta.get(key)
-        if isinstance(host, str) and host.strip():
-            return host.strip()
+        host = _safe_host(meta.get(key))
+        if host:
+            return host
     return ""
 
 
 def read(path):
-    if not os.path.exists(path):
+    if not os.path.isfile(path):
         return None
-    with open(path, encoding="utf-8", errors="replace") as f:
-        return f.read()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 def yaml_scalar(v):
@@ -136,13 +148,15 @@ def acme_first_domain(text):
     in_acme = False
     domains_indent = None
     item_re = re.compile(r'^\s*-\s*["\']?([A-Za-z0-9._-]+)["\']?\s*(?:#.*)?$')
+    inline_re = re.compile(r'^domains:\s*\[([^\]]*)\]\s*(?:#.*)?$')
+    token_re = re.compile(r'^[A-Za-z0-9._-]+$')
     for raw in text.splitlines():
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
         indent = len(raw) - len(raw.lstrip())
         if indent == 0:
-            in_acme = stripped.startswith("acme:")
+            in_acme = bool(re.match(r"^acme:\s*(?:#.*)?$", stripped))
             domains_indent = None
             continue
         if not in_acme:
@@ -155,6 +169,13 @@ def acme_first_domain(text):
                 if m:
                     return m.group(1)
                 continue
+        m_inline = inline_re.match(stripped)
+        if m_inline:
+            for item in m_inline.group(1).split(","):
+                cand = item.strip().strip('"').strip("'").strip()
+                if cand and token_re.match(cand):
+                    return cand
+            continue
         if re.match(r"^domains:\s*(?:#.*)?$", stripped):
             domains_indent = indent
     return ""
@@ -221,8 +242,8 @@ def main():
     # 旧实现拼出 https://a.com:0.0.0.0:8443 还返回 0。
     https_port = (masq.get("listenHTTPS") or "").rpartition(":")[2].strip()
     if not (https_port.isascii() and https_port.isdigit()):
-        # 锚定行首：被注释掉的 `# listenHTTPS: :1111` 不能当成对外端口（2026-11-12 修）。
-        m2 = re.search(r"^\s*listenHTTPS:\s*\S*?:?([0-9]+)[\"']?\s*(?:#.*)?$", cfg_text, re.M)
+        # 锚定行首且只匹配冒号后纯数字：被注释掉的 `# listenHTTPS: :1111` 与 `":abc8443"` 均不得误抽。
+        m2 = re.search(r"^\s*listenHTTPS:\s*[\"']?(?:[^\s#\"']*:)?([0-9]+)[\"']?\s*(?:#.*)?$", cfg_text, re.M)
         https_port = m2.group(1) if m2 else ""
     # 端口 0 / 越界拼出的地址永远连不上，旧实现照样输出并返回 0（2026-11-12 修）；
     # 同时去掉十进制前导零（如 08443 -> 8443），避免严格 URL 解析器拒绝。
@@ -280,16 +301,17 @@ def main():
             print("--panel 不能包含空白或控制字符", file=sys.stderr)
             return 2
         # 只接受 https 且不含查询串或锚点：避免把 /api/nodes 拼进 query/fragment。
-        _p = urllib.parse.urlsplit(raw_panel)
         try:
+            _p = urllib.parse.urlsplit(raw_panel)
             _panel_port = _p.port
+            _panel_host = _p.hostname
         except ValueError:
-            print("--panel 端口不合法（必须在 1-65535 之间）", file=sys.stderr)
+            print("--panel 地址或端口格式不合法", file=sys.stderr)
             return 2
         if _panel_port is not None and not (1 <= _panel_port <= 65535):
             print("--panel 端口不合法（必须在 1-65535 之间）", file=sys.stderr)
             return 2
-        if _p.scheme != "https" or not _p.hostname or _p.username is not None or _p.password is not None or _p.query or _p.fragment:
+        if _p.scheme != "https" or not _panel_host or _p.username is not None or _p.password is not None or _p.query or _p.fragment:
             print("--panel 必须是 https:// 开头的面板地址（不能包含凭据、? 或 #）", file=sys.stderr)
             return 2
         panel = raw_panel.rstrip("/")
@@ -312,12 +334,13 @@ def main():
         if not args.panel:
             print("--register 需要 --panel", file=sys.stderr)
             return 2
-        if not args.admin_token:
+        if not args.admin_token or not args.admin_token.strip():
             print("--register 需要 --admin-token", file=sys.stderr)
             return 2
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in args.admin_token):
             print("--admin-token 不能包含换行或控制字符", file=sys.stderr)
             return 2
+        admin_token = args.admin_token.strip()
         body = json.dumps({
             "name": args.name or result["suggested_name"],
             "api_url": result["api_url"],
@@ -325,7 +348,7 @@ def main():
         }, ensure_ascii=False).encode()
         req = urllib.request.Request(panel + "/api/nodes", data=body, method="POST")
         req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", "Bearer " + args.admin_token)
+        req.add_header("Authorization", "Bearer " + admin_token)
         try:
             with urllib.request.urlopen(req, timeout=30) as r:
                 print(f"登记成功 HTTP {r.status}")
