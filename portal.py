@@ -5242,7 +5242,8 @@ def _restore_config_atomically(config_path, original):
                                      suffix='.tmp', dir=str(config_path.parent))
     temp_path = Path(temp_name)
     try:
-        os.fchmod(fd, 0o600)
+        if hasattr(os, 'fchmod'):
+            os.fchmod(fd, 0o600)
         with os.fdopen(fd, 'wb') as stream:
             fd = None
             stream.write(original)
@@ -12779,7 +12780,7 @@ if __name__ == '__main__':
                     if previous_file is None:
                         cfg_path.unlink(missing_ok=True)
                     else:
-                        cfg_path.write_bytes(previous_file)
+                        _restore_config_atomically(cfg_path, previous_file)
                     if unit_changed:
                         _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
@@ -12863,12 +12864,13 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    with data_lock:
-                        data['anytls_config'] = old_acfg
-                    if previous_file is not None:
-                        cfg_path.write_bytes(previous_file)
-                    if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
-                        raise RuntimeError('AnyTLS 停用保存失败，且原服务状态未能完整恢复')
+                    with anytls_apply_lock:
+                        with data_lock:
+                            data['anytls_config'] = old_acfg
+                        if previous_file is not None:
+                            _restore_config_atomically(cfg_path, previous_file)
+                        if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                            raise RuntimeError('AnyTLS 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
@@ -12979,7 +12981,7 @@ if __name__ == '__main__':
                         if previous_file is None:
                             cfg_path.unlink(missing_ok=True)
                         else:
-                            cfg_path.write_bytes(previous_file)
+                            _restore_config_atomically(cfg_path, previous_file)
                         if unit_changed:
                             _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
                             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
@@ -13060,15 +13062,16 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    with data_lock:
-                        data['tuic_config'] = old_tcfg
-                    cfg_path = portal_path.parent / TUIC_CONFIG_NAME
-                    if previous_file is None:
-                        cfg_path.unlink(missing_ok=True)
-                    else:
-                        cfg_path.write_bytes(previous_file)
-                    if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
-                        raise RuntimeError('TUIC 停用保存失败，且原服务状态未能完整恢复')
+                    with tuic_apply_lock:
+                        with data_lock:
+                            data['tuic_config'] = old_tcfg
+                        cfg_path = portal_path.parent / TUIC_CONFIG_NAME
+                        if previous_file is None:
+                            cfg_path.unlink(missing_ok=True)
+                        else:
+                            _restore_config_atomically(cfg_path, previous_file)
+                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                            raise RuntimeError('TUIC 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 regenerate_page()
                 if closed_port and not close_protocol_port(closed_port, 'udp', 'tuic_config'):
