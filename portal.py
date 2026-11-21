@@ -5461,10 +5461,13 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
                 capture_output=True, timeout=5, check=True)
     except Exception:
         if replaced:
-            if original is None:
-                config_path.unlink(missing_ok=True)
-            else:
-                _restore_config_atomically(config_path, original)
+            try:
+                if original is None:
+                    config_path.unlink(missing_ok=True)
+                else:
+                    _restore_config_atomically(config_path, original)
+            except OSError as rb_exc:
+                _log_ignored('anytls_config_rollback_file', rb_exc)
             if restart and original is not None:
                 try:
                     run(['systemctl', 'reset-failed', service], capture_output=True, timeout=5)
