@@ -5629,6 +5629,20 @@ def _xray_version(binary='/usr/local/bin/xray', run=subprocess.run):
     m = re.search(r'Xray\s+v?(\d+(?:\.\d+)+)', (out.stdout or '') + (out.stderr or ''))
     return m.group(1) if m else ''
 
+_MAX_REMOTE_META_BYTES = 2 * 1024 * 1024
+
+
+def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
+    """带体积上限读取外部响应，防止异常超大响应耗尽门户内存。"""
+    try:
+        raw = resp.read(limit + 1)
+    except TypeError:
+        raw = resp.read()
+    if len(raw) > limit:
+        raise ValueError('响应体积过大（超过 %d 字节）' % limit)
+    return raw
+
+
 def install_xray_binary():
     """下载官方 Xray-core 并校验 SHA2-256 后装到 /usr/local/bin/xray，返回 (ok, message)。
 
@@ -5686,21 +5700,26 @@ def install_xray_binary():
                 with zipfile.ZipFile(zpath, 'r') as zf:
                     member = safe_zip_members(zf.namelist(), 'xray')
                     zf.extract(member, path=tmpdir)
-                bin_path = Path(tmpdir) / 'xray'
+                bin_path = Path(tmpdir) / member
                 if bin_path.exists():
-                    staged = Path('/usr/local/bin/xray.new')
-                    shutil.copyfile(str(bin_path), str(staged))
-                    os.chmod(str(staged), 0o755)
-                    # 换上之前先确认新二进制能跑（2026-11-03 修）：旧实现直接 os.replace，
-                    # 新文件起不来时旧核心已被覆盖，正在跑的 Reality / VMess / VLESS-Enc
-                    # 下一次重启就全挂，而且没有可回滚的旧文件。
-                    if not _xray_version(str(staged)):
-                        staged.unlink(missing_ok=True)
-                        errors.append('%s: 新 xray 无法运行（version 检查失败），未替换' % host)
-                        continue
-                    os.replace(str(staged), '/usr/local/bin/xray')
-                    installed = True
-                    break
+                    staged = Path('/usr/local/bin/xray.new.%s' % secrets.token_hex(6))
+                    replaced = False
+                    try:
+                        shutil.copyfile(str(bin_path), str(staged))
+                        os.chmod(str(staged), 0o755)
+                        # 换上之前先确认新二进制能跑（2026-11-03 修）：旧实现直接 os.replace，
+                        # 新文件起不来时旧核心已被覆盖，正在跑的 Reality / VMess / VLESS-Enc
+                        # 下一次重启就全挂，而且没有可回滚的旧文件。
+                        if not _xray_version(str(staged)):
+                            errors.append('%s: 新 xray 无法运行（version 检查失败），未替换' % host)
+                            continue
+                        os.replace(str(staged), '/usr/local/bin/xray')
+                        replaced = True
+                        installed = True
+                        break
+                    finally:
+                        if not replaced:
+                            staged.unlink(missing_ok=True)
                 errors.append('%s: 包内没有 xray' % host)
             except Exception as exc:
                 errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
@@ -5728,14 +5747,18 @@ def install_singbox():
         req = urllib.request.Request('https://api.github.com/repos/SagerNet/sing-box/releases/latest',
                                      headers={'User-Agent': 'hy2-portal'})
         with urllib.request.urlopen(req, timeout=15) as r:
-            release = json.loads(r.read().decode('utf-8'))
+            release = json.loads(_read_bounded_bytes(r, _MAX_REMOTE_META_BYTES).decode('utf-8', errors='replace'))
     except Exception as exc:
         return False, '取不到 sing-box 最新版本信息: %s' % exc
+    if not isinstance(release, dict):
+        return False, '取不到 sing-box 最新版本信息: 响应结构不是 JSON 对象'
     tag = str(release.get('tag_name') or '')
     ver = tag.lstrip('v')
     asset_name = f'sing-box-{ver}-linux-{arch}.tar.gz'
-    asset = next((a for a in release.get('assets') or [] if a.get('name') == asset_name), None)
-    digest = str((asset or {}).get('digest') or '')
+    raw_assets = release.get('assets')
+    assets = raw_assets if isinstance(raw_assets, list) else []
+    asset = next((a for a in assets if isinstance(a, dict) and a.get('name') == asset_name), None)
+    digest = str((asset or {}).get('digest') or '').strip().lower()
     expected = digest[len('sha256:'):] if digest.startswith('sha256:') else ''
     if not re.fullmatch(r'[0-9a-f]{64}', expected):
         return False, '取不到 %s 的官方 SHA256，无法校验下载内容，已放弃安装' % asset_name
@@ -5752,20 +5775,25 @@ def install_singbox():
                 if not verify_sha256(archive, expected):
                     errors.append('%s: SHA256 与官方不一致' % host)
                     continue
-                with tarfile.open(str(archive), 'r:gz') as tar:
-                    member_name = safe_tar_members([m.name for m in tar.getmembers() if m.isfile()],
-                                                   'sing-box')
-                    member = tar.getmember(member_name)
-                    staged = Path(ANYTLS_BINARY + '.new')
-                    with tar.extractfile(member) as src, open(staged, 'wb') as dst:
-                        shutil.copyfileobj(src, dst)
-                os.chmod(str(staged), 0o755)
-                version = _singbox_version(str(staged))
-                if not version or version < ANYTLS_MIN_SINGBOX:
-                    staged.unlink(missing_ok=True)
-                    return False, 'sing-box 版本 %s 不支持 AnyTLS（需要 1.12.0+）' % ver
-                os.replace(str(staged), ANYTLS_BINARY)
-                return True, 'sing-box %s 安装完成' % ver
+                staged = Path('%s.new.%s' % (ANYTLS_BINARY, secrets.token_hex(6)))
+                replaced = False
+                try:
+                    with tarfile.open(str(archive), 'r:gz') as tar:
+                        member_name = safe_tar_members([m.name for m in tar.getmembers() if m.isfile()],
+                                                       'sing-box')
+                        member = tar.getmember(member_name)
+                        with tar.extractfile(member) as src, open(staged, 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
+                    os.chmod(str(staged), 0o755)
+                    version = _singbox_version(str(staged))
+                    if not version or version < ANYTLS_MIN_SINGBOX:
+                        return False, 'sing-box 版本 %s 不支持 AnyTLS（需要 1.12.0+）' % ver
+                    os.replace(str(staged), ANYTLS_BINARY)
+                    replaced = True
+                    return True, 'sing-box %s 安装完成' % ver
+                finally:
+                    if not replaced:
+                        staged.unlink(missing_ok=True)
             except Exception as exc:
                 errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
     return False, '下载 sing-box 失败 —— ' + ' ｜ '.join(errors)
