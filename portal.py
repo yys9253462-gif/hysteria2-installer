@@ -15027,6 +15027,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             cc = ''
                         return (cc.startswith('bbr'), cc)
 
+                    singbox_installed = bool(_singbox_version())
+                    bbr_enabled, bbr_algo = _bbr_now()
+                    vmess_port = _valid_port(d_snap['vmess'].get('port'))
+                    vlessenc_port = _valid_port(d_snap['vlessenc'].get('port'))
+                    anytls_port = _valid_port(d_snap['anytls'].get('port'))
+                    tuic_port = _valid_port(d_snap['tuic'].get('port'))
+
                     # 节点门户自身版本：流式扫描 __file__ 命中 PORTAL_VERSION 即停，
                     # 避免旧版 [:80] 截断漏掉定义及整文件读入内存；不可读时回落模块常量。
                     portal_version = PORTAL_VERSION
@@ -15041,12 +15048,6 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     except Exception:
                         portal_version = PORTAL_VERSION
 
-                    singbox_installed = bool(_singbox_version())
-                    bbr_enabled, bbr_algo = _bbr_now()
-                    vmess_port = _valid_port(d_snap['vmess'].get('port'))
-                    vlessenc_port = _valid_port(d_snap['vlessenc'].get('port'))
-                    anytls_port = _valid_port(d_snap['anytls'].get('port'))
-                    tuic_port = _valid_port(d_snap['tuic'].get('port'))
                     # 端口一律经 _valid_port（2026-11-03 修）：任何一个协议段的端口被改坏成
                     # 字符串，旧写法 int() 抛异常，整个 capabilities 回 500，控制台看不到这台节点。
                     return self.reply_json(200, {

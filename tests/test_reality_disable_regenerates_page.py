@@ -52,6 +52,7 @@ class RealityDisableRegeneratesPageTests(unittest.TestCase):
             unit_suspended=lambda _: False,
             close_protocol_port=lambda *a, **kw: True,
             regenerate_page=regen_mock,
+            save_data=lambda: None,
         )
         return extract_method('_h_post_manage_reality', ns)
 
