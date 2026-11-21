@@ -618,20 +618,25 @@ def clean_outbounds(outbounds):
     """只保留结构完整的出站条目；容器被改坏时返回空表。
 
     custom_outbounds 是用户可写的 JSON，旧版本还允许直接改 portal.json。
-    渲染时 `entry['type']` / `entry['addr']` / `entry['url']` 对 None / 字符串 / 缺字段会抛
+    渲染时 `entry['type']` 对 None / 字符串 / 缺字段会抛
     TypeError/KeyError，而调用点在 apply_egress_config 里 —— 一次坏数据就让
     WARP 与出站配置永久无法应用，界面只显示「应用失败」。
     """
     if not isinstance(outbounds, (list, tuple)):
         return []
-    # 名称必须同时满足标识符规则，且各类型必填字段必须为不含控制字符的非空字符串，
-    # 避免损坏的历史条目让 render_outbound_yaml 抛 KeyError 或注入恶意 YAML 行。
+    # 名称必须同时满足标识符规则：旧版本允许直接改 portal.json，历史数据里
+    # 可能留着带换行的名字 —— 它会让 render_outbound_yaml 写出一段结构错乱
+    # 的 YAML（后续每一行都被当成新内容），Hysteria 起不来。
+    return [ob for ob in outbounds
+            if isinstance(ob, dict) and ob.get('type') in OUTBOUND_TYPES
+            and isinstance(ob.get('name'), str)
+            and OUTBOUND_NAME_RE.match(ob['name'])]
+
+
+def _renderable_outbounds(outbounds):
+    """在 clean_outbounds 基础上进一步筛选可安全渲染进 YAML 的出站条目。"""
     result = []
-    for ob in outbounds:
-        if not (isinstance(ob, dict) and ob.get('type') in OUTBOUND_TYPES
-                and isinstance(ob.get('name'), str)
-                and OUTBOUND_NAME_RE.match(ob['name'])):
-            continue
+    for ob in clean_outbounds(outbounds):
         otype = ob['type']
         if otype == 'socks5' and not _is_safe_outbound_str(ob.get('addr')):
             continue
@@ -674,7 +679,7 @@ def upsert_outbound_block(cfg_text, outbounds):
     再追加新的。
     """
     text = strip_managed_outbounds(cfg_text)
-    cleaned = clean_outbounds(outbounds)
+    cleaned = _renderable_outbounds(outbounds)
     if not cleaned:
         return text
 
@@ -1986,7 +1991,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 m = re.search(r'/app/(v[0-9][^/]*)/' + re.escape(asset) + r'$', final)
                 # 下载站只给裸版本号，而 GitHub 的 release tag 是 `app/vX.Y.Z`；
                 # 不补前缀拼出的 hashes.txt / 资产 URL 实测 404，回退路径会永远失败。
-                tag = _clean_hy2_tag(('app/' + m.group(1)) if m else '')
+                tag = ('app/' + m.group(1)) if m else ''
+                tag = _clean_hy2_tag(tag)
             except Exception:
                 tag = ''
         if not tag:
@@ -8747,10 +8753,23 @@ def serve(path):
         raise SystemExit('[portal] portal.json 缺少必需字段: %s。'
                          '请从备份恢复 portal.json 或重新执行安装。'
                          % ', '.join(_missing))
-    _bind_port = _valid_port(data.get('port'))
+    _raw_port = data.get('port')
+    _bind_port = 0
+    if not isinstance(_raw_port, bool):
+        if isinstance(_raw_port, int):
+            _bind_port = _raw_port if 1 <= _raw_port <= 65535 else 0
+        elif isinstance(_raw_port, float):
+            if _raw_port == _raw_port and _raw_port != float('inf') and _raw_port != float('-inf') and _raw_port.is_integer():
+                _cand_p = int(_raw_port)
+                _bind_port = _cand_p if 1 <= _cand_p <= 65535 else 0
+        elif isinstance(_raw_port, str):
+            _ps = _raw_port.strip()
+            if _ps.isascii() and _ps.isdigit():
+                _cand_p = int(_ps)
+                _bind_port = _cand_p if 1 <= _cand_p <= 65535 else 0
     if not _bind_port:
         raise SystemExit('[portal] portal.json 的 port 无效: %r。'
-                         '请从备份恢复 portal.json 或重新执行安装。' % (data.get('port'),))
+                         '请从备份恢复 portal.json 或重新执行安装。' % (_raw_port,))
     data['port'] = _bind_port
     # users 必须是对象（2026-11-06 修）：被写成列表 / 字符串时旧实现照常启动，随后十几处
     # data.get('users', {}).get(...) 全部抛 AttributeError，开户、改密、续费、分享页一律 500。
@@ -9208,14 +9227,15 @@ def serve(path):
     SPEED_WINDOW_SECONDS = 15
 
     def _meter_speed_sample(uid, tx, rx, elapsed, source):
+        # 使用内置数值边界判断有限性（不依赖 math），兼容隔离单测命名空间。
         for val in (tx, rx, elapsed):
-            if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not (0 <= val < float('inf')):
                 return
-        if elapsed <= 0 or tx < 0 or rx < 0:
+        if elapsed <= 0:
             return
         tx_rate = tx / elapsed
         rx_rate = rx / elapsed
-        if not (math.isfinite(tx_rate) and math.isfinite(rx_rate)):
+        if not (0 <= tx_rate < float('inf') and 0 <= rx_rate < float('inf')):
             return
         with data_lock:
             speed_tracker.setdefault(uid, {})[source] = (
@@ -9459,7 +9479,20 @@ def serve(path):
                 if not isinstance(svc, dict):
                     continue
                 ptype = svc.get('type') if isinstance(svc.get('type'), str) else 'socks5'
-                port = _valid_port(svc.get('port'))
+                raw_port = svc.get('port')
+                port = 0
+                if not isinstance(raw_port, bool):
+                    if isinstance(raw_port, int):
+                        port = raw_port if 1 <= raw_port <= 65535 else 0
+                    elif isinstance(raw_port, float):
+                        if raw_port == raw_port and raw_port != float('inf') and raw_port != float('-inf') and raw_port.is_integer():
+                            cand_p = int(raw_port)
+                            port = cand_p if 1 <= cand_p <= 65535 else 0
+                    elif isinstance(raw_port, str):
+                        ps = raw_port.strip()
+                        if ps.isascii() and ps.isdigit():
+                            cand_p = int(ps)
+                            port = cand_p if 1 <= cand_p <= 65535 else 0
                 if not port:
                     continue
                 raw_user = svc.get('username', '')

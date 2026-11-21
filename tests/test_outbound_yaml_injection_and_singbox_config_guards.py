@@ -37,7 +37,7 @@ class OutboundYamlInjectionAndSingboxConfigGuardsTests(unittest.TestCase):
             {'name': 'good_socks', 'type': 'socks5', 'addr': '1.2.3.4:1080'},
             {'name': 'good_http', 'type': 'http', 'url': 'http://1.2.3.4:8080'},
         ]
-        cleaned = portal.clean_outbounds(rows)
+        cleaned = portal._renderable_outbounds(rows)
         self.assertEqual(
             [o['name'] for o in cleaned],
             ['good_direct', 'good_socks', 'good_http'],
@@ -46,6 +46,9 @@ class OutboundYamlInjectionAndSingboxConfigGuardsTests(unittest.TestCase):
         base_cfg = 'listen: :443\n'
         updated = portal.upsert_outbound_block(base_cfg, rows[:5])
         self.assertNotIn('outbounds:', updated, '所有自定义出站都被过滤后不得写出孤立的空 outbounds: 键')
+        updated_mixed = portal.upsert_outbound_block(base_cfg, rows)
+        self.assertIn("name: 'good_socks'", updated_mixed)
+        self.assertNotIn('bad_socks_missing', updated_mixed)
 
     def test_validate_outbound_rejects_leading_zero_port_and_slash_host(self):
         """validate_outbound 必须拒绝 SOCKS5 端口前导零与含斜杠/特殊分隔符的主机。"""

@@ -116,10 +116,20 @@ class TestUninstallCoreTimeoutAndDomainGuards(unittest.TestCase):
                     raise subprocess.TimeoutExpired(cmd, 30)
                 return SimpleNamespace(returncode=0, stdout='', stderr='')
 
+            systemd_dir = td_path / 'systemd'
+            systemd_dir.mkdir()
+
+            def _isolated_path(p):
+                s = str(p)
+                if s.startswith('/etc/systemd/system/'):
+                    return systemd_dir / Path(s).name
+                return Path(p)
+
             fn = _extract_method('_h_post_uninstall_core', {
                 'core_operation_lock': threading.Lock(),
                 'acquire_core_operation_lock': lambda: portal.os.open(str(lock_f), portal.os.O_CREAT | portal.os.O_RDWR),
                 'ANYTLS_BINARY': str(fake_bin),
+                'Path': _isolated_path,
                 'xray_unit_foreign': lambda: False,
                 '_systemd_state': lambda u: 'inactive',
                 'subprocess': SimpleNamespace(
