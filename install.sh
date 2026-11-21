@@ -5907,6 +5907,9 @@ uninstall_all() {
         fi
 
         log_info "Hysteria 2 已彻底卸载完成！"
+        if declare -F release_installer_core_lock >/dev/null 2>&1; then
+            release_installer_core_lock
+        fi
     else
         log_info "已取消卸载。"
     fi
@@ -5950,15 +5953,29 @@ ask_preserve_portal() {
     fi
 }
 
+_INSTALLER_CORE_LOCK_FD=""
+
+release_installer_core_lock() {
+    if [[ -n "${_INSTALLER_CORE_LOCK_FD:-}" ]]; then
+        exec {_INSTALLER_CORE_LOCK_FD}>&- 2>/dev/null || true
+        _INSTALLER_CORE_LOCK_FD=""
+    fi
+}
+
 acquire_installer_core_lock() {
     mkdir -p "$HY2_DIR" || return 1
+    if [[ -n "${_INSTALLER_CORE_LOCK_FD:-}" ]]; then
+        release_installer_core_lock
+    fi
     local lock_fd
     exec {lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
         log_err "无法创建核心操作锁。"; return 1; }
     if ! flock -n "$lock_fd"; then
+        exec {lock_fd}>&- 2>/dev/null || true
         log_err "门户正在修改节点核心，等待完成后重试。"
         return 1
     fi
+    _INSTALLER_CORE_LOCK_FD="$lock_fd"
 }
 
 flow_install() {
@@ -5982,6 +5999,7 @@ flow_install() {
         ask_preserve_portal
     fi
     acquire_installer_core_lock || return 1
+    trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi' RETURN
     if [[ -f "$HY2_CONFIG" ]]; then
         backup_state_before_reconfigure || return 1
     fi
@@ -5994,6 +6012,7 @@ flow_install() {
     generate_server_config
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     setup_systemd
+    if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi
     show_client_configs
 }
 
@@ -6006,6 +6025,7 @@ flow_update_core() {
     exec {update_lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
         log_err "无法创建核心升级锁。"; return 1; }
     if ! flock -n "$update_lock_fd"; then
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "另一个核心升级正在运行，请稍后重试。"
         return 1
     fi
@@ -6015,29 +6035,35 @@ flow_update_core() {
     local _current_version
     _current_version="$("$HY2_BIN" version 2>/dev/null | awk -F': *' '/^Version:/{print $2; exit}')" || _current_version=""
     if [[ "$_current_version" == *+* && "${HY2_ALLOW_CUSTOM_CORE_REPLACE:-0}" != "1" ]]; then
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "当前核心是定制版本（${_current_version}），官方核心会覆盖它的补丁，已放弃更新。"
         log_err "确需换成官方核心，请先 export HY2_ALLOW_CUSTOM_CORE_REPLACE=1 再执行。"
         return 1
     fi
     local rollback_file
     rollback_file="$(mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "创建核心备份失败，现有二进制未改动。"; return 1; }
     if ! cp -p "$HY2_BIN" "$rollback_file"; then
         rm -f "$rollback_file"
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "备份核心失败，已放弃更新，现有二进制未改动。"
         return 1
     fi
     if ! install_binary; then
         rm -f "$rollback_file"
+        exec {update_lock_fd}>&- 2>/dev/null || true
         return 1
     fi
     if traffic_suspended; then
         rm -f "$rollback_file"
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_warn "核心已更新；节点正因流量超额被 Teyir 停用，暂不重启，恢复时会自动用上新核心。"
         return 0
     fi
     if ! restart_service; then
         if ! mv -f "$rollback_file" "$HY2_BIN"; then
+            exec {update_lock_fd}>&- 2>/dev/null || true
             log_err "新版本启动失败，回滚失败；本次旧核心保留在 ${rollback_file}。"
             return 1
         fi
@@ -6049,9 +6075,11 @@ flow_update_core() {
         else
             log_err "新版本启动失败，已回滚到本次旧版本。"
         fi
+        exec {update_lock_fd}>&- 2>/dev/null || true
         return 1
     fi
     rm -f "$rollback_file"
+    exec {update_lock_fd}>&- 2>/dev/null || true
 }
 
 flow_reconfigure() {
@@ -6073,6 +6101,7 @@ flow_reconfigure() {
     fi
     ask_preserve_portal
     acquire_installer_core_lock || return 1
+    trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi' RETURN
     backup_state_before_reconfigure || return 1
     # 先记下旧端口：setup_ports_and_obfs 会重写 meta，之后就拿不到了。
     local _old_listen _old_sub
@@ -6087,6 +6116,7 @@ flow_reconfigure() {
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     close_replaced_ports "$_old_listen" "$_old_sub"
     setup_systemd
+    if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi
     show_client_configs
 }
 
@@ -6352,6 +6382,7 @@ if [[ $# -gt 0 ]]; then
             generate_server_config
             setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
             setup_systemd
+            release_installer_core_lock
             show_client_configs
             ;;
         update)
