@@ -20,6 +20,13 @@ readers=load('usage_meter_readers', 'usage-meter-readers-20261007-v1.py')
 if getattr(core, 'ACCOUNTING_REVISION', None) != ACCOUNTING_REVISION:
     raise RuntimeError('usage_meter_core_revision_mismatch')
 
+def _parse_iso_utc_ts(raw):
+    dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
 def _source_fresh(health, source, max_age=30):
     """某来源的健康条目是否新鲜且可用。
 
@@ -37,7 +44,7 @@ def _source_fresh(health, source, max_age=30):
     if not isinstance(raw, str) or not raw:
         return False
     try:
-        when = datetime.fromisoformat(raw.replace('Z', '+00:00')).timestamp()
+        when = _parse_iso_utc_ts(raw)
     except (TypeError, ValueError, OSError, OverflowError):
         return False
     return 0 <= time.time() - when < max_age
@@ -78,7 +85,7 @@ def _recent_gaps(m, window_seconds=86400):
             recent.append(gap)
             continue
         try:
-            when = datetime.fromisoformat(str(at).replace('Z', '+00:00')).timestamp()
+            when = _parse_iso_utc_ts(str(at))
         except (TypeError, ValueError, OSError, OverflowError):
             recent.append(gap)
             continue
@@ -183,19 +190,21 @@ class PortalMeter:
         return check is None or bool(check('xray'))
 
     def _read(self, source, cfg):
+        if not isinstance(cfg, dict):
+            raise ValueError('invalid source config')
         if source=='hysteria':
-            counters=readers.read_hysteria(cfg['url'],cfg['secret'])
+            counters=readers.read_hysteria(cfg.get('url'),cfg.get('secret'))
             # 计数与采样时间一起在锁内换掉（2026-11-04 修）：旧实现分两句、在锁外赋值，
             # summary() 恰好落在两句之间时，会拿新计数配时间 0，或 None 计数配新时间 ——
             # 后者在 .get 上抛 AttributeError，用户页随之 500。
             try:
-                online=(readers.read_hysteria_online(cfg['url'],cfg['secret']),time.time())
+                online=(readers.read_hysteria_online(cfg.get('url'),cfg.get('secret')),time.time())
             except Exception:
                 online=(None,0)
             with self.lock:
                 self.online_counts,self.online_sampled_at=online
             return counters
-        return readers.read_xray(cfg['binary'],cfg['address'])
+        return readers.read_xray(cfg.get('binary'),cfg.get('address'))
 
     def poll(self):
         if self.read == self._read and time.monotonic() >= self.live_next_at:
@@ -366,7 +375,7 @@ class PortalMeter:
                         and isinstance(self.live_sampled_at, (int, float))
                         and not isinstance(self.live_sampled_at, bool)
                         and 0 <= now_ts - self.live_sampled_at < 45)
-            live_entry=self.live_snapshot['users'].get(uid, {}) if live_fresh else None
+            live_entry=self.live_snapshot['users'].get(uid) if live_fresh else None
             if not isinstance(live_entry, dict):
                 live_entry={'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'}
             online_fresh=(isinstance(online_counts, dict)
