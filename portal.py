@@ -251,6 +251,8 @@ def _unlock_read(resp, limit):
 
 def _unlock_fetch(url, timeout=8, limit=400000):
     """返回 (status_code, final_url, body_text)。HTTP 错误码也正常返回，网络错误抛异常。"""
+    if not isinstance(url, str) or urlsplit(url).scheme not in ('http', 'https'):
+        raise ValueError('unsupported unlock url scheme')
     req = urllib.request.Request(url, headers={'User-Agent': _UNLOCK_UA, 'Accept-Language': 'en-US,en;q=0.9'})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1914,7 +1916,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
     if '+' in current_line and not allow_custom:
         raise RuntimeError('当前核心含定制补丁，升级官方核心需要明确确认覆盖补丁')
     machine = platform.machine().lower()
-    arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64', 'armv7l': 'armv7'}.get(machine)
+    arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64',
+            'armv7l': 'armv7', 'armv7': 'armv7', 'armhf': 'armv7'}.get(machine)
     if not arch:
         raise RuntimeError('Unsupported core architecture')
     asset_arch = HYSTERIA_ARCH_ASSET.get(arch)
@@ -1933,11 +1936,20 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
     replaced = False
     try:
         # 先解析确定版本，再取该版本的官方 hashes.txt。绝不用浮动 latest 的字节。
+        def _clean_hy2_tag(raw_tag):
+            if not isinstance(raw_tag, str):
+                return ''
+            val = raw_tag.strip()
+            if not val or '..' in val or not re.fullmatch(r'(?:app/)?v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}', val):
+                return ''
+            return val
+
         tag = ''
         try:
-            tag = str(json.loads(fetch_text(
+            rel_obj = json.loads(fetch_text(
                 'https://api.github.com/repos/apernet/hysteria/releases/latest',
-                timeout=10)).get('tag_name') or '')
+                timeout=10))
+            tag = _clean_hy2_tag(rel_obj.get('tag_name') if isinstance(rel_obj, dict) else '')
         except Exception:
             tag = ''
         if not tag:
@@ -1953,7 +1965,7 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 m = re.search(r'/app/(v[0-9][^/]*)/' + re.escape(asset) + r'$', final)
                 # 下载站只给裸版本号，而 GitHub 的 release tag 是 `app/vX.Y.Z`；
                 # 不补前缀拼出的 hashes.txt / 资产 URL 实测 404，回退路径会永远失败。
-                tag = ('app/' + m.group(1)) if m else ''
+                tag = _clean_hy2_tag(('app/' + m.group(1)) if m else '')
             except Exception:
                 tag = ''
         if not tag:
@@ -1968,7 +1980,7 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                + tag + '/' + asset)
         req = urllib.request.Request(url, headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=90) as source, open(candidate, 'wb') as dest:
-            shutil.copyfileobj(source, dest)
+            _copy_stream_bounded(source, dest, _MAX_BINARY_ARCHIVE_BYTES)
             dest.flush()
             os.fsync(dest.fileno())
         if not verify_sha256(candidate, expected):
@@ -2123,27 +2135,37 @@ def gost_tls_paths(root):
     cert = _config_tls_cert_path(str(config)) or _config_acme_cert_path(str(config))
     key = ''
     in_tls = False
-    if config.exists():
-        for raw in config.read_text(encoding='utf-8').splitlines():
+    if config.is_file():
+        try:
+            cfg_lines = config.read_text(encoding='utf-8').splitlines()
+        except (OSError, UnicodeDecodeError):
+            cfg_lines = []
+        for raw in cfg_lines:
             if not raw.strip() or raw.lstrip().startswith('#'):
                 continue
             if not raw.startswith((' ', '\t')):
-                in_tls = raw.split(':', 1)[0] == 'tls'
+                in_tls = raw.split(':', 1)[0].strip() == 'tls'
             elif in_tls and raw.strip().startswith('key:'):
                 try:
                     values = shlex.split(raw.strip().split(':', 1)[1], comments=True)
                 except ValueError:
                     values = []
-                key = values[0] if values else ''
+                key = ' '.join(values) if values else ''
     if cert:
         cert = Path(os.path.expandvars(str(cert)))
         if not cert.is_absolute():
             cert = root / cert
-        key = Path(os.path.expandvars(key)) if key else cert.with_suffix('.key')
-        if not key.is_absolute():
-            key = root / key
-        if cert.is_file() and key.is_file() and cert.stat().st_size and key.stat().st_size:
-            return str(cert), str(key)
+        key_candidates = []
+        if key:
+            kpath = Path(os.path.expandvars(key))
+            key_candidates.append(kpath if kpath.is_absolute() else root / kpath)
+        else:
+            key_candidates.append(cert.with_suffix('.key'))
+            key_candidates.append(cert.with_name('privkey.pem'))
+        if cert.is_file() and cert.stat().st_size:
+            for kcand in key_candidates:
+                if kcand.is_file() and kcand.stat().st_size:
+                    return str(cert), str(kcand)
     legacy = root / 'gost-cert'
     legacy_cert, legacy_key = legacy / 'cert.pem', legacy / 'key.pem'
     if (legacy_cert.is_file() and legacy_key.is_file()
@@ -2172,7 +2194,10 @@ def _write_private_bytes(target, payload, mode=0o600, call_path_chmod=False):
     """以指定权限直接创建并落盘敏感配置，避免默认 umask 先落明文再改权。"""
     target = Path(target)
     mode = (mode & 0o777) or 0o600
-    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(target), flags, mode)
     try:
         with os.fdopen(fd, 'wb') as handle:
             fd = None
