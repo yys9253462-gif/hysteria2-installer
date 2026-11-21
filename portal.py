@@ -1047,19 +1047,34 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
             data['outbound_mode'] = 'rules'
             state['outbound_mode'] = 'rules'
     rendered = render_egress_config(original, state)
+    replaced = False
     try:
         before = _hy2_runtime_identity()
         if rendered == original and _hy2_config_loaded(cfg, before):
             return True, ''
+        orig_mode = cfg.stat().st_mode & 0o777
         fd, tmp = tempfile.mkstemp(prefix='.config.yaml.warp-', dir=str(cfg.parent))
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                fd = None
                 stream.write(rendered)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.chmod(tmp, cfg.stat().st_mode & 0o777)
+            os.chmod(tmp, orig_mode)
             os.replace(tmp, cfg)
+            replaced = True
+            if hasattr(os, 'O_DIRECTORY'):
+                dir_fd = os.open(cfg.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if os.path.exists(tmp):
                 os.unlink(tmp)
         # 整机流量超额停用期间不能启动服务，但配置应当落盘并视为成功 ——
@@ -1082,6 +1097,8 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
     except Exception as exc:
         detail = '应用 WARP 分流配置失败: %s' % exc
 
+    if not replaced:
+        return False, detail
     rollback_state = _rollback_outbounds(cfg, original)
     if rollback_state != 'active':
         return False, '%s；并且恢复原配置后服务状态为 %s' % (detail, rollback_state)
@@ -2506,7 +2523,7 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     for line in text.split('\n'):
         stripped = line.strip()
@@ -2518,7 +2535,7 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
             # 形如 ":11690" / "0.0.0.0:11690" / "11690"
             # 去掉可能的引号（`: "8443"` 这种写法 YAML 完全合法）。
             raw = raw.rsplit(':', 1)[-1].strip().strip('"').strip("'")
-            if raw.isdigit():
+            if raw.isascii() and raw.isdigit():
                 port = int(raw)
                 # 端口 0 或越界不能当作有效值返回：调用方会把它拼进订阅链接，
                 # 生成一个永远连不上的地址（2026-10-25 修）。
@@ -16104,8 +16121,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         for source, sample in sources.items():
                             if (isinstance(sample, (tuple, list)) and len(sample) >= 3
                                     and all(isinstance(v, (int, float))
-                                            and not isinstance(v, bool) for v in sample[:3])
-                                    and cur_mono - sample[0] <= SPEED_WINDOW_SECONDS):
+                                            and not isinstance(v, bool)
+                                            and v == v and (v - v == 0) for v in sample[:3])
+                                    and sample[1] >= 0 and sample[2] >= 0
+                                    and 0 <= cur_mono - sample[0] <= SPEED_WINDOW_SECONDS):
                                 recent[source] = sample
                     if recent:
                         speed_tracker[uid] = recent
