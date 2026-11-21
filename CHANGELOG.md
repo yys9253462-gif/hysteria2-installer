@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十三批十项修复，门户 2.53
+
+- 节点启动时间解析消除夏令时偏移（`portal.py` 的 `_hy2_config_loaded`）：解析 systemd 服务启动时间中的 `UTC`/`GMT` 时间戳时，改为纯整数格里高利历转纪元秒公式，彻底消除欧美夏令时下因 `time.mktime` 与 `time.timezone` 差 3600 秒导致的配置重载误判。
+- 流量超额停用补偿恢复加固（`portal.py` 的 `_set_traffic_suspension`）：保存失败补偿恢复服务时统一捕获 `Exception`（覆盖子进程超时避免中止后续服务恢复），拉起服务前先执行 `systemctl reset-failed` 清除失败计数；恢复失败补偿停服时跳过已退役（`_retired`）协议服务。
+- 网页端用户管理落盘回滚与安全响应头修复（`portal.py` 的 `_h_post_manage_user`）：`save_data()` 抛出磁盘异常时完整回滚内存中的 `users`、`_pending_revocations`、`usage_meter`、`ip_tracker`、`speed_tracker` 与 `global_ip_deny`，彻底消除磁盘满创建用户残留幽灵账号；回滚保存隔离异常；成功 302 跳转补齐 `Connection: close`、`Cache-Control: no-store`、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY` 与 `Referrer-Policy: no-referrer`。
+- 登录接口损坏哈希容错与安全响应头补齐（`portal.py` 的 `_h_post_login`）：拒绝负的 `Content-Length` 请求头；在 `data_lock`（数据锁）内读取 `token` 与 `auth_hash` 并校验 `auth_hash` 为纯 ASCII 字符串后再调用 `hmac.compare_digest`，避免损坏配置触发 `TypeError`；成功 302 跳转补齐断连与全套安全响应头。
+- 删除最后一个自定义出站同步清理全局模式（`portal.py` 的 `_ob_manage`）：在同一次 `data_lock` 内删除最后一个自定义出站时，将残留的 `outbound_mode == 'global'` 一并重置为 `'rules'` 并随本次 `save_data()` 原子持久化，避免界面与实际出站模式脱节。
+- 全门户用户表损坏容错清零与登出接口加固（`portal.py`）：清零全文件剩余 11 处裸用 `data.get('users', {})`，统一改为 `user_table(data)` 防御非对象损坏结构（写入前确保为字典）；登出处理改为在 `data_lock` 内读取 `token` 并补齐安全响应头。
+- 流量计量运行时非对象配置与损坏时间戳容错（`usage-meter-runtime-20261007-v1.py`）：`PortalMeter.__init__` 与 `from_file` 对非字典配置立即抛出 `ValueError('invalid usage meter config')` 避免延迟崩溃；`summary()` 校验 `live_sampled_at` 与 `online_sampled_at` 为非布尔数字，防止损坏缓存触发 `TypeError`。
+- 门户服务、证书自愈单元与旧出站迁移原子落盘（`install.sh` 的 `setup_portal`、`setup_cert_selfheal` 与 `warp_migrate_legacy_outbound`）：`hysteria-portal.service` 及 `hy2-cert-selfheal.{service,timer,path}` 改为同目录 `mktemp` 加 `chmod 644` 与 `mv -f` 原子替换；`warp_migrate_legacy_outbound` 移除非原子 `sed -i`，改为 `umask 077` 下同目录临时文件配合 `awk` 字面量替换、`chmod 600` 与 `mv -f` 原子落盘。
+- 自定义出站校验支持 IPv6 代理并拦截控制字符与非法端口（`portal.py` 的 `validate_outbound`）：`socks5` 出站地址支持 `[IPv6]:port` 并经 `ipaddress.ip_address` 校验合法性；拦截 `socks5` 与 `http` 代理配置中的换行及控制字符；`http` 代理经 `urlsplit` 严格校验主机名非空与端口位于 `1..65535`。
+- WARP 探测缓存并发加锁与多处接口细节加固（`portal.py`）：新增 `_warp_probe_lock` 保护 `_h_get_warp_status` 原子读写缓存，消除并发撕裂；`user-config` 接口调 `qrencode` 前补充 `self._extend_deadline(30)` 续期并校验节点元信息非空（缺失返回 503 JSON）；`awg-conf` 下载响应补齐 `X-Frame-Options: DENY` 与 `Referrer-Policy: no-referrer`；未认证登录页改为在 `data_lock` 内读取门户令牌。
+
 ## 2026-11-22 — 第四十二批十项修复，门户 2.52
 
 - 节点能力接口门户版本截断修复（`portal.py` 的 `/api/v1/capabilities`）：此前按前 80 行扫描 `PORTAL_VERSION`，但常量定义已位于第 215 行，导致运维面板读取的 `portal_version` 恒为空串；改为流式逐行扫描命中即停并回落模块常量，同时省去每次请求将整份门户源码读入内存的开销。
