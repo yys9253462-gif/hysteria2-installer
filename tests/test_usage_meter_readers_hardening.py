@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,7 +80,7 @@ class UsageMeterReadersHardeningTests(unittest.TestCase):
                     return xray_p
                 return real_path(p)
 
-            with mock.patch.object(mod.pathlib, 'Path', side_effect=fake_path), \
+            with mock.patch.object(mod, 'pathlib', SimpleNamespace(Path=fake_path)), \
                  mock.patch.object(mod.urllib.request, 'urlopen', side_effect=Fake404()), \
                  mock.patch.object(mod, 'read_hysteria_online', return_value={'u1': 0}), \
                  mock.patch.object(mod, 'service_running', return_value=True):
