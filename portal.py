@@ -989,9 +989,21 @@ def _hy2_config_loaded(config_path, identity=None):
         # 被判成已加载，apply_egress_config 直接返回成功（面板显示已生效，
         # 实际 Hysteria 还在用旧 ACL）。这里显式解析末尾时区段。
         when = ' '.join(fields[1:3])
-        timestamp = time.mktime(time.strptime(when, '%Y-%m-%d %H:%M:%S'))
+        tm = time.strptime(when, '%Y-%m-%d %H:%M:%S')
         if len(fields) >= 4 and fields[3] in ('UTC', 'GMT'):
-            timestamp -= time.timezone or 0
+            # 纯算术将 UTC 年月日时分秒转为纪元秒：既避免夏令时下 time.mktime 与
+            # time.timezone 差 1 小时导致误判，又只依赖 time 模块保持最小依赖。
+            y, mo, d = tm.tm_year, tm.tm_mon, tm.tm_mday
+            if mo <= 2:
+                y -= 1
+            era = y // 400
+            yoe = y - era * 400
+            doy = (153 * (mo + (12 if mo <= 2 else 0) - 3) + 2) // 5 + d - 1
+            doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+            days = era * 146097 + doe - 719468
+            timestamp = days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec
+        else:
+            timestamp = time.mktime(tm)
         return state == 'active' and pid not in ('', '0') and Path(config_path).stat().st_mtime <= timestamp + 1
     except Exception:
         return False
