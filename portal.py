@@ -8987,9 +8987,9 @@ def serve(path):
                     entry['listener'] = {'type': 'tls', 'tls': {
                         'certFile': cert_file, 'keyFile': key_file}}
                 services.append(entry)
+            # 记下真正写进配置的端口（持数据锁更新，避免与就绪探针并发读写竞争）。
+            gost_written_ports[:] = [int(s['addr'].lstrip(':')) for s in services]
 
-        # 记下真正写进配置的端口，gost_ports_ready 只等这些（2026-11-03 修）。
-        gost_written_ports[:] = [int(s['addr'].lstrip(':')) for s in services]
         cfg = {'services': services,
                'bypasses': [{'name': GOST_PRIVATE_BYPASS,
                              'matchers': list(PRIVATE_REJECT_RULES) + ['localhost', '*.localhost']}]}
@@ -11572,8 +11572,12 @@ if __name__ == '__main__':
                     if not selected:
                         return 400, {'ok': False, 'error': '指定端口已占用，或无法找到空闲端口'}
                     port = selected
-                    username = str(params.get('username') or '').strip()[:64] or ('user_' + secrets.token_hex(4))
-                    password = str(params.get('password') or '').strip() or secrets.token_hex(12)
+                    raw_user = str(params.get('username') or '')
+                    raw_pass = str(params.get('password') or '')
+                    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_user + raw_pass):
+                        return 400, {'ok': False, 'error': '代理账号或密码不能包含换行或控制字符'}
+                    username = raw_user.strip()[:64] or ('user_' + secrets.token_hex(4))
+                    password = raw_pass.strip() or secrets.token_hex(12)
                     if ptype in ('http', 'https') and ':' in username:
                         return 400, {'ok': False, 'error': 'HTTP Basic 认证用户名不能包含冒号'}
                     if ptype == 'socks5' and (len(username.encode('utf-8')) > 255 or len(password.encode('utf-8')) > 255):
@@ -11603,14 +11607,22 @@ if __name__ == '__main__':
                 if not reload_gost():
                     with data_lock:
                         data['proxy_services'] = previous
-                    save_data()
-                    reload_gost()
+                    try:
+                        save_data()
+                    except Exception as rb_exc:
+                        _log_ignored('proxy_rollback_save', rb_exc)
+                    try:
+                        reload_gost()
+                    except Exception as rb_exc:
+                        _log_ignored('proxy_rollback_reload', rb_exc)
                     return 500, {'ok': False, 'applied': False,
                         'error': 'GOST 配置未成功应用或端口未监听，代理记录已恢复；请检查服务日志'}
                 if action == 'delete':
+                    with data_lock:
+                        data_snapshot = dict(data)
                     for item in working:
                         if item.get('id') == proxy_id and not protocol_port_in_use(
-                                item.get('port'), 'tcp', data, exclude_key='proxy_services'):
+                                item.get('port'), 'tcp', data_snapshot, exclude_key='proxy_services'):
                             if not firewall_port(item.get('port'), 'tcp', open_=False):
                                 return 500, {'ok': False, 'applied': True,
                                     'error': '代理已删除，但端口防火墙规则未能回收'}
@@ -11619,8 +11631,14 @@ if __name__ == '__main__':
                 if not firewall_port(port, 'tcp', open_=True):
                     with data_lock:
                         data['proxy_services'] = previous
-                    save_data()
-                    reload_gost()
+                    try:
+                        save_data()
+                    except Exception as rb_exc:
+                        _log_ignored('proxy_fw_rollback_save', rb_exc)
+                    try:
+                        reload_gost()
+                    except Exception as rb_exc:
+                        _log_ignored('proxy_fw_rollback_reload', rb_exc)
                     return 500, {'ok': False, 'applied': False,
                         'error': '防火墙放行失败，代理记录已恢复；请检查本机防火墙状态'}
                 m = read_meta_file(meta_path)
