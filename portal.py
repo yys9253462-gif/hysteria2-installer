@@ -14952,7 +14952,7 @@ if __name__ == '__main__':
                 length = int(self.headers.get('Content-Length', 0))
                 if length < 0 or length > 4096:
                     return self.reply(400, b'Bad request')
-                body = self.rfile.read(length).decode('utf-8', errors='ignore')
+                body = self.rfile.read(length).decode('utf-8', errors='ignore') if length > 0 else ''
                 params = parse_qs(body)
                 user = params.get('username', [''])[0]
                 pwd = params.get('password', [''])[0]
@@ -14961,8 +14961,11 @@ if __name__ == '__main__':
                 return self.reply(400, b'Bad request')
 
             with data_lock:
-                portal_token = str(data.get('token') or '')
+                raw_tok = data.get('token')
+                portal_token = raw_tok if isinstance(raw_tok, str) else ''
                 expected_hash = data.get('auth_hash')
+            if not portal_token or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in portal_token):
+                return self.reply(503, b'Portal token unavailable')
 
             if self.login_rate_limited():
                 # 与密码错误用同一页面形态，不给爆破者「已被限流」的区分信号。
@@ -16650,10 +16653,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 kernel_ver = platform.release()
-                cc_out = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_congestion_control'],
-                                        capture_output=True, text=True, timeout=2).stdout.strip()
-                qdisc_out = subprocess.run(['sysctl', '-n', 'net.core.default_qdisc'],
-                                          capture_output=True, text=True, timeout=2).stdout.strip()
+                def _sysctl_read(param):
+                    try:
+                        return subprocess.run(['sysctl', '-n', param],
+                                              capture_output=True, text=True, timeout=2).stdout.strip()
+                    except (OSError, subprocess.SubprocessError):
+                        return ''
+                cc_out = _sysctl_read('net.ipv4.tcp_congestion_control')
+                qdisc_out = _sysctl_read('net.core.default_qdisc')
 
                 conf_path = Path('/etc/sysctl.d/99-bbr.conf')
                 configured_bbr = ''
@@ -16689,8 +16696,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # tcp_available_congestion_control 只列出**已加载**的模块：新机器上
                 # tcp_bbr 还没 modprobe，只会看到 "reno cubic"，前端据此把按钮全禁用。
                 # 所以把「内核里装了、可被 modprobe 的模块」也算作可用；未装 modinfo 时平稳跳过。
-                available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
-                                           capture_output=True, text=True, timeout=2).stdout.split()
+                available = _sysctl_read('net.ipv4.tcp_available_congestion_control').split()
                 for algo in ('bbr', 'bbr2', 'bbr3'):
                     if algo in available:
                         continue
@@ -16768,6 +16774,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if kind in ('socks5', 'http') and not addr:
                 return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
+            self._extend_deadline(45)
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
             if kind == 'warp' and not ip:
                 # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
@@ -16794,9 +16801,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(400, {'ok': False, 'error': '缺少 action 参数'})
 
             msg = ''
-            with data_lock:
-                previous_egress = {key: (key in data, copy.deepcopy(data.get(key))) for key in
-                    ('custom_outbounds', 'warp_rules', 'outbound_mode')}
+            previous_egress = {}
             # ---------- 出站增删改 ----------
             if action in ('save', 'delete'):
                 if action == 'save':
@@ -16820,6 +16825,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if not ok:
                         return self.reply_json(400, {'ok': False, 'error': err})
                     with data_lock:
+                        previous_egress = {'custom_outbounds': ('custom_outbounds' in data,
+                                                                copy.deepcopy(data.get('custom_outbounds')))}
                         # 容器被改坏成 null / 数字时按空表处理（2026-11-04 修，与删除一致）：
                         # 旧写法 list(None) 在 data_lock 内抛 TypeError，新增出站一律失败。
                         outs = [o for o in routing_state(data)['custom_outbounds'] if isinstance(o, dict)]
@@ -16847,6 +16854,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         if not any(o.get('name') == name for o in outs):
                             missing_outbound = True
                         else:
+                            previous_egress = {key: (key in data, copy.deepcopy(data.get(key))) for key in
+                                               ('custom_outbounds', 'warp_rules', 'outbound_mode')}
                             data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
                             # 删光最后一个自定义出站时同步切回按域名分流，避免持久化留下 global + 空出站。
                             if not data['custom_outbounds'] and data.get('outbound_mode') == 'global':
@@ -16873,6 +16882,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if mode == 'global' and not valid_outs:
                         no_valid_outbounds = True
                     else:
+                        previous_egress = {'outbound_mode': ('outbound_mode' in data,
+                                                             copy.deepcopy(data.get('outbound_mode')))}
                         data['outbound_mode'] = mode
                 if no_valid_outbounds:
                     return self.reply_json(400, {'ok': False, 'error': '请先新增一个出站，再切换全局出口'})
@@ -16905,6 +16916,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         rules = [r for r in rules if r['domain'] not in (cleaned, dom)]
                         msg = '规则「%s」已删除' % cleaned
                     if rule_error is None:
+                        previous_egress = {'warp_rules': ('warp_rules' in data,
+                                                          copy.deepcopy(data.get('warp_rules')))}
                         data['warp_rules'] = rules
                 if rule_error is not None:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
