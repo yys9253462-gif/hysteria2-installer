@@ -14445,16 +14445,6 @@ if __name__ == '__main__':
                 now_ts = int(time.time())
                 if action not in ('create', 'delete'):
                     return self.reply(400, '请求无效，请刷新页面后重试'.encode('utf-8'))
-                with data_lock:
-                    users_map = user_table(data)
-                    previous_had_user = user_id in users_map
-                    previous_user = copy.deepcopy(users_map.get(user_id))
-                    previous_pending = copy.deepcopy(data.get('_pending_revocations')) if '_pending_revocations' in data else None
-                    previous_meter = copy.deepcopy(data.get('usage_meter')) if 'usage_meter' in data else None
-                    previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
-                    previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
-                    previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
-
 
                 if not VALID_USER_ID_RE.match(user_id):
                     return self.reply(400, '用户标识只能用字母、数字、点、下划线和连字符，长度 1-64'.encode('utf-8'))
@@ -14465,6 +14455,18 @@ if __name__ == '__main__':
                 if action == 'create' and not user_id_shareable(user_id):
                     return self.reply(400, '用户标识不能只由点组成'.encode('utf-8'))
 
+                previous_had_user = False
+                previous_user = None
+                previous_had_pending_key = False
+                previous_user_was_pending = False
+                previous_meter_total = None
+                previous_had_meter_total = False
+                previous_meter_adj = None
+                previous_had_meter_adj = False
+                previous_ip = None
+                previous_speed = None
+                previous_deny = None
+
                 if action == 'create' and user_id:
                     # 不再静默去掉首尾空白（2026-11-04 修）：「abc 」被存成「abc」，客户端按输入的
                     # 原样填就鉴权失败。与 API 同一规则：首尾带空白直接拒，全空则随机生成。
@@ -14472,6 +14474,8 @@ if __name__ == '__main__':
                     if pwd != pwd.strip() and pwd.strip():
                         return self.reply(400, '密码首尾不能有空白字符'.encode('utf-8'))
                     pwd = pwd.strip() or secrets.token_hex(16)
+                    if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
+                        return self.reply(400, '密码不能包含换行或控制字符'.encode('utf-8'))
                     # 同 REST 通道：非数字输入必须回 400，而不是让异常掐断连接。
                     try:
                         days = int(form.get('duration_days', ['30'])[0] or 30)
@@ -14495,6 +14499,8 @@ if __name__ == '__main__':
                     with data_lock:
                         if not isinstance(data.get('users'), dict):
                             data['users'] = {}
+                        previous_had_user = user_id in data['users']
+                        previous_user = copy.deepcopy(data['users'].get(user_id))
                         existing = data['users'].get(user_id)
                         if not isinstance(existing, dict):   # 条目改坏＝不存在（2026-11-06 修）
                             existing = None
@@ -14551,8 +14557,25 @@ if __name__ == '__main__':
                         if user_id not in users_map:
                             delete_missing = True
                         else:
+                            previous_had_user = True
+                            previous_user = copy.deepcopy(users_map.get(user_id))
+                            previous_had_pending_key = '_pending_revocations' in data
+                            previous_user_was_pending = user_id in pending_revocations(data)
+                            meter_obj = data.get('usage_meter')
+                            if isinstance(meter_obj, dict):
+                                totals_obj = meter_obj.get('totals')
+                                if isinstance(totals_obj, dict) and user_id in totals_obj:
+                                    previous_had_meter_total = True
+                                    previous_meter_total = copy.deepcopy(totals_obj[user_id])
+                                adj_obj = meter_obj.get('adjustments')
+                                if isinstance(adj_obj, dict) and user_id in adj_obj:
+                                    previous_had_meter_adj = True
+                                    previous_meter_adj = copy.deepcopy(adj_obj[user_id])
+                            previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
+                            previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
+                            previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
                             data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
-                            del data['users'][user_id]
+                            data['users'].pop(user_id, None)
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
@@ -14575,19 +14598,25 @@ if __name__ == '__main__':
                 except OSError:
                     with data_lock:
                         if previous_had_user:
-                            data.setdefault('users', {})[user_id] = previous_user
+                            if not isinstance(data.get('users'), dict):
+                                data['users'] = {}
+                            data['users'][user_id] = previous_user
                         else:
                             if isinstance(data.get('users'), dict):
                                 data['users'].pop(user_id, None)
                         if action == 'delete':
-                            if previous_pending is None:
-                                data.pop('_pending_revocations', None)
-                            else:
-                                data['_pending_revocations'] = previous_pending
-                            if previous_meter is None:
-                                data.pop('usage_meter', None)
-                            else:
-                                data['usage_meter'] = previous_meter
+                            if not previous_user_was_pending:
+                                remaining_pending = sorted(pending_revocations(data) - {user_id})
+                                if remaining_pending or previous_had_pending_key:
+                                    data['_pending_revocations'] = remaining_pending
+                                else:
+                                    data.pop('_pending_revocations', None)
+                            meter_obj = data.get('usage_meter')
+                            if isinstance(meter_obj, dict):
+                                if previous_had_meter_total and isinstance(meter_obj.get('totals'), dict):
+                                    meter_obj['totals'][user_id] = previous_meter_total
+                                if previous_had_meter_adj and isinstance(meter_obj.get('adjustments'), dict):
+                                    meter_obj['adjustments'][user_id] = previous_meter_adj
                             if previous_ip is None:
                                 ip_tracker.pop(user_id, None)
                             else:
