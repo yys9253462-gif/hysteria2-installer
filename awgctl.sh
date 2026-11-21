@@ -362,12 +362,8 @@ validate_endpoint() {
             log_err "连接地址不是有效的域名或 IPv4: ${ep}"
             return 1
         fi
-        # 只校验形状会放过 99999 或带前导零（如 08080）的端口：它们会被原样写进客户端配置。
+        # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置。
         if [[ -n "$port" ]]; then
-            if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]]; then
-                log_err "连接地址里的端口必须是 1-65535 的十进制整数（不含前导零）: ${ep}"
-                return 1
-            fi
             port="$((10#$port))"
         fi
         if [[ -n "$port" ]] && (( port < 1 || port > 65535 )); then
@@ -725,7 +721,8 @@ render_client_config() {
     # endpoint 允许自带端口（validate_endpoint 接受 host:port）；
     # 无脑再拼一次会得到 host:51820:54321，客户端直接握手失败（2026-10-29 修）。
     if endpoint_has_port "$endpoint"; then
-        echo "Endpoint = ${endpoint}"
+        local ep_host="${endpoint%:*}" ep_port="${endpoint##*:}"
+        echo "Endpoint = ${ep_host}:$((10#$ep_port))"
     else
         echo "Endpoint = ${endpoint}:${port}"
     fi
