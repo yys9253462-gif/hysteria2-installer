@@ -5435,17 +5435,15 @@ def vmess_clients(data):
 
 
 def protocol_host_sni(cfg, fallback=''):
-    """托管 TLS 协议直链用的 (host, sni)：只认非空字符串，改坏的值退回 fallback（2026-11-06 加）。
+    """托管 TLS 协议直链用的 (host, sni)：只认无控制字符与内部空白的非空字符串，改坏的值退回 fallback（2026-11-06 加）。
 
-    domain / sni 被改成数字、列表或 null 时，旧实现把 123、['d'] 原样拼进 vmess:// /
+    domain / sni 被改成数字、列表、含换行或 null 时，旧实现把 123、['d'] 原样拼进 vmess:// /
     vless:// / anytls:// / tuic://，客户端导入后连一个不存在的地址。
     """
-    def clean(v):
-        return v.strip() if isinstance(v, str) and v.strip() else ''
-    fb = clean(fallback)
-    host = clean(cfg.get('domain')) if isinstance(cfg, dict) else ''
+    fb = _clean_host_scalar(fallback)
+    host = _clean_host_scalar(cfg.get('domain')) if isinstance(cfg, dict) else ''
     host = host or fb
-    sni = (clean(cfg.get('sni')) if isinstance(cfg, dict) else '') or host
+    sni = (_clean_host_scalar(cfg.get('sni')) if isinstance(cfg, dict) else '') or host
     return host, sni
 
 
@@ -5464,10 +5462,17 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     # 与 VLESS-Reality 同一套端口校验：`"abc"` / True / 70000 会生成一条
     # 客户端无法解析的链接（admin 面板仍显示成功）。
     port = _valid_port(vcfg.get('port'))
-    path = vcfg.get('ws_path') or '/'
+    raw_path = vcfg.get('ws_path')
+    if raw_path in (None, ''):
+        path = '/'
+    elif (isinstance(raw_path, str)
+          and not any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_path)):
+        path = raw_path
+    else:
+        path = ''
     if not (host and port and path):
         return ''
-    tag = label or ('VMess-WS-' + str(user_id))
+    tag = label if isinstance(label, str) and label else ('VMess-WS-' + str(user_id))
     payload = {
         'v': '2', 'ps': tag, 'add': str(host), 'port': str(port),
         'id': vmess_uuid_for_user(user_id), 'aid': '0', 'scy': 'auto',
@@ -5633,7 +5638,8 @@ def anytls_uri_for_user(acfg, user_id, label=None):
         return ''
     pwd = anytls_password_for_user(secret, user_id)
     params = urlencode({'sni': _sni})
-    return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
+    tag = label if isinstance(label, str) and label else ('AnyTLS-' + str(user_id))
+    return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(tag)}"
 
 
 def _restore_config_atomically(config_path, original):
@@ -5860,7 +5866,8 @@ def tuic_uri_for_user(tcfg, user_id, label=None):
     u, pwd = tuic_credentials_for_user(secret, user_id)
     params = urlencode({'sni': _sni, 'alpn': 'h3',
                         'congestion_control': 'bbr', 'udp_relay_mode': 'native'})
-    return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(label or ('TUIC-' + str(user_id)))}"
+    tag = label if isinstance(label, str) and label else ('TUIC-' + str(user_id))
+    return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(tag)}"
 
 
 def pick_tuic_port(preferred, blocked, listening=None, own_port_active=False):
@@ -5872,25 +5879,20 @@ def pick_tuic_port(preferred, blocked, listening=None, own_port_active=False):
     listening = _listening_ports() if listening is None else listening
     bad = set()
     for p in blocked or ():
-        try:
-            bad.add(int(p))
-        except (TypeError, ValueError):
-            pass
+        vp = _valid_port(p)
+        if vp:
+            bad.add(vp)
 
     def usable(p, own=False):
-        if isinstance(p, bool):
-            return False
-        try:
-            p = int(p)
-        except (TypeError, ValueError):
-            return False
-        if not 1024 <= p <= 65535 or 20000 <= p <= 40000 or p in bad:
+        vp = _valid_port(p)
+        if not vp or not 1024 <= vp <= 65535 or 20000 <= vp <= 40000 or vp in bad:
             return False
         # 自己的旧端口：重新启用前 sing-box 已停，监听表里残留也不算冲突。
-        return own or p not in listening
+        return own or vp not in listening
 
-    if usable(preferred, own=own_port_active):
-        return int(preferred)
+    pref_port = _valid_port(preferred)
+    if pref_port and usable(pref_port, own=own_port_active):
+        return pref_port
     lo, hi = TUIC_PORT_RANGE
     candidates = list(range(lo, hi + 1))
     random.shuffle(candidates)
@@ -6279,10 +6281,10 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     host, _sni = protocol_host_sni(vcfg, public_ip)
     # 同 Reality / VMess：非整数端口会让客户端解析失败。
     port = _valid_port(vcfg.get('port'))
-    enc = vcfg.get('encryption', '')
+    enc = _clean_host_scalar(vcfg.get('encryption'))
     if not (host and port and enc):
         return ''
-    tag = label or ('VLESS-Enc-' + str(user_id))
+    tag = label if isinstance(label, str) and label else ('VLESS-Enc-' + str(user_id))
     params = {'encryption': enc, 'security': 'tls', 'sni': _sni,
               'type': 'tcp', 'headerType': 'none', 'fp': 'chrome'}
     return (f"vless://{reality_uuid_for_user(user_id)}@{_host_for_url(host)}:{port}"
@@ -6312,7 +6314,7 @@ def user_access_denial(info, now=None):
         # bool 是 int 的子类：`limit_bytes: true` 会被当成「1 字节配额」，
         # 用户只要用了 1 字节就被判超额停用，而界面上配额显示成 1 B。
         # JSON 里把字段写成 true 是控制台/旧脚本的常见错误，必须显式拒绝。
-        for field in ('limit_bytes', 'used_bytes'):
+        for field in ('expires_at', 'limit_bytes', 'used_bytes'):
             if isinstance(info.get(field), bool):
                 return 'Invalid user record'
         if expires_at is not None:
@@ -7604,11 +7606,8 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None, own_act
     blocked = set()
     if extra_blocked:
         for p in extra_blocked:
-            try:
-                iv = int(p)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if 1 <= iv <= 65535:
+            iv = _valid_port(p)
+            if iv:
                 blocked.add(iv)
 
     def _as_port(v):
@@ -7622,17 +7621,8 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None, own_act
         根本猜不到是「配置里存了个坏端口值」。
         这里降级为「忽略这个偏好值」，继续正常选端口。
         """
-        # bool 是 int 的子类（True == 1），配置里出现 true 会被当成端口 1；
-        # 小数会被 int() 静默截断（65535.9 -> 65535）。两者都拒绝（2026-10-25）。
-        if isinstance(v, bool):
-            return 0
-        if isinstance(v, float) and not v.is_integer():
-            return 0
-        try:
-            iv = int(v)
-        except (TypeError, ValueError):
-            return 0
-        return iv if 1 <= iv <= 65535 else 0
+        # 复用 _valid_port：拒绝 bool、非整数浮点、非有限值、全角数字及越界值。
+        return _valid_port(v)
 
     # `pref` 必须在 free() 之前算出来 —— free() 要用它判断
     # 「这个端口是不是 Reality 自己已经在用的」。
