@@ -493,9 +493,9 @@ def validate_outbound(entry):
         addr = raw_addr.strip() if isinstance(raw_addr, str) else ''
         if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in addr):
             return False, None, "SOCKS5 地址不能包含控制字符"
-        # 支持 host:port 与 [IPv6]:port 两种形式，且必须带合法端口
+        # 支持 host:port 与 [IPv6]:port 两种形式，且必须带无前导零的纯 ASCII 合法端口
         if addr.startswith('['):
-            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:([0-9]{1,5})', addr)
+            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:([1-9][0-9]{0,4})', addr, re.ASCII)
             if not m_v6:
                 return False, None, "SOCKS5 IPv6 地址格式应为 [IPv6]:port，例如 [::1]:1080"
             try:
@@ -506,7 +506,7 @@ def validate_outbound(entry):
                 return False, None, "SOCKS5 方括号内必须是 IPv6 地址"
             port_str = m_v6.group(2)
         else:
-            if not re.fullmatch(r'[^\s:\[\]]+:[0-9]{1,5}', addr):
+            if not re.fullmatch(r'[^\s:\[\]/@?#]+:[1-9][0-9]{0,4}', addr, re.ASCII):
                 return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
             _, port_str = addr.rsplit(':', 1)
         if not (0 < int(port_str) < 65536):
@@ -571,9 +571,10 @@ def _yaml_scalar(value):
     校验层只要求「可见 ASCII」，但 `*`（别名）、`{`/`[`（流式集合）、
     `&`（锚点）、`%`（指令）开头的值直接拼进 YAML 会让整份配置解析失败 ——
     Hysteria 起不来，用户只看到「应用失败」却不知道是密码写法的问题。
-    单引号标量里只需把 `'` 写成 `''`。
+    同时剔除回车/换行等控制字符，避免破坏单引号标量导致多行注入。
     """
-    return "'" + str(value).replace("'", "''") + "'"
+    cleaned = re.sub(r'[\x00-\x1f\x7f]', '', str(value))
+    return "'" + cleaned.replace("'", "''") + "'"
 
 
 
@@ -604,23 +605,40 @@ def outbound_names_in(text):
     return [_yaml_name_value(m)
             for m in re.findall(_OUTBOUND_NAME_LINE_RE.pattern, text or '', re.M)]
 
+_DIRECT_OUTBOUND_MODES = ('auto', '64', '46', '6', '4')
+
+
+def _is_safe_outbound_str(value):
+    return isinstance(value, str) and bool(value.strip()) and not any(
+        ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value
+    )
+
+
 def clean_outbounds(outbounds):
     """只保留结构完整的出站条目；容器被改坏时返回空表。
 
     custom_outbounds 是用户可写的 JSON，旧版本还允许直接改 portal.json。
-    渲染时 `entry['type']` 对 None / 字符串 / 缺字段会抛
+    渲染时 `entry['type']` / `entry['addr']` / `entry['url']` 对 None / 字符串 / 缺字段会抛
     TypeError/KeyError，而调用点在 apply_egress_config 里 —— 一次坏数据就让
     WARP 与出站配置永久无法应用，界面只显示「应用失败」。
     """
     if not isinstance(outbounds, (list, tuple)):
         return []
-    # 名称必须同时满足标识符规则：旧版本允许直接改 portal.json，历史数据里
-    # 可能留着带换行的名字 —— 它会让 render_outbound_yaml 写出一段结构错乱
-    # 的 YAML（后续每一行都被当成新内容），Hysteria 起不来。
-    return [ob for ob in outbounds
-            if isinstance(ob, dict) and ob.get('type') in OUTBOUND_TYPES
-            and isinstance(ob.get('name'), str)
-            and OUTBOUND_NAME_RE.match(ob['name'])]
+    # 名称必须同时满足标识符规则，且各类型必填字段必须为不含控制字符的非空字符串，
+    # 避免损坏的历史条目让 render_outbound_yaml 抛 KeyError 或注入恶意 YAML 行。
+    result = []
+    for ob in outbounds:
+        if not (isinstance(ob, dict) and ob.get('type') in OUTBOUND_TYPES
+                and isinstance(ob.get('name'), str)
+                and OUTBOUND_NAME_RE.match(ob['name'])):
+            continue
+        otype = ob['type']
+        if otype == 'socks5' and not _is_safe_outbound_str(ob.get('addr')):
+            continue
+        if otype == 'http' and not _is_safe_outbound_str(ob.get('url')):
+            continue
+        result.append(ob)
+    return result
 
 
 def render_outbound_yaml(entry):
@@ -631,17 +649,19 @@ def render_outbound_yaml(entry):
     if otype == 'socks5':
         lines.append('    socks5:')
         lines.append('      addr: %s' % _yaml_scalar(entry['addr']))
-        if entry.get('username'):
+        if isinstance(entry.get('username'), str) and entry['username']:
             lines.append('      username: %s' % _yaml_scalar(entry['username']))
-        if entry.get('password'):
+        if isinstance(entry.get('password'), str) and entry['password']:
             lines.append('      password: %s' % _yaml_scalar(entry['password']))
     elif otype == 'http':
         lines.append('    http:')
         lines.append('      url: %s' % _yaml_scalar(entry['url']))
         lines.append('      insecure: %s' % ('true' if entry.get('insecure') else 'false'))
     elif otype == 'direct':
+        raw_mode = entry.get('mode')
+        mode = raw_mode if isinstance(raw_mode, str) and raw_mode in _DIRECT_OUTBOUND_MODES else 'auto'
         lines.append('    direct:')
-        lines.append('      mode: %s' % (entry.get('mode') or 'auto'))
+        lines.append('      mode: %s' % mode)
     return '\n'.join(lines)
 
 
@@ -654,10 +674,11 @@ def upsert_outbound_block(cfg_text, outbounds):
     再追加新的。
     """
     text = strip_managed_outbounds(cfg_text)
-    if not outbounds:
+    cleaned = clean_outbounds(outbounds)
+    if not cleaned:
         return text
 
-    block = '\n'.join(render_outbound_yaml(ob) for ob in clean_outbounds(outbounds))
+    block = '\n'.join(render_outbound_yaml(ob) for ob in cleaned)
     if 'outbounds:' in text:
         # 插到 outbounds 段的末尾（顶格行的下一行起）
         lines = text.split('\n')
@@ -5556,17 +5577,26 @@ def build_anytls_config(acfg, users, cert_file, key_file):
     出站同样要拒绝内网 / 云元数据，与 Hy2 ACL、Xray 的 add_private_network_guard
     对齐。先 resolve 再按 IP 拒：客户端用域名访问内网地址时也能挡住。
     """
+    if not isinstance(acfg, dict):
+        raise ValueError('invalid anytls config')
+    port = _valid_port(acfg.get('port'))
+    if not port:
+        raise ValueError('invalid anytls port')
+    raw_sni = acfg.get('sni')
+    raw_domain = acfg.get('domain')
+    server_name = (raw_sni.strip() if isinstance(raw_sni, str) and raw_sni.strip()
+                   else (raw_domain.strip() if isinstance(raw_domain, str) and raw_domain.strip() else ''))
     return {
         'log': {'level': 'warn', 'timestamp': True},
         'inbounds': [{
             'type': 'anytls',
             'tag': ANYTLS_INBOUND_TAG,
             'listen': '::',
-            'listen_port': int(acfg['port']),
+            'listen_port': port,
             'users': users,
             'tls': {
                 'enabled': True,
-                'server_name': acfg.get('sni') or acfg.get('domain'),
+                'server_name': server_name,
                 'certificate_path': cert_file,
                 'key_path': key_file,
             },
@@ -5773,18 +5803,27 @@ def tuic_users(data):
 
 def build_tuic_config(tcfg, users, cert_file, key_file):
     """sing-box 完整配置（只有一个 tuic 入站）；出站先 resolve 再拒内网。"""
+    if not isinstance(tcfg, dict):
+        raise ValueError('invalid tuic config')
+    port = _valid_port(tcfg.get('port'))
+    if not port:
+        raise ValueError('invalid tuic port')
+    raw_sni = tcfg.get('sni')
+    raw_domain = tcfg.get('domain')
+    server_name = (raw_sni.strip() if isinstance(raw_sni, str) and raw_sni.strip()
+                   else (raw_domain.strip() if isinstance(raw_domain, str) and raw_domain.strip() else ''))
     return {
         'log': {'level': 'warn', 'timestamp': True},
         'inbounds': [{
             'type': 'tuic',
             'tag': TUIC_INBOUND_TAG,
             'listen': '::',
-            'listen_port': int(tcfg['port']),
+            'listen_port': port,
             'users': users,
             'congestion_control': 'bbr',
             'tls': {
                 'enabled': True,
-                'server_name': tcfg.get('sni') or tcfg.get('domain'),
+                'server_name': server_name,
                 'alpn': ['h3'],
                 'certificate_path': cert_file,
                 'key_path': key_file,
