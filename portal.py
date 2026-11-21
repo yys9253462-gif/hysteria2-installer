@@ -963,7 +963,7 @@ def routing_state(data):
     return {'warp_enabled': bool(data.get('warp_enabled', False)),
             'warp_rules': copy.deepcopy(list(rules)),
             'custom_outbounds': copy.deepcopy(list(outbounds)),
-            'outbound_mode': mode if isinstance(mode, str) else 'rules'}
+            'outbound_mode': mode if mode in ('rules', 'global') else 'rules'}
 
 
 def render_egress_config(original, state):
@@ -1042,9 +1042,10 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
     except Exception as exc:
         return False, '读取 Hysteria 配置失败: %s' % exc
     with data_lock:
-        if data.get('outbound_mode') == 'global' and not data.get('custom_outbounds'):
-            data['outbound_mode'] = 'rules'
         state = routing_state(data)
+        if state['outbound_mode'] == 'global' and not clean_outbounds(state['custom_outbounds']):
+            data['outbound_mode'] = 'rules'
+            state['outbound_mode'] = 'rules'
     rendered = render_egress_config(original, state)
     try:
         before = _hy2_runtime_identity()
@@ -1102,17 +1103,49 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
     🔴 这是用户判断"到底生效没有"的唯一依据。旧面板只显示 WARP 装没装，
     显示不了实际出口，用户只能靠访问 ipify 自己猜。
     """
+    if isinstance(timeout, bool):
+        return ''
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError):
+        return ''
+    if not math.isfinite(seconds):
+        return ''
+    seconds = min(30.0, max(1.0, seconds))
+
     proxy_url = ''
     if kind == 'socks5' and addr:
-        proxy_url = 'socks5h://' + str(addr)
+        raw_addr = str(addr)
+        if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_addr):
+            return ''
+        lower = raw_addr.lower()
+        if '://' in raw_addr:
+            if lower.startswith('socks5h://'):
+                raw_addr = raw_addr[10:]
+            elif lower.startswith('socks5://'):
+                raw_addr = raw_addr[9:]
+            else:
+                return ''
+        if not raw_addr:
+            return ''
+        proxy_url = 'socks5h://' + raw_addr
     elif kind == 'http' and addr:
-        proxy_url = str(addr)
+        raw_addr = str(addr)
+        if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_addr):
+            return ''
+        lower = raw_addr.lower()
+        if '://' in raw_addr:
+            if not (lower.startswith('http://') or lower.startswith('https://')):
+                return ''
+            proxy_url = raw_addr
+        else:
+            proxy_url = 'http://' + raw_addr
     elif kind == 'warp':
         proxy_url = 'socks5h://127.0.0.1:19898'
+
     if proxy_url and any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in proxy_url):
         return ''
     try:
-        seconds = max(1, float(timeout))
         # urllib's ProxyHandler speaks HTTP CONNECT, not the SOCKS5 protocol.
         # Explicitly override no_proxy: '*' would silently bypass this proxy.
         args = ['curl', '--disable', '--silent', '--show-error', '--fail',
@@ -16183,7 +16216,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # null 或数字时 list() 抛 TypeError，连接被掐断，出口编辑器整块空白。
                 state = routing_state(data)
                 outs = state['custom_outbounds']
-                mode = data.get('outbound_mode', 'rules')
+                mode = state['outbound_mode']
                 rules = [r for r in state['warp_rules'] if isinstance(r, (str, dict))]
                 applying = bool(data.get('egress_applying'))
                 error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
@@ -16229,6 +16262,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
+            if kind == 'warp' and not ip:
+                # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
+                ip = detect_outbound_ip('socks5', '127.0.0.1:40000', proxy_insecure=insecure)
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})
 
         def _ob_manage(self):
@@ -16326,8 +16362,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         'error': '模式只能是 rules（按域名分流）或 global（全局出口）'})
                 no_valid_outbounds = False
                 with data_lock:
-                    valid_outs = [o for o in routing_state(data)['custom_outbounds']
-                                  if isinstance(o, dict) and o.get('name')]
+                    valid_outs = clean_outbounds(routing_state(data)['custom_outbounds'])
                     if mode == 'global' and not valid_outs:
                         no_valid_outbounds = True
                     else:
@@ -16390,10 +16425,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
-                enabled = data.get('warp_enabled', False)
                 state = routing_state(data)
+                enabled = state['warp_enabled']
                 rules = [r['domain'] for r in normalize_route_rules(state['warp_rules']) if r['outbound'] in ('warp', 'warp_socks')]
-                overridden = state['outbound_mode'] == 'global' and bool(state['custom_outbounds'])
+                overridden = state['outbound_mode'] == 'global' and bool(clean_outbounds(state['custom_outbounds']))
             # 统一到 wgcf + wireproxy(127.0.0.1:19898)；同时兼容尚未升级、
             # 仍跑官方 cloudflare-warp(127.0.0.1:40000) 的旧节点，避免误报「未安装」
             is_installed = warp_backend_installed()
