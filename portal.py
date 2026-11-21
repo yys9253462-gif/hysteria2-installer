@@ -11358,7 +11358,11 @@ if __name__ == '__main__':
                 return self.reply(429, b'Too many requests')
 
             # 3. Web 网页版管理通道 (用户管理 / WARP 开关 / 触发升级)
-            prefix = '/' + data['token'] + '/'
+            with data_lock:
+                _portal_tok = data.get('token')
+            if not isinstance(_portal_tok, str) or not _portal_tok:
+                return self.reply(503, b'Portal token unavailable')
+            prefix = '/' + _portal_tok + '/'
             if self.path == prefix + 'do-upgrade':
                 return self._h_post_do_upgrade(prefix)
 
@@ -15037,6 +15041,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     except Exception:
                         portal_version = PORTAL_VERSION
 
+                    singbox_installed = bool(_singbox_version())
+                    bbr_enabled, bbr_algo = _bbr_now()
+                    vmess_port = _valid_port(d_snap['vmess'].get('port'))
+                    vlessenc_port = _valid_port(d_snap['vlessenc'].get('port'))
+                    anytls_port = _valid_port(d_snap['anytls'].get('port'))
+                    tuic_port = _valid_port(d_snap['tuic'].get('port'))
                     # 端口一律经 _valid_port（2026-11-03 修）：任何一个协议段的端口被改坏成
                     # 字符串，旧写法 int() 抛异常，整个 capabilities 回 500，控制台看不到这台节点。
                     return self.reply_json(200, {
@@ -15085,8 +15095,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'active': d_snap['vmess_inbound'],
                                     'configured': bool(d_snap['vmess'].get('domain')),
                                 },
-                                **({'port': _valid_port(d_snap['vmess'].get('port'))}
-                                   if d_snap['vmess'].get('port') else {}),
+                                **({'port': vmess_port} if vmess_port else {}),
                                 **({'domain': d_snap['vmess']['domain']}
                                    if d_snap['vmess'].get('domain') else {}),
                                 **({'ws_path': d_snap['vmess']['ws_path']}
@@ -15102,8 +15111,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'active': d_snap['vlessenc_inbound'],
                                     'configured': bool(d_snap['vlessenc'].get('domain')),
                                 },
-                                **({'port': _valid_port(d_snap['vlessenc'].get('port'))}
-                                   if d_snap['vlessenc'].get('port') else {}),
+                                **({'port': vlessenc_port} if vlessenc_port else {}),
                                 **({'domain': d_snap['vlessenc']['domain']}
                                    if d_snap['vlessenc'].get('domain') else {}),
                                 **({'sni': d_snap['vlessenc']['sni']}
@@ -15114,7 +15122,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             # 同样只给客户端公开参数，secret（服务端派生密钥）不外泄。
                             'anytls': dict(
                                 {
-                                    'installed': bool(_singbox_version()),
+                                    'installed': singbox_installed,
                                     # 与 /anytls-status、_active_*_config 同一判据：
                                     # 「已启用且配置文件在」。只看服务状态会在
                                     # 配置被删/损坏但进程还在时误报能力可用。
@@ -15122,8 +15130,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                               and _svc_active(ANYTLS_SERVICE),
                                     'configured': bool(d_snap['anytls'].get('domain')),
                                 },
-                                **({'port': _valid_port(d_snap['anytls'].get('port'))}
-                                   if d_snap['anytls'].get('port') else {}),
+                                **({'port': anytls_port} if anytls_port else {}),
                                 **({'domain': d_snap['anytls']['domain']}
                                    if d_snap['anytls'].get('domain') else {}),
                                 **({'sni': d_snap['anytls']['sni']}
@@ -15132,13 +15139,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             # TUIC（2026-10-31 加）：同样由 sing-box 承载，端口为 UDP。
                             'tuic': dict(
                                 {
-                                    'installed': bool(_singbox_version()),
+                                    'installed': singbox_installed,
                                     'active': _active_tuic_config() is not None
                                               and _svc_active(TUIC_SERVICE),
                                     'configured': bool(d_snap['tuic'].get('domain')),
                                 },
-                                **({'port': _valid_port(d_snap['tuic'].get('port'))}
-                                   if d_snap['tuic'].get('port') else {}),
+                                **({'port': tuic_port} if tuic_port else {}),
                                 **({'domain': d_snap['tuic']['domain']}
                                    if d_snap['tuic'].get('domain') else {}),
                                 **({'sni': d_snap['tuic']['sni']}
@@ -15156,7 +15162,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'warp': {'installed': Path('/etc/hysteria/warp').exists()
                                      or _bin('wireproxy'),
                                      'enabled': d_snap['warp_enabled']},
-                            'bbr': {'enabled': _bbr_now()[0], 'algo': _bbr_now()[1]},
+                            'bbr': {'enabled': bbr_enabled, 'algo': bbr_algo},
                             # 证书到期一并带出（2026-10-09）：主面板的节点列表
                             # 需要在**到期前**就把临期节点标出来，而不是等用户
                             # 报障「昨天还好好的今天连不上」才回来查。只给面板
@@ -15254,7 +15260,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.check_rate_limit(bucket='web'):
                 return self.reply(429, b'Too many requests')
 
-            prefix = '/' + data['token'] + '/'
+            with data_lock:
+                _portal_tok = data.get('token')
+            if not isinstance(_portal_tok, str) or not _portal_tok:
+                return self.reply(503, b'Portal token unavailable')
+            prefix = '/' + _portal_tok + '/'
             if not self.path.startswith(prefix):
                 return self.reply(404, b'Not found')
 
