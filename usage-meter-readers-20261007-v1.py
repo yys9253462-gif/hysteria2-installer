@@ -49,7 +49,7 @@ def _validate_loopback_xray_addr(address):
     if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
         raise ValueError('xray endpoint must be loopback')
     port_text = address[len('127.0.0.1:'):]
-    if not port_text.isdigit() or not (1 <= int(port_text) <= 65535):
+    if not (port_text.isascii() and port_text.isdigit()) or not (1 <= int(port_text) <= 65535):
         raise ValueError('xray endpoint must be loopback')
     return address
 
@@ -85,7 +85,7 @@ def parse_xray(raw):
         if len(parts)!=4 or parts[0]!='user' or parts[2]!='traffic': continue
         if parts[3] not in ('uplink','downlink'): continue
         value=row.get('value')
-        if isinstance(value,str) and value.isdigit(): value=int(value)
+        if isinstance(value,str) and value.isascii() and value.isdigit(): value=int(value)
         if type(value) is not int or value<0: raise ValueError('invalid xray counter')
         pair=out.setdefault(parts[1],{'tx':0,'rx':0})
         # 方向必须与 Hy2 的语义对齐（2026-10-29 修）：
@@ -104,10 +104,14 @@ def parse_xray(raw):
 
 
 def read_xray(binary, address):
+    if not isinstance(binary, str) or not binary.strip() or '\x00' in binary:
+        raise ValueError('invalid xray binary')
     address = _validate_loopback_xray_addr(address)
     r=subprocess.run([binary,'api','statsquery','--server='+address,'-pattern','user>>>','-reset=false'],
                      capture_output=True,timeout=5,check=True)
-    return parse_xray(r.stdout.decode())
+    if len(r.stdout)>8*1024*1024:
+        raise ValueError('xray stats response too large')
+    return parse_xray(r.stdout.decode('utf-8', errors='replace'))
 
 
 def read_hysteria_online(url, secret):
@@ -141,7 +145,15 @@ def _addr_ip(addr):
     """
     text=addr.strip()
     if text.startswith('['):
-        ip=ipaddress.ip_address(text[1:text.index(']')])
+        end=text.index(']')
+        rest=text[end+1:]
+        if rest:
+            if not rest.startswith(':'):
+                raise ValueError('invalid_bracketed_addr')
+            port_text=rest[1:]
+            if not (port_text.isascii() and port_text.isdigit()) or not (1<=int(port_text)<=65535):
+                raise ValueError('invalid_bracketed_port')
+        ip=ipaddress.ip_address(text[1:end])
     else:
         try:
             ip=ipaddress.ip_address(text)
@@ -224,7 +236,7 @@ def confirmed_ips(connections,uid,count):
     return sorted(known)
 
 def cmd(args):
-    return subprocess.run(args,capture_output=True,text=True,timeout=8,check=True).stdout
+    return subprocess.run(args,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=8,check=True).stdout
 
 def read_live_connections():
     cfg=json.loads(pathlib.Path('/etc/hysteria/usage-meter-config.json').read_text(encoding='utf-8'))
@@ -330,9 +342,13 @@ def read_live_connections():
                 # 否则同一设备同时测速 Hy2 与 Reality 时会被当成两个在线 IP，也对不上跨节点拦截名单。
                 merged={}
                 for ip,seen in ips.items():
-                    if isinstance(seen,bool):raise ValueError('invalid_online_seen')
+                    if isinstance(seen,str) and seen.isascii() and seen.isdigit():
+                        ts=int(seen)
+                    elif type(seen) is int and seen>=0:
+                        ts=seen
+                    else:
+                        raise ValueError('invalid_online_seen')
                     norm=_norm_ip(ip)
-                    ts=int(seen)
                     if norm not in merged or ts>merged[norm]:
                         merged[norm]=ts
                 for norm,ts in merged.items():
