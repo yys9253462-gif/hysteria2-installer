@@ -10588,7 +10588,8 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     password_changed = False
                     with data_lock:
-                        existing = data.get('users', {}).get(user_id)
+                        users_map = user_table(data)
+                        existing = users_map.get(user_id)
                         # 条目被改坏时按「不存在」覆盖掉（2026-11-06 修）：否则
                         # `'view_nonce' in existing` / existing.get 抛 TypeError/AttributeError，
                         # 坏条目也没法通过重建修复。
@@ -10602,7 +10603,7 @@ if __name__ == '__main__':
                             # 同名旧账号的收回还没完成（2026-11-04 修）：此时重建，worker 每 5 秒
                             # 会把新账号当成待收回对象踢下线，故障不消失就一直踢。
                             conflict = (409, 'Revocation of the previous account with this user_id is still pending; retry later')
-                        elif params.get('password') and password_taken(data.get('users', {}), pwd, user_id):
+                        elif params.get('password') and password_taken(users_map, pwd, user_id):
                             conflict = (409, 'Password already in use by another user')
                         if conflict is None:
                             record = {
@@ -10659,7 +10660,9 @@ if __name__ == '__main__':
                                 try:
                                     reconcile_meter_usage(data, user_id, initial_used)
                                     restore_meter_user(data, user_id)
-                                    data.setdefault('users', {})[user_id] = record
+                                    if not isinstance(data.get('users'), dict):
+                                        data['users'] = {}
+                                    data['users'][user_id] = record
                                     save_data()
                                 except ValueError:
                                     conflict = (409, 'Invalid meter ledger; reconciliation not applied')
@@ -10668,7 +10671,8 @@ if __name__ == '__main__':
                                     durability_uncertain = True
                                 except OSError:
                                     if existing is None:
-                                        data.get('users', {}).pop(user_id, None)
+                                        if isinstance(data.get('users'), dict):
+                                            data['users'].pop(user_id, None)
                                     else:
                                         data['users'][user_id] = existing
                                     if previous_meter is missing:
@@ -10679,16 +10683,19 @@ if __name__ == '__main__':
                             elif conflict is None:
                                 previous_record = copy.deepcopy(existing)
                                 restore_meter_user(data, user_id)
-                                data.setdefault('users', {})[user_id] = record
+                                if not isinstance(data.get('users'), dict):
+                                    data['users'] = {}
+                                data['users'][user_id] = record
                                 try:
                                     save_data()
                                 except AtomicWriteDurabilityError:
                                     durability_uncertain = True
                                 except OSError:
                                     if previous_record is None:
-                                        data.get('users', {}).pop(user_id, None)
+                                        if isinstance(data.get('users'), dict):
+                                            data['users'].pop(user_id, None)
                                     else:
-                                        data.setdefault('users', {})[user_id] = previous_record
+                                        data['users'][user_id] = previous_record
                                     reality_registry(data)
                                     conflict = (503, 'User save failed; disk state may require verification')
                             if conflict is None:
@@ -10809,10 +10816,11 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     password_changed = False
                     with data_lock:
-                        u = data.get('users', {}).get(user_id)
+                        users_map = user_table(data)
+                        u = users_map.get(user_id)
                         if not isinstance(u, dict):   # 条目改坏同样按不存在（2026-11-06 修）
                             conflict = (404, 'User not found')
-                        elif 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
+                        elif 'password' in changes and password_taken(users_map, changes['password'], user_id):
                             conflict = (409, 'Password already in use by another user')
                         else:
                             previous = copy.deepcopy(u)
@@ -10869,7 +10877,7 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     with data_lock:
-                        u = data.get('users', {}).get(user_id)
+                        u = user_table(data).get(user_id)
                         # 条目被改成数字 / 字符串时按不存在处理（2026-11-06 修）：`not u` 放行后
                         # u.get 抛 AttributeError，续费在锁内 500。
                         if not isinstance(u, dict):
@@ -10964,16 +10972,17 @@ if __name__ == '__main__':
                     if user_id == MASTER_USER_ID:
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot delete the master account'})
                     with data_lock:
+                        users_map = user_table(data)
                         previous_global_deny = copy.deepcopy(global_ip_deny.get(user_id))
                         previous = {
-                            'user': copy.deepcopy(data.get('users', {}).get(user_id)),
+                            'user': copy.deepcopy(users_map.get(user_id)),
 
                             'pending': copy.deepcopy(data.get('_pending_revocations')),
                             'meter': copy.deepcopy(data.get('usage_meter')),
                             'ip': copy.deepcopy(ip_tracker.get(user_id)),
                             'speed': copy.deepcopy(speed_tracker.get(user_id)),
                         }
-                        previous_had_user = user_id in data.get('users', {})
+                        previous_had_user = user_id in users_map
                         data['_pending_revocations'] = sorted(pending_revocations(data) | {user_id})
                         # Even an already-absent account may have a live IP-deny row;
                         # successful idempotent deletion must clear that stale scope.
@@ -11044,7 +11053,7 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     with data_lock:
-                        u = data.get('users', {}).get(user_id)
+                        u = user_table(data).get(user_id)
                         # 同上：`not u` 对 7 / "x" 为假，随后 u.get / u['status'] 抛异常，
                         # 滥用用户根本停不掉（2026-11-06 修）。
                         missing = not isinstance(u, dict)
@@ -11230,6 +11239,8 @@ if __name__ == '__main__':
                         save_data()
                     except OSError as exc:
                         _log_ignored('logout_epoch_save', exc)
+                with data_lock:
+                    portal_token = str(data.get('token') or '')
                 self.send_response(302)
                 self._responded = True
                 self.send_header('Location', prefix)
@@ -11240,8 +11251,11 @@ if __name__ == '__main__':
                 _secure = '; Secure' if self._is_https_request() else ''
                 self.send_header('Set-Cookie',
                                  'hy2_session=; Path=/%s/; HttpOnly; SameSite=Strict%s; Max-Age=0'
-                                 % (data['token'], _secure))
+                                 % (portal_token, _secure))
                 self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('X-Frame-Options', 'DENY')
+                self.send_header('Referrer-Policy', 'no-referrer')
                 self.send_header('Connection', 'close')
                 self.end_headers()
                 return
@@ -14749,7 +14763,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                     with data_lock:
-                        u = data.get('users', {}).get(user_id)
+                        u = user_table(data).get(user_id)
                         # 条目不是对象时按不存在返回 404（2026-11-06 修），旧实现 u.items() 抛异常
                         missing_user = not isinstance(u, dict)
                         result = None
