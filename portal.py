@@ -13857,7 +13857,14 @@ if __name__ == '__main__':
                 if action not in ('create', 'delete'):
                     return self.reply(400, '请求无效，请刷新页面后重试'.encode('utf-8'))
                 with data_lock:
-                    previous_user = copy.deepcopy(data.get('users', {}).get(user_id))
+                    users_map = user_table(data)
+                    previous_had_user = user_id in users_map
+                    previous_user = copy.deepcopy(users_map.get(user_id))
+                    previous_pending = copy.deepcopy(data.get('_pending_revocations')) if '_pending_revocations' in data else None
+                    previous_meter = copy.deepcopy(data.get('usage_meter')) if 'usage_meter' in data else None
+                    previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
+                    previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
+                    previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
 
 
                 if not VALID_USER_ID_RE.match(user_id):
@@ -13897,7 +13904,9 @@ if __name__ == '__main__':
                     # 现在显式 409，并回显密码尾号帮机主确认自己是不是认错了人。
                     conflict = None
                     with data_lock:
-                        existing = data.get('users', {}).get(user_id)
+                        if not isinstance(data.get('users'), dict):
+                            data['users'] = {}
+                        existing = data['users'].get(user_id)
                         if not isinstance(existing, dict):   # 条目改坏＝不存在（2026-11-06 修）
                             existing = None
                         if existing is not None:
@@ -13911,12 +13920,12 @@ if __name__ == '__main__':
                                 _used = 0
                             used_gb = round(_used / (1024 ** 3), 2)
                             conflict = ('exists', tail, used_gb)
-                        elif password_taken(data.get('users', {}), pwd, user_id):
+                        elif password_taken(data['users'], pwd, user_id):
                             conflict = ('password',)
                         elif user_id in pending_revocations(data):
                             conflict = ('pending',)
                         else:
-                            data.setdefault('users', {})[user_id] = {
+                            data['users'][user_id] = {
                                 'password': pwd,
                                 'expires_at': now_ts + days * 86400,
                                 'ip_limit': ip_limit,
@@ -13949,7 +13958,8 @@ if __name__ == '__main__':
                         return self.reply(400, '机主账号不能删除'.encode('utf-8'))
                     delete_missing = False
                     with data_lock:
-                        if user_id not in data.get('users', {}):
+                        users_map = user_table(data)
+                        if user_id not in users_map:
                             delete_missing = True
                         else:
                             data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
@@ -13969,7 +13979,39 @@ if __name__ == '__main__':
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply(404, '该用户已不存在（可能已在别处删除），请刷新页面'.encode('utf-8'))
 
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        if previous_had_user:
+                            data.setdefault('users', {})[user_id] = previous_user
+                        else:
+                            if isinstance(data.get('users'), dict):
+                                data['users'].pop(user_id, None)
+                        if action == 'delete':
+                            if previous_pending is None:
+                                data.pop('_pending_revocations', None)
+                            else:
+                                data['_pending_revocations'] = previous_pending
+                            if previous_meter is None:
+                                data.pop('usage_meter', None)
+                            else:
+                                data['usage_meter'] = previous_meter
+                            if previous_ip is None:
+                                ip_tracker.pop(user_id, None)
+                            else:
+                                ip_tracker[user_id] = previous_ip
+                            if previous_speed is None:
+                                speed_tracker.pop(user_id, None)
+                            else:
+                                speed_tracker[user_id] = previous_speed
+                            if previous_deny is None:
+                                global_ip_deny.pop(user_id, None)
+                            else:
+                                global_ip_deny[user_id] = previous_deny
+                    raise
                 if not self._sync_reality_clients():
                     with data_lock:
                         if action == 'delete':
@@ -13977,7 +14019,8 @@ if __name__ == '__main__':
                         else:
                             revoked_pending = False
                             if previous_user is None:
-                                data.get('users', {}).pop(user_id, None)
+                                if isinstance(data.get('users'), dict):
+                                    data['users'].pop(user_id, None)
                             else:
                                 data.setdefault('users', {})[user_id] = previous_user
                     if revoked_pending:
@@ -13985,13 +14028,21 @@ if __name__ == '__main__':
                         regenerate_page()
                         return self.reply(503, '用户已删除，但节点上的旧连接还没确认断开，后台会自动重试；请稍后刷新页面确认'
                                           .encode('utf-8'))
-                    save_data()
+                    try:
+                        save_data()
+                    except Exception as rb_exc:
+                        _log_ignored('manage_user_rollback_save', rb_exc)
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
                 regenerate_page()
                 self.send_response(302)
                 self._responded = True
                 self.send_header('Location', prefix + '#users')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('X-Frame-Options', 'DENY')
+                self.send_header('Referrer-Policy', 'no-referrer')
+                self.send_header('Connection', 'close')
                 self.end_headers()
                 return
             except (ValueError, TypeError, UnicodeDecodeError):
