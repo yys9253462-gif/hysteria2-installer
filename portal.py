@@ -12764,8 +12764,15 @@ if __name__ == '__main__':
                 if action not in ('toggle', 'enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 VMess 操作类型，请刷新页面后重试'})
                 xray_path = Path('/etc/hysteria/xray.json')
-                config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                          if xray_path.exists() else None)
+                try:
+                    config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                              if xray_path.exists() else None)
+                except ValueError:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'xray.json 不是合法 JSON，未做任何修改'})
+                if config is not None and not isinstance(config, dict):
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'xray.json 不是合法 JSON 对象，未做任何修改'})
                 enabled = bool(config) and has_managed_inbound(config, VMESS_INBOUND_TAG)
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
@@ -12789,6 +12796,8 @@ if __name__ == '__main__':
                     try:
                         current = json.loads(xray_path.read_text(encoding='utf-8'))
                     except (OSError, ValueError):
+                        current = config
+                    if not isinstance(current, dict):
                         current = config
                     original_config = copy.deepcopy(current)
                     with data_lock:
@@ -12818,6 +12827,8 @@ if __name__ == '__main__':
                         with data_lock:
                             if old_state is not None:
                                 data['vmess_config'] = old_state
+                            else:
+                                data.pop('vmess_config', None)
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
@@ -13260,9 +13271,16 @@ if __name__ == '__main__':
                     with anytls_apply_lock:
                         with data_lock:
                             data['anytls_config'] = old_acfg
-                        if previous_file is not None:
-                            _restore_config_atomically(cfg_path, previous_file)
-                        if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                        rollback_failed = False
+                        try:
+                            if previous_file is None:
+                                cfg_path.unlink(missing_ok=True)
+                            else:
+                                _restore_config_atomically(cfg_path, previous_file)
+                        except OSError as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('anytls_disable_rollback_cfg', rb_exc)
+                        if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state) or rollback_failed:
                             raise RuntimeError('AnyTLS 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
@@ -13472,11 +13490,16 @@ if __name__ == '__main__':
                         with data_lock:
                             data['tuic_config'] = old_tcfg
                         cfg_path = portal_path.parent / TUIC_CONFIG_NAME
-                        if previous_file is None:
-                            cfg_path.unlink(missing_ok=True)
-                        else:
-                            _restore_config_atomically(cfg_path, previous_file)
-                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                        rollback_failed = False
+                        try:
+                            if previous_file is None:
+                                cfg_path.unlink(missing_ok=True)
+                            else:
+                                _restore_config_atomically(cfg_path, previous_file)
+                        except OSError as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('tuic_disable_rollback_cfg', rb_exc)
+                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state) or rollback_failed:
                             raise RuntimeError('TUIC 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 regenerate_page()
@@ -13536,8 +13559,15 @@ if __name__ == '__main__':
                 if action not in ('toggle', 'enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 VLESS Encryption 操作类型，请刷新页面后重试'})
                 xray_path = Path('/etc/hysteria/xray.json')
-                config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                          if xray_path.exists() else None)
+                try:
+                    config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                              if xray_path.exists() else None)
+                except ValueError:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'xray.json 不是合法 JSON，未做任何修改'})
+                if config is not None and not isinstance(config, dict):
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'xray.json 不是合法 JSON 对象，未做任何修改'})
                 enabled = bool(config) and has_managed_inbound(config, VLESSENC_INBOUND_TAG)
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
@@ -13559,6 +13589,8 @@ if __name__ == '__main__':
                     try:
                         current = json.loads(xray_path.read_text(encoding='utf-8'))
                     except (OSError, ValueError):
+                        current = config
+                    if not isinstance(current, dict):
                         current = config
                     original_config = copy.deepcopy(current)
                     with data_lock:
@@ -13588,6 +13620,8 @@ if __name__ == '__main__':
                         with data_lock:
                             if old_state is not None:
                                 data['vlessenc_config'] = old_state
+                            else:
+                                data.pop('vlessenc_config', None)
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
