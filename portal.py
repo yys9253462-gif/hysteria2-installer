@@ -13289,7 +13289,8 @@ if __name__ == '__main__':
             """
             m = read_meta_file(meta_path)
             public_ip = m.get('public_ip', '127.0.0.1')
-            domain = (m.get('server_name') or '').strip()
+            raw_sn = m.get('server_name')
+            domain = raw_sn.strip() if isinstance(raw_sn, str) else ''
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('VMess 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain)
@@ -13400,7 +13401,8 @@ if __name__ == '__main__':
             """
             m = read_meta_file(meta_path)
             public_ip = m.get('public_ip', '127.0.0.1')
-            domain = (m.get('server_name') or '').strip()
+            raw_sn = m.get('server_name')
+            domain = raw_sn.strip() if isinstance(raw_sn, str) else ''
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('VLESS Encryption 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain, 'VLESS Encryption')
@@ -13655,6 +13657,7 @@ if __name__ == '__main__':
             """GET /cores-status —— 核心管理页：各核心装没装、版本、服务状态、被谁依赖。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(45)
 
             def version_of(binary, args, pattern):
                 if not Path(binary).exists():
@@ -13826,25 +13829,33 @@ if __name__ == '__main__':
                         unit_states = {}
                         for unit in unit_names:
                             active = _systemd_state(unit) == 'active'
-                            is_en = subprocess.run(
-                                ['systemctl', 'is-enabled', unit], capture_output=True,
-                                text=True, timeout=5)
-                            enabled_state = is_en.stdout.strip()
+                            try:
+                                is_en = subprocess.run(
+                                    ['systemctl', 'is-enabled', unit], capture_output=True,
+                                    text=True, timeout=5)
+                                enabled_state = is_en.stdout.strip()
+                                is_en_rc = is_en.returncode
+                            except (OSError, subprocess.SubprocessError):
+                                enabled_state = ''
+                                is_en_rc = 1
                             unit_absent = (
                                 not active
                                 and not Path('/etc/systemd/system/%s.service' % unit).exists()
-                                and (enabled_state == 'not-found' or (is_en.returncode != 0 and not enabled_state))
+                                and (enabled_state == 'not-found' or (is_en_rc != 0 and not enabled_state))
                             )
                             unit_states[unit] = (active, enabled_state == 'enabled', unit_absent)
                         for unit in unit_names:
                             _, _, unit_absent = unit_states[unit]
                             if unit_absent:
                                 continue
-                            stop_result = subprocess.run(
-                                ['systemctl', 'disable', '--now', unit],
-                                capture_output=True, timeout=30)
+                            try:
+                                stop_result = subprocess.run(
+                                    ['systemctl', 'disable', '--now', unit],
+                                    capture_output=True, timeout=30)
+                            except (OSError, subprocess.SubprocessError):
+                                stop_result = None
                             state = _systemd_state(unit)
-                            if not _service_stop_confirmed(stop_result, state):
+                            if not (stop_result is not None and _service_stop_confirmed(stop_result, state)):
                                 # 恢复每个原本存在单元的激活与开机自启状态（逐单元隔离超时/异常）
                                 restore_failed = []
                                 for restore_unit, (was_active, was_enabled, restore_absent) in unit_states.items():
@@ -13855,8 +13866,11 @@ if __name__ == '__main__':
                                             ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
                                             capture_output=True, timeout=30)
                                         if was_active:
-                                            subprocess.run(['systemctl', 'reset-failed', restore_unit],
-                                                           capture_output=True, timeout=5)
+                                            try:
+                                                subprocess.run(['systemctl', 'reset-failed', restore_unit],
+                                                               capture_output=True, timeout=5)
+                                            except (OSError, subprocess.SubprocessError):
+                                                pass
                                         action_result = subprocess.run(
                                             ['systemctl', 'start' if was_active else 'stop', restore_unit],
                                             capture_output=True, timeout=30)
@@ -13874,9 +13888,15 @@ if __name__ == '__main__':
                                     '核心服务 %s 未能确认停止；已恢复原服务状态并保留所有文件' % unit})
                         for unit in unit_names:
                             Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
-                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                        try:
+                            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                        except (OSError, subprocess.SubprocessError):
+                            pass
                         for unit in unit_names:
-                            subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
+                            try:
+                                subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
+                            except (OSError, subprocess.SubprocessError):
+                                pass
                         Path(binary).unlink(missing_ok=True)
                     finally:
                         os.close(core_lock_fd)
@@ -13891,7 +13911,8 @@ if __name__ == '__main__':
             不会留下「显示已启用、实际没有」的状态。secret 只在首次生成。
             """
             m = read_meta_file(meta_path)
-            domain = (m.get('server_name') or '').strip()
+            raw_sn = m.get('server_name')
+            domain = raw_sn.strip() if isinstance(raw_sn, str) else ''
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('AnyTLS 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain, 'AnyTLS')
@@ -14127,7 +14148,8 @@ if __name__ == '__main__':
             规则同 _apply_anytls_enable：配置先落地、数据后写入；secret 只在首次生成。
             """
             m = read_meta_file(meta_path)
-            domain = (m.get('server_name') or '').strip()
+            raw_sn = m.get('server_name')
+            domain = raw_sn.strip() if isinstance(raw_sn, str) else ''
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('TUIC 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain, 'TUIC')
