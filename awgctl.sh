@@ -319,7 +319,7 @@ pick_port() {
     local hy2_port="${1:-}" listening port
     listening="$(ss -Hlun 2>/dev/null)" || return 1
     port="$(printf '%s
-' "$listening" | python3 -c '
+' "$listening" | python3 -I -c '
 import secrets, sys
 lo, hi, hy2 = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
 used = set()
@@ -327,10 +327,14 @@ for line in sys.stdin:
     parts = line.split()
     if len(parts) >= 4 and ":" in parts[3]:
         tail = parts[3].rsplit(":", 1)[1]
-        if tail.isdigit():
-            used.add(int(tail))
-if hy2.isdigit():
-    used.add(int(hy2))
+        if tail.isascii() and tail.isdigit():
+            p = int(tail)
+            if 1 <= p <= 65535:
+                used.add(p)
+if hy2.isascii() and hy2.isdigit():
+    p = int(hy2)
+    if 1 <= p <= 65535:
+        used.add(p)
 free = [p for p in range(lo, hi + 1) if p not in used]
 if not free:
     raise SystemExit("no-free-udp-port")
@@ -379,12 +383,12 @@ validate_endpoint() {
         host="${ep%:"$port"}"; [[ -n "$port" ]] || host="$ep"
         if [[ "$host" == \[*\] ]]; then
             host="${host#[}"; host="${host%]}"
-            python3 -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]).version == 6 else 1)'                 "$host" 2>/dev/null || { log_err "方括号里必须是 IPv6 地址: ${ep}"; return 1; }
+            python3 -I -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]).version == 6 else 1)'                 "$host" 2>/dev/null || { log_err "方括号里必须是 IPv6 地址: ${ep}"; return 1; }
         elif [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
             log_err "连接地址不是有效的域名或 IPv4: ${ep}"
             return 1
         elif [[ "${host##*.}" =~ ^[0-9]+$ ]] \
-                && ! python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$host" 2>/dev/null; then
+                && ! python3 -I -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$host" 2>/dev/null; then
             # 末段全是数字只能是 IPv4（顶级域不会全是数字，2026-11-12 修，与门户同一规则）。
             log_err "连接地址不是有效的域名或 IPv4: ${ep}"
             return 1
@@ -743,14 +747,17 @@ render_client_config() {
     mtu=$(( 1420 - 10#$s4v ))
     (( mtu < 1280 )) && mtu=1280
 
-    priv="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .private_key' "$AWG_PEERS_FILE")"
-    psk="$(jq  -r --arg n "$name" '.peers[]? | select(.name==$n) | .preshared_key' "$AWG_PEERS_FILE")"
-    addr="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .address' "$AWG_PEERS_FILE")"
+    priv="$(jq -r --arg n "$name" 'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.private_key | if type=="string" then . else empty end)) // empty' "$AWG_PEERS_FILE")"
+    psk="$(jq  -r --arg n "$name" 'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.preshared_key | if type=="string" then . else empty end)) // empty' "$AWG_PEERS_FILE")"
+    addr="$(jq -r --arg n "$name" 'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.address | if type=="string" then . else empty end)) // empty' "$AWG_PEERS_FILE")"
     [[ -n "$endpoint" ]] || endpoint="$(jq -r --arg n "$name" \
-        '.peers[]? | select(.name==$n) | .endpoint // empty' "$AWG_PEERS_FILE")"
+        'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)) // empty' "$AWG_PEERS_FILE")"
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
-    [[ -n "$priv" ]] || die "找不到客户端: ${name}"
+    [[ -n "$priv" && -n "$addr" ]] || die "找不到客户端或客户端记录损坏: ${name}"
+    if ! endpoint_has_port "$endpoint"; then
+        [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || die "AWG 服务端端口配置无效: ${port}"
+    fi
 
     echo "# AmneziaWG 客户端配置 (AWG ${line}.x) —— ${name}"
     echo "# ⚠️ 下方 S1~S4 / H1~H4 等混淆参数必须与服务端完全一致，请勿改动。"
@@ -797,10 +804,11 @@ render_client_config() {
 # ==============================================================================
 
 write_service() {
-    local svc_dir tmp
+    local svc_dir tmp=""
+    trap 'rm -f "${tmp:-}"' RETURN
     svc_dir="$(dirname "$AWG_SERVICE")"
     mkdir -p "$svc_dir"
-    tmp="$(mktemp "${svc_dir}/.awg-service.XXXXXX")"
+    tmp="$(umask 077 && mktemp "${svc_dir}/.awg-service.XXXXXX")"
     if ! cat > "$tmp" <<EOF
 [Unit]
 Description=AmneziaWG Server (userspace daemon via awg-quick)
@@ -842,7 +850,7 @@ EOF
 
 allow_firewall() {
     local port="$1"
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+    if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
         log_warn "跳过无效防火墙端口放行: ${port}"
         return 1
     fi
@@ -860,7 +868,7 @@ allow_firewall() {
 
 revoke_firewall() {
     local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || return 0
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || return 0
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
     fi
@@ -891,14 +899,14 @@ peers_init() {
 peer_exists() {
     local name="$1" n
     [[ -f "$AWG_PEERS_FILE" ]] || return 1
-    n="$(jq -r --arg n "$name" '[.peers[]? | select(.name==$n)] | length' "$AWG_PEERS_FILE")"
+    n="$(jq -r --arg n "$name" '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n)] | length' "$AWG_PEERS_FILE")"
     [[ "$n" != "0" && -n "$n" ]]
 }
 
 # 分配下一个隧道内网地址（.2 起，.1 留给服务端）
 next_peer_address() {
     local used n
-    used="$(jq -r '[.peers[]?.address] | join(" ")' "$AWG_PEERS_FILE" 2>/dev/null || echo "")"
+    used="$(jq -r '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | .address | select(type=="string")] | join(" ")' "$AWG_PEERS_FILE" 2>/dev/null || echo "")"
     for n in $(seq 2 254); do
         if [[ " ${used} " != *" ${AWG_SUBNET}.${n} "* ]]; then
             echo "${AWG_SUBNET}.${n}"
