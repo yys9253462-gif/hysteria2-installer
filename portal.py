@@ -10111,7 +10111,7 @@ if __name__ == '__main__':
 
             new_rcfg = {
                 'private_key': priv_key, 'public_key': pub_key, 'short_id': short_id,
-                'dest_sni': dest_sni, 'port': listen_port,
+                'dest_sni': dest_sni, 'port': listen_port, 'enabled': True,
             }
             new_rcfg['uuid'] = reality_uuid_for_user(MASTER_USER_ID)
             new_rcfg['uri'] = reality_uri_for_user(new_rcfg, MASTER_USER_ID, public_ip,
@@ -12708,11 +12708,36 @@ if __name__ == '__main__':
                                 current = cfg_now
                             if not isinstance(current, dict):
                                 current = cfg_now
+                            original_config = copy.deepcopy(current)
+                            with data_lock:
+                                old_state = copy.deepcopy(data.get('reality_config'))
                             remove_managed_inbound(current, REALITY_INBOUND_TAG)
                             apply_xray_config_transaction(
                                 current, config_path=str(xray_path),
                                 binary='/usr/local/bin/xray',
                                 restart=not unit_suspended('xray'))
+                        with data_lock:
+                            _kept = dict(config_section(data, 'reality_config'))
+                            _kept['enabled'] = False
+                            data['reality_config'] = _kept
+                        try:
+                            save_data()
+                        except AtomicWriteDurabilityError:
+                            raise
+                        except OSError:
+                            try:
+                                with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                                    apply_xray_config_transaction(
+                                        original_config, config_path=str(xray_path),
+                                        binary='/usr/local/bin/xray',
+                                        restart=not unit_suspended('xray'))
+                            finally:
+                                with data_lock:
+                                    if old_state is not None:
+                                        data['reality_config'] = old_state
+                                    else:
+                                        data.pop('reality_config', None)
+                            raise
                         # 停用后重建连接页与订阅缓存，避免订阅中残留已关闭的 Reality 节点。
                         regenerate_page()
                         new_active = False
