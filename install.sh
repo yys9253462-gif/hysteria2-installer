@@ -1763,7 +1763,11 @@ setup_cert_via_dns_api() {
     # Global API Key 要走 CF_Key + CF_Email，旧实现只能塞进 CF_Token，被当成 Bearer 认证失败。
     if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
         provider="Cloudflare"; prov_env="HY2_CF_TOKEN"
-    elif [[ -n "${HY2_CF_KEY:-}" && -n "${HY2_CF_EMAIL:-}" ]]; then
+    elif [[ -n "${HY2_CF_KEY:-}" ]]; then
+        if [[ -z "${HY2_CF_EMAIL:-}" ]]; then
+            log_err "Cloudflare Global API Key 需要 HY2_CF_KEY 与 HY2_CF_EMAIL 两项，缺 HY2_CF_EMAIL。"
+            return 1
+        fi
         provider="Cloudflare"; prov_env="HY2_CF_KEY + HY2_CF_EMAIL"
     elif [[ -n "${HY2_ALICLOUD_KEY:-}" ]]; then
         # 缺 Secret 时直接说清楚，旧实现照样去签发，最后只报一句看不出原因的认证失败。
@@ -1787,7 +1791,7 @@ setup_cert_via_dns_api() {
     # 真正生效的是 account.conf 里的 AUTO_UPGRADE='0'（安装/检查时已写入）。
     # 这里保留导出只是为了兼容旧脚本行为，不要指望它阻止升级。
     export SKIP_ACME_SH_UPGRADE=1
-    local ok=0
+    local rc=0
     case "$provider" in
         # acme.sh 的 DNS 插件从环境变量读凭据（2026-11-04 修）：旧实现传 --dns_cf_token
         # 之类的参数，acme.sh 不认识，直接报 Unknown parameter 退出，DNS API 签发从未成功过。
@@ -1795,24 +1799,25 @@ setup_cert_via_dns_api() {
         Cloudflare)
             if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
                 CF_Token="$HY2_CF_TOKEN" CF_Email="${HY2_CF_EMAIL:-}" \
-                    "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+                    "$acct" --issue --dns dns_cf -d "$domain" || rc=$?
             else
                 CF_Key="$HY2_CF_KEY" CF_Email="$HY2_CF_EMAIL" \
-                    "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+                    "$acct" --issue --dns dns_cf -d "$domain" || rc=$?
             fi
             ;;
         阿里云)
             Ali_Key="$HY2_ALICLOUD_KEY" Ali_Secret="$HY2_ALICLOUD_SECRET" \
-                "$acct" --issue --dns dns_ali -d "$domain" || ok=1
+                "$acct" --issue --dns dns_ali -d "$domain" || rc=$?
             ;;
         DuckDNS)
             DuckDNS_Token="$HY2_DP_TOKEN" \
-                "$acct" --issue --dns dns_duckdns -d "$domain" || ok=1
+                "$acct" --issue --dns dns_duckdns -d "$domain" || rc=$?
             ;;
     esac
 
-    if [[ $ok -ne 0 ]]; then
-        log_err "${provider} DNS API 签发失败（凭据来源：${prov_env}）。"
+    # 与借 Nginx 签发保持一致：acme.sh 返回 2 表示证书仍在有效期内本次跳过，同样算成功。
+    if [[ $rc -ne 0 && $rc -ne 2 ]]; then
+        log_err "${provider} DNS API 签发失败（凭据来源：${prov_env}，退出码：${rc}）。"
         log_err "常见原因：token 权限不足 / 域名未托管在该 DNS 服务商下。"
         return 1
     fi
@@ -5186,7 +5191,14 @@ awg_ensure_ctl() {
         fi
     fi
 
-    if ! install -m 0755 "$src" "$AWG_CTL_BIN"; then
+    local staged=""
+    staged="$(umask 077; mktemp "${AWG_CTL_BIN}.new.XXXXXX")" || {
+        [[ -n "$tmp" ]] && rm -f "$tmp"
+        log_err "安装 ${AWG_CTL_BIN} 失败"
+        return 1
+    }
+    if ! install -m 0755 "$src" "$staged" || ! mv -f "$staged" "$AWG_CTL_BIN"; then
+        rm -f "$staged"
         if [[ -n "$tmp" ]]; then
             rm -f "$tmp"
         fi
