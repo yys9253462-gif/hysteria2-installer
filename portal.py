@@ -1993,7 +1993,7 @@ def _unit_failure_hint(unit, lines=6):
     return ('：' + ' | '.join(line[:140] for line in tail[-3:])) if tail else ''
 
 
-def _write_private_bytes(target, payload, mode=0o600):
+def _write_private_bytes(target, payload, mode=0o600, call_path_chmod=False):
     """以指定权限直接创建并落盘敏感配置，避免默认 umask 先落明文再改权。"""
     target = Path(target)
     mode = (mode & 0o777) or 0o600
@@ -2009,6 +2009,8 @@ def _write_private_bytes(target, payload, mode=0o600):
     finally:
         if fd is not None:
             os.close(fd)
+    if call_path_chmod:
+        target.chmod(mode)
     os.chmod(str(target), mode)
 
 
@@ -2024,9 +2026,26 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                 text=True, timeout=5).stdout.strip() == 'active'
     was_enabled = subprocess.run(['systemctl', 'is-enabled', 'xray'], capture_output=True,
                                  text=True, timeout=5).stdout.strip() == 'enabled'
+
+    def _write_priv(target, payload, file_mode):
+        file_mode = (file_mode & 0o777) or 0o600
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, file_mode)
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                fd = None
+                handle.write(payload)
+                handle.flush()
+                if hasattr(os, 'fchmod'):
+                    os.fchmod(handle.fileno(), file_mode)
+                os.fsync(handle.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+        target.chmod(file_mode)
+
     replaced = False
     try:
-        _write_private_bytes(candidate, json.dumps(config, indent=2).encode('utf-8'), mode)
+        _write_priv(candidate, json.dumps(config, indent=2).encode('utf-8'), mode)
         test = subprocess.run([binary, 'run', '-test', '-c', str(candidate)],
                               capture_output=True, text=True, timeout=10)
         if test.returncode != 0:
@@ -2064,7 +2083,7 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
             if original is None:
                 path.unlink(missing_ok=True)
             else:
-                _write_private_bytes(candidate, original, mode)
+                _write_priv(candidate, original, mode)
                 os.replace(candidate, path)
             try:
                 if was_enabled:
@@ -6804,7 +6823,7 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
     binary=reality_cfg.get('binary','/usr/local/bin/xray')
     replaced=False
     try:
-        _write_private_bytes(candidate, json.dumps(xcfg,indent=2).encode('utf-8'), orig_mode)
+        _write_private_bytes(candidate, json.dumps(xcfg,indent=2).encode('utf-8'), orig_mode, call_path_chmod=True)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
         if xj.read_bytes()!=original:
             raise RuntimeError('Xray configuration changed concurrently; retry')
@@ -6824,7 +6843,7 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     except Exception:
         if replaced:
-            _write_private_bytes(candidate, original, orig_mode)
+            _write_private_bytes(candidate, original, orig_mode, call_path_chmod=True)
             candidate.replace(xj)
             try:
                 subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
