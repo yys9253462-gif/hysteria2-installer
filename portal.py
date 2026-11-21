@@ -13703,11 +13703,13 @@ verify_sha() {
     [[ "$(sha256sum "$1" | awk '{print $1}')" == "$2" ]]
 }
 tar_member() {
-    local m n=0 hit=""
+    local listing m n=0 hit=""
+    listing=$(tar -tzf - <"$2" 2>/dev/null) || return 1
     while IFS= read -r m; do
+        m="${m%$'\r'}"
         case "$m" in /*|..|../*|*/../*|*/..) return 2 ;; esac
         if [[ "${m#./}" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
-    done < <(tar -tzf "$2" 2>/dev/null)
+    done <<<"$listing"
     [[ $n -eq 1 ]] || return 3
     echo "$hit"
 }
@@ -13820,7 +13822,11 @@ if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ]; then
 fi
 
 claim_warp_assets
-cat > "$WP_CFG" <<WPEOF
+(
+    umask 077
+    WP_TMP=$(mktemp "${WG_DIR}/.wp.conf.XXXXXX")
+    trap 'rm -f "${WP_TMP:-}"' EXIT
+    cat > "$WP_TMP" <<WPEOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
 Address = ${WG_ADDR}
@@ -13836,7 +13842,10 @@ PersistentKeepalive = 25
 [Socks5]
 BindAddress = ${WARP_SOCKS_ADDR}
 WPEOF
-chmod 600 "$WP_CFG"
+    chmod 600 "$WP_TMP"
+    mv -f "$WP_TMP" "$WP_CFG"
+    trap - EXIT
+)
 
 cat > /etc/systemd/system/wireproxy.service <<'WPSVCEOF'
 [Unit]
@@ -13856,6 +13865,7 @@ WantedBy=multi-user.target
 WPSVCEOF
 systemctl daemon-reload
 systemctl enable wireproxy >/dev/null 2>&1 || true
+systemctl reset-failed wireproxy >/dev/null 2>&1 || true
 systemctl restart wireproxy >/dev/null 2>&1 || true
 sleep 3
 
@@ -13881,6 +13891,7 @@ set -u
 probe() { curl --proxy socks5h://127.0.0.1:19898 --silent --fail --max-time 6 "$1" >/dev/null 2>&1; }
 if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
+    systemctl reset-failed wireproxy >/dev/null 2>&1 || true
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
 WDE

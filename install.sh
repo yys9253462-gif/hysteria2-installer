@@ -2779,24 +2779,30 @@ EOF
     # 写入 toggle_warp.sh 控制脚本，供 portal.py 或命令行无感知调用
     cat > "$HY2_DIR/toggle_warp.sh" <<'EOTW'
 #!/usr/bin/env bash
-ACTION="$1" # 1: enable, 0: disable
-CONFIG="/etc/hysteria/config.yaml"
+set -euo pipefail
+umask 077
+ACTION="${1:-0}" # 1: enable, 0: disable
+CONFIG="${HY2_CONFIG_PATH:-/etc/hysteria/config.yaml}"
 [[ -f "$CONFIG" ]] || exit 1
 
 # 仅提取顶格 acl 块本身（不含排在后面的 obfs 等段落），供收尾判断是否需要重启
 extract_acl() { awk 'BEGIN{f=0} /^acl:/{f=1;print;next} f && /^[^ \t#]/{f=0} f' "$1"; }
 BEFORE_ACL=$(extract_acl "$CONFIG")
 
-# 清理旧 acl 段：只删 acl 块本身，obfs 等排在其后的顶格段落必须保留
-awk 'BEGIN{d=0} /^acl:/{d=1;next} d && /^[^ \t#]/{d=0} !d' "$CONFIG" > "$CONFIG.tmp" && cat "$CONFIG.tmp" > "$CONFIG" && rm -f "$CONFIG.tmp"
+TMP_CFG=$(mktemp "${CONFIG}.XXXXXX")
+trap 'rm -f "${TMP_CFG:-}"' EXIT
+
+# 在独立 0600 临时文件中先剥除旧 acl 段，再整体拼装新 acl 后原子替换
+awk 'BEGIN{d=0} /^acl:/{d=1;next} d && /^[^ \t#]/{d=0} !d' "$CONFIG" > "$TMP_CFG"
 
 if [[ "$ACTION" == "1" ]]; then
     # 统一走 wgcf + wireproxy 出口（不再依赖官方 warp-cli）：探活失败则拉起 wireproxy
     if ! curl --proxy "socks5h://127.0.0.1:19898" --silent --fail --max-time 6 https://api4.ipify.org >/dev/null 2>&1; then
+        systemctl reset-failed wireproxy >/dev/null 2>&1 || true
         systemctl restart wireproxy >/dev/null 2>&1 || true
         sleep 2
     fi
-    cat >> "$CONFIG" <<'EOF'
+    cat >> "$TMP_CFG" <<'EOF'
 acl:
   inline:
     - reject(127.0.0.0/8)
@@ -2826,9 +2832,9 @@ acl:
 EOF
 fi
 
-if ! grep -q '^acl:' "$CONFIG"; then
+if ! grep -q '^acl:' "$TMP_CFG"; then
     # 关闭 WARP 时也保留内网拦截
-    cat >> "$CONFIG" <<'EOF'
+    cat >> "$TMP_CFG" <<'EOF'
 acl:
   inline:
     - reject(127.0.0.0/8)
@@ -2844,6 +2850,10 @@ acl:
     - direct_ipv4(all)
 EOF
 fi
+
+chmod 600 "$TMP_CFG"
+mv -f "$TMP_CFG" "$CONFIG"
+trap - EXIT
 
 # acl 段无实际变化时不重启，避免无谓掐断所有在线用户
 if [[ "${BEFORE_ACL:-}" != "$(extract_acl "$CONFIG")" ]]; then
@@ -4555,18 +4565,20 @@ install_warp_local_proxy() {
 
     # 4. 生成 wireproxy 配置 (只暴露 socks5 在 127.0.0.1)
     WP_CFG="/etc/wireguard/wp.conf"
-    WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF")
-    WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF" | tr -d '
-')
-    WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF" | tr -d '
-')
+    WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF" | tr -d '\r')
+    WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+    WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
     # 用 wgcf 下发的地址（含 IPv6），AllowedIPs 同时放行 ::/0（2026-11-03 修）：
     # 旧配置只写 IPv4，走 WARP 的域名一旦解析到 IPv6 就连不上（SE 上实测）。
     WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
     [[ -n "$WG_ADDR" ]] || WG_ADDR="172.16.0.2/32"
     WG_ALLOWED="0.0.0.0/0"
     [[ "$WG_ADDR" == *:* ]] && WG_ALLOWED="0.0.0.0/0, ::/0"
-    cat > "$WP_CFG" <<EOF
+    (
+        umask 077
+        WP_TMP=$(mktemp "${WGCF_DIR}/.wp.conf.XXXXXX")
+        trap 'rm -f "${WP_TMP:-}"' EXIT
+        cat > "$WP_TMP" <<EOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
 Address = ${WG_ADDR}
@@ -4582,7 +4594,10 @@ PersistentKeepalive = 25
 [Socks5]
 BindAddress = 127.0.0.1:${WARP_SOCKS_PORT}
 EOF
-    chmod 600 "$WP_CFG"
+        chmod 600 "$WP_TMP"
+        mv -f "$WP_TMP" "$WP_CFG"
+        trap - EXIT
+    )
 
     # 5. wireproxy systemd 守护
     cat > /etc/systemd/system/wireproxy.service <<EOF
@@ -4602,6 +4617,7 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
+    systemctl reset-failed wireproxy >/dev/null 2>&1 || true
     systemctl enable --now wireproxy >/dev/null 2>&1 || true
     sleep 3
 
@@ -4623,6 +4639,7 @@ set -u
 probe() { curl --proxy socks5h://${WARP_SOCKS_ADDR} --silent --fail --max-time 6 "\$1" >/dev/null 2>&1; }
 if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
+    systemctl reset-failed wireproxy >/dev/null 2>&1 || true
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
 EOWD
