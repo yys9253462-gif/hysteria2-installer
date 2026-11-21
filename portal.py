@@ -1447,10 +1447,14 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20,
     # 下次启动 / 人工排查能直接看到。
     # 新版本起来了就清掉上一次留下的失败标记（2026-11-04 修）：旧脚本只写不删，
     # 一次双重失败之后标记永远留着，谁读它都会把早已过去的故障当成当前状态。
-    return ('sleep 1; systemctl restart hysteria-portal; '
+    # 升级重启与自动回滚重启前都先清理失败计数：若新版本反复崩溃触发 StartLimitBurst，
+    # 不清理计数会导致自动回滚的那次 restart 同样被 systemd 拒绝，节点鉴权后端彻底离线。
+    return ('sleep 1; systemctl reset-failed hysteria-portal >/dev/null 2>&1 || true; '
+            'systemctl restart hysteria-portal; '
             'for i in $(seq 1 %d); do sleep 1; python3 -c %s && { rm -f %s; exit 0; }; done; '
             'logger -t hysteria-portal "面板更新后未能启动，已自动回滚到旧版本"; '
-            '%s %s systemctl restart hysteria-portal; '
+            '%s %s systemctl reset-failed hysteria-portal >/dev/null 2>&1 || true; '
+            'systemctl restart hysteria-portal; '
             'for i in $(seq 1 10); do sleep 1; python3 -c %s && '
             '{ logger -t hysteria-portal "回滚后已恢复"; exit 0; }; done; '
             'logger -t hysteria-portal "回滚后仍未启动，需要人工介入"; '
