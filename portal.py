@@ -13227,6 +13227,8 @@ if __name__ == '__main__':
                 action = form.get('action', ['toggle'])[0]
                 if action not in ('toggle', 'enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 VMess 操作类型，请刷新页面后重试'})
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(120)
                 xray_path = Path('/etc/hysteria/xray.json')
                 try:
                     config = (json.loads(xray_path.read_text(encoding='utf-8'))
@@ -13700,6 +13702,8 @@ if __name__ == '__main__':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 AnyTLS 操作类型，请刷新页面后重试'})
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(120)
                 if action == 'disable' and not enabled:
                     # anytls.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
                     # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉，
@@ -13721,16 +13725,19 @@ if __name__ == '__main__':
                 if not enabled:
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'AnyTLS 本来就没有启用'})
-                with anytls_apply_lock:
+                with core_operation_lock, core_operation_file_lock(), anytls_apply_lock:
                     cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
-                    stop_result = subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
-                                                  capture_output=True, timeout=30)
-                    # 命令失败或状态查询无结果时无法证明旧进程退出；保留配置，
+                    try:
+                        stop_result = subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
+                                                      capture_output=True, timeout=30)
+                    except (OSError, subprocess.SubprocessError):
+                        stop_result = None
+                    # 命令失败、超时或状态查询无结果时无法证明旧进程退出；保留配置并恢复原服务状态，
                     # 不能误报已关闭，否则撤销用户仍可能用内存中的旧名单连接。
                     state = _systemd_state(ANYTLS_SERVICE)
-                    if not _service_stop_confirmed(stop_result, state):
+                    if stop_result is None or not _service_stop_confirmed(stop_result, state):
                         if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
                             return self.reply_json(500, {'ok': False, 'error':
                                 'AnyTLS 停止失败且原服务状态未能恢复；配置已保留，请检查 systemctl status %s'
@@ -13751,7 +13758,7 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    with anytls_apply_lock:
+                    with core_operation_lock, core_operation_file_lock(), anytls_apply_lock:
                         with data_lock:
                             data['anytls_config'] = old_acfg
                         rollback_failed = False
@@ -13928,6 +13935,8 @@ if __name__ == '__main__':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 TUIC 操作类型，请刷新页面后重试'})
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(120)
                 if action == 'disable' and not enabled:
                     # tuic.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
                     # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉。
@@ -13948,16 +13957,19 @@ if __name__ == '__main__':
                 if not enabled:
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'TUIC 本来就没有启用'})
-                with tuic_apply_lock:
+                with core_operation_lock, core_operation_file_lock(), tuic_apply_lock:
                     cfg_path = portal_path.parent / TUIC_CONFIG_NAME
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
-                    stop_result = subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
-                                                  capture_output=True, timeout=30)
-                    # 只有明确确认服务停止后才能删配置与汇报成功；命令失败或
-                    # systemd 状态无法确认时保留配置，避免旧进程继续接受用户连接。
+                    try:
+                        stop_result = subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
+                                                      capture_output=True, timeout=30)
+                    except (OSError, subprocess.SubprocessError):
+                        stop_result = None
+                    # 只有明确确认服务停止后才能删配置与汇报成功；命令失败、超时或
+                    # systemd 状态无法确认时保留配置并恢复原服务状态，避免旧进程继续接受用户连接。
                     state = _systemd_state(TUIC_SERVICE)
-                    if not _service_stop_confirmed(stop_result, state):
+                    if stop_result is None or not _service_stop_confirmed(stop_result, state):
                         if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
                             return self.reply_json(500, {'ok': False, 'error':
                                 'TUIC 停止失败且原服务状态未能恢复；配置已保留，请检查 systemctl status %s'
@@ -13978,7 +13990,7 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    with tuic_apply_lock:
+                    with core_operation_lock, core_operation_file_lock(), tuic_apply_lock:
                         with data_lock:
                             data['tuic_config'] = old_tcfg
                         cfg_path = portal_path.parent / TUIC_CONFIG_NAME
@@ -14056,6 +14068,8 @@ if __name__ == '__main__':
                 action = form.get('action', ['toggle'])[0]
                 if action not in ('toggle', 'enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 VLESS Encryption 操作类型，请刷新页面后重试'})
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(120)
                 xray_path = Path('/etc/hysteria/xray.json')
                 try:
                     config = (json.loads(xray_path.read_text(encoding='utf-8'))
