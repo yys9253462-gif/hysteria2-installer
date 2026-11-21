@@ -4686,11 +4686,16 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     try:
         cert_file = Path(cert_file)
         digest = hashlib.sha256(cert_file.read_bytes()).hexdigest()
-        state = json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else {}
-        if not isinstance(state, dict):
-            state = {}
-    except (OSError, ValueError):
+    except OSError:
         return False
+    state = {}
+    if state_path.exists():
+        try:
+            loaded = json.loads(state_path.read_text(encoding='utf-8'))
+            if isinstance(loaded, dict):
+                state = loaded
+        except (OSError, ValueError):
+            state = {}
     previous = state.get('loaded_cert_sha256')
     # If this is the first observation, an already-running listener may have loaded
     # the previous certificate before the fingerprint state file existed. Reload it
@@ -4741,7 +4746,12 @@ def record_cert_heal(root, state, before, after):
                 loaded = json.loads(state_path.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
                     previous = loaded
-                prev_count = int(previous.get('heal_count') or 0)
+                raw_count = previous.get('heal_count')
+                if isinstance(raw_count, bool):
+                    prev_count = 0
+                else:
+                    parsed_count = int(raw_count or 0)
+                    prev_count = parsed_count if parsed_count >= 0 else 0
             except Exception:
                 prev_count = 0
         # before/after 是 meta 快照；被改成数字/列表时 `.get` 抛 AttributeError，
@@ -8302,6 +8312,13 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
         return False
 
     before = dict(m)
+    configured = _config_tls_cert_path(config_path)
+    configured_missing = False
+    if configured:
+        configured_path = Path(configured)
+        if not configured_path.is_absolute():
+            configured_path = Path(config_path).parent / configured_path
+        configured_missing = not configured_path.exists()
     live_cert, _, _, _ = _resolve_live_cert(root, config_path)
     changed = sync_cert_trust(m, root, meta_path, config_path=config_path)
     # sync_cert_trust 只在漂移时写盘；pin 的修正也一并在此处理（保持与 refresh 一致）。
@@ -8310,9 +8327,9 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     if m.get('pin_sha256') != pin_before:
         changed = True
     # 每轮都交给 sync_cert_runtime 比对（2026-11-04 修）：它拿磁盘证书与上次重载时记下的
-    # 指纹比，相同就直接返回，不会每 30 分钟重启一次。旧的门槛只看「本轮前后」两次快照，
-    # 而本轮里根本不写证书：Caddy / 手工换证后服务一直握着旧证书，到期时 TLS 全挂。
-    runtime_reloaded = sync_cert_runtime(root, live_cert)
+    # 指纹比，相同就直接返回，不会每 30 分钟重启一次。若 config.yaml 显式指向的证书缺失，
+    # 不得回退拿旧自签证书触发无意义重载或污染运行态指纹。
+    runtime_reloaded = False if configured_missing else sync_cert_runtime(root, live_cert)
 
     if changed or runtime_reloaded:
         # 留痕：让「刚刚自动对齐过一次」在门户卡片上可见，而不是悄无声息。
@@ -8354,8 +8371,10 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
         config = json.loads(path.read_text(encoding='utf-8'))
         for tag in MANAGED_INBOUND_TAGS:
             index, inbound = managed_inbound_index(config, tag)
-            if index >= 0:
-                current[tag] = inbound.get('settings', {}).get('clients') or []
+            if index >= 0 and isinstance(inbound, dict):
+                settings = inbound.get('settings')
+                clients = settings.get('clients') if isinstance(settings, dict) else []
+                current[tag] = clients if isinstance(clients, list) else []
     except Exception:
         current = {}
     if not current or suspended('xray'):
@@ -8364,7 +8383,10 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
     if not mismatch and systemd_state('xray') == 'active':
         return ''
     # 先清失败计数：连续崩溃撞上启动频率上限时 restart 会被直接拒绝。
-    run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+    try:
+        run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log_ignored('recover_xray.reset_failed', exc)
     notes = []
     if mismatch:
         # current != wanted 时 apply_access 自己就会改写，运行中的 Xray 会被它重启，不需要 force_ids。
@@ -8374,7 +8396,11 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
         notes.append('启动时按 portal.json 重写了 xray clients')
         if systemd_state('xray') == 'active':
             return notes[0]
-    run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
+    try:
+        run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        notes.append('启动时恢复 xray 服务失败（%s）' % type(exc).__name__)
+        return '；'.join(notes)
     # Type=simple：restart 一 fork 就返回，配置坏 / 端口被占时 Xray 随后才退出（同安装 Xray）。
     sleep(2)
     if systemd_state('xray') == 'active':
