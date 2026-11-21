@@ -8157,6 +8157,8 @@ def repair_missing_api_key(portal_path, data):
     try:
         if old_access is not None:
             access = json.loads(old_access.decode('utf-8'))
+            if not isinstance(access, dict):
+                raise ValueError('portal-access.json 顶层不是 JSON 对象')
             access['api_key'] = new_key
             atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
         data['api_key'] = new_key
@@ -8928,7 +8930,6 @@ def serve(path):
         if not probed:
             return True      # 探测不了就不阻断，交给服务状态判断
         return all(port in listening for port in ports)
-        return True
 
     def reload_gost():
         """Return real application success, including expected listener readiness."""
@@ -8955,6 +8956,7 @@ def serve(path):
                             if gost_status() and gost_ports_ready():
                                 return True
                             time.sleep(0.2)
+                subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=5)
                 r = subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=12)
                 if r.returncode != 0:
                     return False
