@@ -72,37 +72,46 @@ except ImportError as _e:      # pragma: no cover - 只在部署缺文件时触�
 # 用 unredirected header，跳转到别的主机时不会被转发。
 GITHUB_TOKEN_FILE = Path('/etc/hysteria/github-token')
 _github_token_cache = {'mtime': None, 'token': ''}
+_github_token_lock = threading.Lock()
 
 
 def github_token():
-    """读取 token（按 mtime 缓存）；文件不存在、为空或格式不对时返回空串。"""
+    """读取 token（按元信息快照缓存，含权限位与 ctime）；文件不存在、权限过宽或格式不对时返回空串。"""
     try:
-        mtime = GITHUB_TOKEN_FILE.stat().st_mtime
+        st = GITHUB_TOKEN_FILE.stat()
     except OSError:
-        _github_token_cache.update(mtime=None, token='')
+        with _github_token_lock:
+            _github_token_cache.update(mtime=None, token='')
         return ''
-    if mtime != _github_token_cache['mtime']:
-        # 权限必须足够严：token 等同于账号凭据，0644 时同机其它用户可以读走。
-        # 之前只校验字符集，权限过宽的文件照常被使用（2026-10-29 修）。
-        try:
-            mode = GITHUB_TOKEN_FILE.stat().st_mode & 0o777
-        except OSError:
-            mode = 0
-        # 只在 POSIX 上检查：Windows 没有对应的权限位语义，
-        # stat() 恒返回 0666，照此判断会让所有 Windows 环境都无法使用 token。
-        if os.name == 'posix' and mode and mode & 0o077:
-            print('[portal] %s 权限为 %o，应改为 600；本次忽略该 token'
-                  % (GITHUB_TOKEN_FILE, mode), file=sys.stderr)
-            _github_token_cache.update(mtime=mtime, token='')
-            return ''
-        try:
-            value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
-        except OSError:
-            value = ''
-        # 只接受 token 字符集，防止把换行等注入到请求头里。
-        _github_token_cache.update(mtime=mtime,
-                                   token=value if re.fullmatch(r'[A-Za-z0-9_]{20,255}', value) else '')
-    return _github_token_cache['token']
+    # 将权限位与 ctime 纳入缓存键：chmod 644 不改 mtime，仅按 mtime 缓存会导致过宽权限令牌继续生效。
+    stamp = (
+        getattr(st, 'st_mtime_ns', st.st_mtime),
+        getattr(st, 'st_ctime_ns', getattr(st, 'st_ctime', 0)),
+        getattr(st, 'st_mode', 0),
+        getattr(st, 'st_ino', 0),
+        getattr(st, 'st_size', 0),
+    )
+    with _github_token_lock:
+        if stamp == _github_token_cache.get('mtime'):
+            return _github_token_cache.get('token', '')
+    mode = getattr(st, 'st_mode', 0) & 0o777
+    # 只在 POSIX 上检查：Windows 没有对应的权限位语义，
+    # stat() 恒返回 0666，照此判断会让所有 Windows 环境都无法使用 token。
+    if os.name == 'posix' and mode and mode & 0o077:
+        print('[portal] %s 权限为 %o，应改为 600；本次忽略该 token'
+              % (GITHUB_TOKEN_FILE, mode), file=sys.stderr)
+        with _github_token_lock:
+            _github_token_cache.update(mtime=stamp, token='')
+        return ''
+    try:
+        value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
+    except OSError:
+        value = ''
+    # 只接受 token 字符集，防止把换行等注入到请求头里。
+    valid = value if re.fullmatch(r'[A-Za-z0-9_]{20,255}', value) else ''
+    with _github_token_lock:
+        _github_token_cache.update(mtime=stamp, token=valid)
+        return _github_token_cache['token']
 
 
 class GitHubTokenHandler(urllib.request.BaseHandler):
@@ -9713,21 +9722,31 @@ if __name__ == '__main__':
         # 不用 SimpleCookie（2026-11-04 修）：同一 Cookie 头里只要有一个不合 RFC 的值
         # （同域其它应用 / 统计脚本写的带空格或裸 JSON 的 cookie），load() 会把**全部**
         # cookie 丢掉且不抛异常，管理员登录后刷新就回到登录页，日志里什么也没有。
-        value = None
+        # 收集所有同名 hy2_session 候选值逐个验签，防止排在后面的旧路径失效 Cookie 覆盖有效会话。
+        candidates = []
         for part in str(cookie_header).split(';'):
             name, sep, val = part.strip().partition('=')
             if sep and name == 'hy2_session':
-                value = val.strip().strip('"')
-        if value is None:
+                candidates.append(val.strip().strip('"'))
+        if not candidates:
             return False
-        parts = value.split('.')
-        if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
+        with data_lock:
+            expected_token = data.get('token')
+            epoch = session_epoch()
+        if not isinstance(expected_token, str) or not expected_token or not expected_token.isascii():
             return False
-        t, issued_at, sig = parts
-        if not 0 <= time.time() - int(issued_at) <= SESSION_MAX_AGE:
-            return False
-        expected = _session_sig(t, issued_at, session_epoch())
-        return hmac.compare_digest(t, data['token']) and hmac.compare_digest(sig, expected)
+        now = time.time()
+        for value in candidates:
+            parts = value.split('.')
+            if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
+                continue
+            t, issued_at, sig = parts
+            if not 0 <= now - int(issued_at) <= SESSION_MAX_AGE:
+                continue
+            expected = _session_sig(t, issued_at, epoch)
+            if hmac.compare_digest(t, expected_token) and hmac.compare_digest(sig, expected):
+                return True
+        return False
 
     # SPEEDTEST_TARGETS 是 /api/v1/speedtest 的**唯一**靶点来源。
     #
