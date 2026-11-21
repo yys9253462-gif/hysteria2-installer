@@ -12352,6 +12352,9 @@ if __name__ == '__main__':
                     except ValueError:
                         return self.reply_json(500, {'ok': False, 'error':
                             'xray.json 不是合法 JSON，未做任何修改'})
+                    if cfg_now is not None and not isinstance(cfg_now, dict):
+                        return self.reply_json(500, {'ok': False, 'error':
+                            'xray.json 不是合法 JSON 对象，未做任何修改'})
                     reality_on = bool(cfg_now) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)
                     # 也接受明确的 enable / disable（2026-11-13 加，与 VMess 等协议一致）：调用方按自己看到的
                     # 状态下指令，状态已经符合时什么都不动。页面停留久了或在别处改过时，toggle 会把「想开」变成关掉。
@@ -12369,11 +12372,15 @@ if __name__ == '__main__':
                                 current = json.loads(xray_path.read_text(encoding='utf-8'))
                             except (OSError, ValueError):
                                 current = cfg_now
+                            if not isinstance(current, dict):
+                                current = cfg_now
                             remove_managed_inbound(current, REALITY_INBOUND_TAG)
                             apply_xray_config_transaction(
                                 current, config_path=str(xray_path),
                                 binary='/usr/local/bin/xray',
                                 restart=not unit_suspended('xray'))
+                        # 停用后重建连接页与订阅缓存，避免订阅中残留已关闭的 Reality 节点。
+                        regenerate_page()
                         new_active = False
                         if old_reality_port and not close_protocol_port(
                                 old_reality_port, 'tcp', 'reality_config'):
@@ -12402,7 +12409,7 @@ if __name__ == '__main__':
                                    if xray_path.exists() else None)
                     except ValueError:
                         cfg_now = None
-                    if not (cfg_now and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
+                    if not (isinstance(cfg_now, dict) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
                         return self.reply_json(409, {'ok': False, 'error':
                             'Reality 当前未开启；请先开启 Reality，再重置密钥'})
                     # force=True：只有「重置密钥」按钮才真的换密钥对。
