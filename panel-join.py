@@ -193,10 +193,14 @@ def main():
 
     raw_api_key = meta.get("api_key")
     api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in api_key):
+        print("portal.json 中的 api_key 包含非法控制字符，请检查配置文件。", file=sys.stderr)
+        return 2
     raw_portal_port = meta.get("port")
     if isinstance(raw_portal_port, int) and not isinstance(raw_portal_port, bool) and 1 <= raw_portal_port <= 65535:
         portal_port = raw_portal_port
-    elif isinstance(raw_portal_port, str) and raw_portal_port.strip().isdigit() and 1 <= int(raw_portal_port.strip()) <= 65535:
+    elif (isinstance(raw_portal_port, str) and raw_portal_port.strip().isascii()
+          and raw_portal_port.strip().isdigit() and 1 <= int(raw_portal_port.strip()) <= 65535):
         portal_port = int(raw_portal_port.strip())
     else:
         portal_port = None
@@ -216,13 +220,13 @@ def main():
     # 可能写成 `:8443` 或 `0.0.0.0:8443`：只取最后一个冒号后的数字（2026-11-04 修），
     # 旧实现拼出 https://a.com:0.0.0.0:8443 还返回 0。
     https_port = (masq.get("listenHTTPS") or "").rpartition(":")[2].strip()
-    if not https_port.isdigit():
+    if not (https_port.isascii() and https_port.isdigit()):
         # 锚定行首：被注释掉的 `# listenHTTPS: :1111` 不能当成对外端口（2026-11-12 修）。
-        m2 = re.search(r"^\s*listenHTTPS:\s*\S*?:?(\d+)[\"']?\s*(?:#.*)?$", cfg_text, re.M)
+        m2 = re.search(r"^\s*listenHTTPS:\s*\S*?:?([0-9]+)[\"']?\s*(?:#.*)?$", cfg_text, re.M)
         https_port = m2.group(1) if m2 else ""
     # 端口 0 / 越界拼出的地址永远连不上，旧实现照样输出并返回 0（2026-11-12 修）；
     # 同时去掉十进制前导零（如 08443 -> 8443），避免严格 URL 解析器拒绝。
-    if https_port.isdigit() and 1 <= int(https_port) <= 65535:
+    if https_port.isascii() and https_port.isdigit() and 1 <= int(https_port) <= 65535:
         https_port = str(int(https_port))
     else:
         https_port = ""
@@ -241,7 +245,7 @@ def main():
     # `listen` 也可能带主机（`0.0.0.0:443` / `[::]:443`）：旧实现只去掉开头的冒号，
     # listen_port 变成 null、建议节点名成了 `a.com-0.0.0.0:443`（2026-11-12 修）。
     listen = (cfg.get("listen", {}).get("__value__") or "").rpartition(":")[2].strip()
-    if listen.isdigit() and 1 <= int(listen) <= 65535:
+    if listen.isascii() and listen.isdigit() and 1 <= int(listen) <= 65535:
         listen = str(int(listen))
     else:
         listen = ""
@@ -285,8 +289,8 @@ def main():
         if _panel_port is not None and not (1 <= _panel_port <= 65535):
             print("--panel 端口不合法（必须在 1-65535 之间）", file=sys.stderr)
             return 2
-        if _p.scheme != "https" or not _p.hostname or _p.query or _p.fragment:
-            print("--panel 必须是 https:// 开头的面板地址（不能包含 ? 或 #）", file=sys.stderr)
+        if _p.scheme != "https" or not _p.hostname or _p.username is not None or _p.password is not None or _p.query or _p.fragment:
+            print("--panel 必须是 https:// 开头的面板地址（不能包含凭据、? 或 #）", file=sys.stderr)
             return 2
         panel = raw_panel.rstrip("/")
 

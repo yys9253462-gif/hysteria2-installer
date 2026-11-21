@@ -995,6 +995,7 @@ if (btnInstallWarp) {
     if (!confirmed) return;
     btnInstallWarp.disabled = true;
     const origText = btnInstallWarp.textContent;
+    let installedOk = false;
     btnInstallWarp.textContent = '⏳ 正在安装 WARP (耗时约 30 秒)...';
     try {
       const res = await fetch(location.pathname + 'install-warp', {
@@ -1006,6 +1007,7 @@ if (btnInstallWarp) {
       // {"ok": false, "error": ...} 一串；会话过期或反代回 502 时是整页 HTML。
       const json = await res.json();
       if (res.ok && json.ok) {
+        installedOk = true;
         showToast(json.message || 'Cloudflare WARP 安装成功！服务已自动就绪。', 'success');
         await checkWarpStatus();
       } else {
@@ -1015,7 +1017,7 @@ if (btnInstallWarp) {
       showToast('安装请求异常: ' + e.message, 'error');
     } finally {
       btnInstallWarp.disabled = false;
-      btnInstallWarp.textContent = origText;
+      if (!installedOk) btnInstallWarp.textContent = origText;
     }
   });
 }
@@ -3050,7 +3052,8 @@ async function doUpgrade(target) {
         await new Promise(resolve => setTimeout(resolve, 3000));
         const back = await waitPortalBack();
         if (updateStatusMsg) updateStatusMsg.textContent = back ? '面板已恢复，正在刷新...' : '面板长时间未恢复，请稍后手动刷新页面';
-        if (back) location.reload();
+        if (back) { location.reload(); return; }
+        if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
         return;
       }
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
@@ -3290,6 +3293,7 @@ if (btnInstallGost) {
     if (!confirmed) return;
     btnInstallGost.disabled = true;
     const origText = btnInstallGost.textContent;
+    let installedOk = false;
     btnInstallGost.textContent = '⏳ 正在安装 GOST...';
     try {
       const res = await fetch(location.pathname + 'install-gost', {
@@ -3298,9 +3302,10 @@ if (btnInstallGost) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
       const json = await res.json();
-      if (json.ok) {
+      if (res.ok && json.ok) {
+        installedOk = true;
         alert(json.message || 'GOST 安装成功！服务已就绪。');
-        loadProxyServices();
+        await loadProxyServices();
       } else {
         alert(json.error || '安装失败，请检查服务器网络或日志');
       }
@@ -3308,7 +3313,7 @@ if (btnInstallGost) {
       alert('安装请求异常: ' + e.message);
     } finally {
       btnInstallGost.disabled = false;
-      btnInstallGost.textContent = origText;
+      if (!installedOk) btnInstallGost.textContent = origText;
     }
   });
 }
@@ -3366,10 +3371,11 @@ async function loadProxyServices() {
     const proxyHostPart = (rawHost.includes(':') && !rawHost.startsWith('[')) ? ('[' + rawHost + ']') : rawHost;
     const typeLabel = { socks5: 'SOCKS5', http: 'HTTP', https: 'HTTPS' };
     proxyTbody.innerHTML = services.map(s => {
+      const safeTypeClass = Object.prototype.hasOwnProperty.call(typeLabel, s.type) ? s.type : '';
       const fullUrl = `${s.type || ''}://${encodeURIComponent(s.username || '')}:${encodeURIComponent(s.password || '')}@${proxyHostPart}:${s.port}`;
       return `
       <tr>
-        <td><span class="proxy-type ${obEsc(s.type)}">${obEsc(typeLabel[s.type] || s.type)}</span></td>
+        <td><span class="proxy-type ${safeTypeClass}">${obEsc(typeLabel[s.type] || s.type)}</span></td>
         <td><code style="font-size:12px;font-weight:700;color:var(--accent)">:${obEsc(s.port)}</code></td>
         <td><code style="font-size:12px">${obEsc(s.username)}</code></td>
         <td><code style="font-size:12px">${obEsc(s.password)}</code></td>

@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.57'
+PORTAL_VERSION = '2.58'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -963,7 +963,7 @@ def routing_state(data):
     return {'warp_enabled': bool(data.get('warp_enabled', False)),
             'warp_rules': copy.deepcopy(list(rules)),
             'custom_outbounds': copy.deepcopy(list(outbounds)),
-            'outbound_mode': mode if isinstance(mode, str) else 'rules'}
+            'outbound_mode': mode if mode in ('rules', 'global') else 'rules'}
 
 
 def render_egress_config(original, state):
@@ -1042,9 +1042,10 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
     except Exception as exc:
         return False, '读取 Hysteria 配置失败: %s' % exc
     with data_lock:
-        if data.get('outbound_mode') == 'global' and not data.get('custom_outbounds'):
-            data['outbound_mode'] = 'rules'
         state = routing_state(data)
+        if state['outbound_mode'] == 'global' and not clean_outbounds(state['custom_outbounds']):
+            data['outbound_mode'] = 'rules'
+            state['outbound_mode'] = 'rules'
     rendered = render_egress_config(original, state)
     try:
         before = _hy2_runtime_identity()
@@ -1102,17 +1103,49 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
     🔴 这是用户判断"到底生效没有"的唯一依据。旧面板只显示 WARP 装没装，
     显示不了实际出口，用户只能靠访问 ipify 自己猜。
     """
+    if isinstance(timeout, bool):
+        return ''
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError):
+        return ''
+    if not math.isfinite(seconds):
+        return ''
+    seconds = min(30.0, max(1.0, seconds))
+
     proxy_url = ''
     if kind == 'socks5' and addr:
-        proxy_url = 'socks5h://' + str(addr)
+        raw_addr = str(addr)
+        if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_addr):
+            return ''
+        lower = raw_addr.lower()
+        if '://' in raw_addr:
+            if lower.startswith('socks5h://'):
+                raw_addr = raw_addr[10:]
+            elif lower.startswith('socks5://'):
+                raw_addr = raw_addr[9:]
+            else:
+                return ''
+        if not raw_addr:
+            return ''
+        proxy_url = 'socks5h://' + raw_addr
     elif kind == 'http' and addr:
-        proxy_url = str(addr)
+        raw_addr = str(addr)
+        if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_addr):
+            return ''
+        lower = raw_addr.lower()
+        if '://' in raw_addr:
+            if not (lower.startswith('http://') or lower.startswith('https://')):
+                return ''
+            proxy_url = raw_addr
+        else:
+            proxy_url = 'http://' + raw_addr
     elif kind == 'warp':
         proxy_url = 'socks5h://127.0.0.1:19898'
+
     if proxy_url and any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in proxy_url):
         return ''
     try:
-        seconds = max(1, float(timeout))
         # urllib's ProxyHandler speaks HTTP CONNECT, not the SOCKS5 protocol.
         # Explicitly override no_proxy: '*' would silently bypass this proxy.
         args = ['curl', '--disable', '--silent', '--show-error', '--fail',
@@ -4653,11 +4686,16 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     try:
         cert_file = Path(cert_file)
         digest = hashlib.sha256(cert_file.read_bytes()).hexdigest()
-        state = json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else {}
-        if not isinstance(state, dict):
-            state = {}
-    except (OSError, ValueError):
+    except OSError:
         return False
+    state = {}
+    if state_path.exists():
+        try:
+            loaded = json.loads(state_path.read_text(encoding='utf-8'))
+            if isinstance(loaded, dict):
+                state = loaded
+        except (OSError, ValueError):
+            state = {}
     previous = state.get('loaded_cert_sha256')
     # If this is the first observation, an already-running listener may have loaded
     # the previous certificate before the fingerprint state file existed. Reload it
@@ -4708,7 +4746,12 @@ def record_cert_heal(root, state, before, after):
                 loaded = json.loads(state_path.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
                     previous = loaded
-                prev_count = int(previous.get('heal_count') or 0)
+                raw_count = previous.get('heal_count')
+                if isinstance(raw_count, bool):
+                    prev_count = 0
+                else:
+                    parsed_count = int(raw_count or 0)
+                    prev_count = parsed_count if parsed_count >= 0 else 0
             except Exception:
                 prev_count = 0
         # before/after 是 meta 快照；被改成数字/列表时 `.get` 抛 AttributeError，
@@ -6266,15 +6309,18 @@ class AuthLimiter:
         if len(self.global_requests) >= self.global_rate:
             return True
         requests, failures = self._bucket(key)
+        # 失败：同一来源 60 秒内失败满 per_ip_failures 次就直接拒，
+        # 不得继续消耗 global_requests 配额，避免已封禁攻击者拖死全节点合法用户。
+        self._prune(failures, now, self.failure_window)
+        if len(failures) >= self.per_ip_failures:
+            return True
         # 速率：同一来源 1 秒内超过 per_ip_rate 次直接拒
         self._prune(requests, now, 1)
         too_fast = len(requests) >= self.per_ip_rate
         if not too_fast:
             requests.append(now)
             self.global_requests.append(now)
-        # 失败：同一来源 60 秒内失败满 per_ip_failures 次就拒（哪怕速率不超）
-        self._prune(failures, now, self.failure_window)
-        return too_fast or len(failures) >= self.per_ip_failures
+        return too_fast
 
     def record_failure(self, key, now):
         self._bucket(key)[1].append(now)
@@ -6305,6 +6351,21 @@ def active_ip_deny(table, uid, now):
     return set(row)
 
 
+def _valid_loopback_stats_url(url):
+    if not isinstance(url, str):
+        return False
+    m = re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):([0-9]{1,5})', url)
+    if not m:
+        return False
+    port_text = m.group(1)
+    return not port_text.startswith('0') and 1 <= int(port_text) <= 65535
+
+
+def _valid_stats_secret(secret):
+    return (isinstance(secret, str) and bool(secret)
+            and not any(ord(ch) < 32 or ord(ch) == 127 for ch in secret))
+
+
 def kick_hy2_users(root, uids):
     """让 Hy2 核心断开这些用户的全部会话（被拦 IP 断开后重连会在 /auth 被拒，放行的设备会自动重连）。"""
     cfg_path = Path(root) / 'usage-meter-config.json'
@@ -6320,8 +6381,7 @@ def kick_hy2_users(root, uids):
     secret = hc.get('secret')
     url = hc.get('url')
     url = url.rstrip('/') if isinstance(url, str) else ''
-    if (not uids or not isinstance(secret, str) or not secret
-            or not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url)):
+    if not uids or not _valid_stats_secret(secret) or not _valid_loopback_stats_url(url):
         return False
     req = urllib.request.Request(url + '/kick', data=json.dumps(sorted(uids)).encode(),
                                  headers={'Authorization': secret, 'Content-Type': 'application/json'})
@@ -6853,14 +6913,27 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
         hc = hc if isinstance(hc, dict) else {}
         url = hc.get('url')
         url = url.rstrip('/') if isinstance(url, str) else ''
-        if not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url):
+        secret = hc.get('secret')
+        if not _valid_loopback_stats_url(url):
             raise RuntimeError('cannot confirm Hy2 revocation: loopback stats unavailable')
+        if not _valid_stats_secret(secret):
+            raise RuntimeError('cannot confirm Hy2 revocation: loopback stats secret unavailable')
         def request_stats(path, payload=None):
             req = urllib.request.Request(url + path, data=json.dumps(payload).encode() if payload is not None else None,
-                                         headers={'Authorization': hc['secret'], 'Content-Type':'application/json'})
+                                         headers={'Authorization': secret, 'Content-Type':'application/json'})
             with urllib.request.urlopen(req, timeout=4) as response:
-                raw=response.read()
+                raw=_read_bounded_bytes(response, 4 * 1024 * 1024)
             return json.loads(raw) if raw.strip() else {}
+        def _online_count(online_map, uid):
+            if not isinstance(online_map, dict):
+                raise RuntimeError('invalid Hy2 /online response; cannot confirm revocation')
+            val = online_map.get(uid, 0)
+            if isinstance(val, bool):
+                raise RuntimeError('invalid Hy2 /online count; cannot confirm revocation')
+            try:
+                return int(val)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError('invalid Hy2 /online count; cannot confirm revocation') from exc
         try:
             online=request_stats('/online')
         except OSError:
@@ -6873,12 +6946,14 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
                 online={}
             else:
                 raise
-        active=[uid for uid in blocked if int(online.get(uid, 0)) > 0]
+        if not isinstance(online, dict):
+            raise RuntimeError('invalid Hy2 /online response; cannot confirm revocation')
+        active=[uid for uid in blocked if _online_count(online, uid) > 0]
         if active:
             request_stats('/kick', active)
             time.sleep(0.2)
             online=request_stats('/online')
-            if any(int(online.get(uid, 0)) > 0 for uid in active):
+            if any(_online_count(online, uid) > 0 for uid in active):
                 # 标准核心只在下一次传输消费 kick；闲置/多实例需确保全部会话关闭。
                 # 走 _restart_hy2（2026-11-04 修）：直接 restart 不清失败计数，一阵连续收回就撞上
                 # StartLimitBurst，服务锁死、全员掉线。重启后统计接口要稍等才绑好端口：Type=simple
@@ -6894,7 +6969,7 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
                         time.sleep(0.2)
                 if online is None:
                     raise RuntimeError('Hy2 stats API not reachable after restart; cannot confirm revocation')
-                if any(int(online.get(uid, 0)) > 0 for uid in active):
+                if any(_online_count(online, uid) > 0 for uid in active):
                     raise RuntimeError('Hy2 sessions still present after revocation')
     xj=root/'xray.json'
     if not xj.exists():
@@ -8269,6 +8344,13 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
         return False
 
     before = dict(m)
+    configured = _config_tls_cert_path(config_path)
+    configured_missing = False
+    if configured:
+        configured_path = Path(configured)
+        if not configured_path.is_absolute():
+            configured_path = Path(config_path).parent / configured_path
+        configured_missing = not configured_path.exists()
     live_cert, _, _, _ = _resolve_live_cert(root, config_path)
     changed = sync_cert_trust(m, root, meta_path, config_path=config_path)
     # sync_cert_trust 只在漂移时写盘；pin 的修正也一并在此处理（保持与 refresh 一致）。
@@ -8277,9 +8359,9 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     if m.get('pin_sha256') != pin_before:
         changed = True
     # 每轮都交给 sync_cert_runtime 比对（2026-11-04 修）：它拿磁盘证书与上次重载时记下的
-    # 指纹比，相同就直接返回，不会每 30 分钟重启一次。旧的门槛只看「本轮前后」两次快照，
-    # 而本轮里根本不写证书：Caddy / 手工换证后服务一直握着旧证书，到期时 TLS 全挂。
-    runtime_reloaded = sync_cert_runtime(root, live_cert)
+    # 指纹比，相同就直接返回，不会每 30 分钟重启一次。若 config.yaml 显式指向的证书缺失，
+    # 不得回退拿旧自签证书触发无意义重载或污染运行态指纹。
+    runtime_reloaded = False if configured_missing else sync_cert_runtime(root, live_cert)
 
     if changed or runtime_reloaded:
         # 留痕：让「刚刚自动对齐过一次」在门户卡片上可见，而不是悄无声息。
@@ -8321,8 +8403,10 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
         config = json.loads(path.read_text(encoding='utf-8'))
         for tag in MANAGED_INBOUND_TAGS:
             index, inbound = managed_inbound_index(config, tag)
-            if index >= 0:
-                current[tag] = inbound.get('settings', {}).get('clients') or []
+            if index >= 0 and isinstance(inbound, dict):
+                settings = inbound.get('settings')
+                clients = settings.get('clients') if isinstance(settings, dict) else []
+                current[tag] = clients if isinstance(clients, list) else []
     except Exception:
         current = {}
     if not current or suspended('xray'):
@@ -8331,7 +8415,10 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
     if not mismatch and systemd_state('xray') == 'active':
         return ''
     # 先清失败计数：连续崩溃撞上启动频率上限时 restart 会被直接拒绝。
-    run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+    try:
+        run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log_ignored('recover_xray.reset_failed', exc)
     notes = []
     if mismatch:
         # current != wanted 时 apply_access 自己就会改写，运行中的 Xray 会被它重启，不需要 force_ids。
@@ -8341,7 +8428,11 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
         notes.append('启动时按 portal.json 重写了 xray clients')
         if systemd_state('xray') == 'active':
             return notes[0]
-    run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
+    try:
+        run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        notes.append('启动时恢复 xray 服务失败（%s）' % type(exc).__name__)
+        return '；'.join(notes)
     # Type=simple：restart 一 fork 就返回，配置坏 / 端口被占时 Xray 随后才退出（同安装 Xray）。
     sleep(2)
     if systemd_state('xray') == 'active':
@@ -8610,9 +8701,9 @@ def serve(path):
                 # 文件已经替换；不恢复待撤权标记，否则重启后的内存与磁盘不一致。
                 raise
             except OSError:
-                # 保留撤权重试记录并尽力重新落盘。调用方收到失败后也不能报告删除成功。
+                # 保留撤权重试记录并尽力重新落盘；合并锁外期间并发新增的待撤销用户，避免覆盖丢失。
                 with data_lock:
-                    data['_pending_revocations'] = sorted(previous_pending | pending)
+                    data['_pending_revocations'] = sorted(pending_revocations(data) | previous_pending | pending)
                 try:
                     save_data()
                 except OSError:
@@ -10233,8 +10324,9 @@ if __name__ == '__main__':
             # api_key 为空/非字符串时一律拒绝（2026-10-29 修）：
             # 旧实现拼出常量 "Bearer "，而 HTTP 头允许尾随空格，
             # 一个 `Authorization: Bearer ` 就能通过 —— 等于 API 全开。
-            key = data.get('api_key')
-            if not isinstance(key, str) or not key:
+            with data_lock:
+                key = data.get('api_key')
+            if not isinstance(key, str) or not key or not key.isascii():
                 return False
             expected = 'Bearer ' + key
             # ⚠️ 必须先挡非 ASCII（2026-10-09 修）：hmac.compare_digest 遇到
@@ -10253,9 +10345,12 @@ if __name__ == '__main__':
             if len(auth) > 1024:
                 return False
             if auth.startswith('Basic '):
-                digest = hashlib.sha256(auth.removeprefix('Basic ').encode()).hexdigest()
-                if hmac.compare_digest(digest, data['auth_hash']):
-                    return True
+                with data_lock:
+                    stored_hash = data.get('auth_hash')
+                if isinstance(stored_hash, str) and stored_hash and stored_hash.isascii():
+                    digest = hashlib.sha256(auth.removeprefix('Basic ').encode()).hexdigest()
+                    if hmac.compare_digest(digest, stored_hash):
+                        return True
             return verify_session(self.headers.get('Cookie', ''))
 
         def reply_json(self, code, payload):
@@ -11810,8 +11905,11 @@ if __name__ == '__main__':
                     # 用已清洗的工作副本（2026-11-03 修）：previous 是原始值，容器是
                     # null / 数字时 `for item in previous` 抛 TypeError，新增代理一律 500。
                     for item in working:
+                        raw_item_port = item.get('port')
+                        if isinstance(raw_item_port, bool):
+                            continue
                         try:
-                            existing.add(int(item['port']))
+                            existing.add(int(raw_item_port))
                         except (KeyError, TypeError, ValueError):
                             continue
                     # 自动选端口时必须避开本机已知的端口：
@@ -11820,7 +11918,8 @@ if __name__ == '__main__':
                     # 「保存成功但 gost 起不来」，然后回滚（2026-10-30 修）。
                     _meta_now = read_meta_file(meta_path)
                     try:
-                        _cfg_now = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                        _cfg_parsed = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                        _cfg_now = _cfg_parsed if isinstance(_cfg_parsed, dict) else None
                     except (OSError, ValueError):
                         _cfg_now = None
                     with data_lock:
@@ -11894,8 +11993,9 @@ if __name__ == '__main__':
                     with data_lock:
                         data_snapshot = dict(data)
                     for item in working:
+                        # data_snapshot 已剔除被删除的代理；不传 exclude_key 以免跳过其余仍在运行的同端口代理。
                         if item.get('id') == proxy_id and not protocol_port_in_use(
-                                item.get('port'), 'tcp', data_snapshot, exclude_key='proxy_services'):
+                                item.get('port'), 'tcp', data_snapshot):
                             if not firewall_port(item.get('port'), 'tcp', open_=False):
                                 return 500, {'ok': False, 'applied': True,
                                     'error': '代理已删除，但端口防火墙规则未能回收'}
@@ -16183,7 +16283,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # null 或数字时 list() 抛 TypeError，连接被掐断，出口编辑器整块空白。
                 state = routing_state(data)
                 outs = state['custom_outbounds']
-                mode = data.get('outbound_mode', 'rules')
+                mode = state['outbound_mode']
                 rules = [r for r in state['warp_rules'] if isinstance(r, (str, dict))]
                 applying = bool(data.get('egress_applying'))
                 error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
@@ -16229,6 +16329,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
+            if kind == 'warp' and not ip:
+                # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
+                ip = detect_outbound_ip('socks5', '127.0.0.1:40000', proxy_insecure=insecure)
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})
 
         def _ob_manage(self):
@@ -16326,8 +16429,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         'error': '模式只能是 rules（按域名分流）或 global（全局出口）'})
                 no_valid_outbounds = False
                 with data_lock:
-                    valid_outs = [o for o in routing_state(data)['custom_outbounds']
-                                  if isinstance(o, dict) and o.get('name')]
+                    valid_outs = clean_outbounds(routing_state(data)['custom_outbounds'])
                     if mode == 'global' and not valid_outs:
                         no_valid_outbounds = True
                     else:
@@ -16390,10 +16492,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
-                enabled = data.get('warp_enabled', False)
                 state = routing_state(data)
+                enabled = state['warp_enabled']
                 rules = [r['domain'] for r in normalize_route_rules(state['warp_rules']) if r['outbound'] in ('warp', 'warp_socks')]
-                overridden = state['outbound_mode'] == 'global' and bool(state['custom_outbounds'])
+                overridden = state['outbound_mode'] == 'global' and bool(clean_outbounds(state['custom_outbounds']))
             # 统一到 wgcf + wireproxy(127.0.0.1:19898)；同时兼容尚未升级、
             # 仍跑官方 cloudflare-warp(127.0.0.1:40000) 的旧节点，避免误报「未安装」
             is_installed = warp_backend_installed()

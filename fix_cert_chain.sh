@@ -63,6 +63,9 @@ leaf_pub () {
 # 正则，key: "/x/a.cer.key" 这种同前缀路径会一起被改坏，hysteria 随即起不来。
 set_tls_cert () {   # $1=config $2=new path
     local tmp
+    case "$2" in
+        *'"'*|*'\'*|*$'\n'*|*$'\r'*) return 1 ;;
+    esac
     tmp="$(umask 077 && mktemp "${1}.XXXXXX")" || return 1
     NEW_CERT="$2" awk '
         /^tls:[[:space:]]*(#.*)?$/ {f=1; print; next}
@@ -74,14 +77,14 @@ set_tls_cert () {   # $1=config $2=new path
         {print}
         END { if (!done) exit 1 }' "$1" > "$tmp" || { rm -f "$tmp"; return 1; }
     chmod --reference="$1" "$tmp" 2>/dev/null || chmod 600 "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$1"
+    mv -f "$tmp" "$1" || { rm -f "$tmp"; return 1; }
 }
 # 通过同目录临时文件原子回滚配置，避免覆盖过程中断留下半截 config.yaml。
 restore_config_file () {   # $1=backup $2=target
     local tmp
     tmp="$(umask 077 && mktemp "${2}.restore.XXXXXX")" || return 1
     cp -a "$1" "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$2"
+    mv -f "$tmp" "$2" || { rm -f "$tmp"; return 1; }
 }
 # 重启前先清失败计数（2026-11-12 修，与 do_upgrade.sh 同理）：证书出问题时服务常已反复崩溃、
 # 撞上 StartLimitBurst，这时 restart 被直接拒绝，修好的链被当成「起不来」回滚。
@@ -134,6 +137,7 @@ if [[ -z "$CERT_FILE" ]]; then
     exit 0
 fi
 
+[[ "$CERT_FILE" != /* && ! "$CERT_FILE" =~ ^[A-Za-z]:[/\\] ]] && CERT_FILE="$(dirname "$CONFIG")/${CERT_FILE}"
 info "当前证书文件：$CERT_FILE"
 [[ -f "$CERT_FILE" ]] || { err "证书文件不存在：$CERT_FILE"; exit 1; }
 
@@ -198,6 +202,10 @@ if [[ "$CHANGED" == "1" ]]; then
         err "新配置下 hysteria-server 未能启动，已恢复原配置：$BK"
         restore_config_file "$BK" "$CONFIG" || true
         restart_hysteria
+        sleep 2
+        if ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
+            err "回滚后 hysteria-server 仍未恢复运行，请立即检查 journalctl -u hysteria-server。"
+        fi
         exit 1
     fi
 fi
