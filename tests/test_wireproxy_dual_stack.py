@@ -55,13 +55,15 @@ class WireproxyDualStackTests(unittest.TestCase):
         self.assertNotIn('\r', conf)
 
     def test_install_sh(self):
-        m = re.search(r'\n(    WG_PRIV=\$\(awk .*?\n    cat > "\$WP_CFG" <<EOF\n.*?\nEOF\n)', INSTALL, re.S)
+        m = re.search(r'\n(    WG_PRIV=\$\(awk .*?\n    \(\n        umask 077\n.*?\n    \)\n)', INSTALL, re.S)
+        self.assertIsNotNone(m, '未匹配到 install.sh 中生成 wp.conf 的代码段')
         self.check(self.render(m.group(1)))
 
     def test_portal_web_install(self):
-        m = re.search(r'\n(WG_PRIV=\$\(awk .*?\ncat > "\$WP_CFG" <<WPEOF\n.*?\nWPEOF\n)', PORTAL, re.S)
+        m = re.search(r'\n(WG_PRIV=\$\(awk .*?\n\(\n    umask 077\n.*?\n\)\n)', PORTAL, re.S)
+        self.assertIsNotNone(m, '未匹配到 portal.py 中生成 wp.conf 的代码段')
         snippet = m.group(1).replace('    exit 1\n', '    exit 1\n')
-        self.check(self.render(snippet))
+        self.check(self.render(snippet, extra='claim_warp_assets() { :; }'))
 
 
 if __name__ == '__main__':

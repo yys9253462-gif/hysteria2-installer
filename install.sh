@@ -2782,7 +2782,7 @@ EOF
 set -euo pipefail
 umask 077
 ACTION="${1:-0}" # 1: enable, 0: disable
-CONFIG="${HY2_CONFIG_PATH:-/etc/hysteria/config.yaml}"
+CONFIG="/etc/hysteria/config.yaml"
 [[ -f "$CONFIG" ]] || exit 1
 
 # 仅提取顶格 acl 块本身（不含排在后面的 obfs 等段落），供收尾判断是否需要重启
@@ -4576,7 +4576,7 @@ install_warp_local_proxy() {
     [[ "$WG_ADDR" == *:* ]] && WG_ALLOWED="0.0.0.0/0, ::/0"
     (
         umask 077
-        WP_TMP=$(mktemp "${WGCF_DIR}/.wp.conf.XXXXXX")
+        WP_TMP=$(mktemp "${WP_CFG}.XXXXXX")
         trap 'rm -f "${WP_TMP:-}"' EXIT
         cat > "$WP_TMP" <<EOF
 # wireproxy config (managed by hysteria2-installer, do not edit)

@@ -8966,7 +8966,13 @@ def serve(path):
                 headers={'User-Agent': 'Mozilla/5.0',
                          'Accept': 'application/vnd.github+json'})
             with urllib.request.urlopen(req, timeout=8) as resp:
-                items = json.loads(_read_bounded_bytes(resp).decode('utf-8', errors='replace'))
+                try:
+                    raw = resp.read(2 * 1024 * 1024 + 1)
+                except TypeError:
+                    raw = resp.read()
+                if len(raw) > 2 * 1024 * 1024:
+                    raise ValueError('远端目录清单响应过大')
+                items = json.loads(raw.decode('utf-8', errors='replace'))
             # GitHub 在限流/出错时返回的是对象（{"message": ...}），不是列表；
             # 旧写法 `for it in items` 直接抛 TypeError，虽然被下面 except 兜住，
             # 但每次都白跑一遍请求且永远拿不到缓存。
@@ -9246,7 +9252,12 @@ if __name__ == '__main__':
             try:
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    content = _read_bounded_bytes(resp, _MAX_PORTAL_FILE_BYTES)
+                    try:
+                        content = resp.read(4 * 1024 * 1024 + 1)
+                    except TypeError:
+                        content = resp.read()
+                    if len(content) > 4 * 1024 * 1024:
+                        raise ValueError('远端源码文件响应过大')
                 # 体积 + 关键字双重校验，挡住错误页
                 if len(content) > min_size and (marker is None or marker in content):
                     if expect_blob is not None and _git_blob_sha(content) != expect_blob:
@@ -9286,7 +9297,13 @@ if __name__ == '__main__':
                 'Accept': 'application/vnd.github+json',
             })
             with urllib.request.urlopen(req, timeout=8) as resp:
-                info = json.loads(_read_bounded_bytes(resp).decode('utf-8', errors='replace'))
+                try:
+                    raw = resp.read(2 * 1024 * 1024 + 1)
+                except TypeError:
+                    raw = resp.read()
+                if len(raw) > 2 * 1024 * 1024:
+                    raise ValueError('远端摘要响应过大')
+                info = json.loads(raw.decode('utf-8', errors='replace'))
             sha = info.get('sha', '') if isinstance(info, dict) else ''
             if isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha):
                 return sha
@@ -13867,7 +13884,7 @@ fi
 claim_warp_assets
 (
     umask 077
-    WP_TMP=$(mktemp "${WG_DIR}/.wp.conf.XXXXXX")
+    WP_TMP=$(mktemp "${WP_CFG}.XXXXXX")
     trap 'rm -f "${WP_TMP:-}"' EXIT
     cat > "$WP_TMP" <<WPEOF
 # wireproxy config (managed by hysteria2-installer, do not edit)

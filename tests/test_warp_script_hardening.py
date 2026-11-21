@@ -66,7 +66,7 @@ class WarpScriptHardeningTests(unittest.TestCase):
             cfg = td_path / 'config.yaml'
             cfg.write_text('listen: :443\nacl:\n  inline:\n    - direct_ipv4(all)\nobfs:\n  type: salamander\n', encoding='utf-8')
             toggle = td_path / 'toggle_warp.sh'
-            toggle.write_bytes(script.encode('utf-8'))
+            toggle.write_bytes(script.replace('/etc/hysteria/config.yaml', str(cfg)).encode('utf-8'))
             fake_bin = td_path / 'bin'
             fake_bin.mkdir()
             for tool in ('curl', 'systemctl', 'jq'):
@@ -74,7 +74,6 @@ class WarpScriptHardeningTests(unittest.TestCase):
                 p.write_bytes(b'#!/usr/bin/env bash\nexit 0\n')
                 os.chmod(p, 0o755)
             env = dict(os.environ)
-            env['HY2_CONFIG_PATH'] = str(cfg)
             env['PATH'] = str(fake_bin) + os.pathsep + env.get('PATH', '')
             res = subprocess.run([BASH, str(toggle), '1'], env=env, capture_output=True, text=True, timeout=15)
             self.assertEqual(res.returncode, 0, res.stderr)
