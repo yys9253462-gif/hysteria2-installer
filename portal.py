@@ -13414,13 +13414,42 @@ if __name__ == '__main__':
                     runtime[key] = result.stdout.strip()
                 paths = [Path('/etc/modules-load.d/bbr.conf'), Path('/etc/sysctl.d/99-bbr.conf')]
                 originals = {path: path.read_bytes() if path.exists() else None for path in paths}
+
+                def _write_bbr_file(target_path, raw_bytes):
+                    tmp_path = target_path.with_name(target_path.name + '.tmp.' + secrets.token_hex(4))
+                    try:
+                        tmp_path.write_bytes(raw_bytes)
+                        os.chmod(str(tmp_path), 0o644)
+                        os.replace(str(tmp_path), str(target_path))
+                    except BaseException:
+                        tmp_path.unlink(missing_ok=True)
+                        raise
+
+                def _rollback_bbr_files_and_runtime():
+                    for path, content in originals.items():
+                        try:
+                            if content is None:
+                                path.unlink(missing_ok=True)
+                            else:
+                                _write_bbr_file(path, content)
+                        except OSError as rb_exc:
+                            _log_ignored('bbr_rollback_file', rb_exc)
+                    for key, value in runtime.items():
+                        try:
+                            subprocess.run(['sysctl', '-w', key + '=' + value],
+                                           capture_output=True, timeout=3)
+                        except Exception as rb_exc:
+                            _log_ignored('bbr_rollback_sysctl', rb_exc)
+
                 try:
                     # 带上归属标记，卸载时据此认出并删除（2026-11-03 修）：旧文件没有标记，
                     # 卸载后重启仍加载 BBR 模块、套用这些 sysctl。
-                    paths[0].write_text(BBR_FILE_MARKER + '\ntcp_' + target + '\n', encoding='utf-8')
-                    paths[1].write_text(BBR_FILE_MARKER + '\n'
-                                        + '\n'.join('%s = %s' % item for item in settings.items()) + '\n',
-                                        encoding='utf-8')
+                    _write_bbr_file(paths[0], (BBR_FILE_MARKER + '\ntcp_' + target + '\n').encode('utf-8'))
+                    _write_bbr_file(
+                        paths[1],
+                        (BBR_FILE_MARKER + '\n'
+                         + '\n'.join('%s = %s' % item for item in settings.items()) + '\n').encode('utf-8'),
+                    )
                     applied = subprocess.run(['sysctl', '-p', str(paths[1])], capture_output=True, text=True, timeout=5)
                     if applied.returncode != 0:
                         raise RuntimeError('sysctl 应用失败')
@@ -13429,13 +13458,7 @@ if __name__ == '__main__':
                         if actual.returncode != 0 or actual.stdout.strip() != settings[key]:
                             raise RuntimeError('sysctl 读回与目标不一致')
                 except Exception:
-                    for path, content in originals.items():
-                        if content is None:
-                            path.unlink(missing_ok=True)
-                        else:
-                            path.write_bytes(content)
-                    for key, value in runtime.items():
-                        subprocess.run(['sysctl', '-w', key + '=' + value], capture_output=True, timeout=3)
+                    _rollback_bbr_files_and_runtime()
                     return self.reply_json(500, {'ok': False, 'error': 'BBR 应用失败，已恢复原文件并尝试恢复原运行参数'})
                 with data_lock:
                     old_target = data.get('bbr_target_version')
@@ -13446,19 +13469,13 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    for path, content in originals.items():
-                        if content is None:
-                            path.unlink(missing_ok=True)
-                        else:
-                            path.write_bytes(content)
-                    for key, value in runtime.items():
-                        subprocess.run(['sysctl', '-w', key + '=' + value],
-                                       capture_output=True, timeout=3)
+                    # 先还原内存目标版本，再逐项隔离恢复文件与运行参数，避免某次 sysctl 超时导致内存残留脏版本。
                     with data_lock:
                         if had_target:
                             data['bbr_target_version'] = old_target
                         else:
                             data.pop('bbr_target_version', None)
+                    _rollback_bbr_files_and_runtime()
                     return self.reply_json(500, {'ok': False,
                         'error': 'BBR 状态保存失败，已恢复原配置并尝试恢复原运行参数'})
                 return self.reply_json(200, {'ok': True, 'applied': True, 'current': target,
