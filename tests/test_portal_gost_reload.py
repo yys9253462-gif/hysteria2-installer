@@ -94,7 +94,7 @@ def _heredoc(marker, quote="<<'%s'"):
 
 
 def _shell_unit():
-    m = re.search(r'cat > /etc/systemd/system/gost\.service <<EOF\n(.*?)\nEOF',
+    m = re.search(r'cat > (?:"\$_gost_unit_tmp"|/etc/systemd/system/gost\.service) <<EOF\n(.*?)\nEOF',
                   INSTALL_SRC, re.S)
     if not m:
         raise AssertionError('install.sh 里找不到 gost.service 的 heredoc')

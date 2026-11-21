@@ -4159,13 +4159,9 @@ PYEOF
     fi
     local _meter_tmp
     _meter_tmp="$(umask 077; mktemp "${dest_dir}/usage-meter-config.json.tmp.XXXXXX")" || return 1
-    if ! printf '%s' "$_meter_secret" | python3 -c '
-import json, os, sys
+    if ! printf '%s' "$_meter_secret" | python3 -c 'import json, os, sys
 secret = sys.stdin.read()
-payload = {
-    "hysteria": {"url": "http://127.0.0.1:19996", "secret": secret},
-    "reality": {"binary": "/usr/local/bin/xray", "address": "127.0.0.1:19997"},
-}
+payload = {"hysteria": {"url": "http://127.0.0.1:19996", "secret": secret}, "reality": {"binary": "/usr/local/bin/xray", "address": "127.0.0.1:19997"}}
 with open(sys.argv[1], "wb") as fh:
     fh.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
     fh.flush()
