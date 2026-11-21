@@ -7510,12 +7510,14 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 握手，VMess 必须真的出示证书。因此只在启用且拿到域名时才追加。
     vmess_proxy = None
     vmess_sing = None
-    if vmess and user_id and vmess.get('domain') and _valid_port(vmess.get('port')):
+    if isinstance(vmess, dict) and user_id \
+            and isinstance(vmess.get('domain'), str) and vmess.get('domain').strip() \
+            and _valid_port(vmess.get('port')):
         v_name = name + '-VMess'
         v_uuid = vmess_uuid_for_user(user_id)
-        v_host = vmess['domain']
-        v_sni = vmess.get('sni') or v_host
-        v_path = vmess.get('ws_path') or '/'
+        v_host = vmess['domain'].strip()
+        v_sni = vmess.get('sni').strip() if isinstance(vmess.get('sni'), str) and vmess.get('sni').strip() else v_host
+        v_path = vmess.get('ws_path') if isinstance(vmess.get('ws_path'), str) and vmess.get('ws_path') else '/'
         v_port = _valid_port(vmess.get('port'))
         vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
                            port=v_port, uuid=v_uuid, alterId=0,
@@ -7535,13 +7537,16 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 同样是 TCP + 自有证书，但比 VMess 多了后量子密钥交换。
     vlessenc_proxy = None
     vlessenc_sing = None
-    if vlessenc and user_id and vlessenc.get('domain') \
-            and _valid_port(vlessenc.get('port')) and vlessenc.get('encryption'):
+    if isinstance(vlessenc, dict) and user_id \
+            and isinstance(vlessenc.get('domain'), str) and vlessenc.get('domain').strip() \
+            and _valid_port(vlessenc.get('port')) \
+            and isinstance(vlessenc.get('encryption'), str) and vlessenc.get('encryption').strip():
         e_name = name + '-VLESS-Enc'
         e_uuid = reality_uuid_for_user(user_id)
-        e_host = vlessenc['domain']
-        e_sni = vlessenc.get('sni') or e_host
-        e_enc = vlessenc['encryption']
+        e_host = vlessenc['domain'].strip()
+        e_sni = (vlessenc.get('sni').strip()
+                 if isinstance(vlessenc.get('sni'), str) and vlessenc.get('sni').strip() else e_host)
+        e_enc = vlessenc['encryption'].strip()
         e_port = _valid_port(vlessenc.get('port'))
         vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
                               port=e_port, uuid=e_uuid, udp=True,
@@ -7558,11 +7563,14 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
     anytls_proxy = None
     anytls_sing = None
-    if anytls and user_id and anytls.get('domain') \
-            and _valid_port(anytls.get('port')) and anytls.get('secret'):
+    if isinstance(anytls, dict) and user_id \
+            and isinstance(anytls.get('domain'), str) and anytls.get('domain').strip() \
+            and _valid_port(anytls.get('port')) \
+            and isinstance(anytls.get('secret'), str) and anytls.get('secret'):
         a_name = name + '-AnyTLS'
-        a_host = anytls['domain']
-        a_sni = anytls.get('sni') or a_host
+        a_host = anytls['domain'].strip()
+        a_sni = (anytls.get('sni').strip()
+                 if isinstance(anytls.get('sni'), str) and anytls.get('sni').strip() else a_host)
         a_pwd = anytls_password_for_user(anytls['secret'], user_id)
         a_port = _valid_port(anytls.get('port'))
         anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
@@ -7577,11 +7585,13 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # QUIC（UDP）+ 自有证书，由 sing-box 承载。
     tuic_proxy = None
     tuic_sing = None
-    if tuic and user_id and tuic.get('domain') \
+    if isinstance(tuic, dict) and user_id \
+            and isinstance(tuic.get('domain'), str) and tuic.get('domain').strip() \
             and _valid_port(tuic.get('port')) and isinstance(tuic.get('secret'), str) and tuic.get('secret'):
         t_name = name + '-TUIC'
-        t_host = tuic['domain']
-        t_sni = tuic.get('sni') or t_host
+        t_host = tuic['domain'].strip()
+        t_sni = (tuic.get('sni').strip()
+                 if isinstance(tuic.get('sni'), str) and tuic.get('sni').strip() else t_host)
         t_uuid, t_pwd = tuic_credentials_for_user(tuic['secret'], user_id)
         t_port = _valid_port(tuic.get('port'))
         tuic_proxy = dict(name=t_name, type='tuic', server=t_host, port=t_port,
@@ -7605,6 +7615,8 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                      ([tuic_sing] if tuic_sing else [])
     alternates = [p['name'] for p in (reality_proxy, vmess_proxy, vlessenc_proxy, anytls_proxy,
                                       tuic_proxy) if p]
+    sing_alternates = [o['tag'] for o in (reality_sing, vmess_sing, vlessenc_sing, anytls_sing,
+                                          tuic_sing) if o]
 
     if alternates:
         # url-test：客户端定时探测多条链路，自动选延迟低的。
@@ -7620,13 +7632,12 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
              'proxies': proxies, 'proxy-groups': [group],
              'rules': ['MATCH,PROXY']}
     sing_doc = {'outbounds': sing_outbounds}
-    if alternates:
-        # sing-box 侧同样给一个 urltest outbound，让 SFA/SFI 自动择优。
+    if sing_alternates:
+        # sing-box 侧仅在确实有 sing-box 备用节点时才附带 urltest 组，
+        # 避免仅启用 VLESS-Enc（sing-box 不下发）时生成单节点空转 urltest。
         sing_doc['outbounds'].append({
             'type': 'urltest', 'tag': 'PROXY',
-            'outbounds': [sing['tag']] + [o['tag'] for o in
-                                          (reality_sing, vmess_sing, vlessenc_sing, anytls_sing,
-                                           tuic_sing) if o],
+            'outbounds': [sing['tag']] + sing_alternates,
             'url': 'https://www.gstatic.com/generate_204',
             'interval': '5m', 'tolerance': 50,
         })
