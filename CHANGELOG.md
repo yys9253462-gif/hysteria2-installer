@@ -1,3 +1,16 @@
+## 2026-11-21 — 第三十八批十项修复，门户 2.48
+
+- 独立生成的升级与自愈脚本（`install.sh` 产出的 `do_upgrade.sh` 与 `repair-config.sh`）内联 `config_tls_cert()` 证书路径解析函数定义：此前两处调用了仅存在于 `install.sh` 运行时的未定义函数，导致自定义证书或反向代理证书节点在门户在线升级或自愈时回退为自签模式，且证书监控路径单元盯错目录。
+- 核心在线升级失败回滚（`portal.py` 的 `_upgrade_core_binary_locked`）改为先写入同目录临时文件、赋权 `0o755` 再通过 `os.replace` 原子替换回目标路径，并隔离回滚重启异常避免掩盖原始失败原因：此前 `shutil.copy2` 直接覆写正在运行的二进制在 Linux 上可能触发 `ETXTBSY`（文本文件忙）导致回滚失败。
+- 门户超文本服务（`portal.py` 的 `do_HEAD`）在入口与 `finally` 块中重置 `self._head_body_started = False`：修复超文本长连接（`HTTP/1.1` 复用）连续发送两次 `HEAD` 请求时，第二次响应头被 `_HeadersOnly.write` 全部吞掉导致客户端报空响应或协议错误的缺陷。
+- 核心卸载接口（`portal.py` 的 `_h_post_uninstall_core`）补齐三项安全护栏：入口申领重型任务槽位（防止并发核心操作）；持有跨进程核心锁后拒绝卸载非本脚本托管的宿主机 `xray` 服务与二进制；采集伴随服务单元状态时识别从未安装过的单元（如未启用过的 `hy2-tuic`）并在停服与回滚中跳过，且回滚恢复活跃服务前先执行 `systemctl reset-failed`（同时统一核心锁冲突中文文案）。
+- 节点身份与展示主机清洗统一收口（`portal.py` 共十处）：将 `cert_status`、`sync_cert_trust`、`ensure_portal_access`、`regenerate_page`、`_render_admin_page`、`_h_get_proxy_services`、`_manage_proxy_operation` 以及 `/api/v1/capabilities` 与 `proxy-services/list` 接口全部改用 `clean_node_identity` / `meta_display_host`，消除手工或旧版写入 `"is_insecure": "false"` 字符串假值导致的错拼公网地址与缺键报错。
+- 出口分流脚本全面加固（`portal.py` 内嵌安装脚本与 `install.sh` 内嵌 `toggle_warp.sh`、`install_warp_local_proxy` 及看门狗脚本）：`tar_member()` 改为先从标准输入捕获归档清单并校验退出码，杜绝进程替换丢弃错误码放行截断压缩包；写入含私钥的 `wp.conf` 与重写 `config.yaml` 全部改用 `umask 077` 加同目录 `mktemp` 原子替换；五处重启或拉起 `wireproxy` 前均先执行 `systemctl reset-failed wireproxy`，防止撞上启动频率上限后看门狗永久自愈失败。
+- 核心二进制安装流程加固（`portal.py` 的 `install_xray_binary` 与 `install_singbox`）：暂存文件改用同目录随机后缀并在 `finally` 中保证未替换即清理，消除异常中断后 `/usr/local/bin/*.new` 长期残留；`install_xray_binary` 解压路径改为严格对齐校验成员；`install_singbox` 为发布元数据拉取增加 2 MiB 体积上限及非对象、非列表条目容错，避免异常接口返回触发未捕获异常。
+- 外部元数据与门户更新包拉取统一限流与容错（`portal.py` 新增 `_read_bounded_bytes`）：覆盖 `resolve_update_ref`（接口与提交订阅源）、`fetch_text`、`_remote_root_shas`、`fetch_portal_file`（4 MiB 上限）、`_remote_blob_sha`、`_h_post_install_gost` 与 `_h_get_check_version`，防止异常超大响应耗尽门户进程内存并拦截非对象数据结构。
+- 分流规则域名增删逻辑统一（`portal.py` 的 `_h_post_manage_warp` 与 `_ob_manage` 抽出 `_clean_route_domain` 与 `_valid_route_domain`）：删除域名规则时采用与添加完全一致的协议头、路径、查询串、锚点、端口与首尾点清洗，修复粘贴完整地址能添加却删不掉的问题；同时拒绝包含连续点（`..`）的非法域名。
+- 节点接入辅助脚本加固（`panel-join.py`）：`meta_host` 改用严格布尔解析并支持双字段回落，修复 `"is_insecure": "false"` 错选公网地址；`listenHTTPS` 与 `listen` 端口去除前导零并做端口范围校验；`--panel` 拒绝含 `?` 或 `#` 的地址避免拼坏登记路径；`--register` 改用上下文管理器关闭连接、加读取上限并用 `errors="replace"` 解码避免非 UTF-8 网关报错页引发解码崩溃。
+
 ## 2026-11-21 — 第三十七批十项修复，门户 2.47
 
 - 实时在线地址采集（`usage-meter-readers-20261007-v1.py` 的 `read_live_connections` 与 `parse_events`）兼容空切片或空映射序列化产生的空值（`{"users": null}`、`{"ips": null}`、核心条目 `ips: null`），避免单次空在线状态把全机采集标成异常；同步补齐 `/online/ips` 与回退 `/online` 的 4 MiB 体积上限、日志非对象负载拦截与同协议双栈地址去重。
