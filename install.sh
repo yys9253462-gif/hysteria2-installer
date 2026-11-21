@@ -2520,8 +2520,10 @@ if isinstance(_data, dict):
             _p = _sec.get('port')
             if isinstance(_p, int) and not isinstance(_p, bool):
                 RESERVED.add(_p)
-            elif isinstance(_p, str) and _p.strip().isdigit():
-                RESERVED.add(int(_p.strip()))
+            elif isinstance(_p, str):
+                _ps = _p.strip()
+                if _ps.isascii() and _ps.isdigit():
+                    RESERVED.add(int(_ps))
     _proxies = _data.get('proxy_services')
     if isinstance(_proxies, list):
         for _item in _proxies:
@@ -2529,8 +2531,10 @@ if isinstance(_data, dict):
                 _p = _item.get('port')
                 if isinstance(_p, int) and not isinstance(_p, bool):
                     RESERVED.add(_p)
-                elif isinstance(_p, str) and _p.strip().isdigit():
-                    RESERVED.add(int(_p.strip()))
+                elif isinstance(_p, str):
+                    _ps = _p.strip()
+                    if _ps.isascii() and _ps.isdigit():
+                        RESERVED.add(int(_ps))
 for _ in range(100):
     port = 10000 + secrets.randbelow(50000)
     if port in RESERVED or 20000 <= port <= 40000:
@@ -2660,6 +2664,12 @@ setup_iptables_port_hopping() {
     local e_port="$3"
     local hop_skip=""
 
+    if [[ ! "$l_port" =~ ^[0-9]+$ || ! "$s_port" =~ ^[0-9]+$ || ! "$e_port" =~ ^[0-9]+$ ]] \
+            || (( 10#$l_port < 1 || 10#$l_port > 65535 || 10#$s_port < 1 || 10#$s_port > 65535 || 10#$e_port < 1 || 10#$e_port > 65535 || 10#$s_port > 10#$e_port )); then
+        log_err "端口跳跃参数非法（监听=${l_port}，区间=${s_port}-${e_port}），拒绝配置。"
+        return 1
+    fi
+
     # 没有 iptables 命令（极简镜像 / 纯 nftables 主机）时直接跳过：
     # 旧实现会在 set -e 下以 127 退出，安装停在「二进制与证书已就位、
     # 配置与门户还没写」的半成品状态，还会留下一个开机必失败的
@@ -2718,8 +2728,14 @@ setup_iptables_port_hopping() {
         service iptables save >/dev/null 2>&1 || true
     fi
 
-    # 兜底部署 systemd 端口跳跃自愈守护服务，保证开机/重启 100% 自动恢复规则
-    cat > /etc/systemd/system/hy2-iptables.service <<EOF
+    # 兜底部署 systemd 端口跳跃自愈守护服务（同目录临时文件原子落盘），保证开机/重启 100% 自动恢复规则
+    local _ipt_unit="/etc/systemd/system/hy2-iptables.service"
+    local _ipt_unit_tmp=""
+    _ipt_unit_tmp="$(umask 022; mktemp "${_ipt_unit}.XXXXXX")" || {
+        log_err "无法为 ${_ipt_unit} 创建临时文件。"
+        return 1
+    }
+    if ! cat > "$_ipt_unit_tmp" <<EOF
 [Unit]
 Description=Hysteria 2 Port Hopping iptables persistence
 After=network.target
@@ -2736,6 +2752,16 @@ ExecStart=/bin/bash -c "command -v ip6tables >/dev/null 2>&1 || exit 0; ip6table
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        rm -f "$_ipt_unit_tmp"
+        log_err "写入 ${_ipt_unit} 失败。"
+        return 1
+    fi
+    if ! chmod 644 "$_ipt_unit_tmp" || ! mv -f "$_ipt_unit_tmp" "$_ipt_unit"; then
+        rm -f "$_ipt_unit_tmp"
+        log_err "原子落盘 ${_ipt_unit} 失败。"
+        return 1
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable hy2-iptables.service >/dev/null 2>&1 || true
 
@@ -2800,22 +2826,19 @@ listen: :${LISTEN_PORT}
 EOF
 
     if [[ "$CERT_TYPE" == "acme" ]]; then
-        # ⚠️ SERVER_NAME / ACME_EMAIL 必须加引号（2026-10-09 修）：
-        # 域名/邮箱里出现空格或 '#' 时，未加引号的裸值会被 YAML 解析成
-        # 另一个值、或把 '#' 之后整行当注释吃掉 —— hysteria 随后报一个
-        # 语法错，现象是「装完服务反复重启」，而错误信息完全指不到输入框。
+        # ⚠️ SERVER_NAME / ACME_EMAIL 经 jq 转义输出 YAML 双引号串，防止空格、'#'、引号或反斜杠破坏语法。
         cat >> "$_cfg_tmp" <<EOF
 acme:
   domains:
-    - "${SERVER_NAME}"
-  email: "${ACME_EMAIL}"
+    - $(jq -Rn --arg value "${SERVER_NAME}" '$value')
+  email: $(jq -Rn --arg value "${ACME_EMAIL}" '$value')
   type: http
 EOF
     else
         cat >> "$_cfg_tmp" <<EOF
 tls:
-  cert: "${CERT_FILE}"
-  key: "${KEY_FILE}"
+  cert: $(jq -Rn --arg value "${CERT_FILE}" '$value')
+  key: $(jq -Rn --arg value "${KEY_FILE}" '$value')
 EOF
     fi
 
