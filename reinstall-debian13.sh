@@ -175,6 +175,36 @@ disk_mounts() {
     ' "$_dm_file" 2>/dev/null
 }
 
+# 精确列出目标整盘及其分区设备，不用 "${d}"* 模糊前缀，防止多盘环境下误判签名或误卸载其它磁盘
+disk_devices() {
+    _dd_d="$1"
+    [ -e "$_dd_d" ] && printf '%s\n' "$_dd_d"
+    case "$_dd_d" in
+        *[0-9])
+            for _dd_p in "${_dd_d}p"[0-9]*; do
+                case "$_dd_p" in
+                    "${_dd_d}p"[0-9]*)
+                        _dd_num="${_dd_p#"${_dd_d}p"}"
+                        case "$_dd_num" in ''|*[!0-9]*) continue ;; esac
+                        [ -e "$_dd_p" ] && printf '%s\n' "$_dd_p"
+                        ;;
+                esac
+            done
+            ;;
+        *)
+            for _dd_p in "${_dd_d}"[0-9]*; do
+                case "$_dd_p" in
+                    "${_dd_d}"[0-9]*)
+                        _dd_num="${_dd_p#"${_dd_d}"}"
+                        case "$_dd_num" in ''|*[!0-9]*) continue ;; esac
+                        [ -e "$_dd_p" ] && printf '%s\n' "$_dd_p"
+                        ;;
+                esac
+            done
+            ;;
+    esac
+}
+
 # 打印开头整段注释：写死行号会把后面的常量与默认值代码一起打出来（2026-11-12 修）。
 print_help() {
     for _f in "$0" rd13.sh; do
@@ -398,7 +428,7 @@ fi
 
 # 特征 C 补充：盘里的子分区带 iso9660（整盘没了签名、分区还在的情形）
 if [ "$_iso_signature" = "0" ] && command -v blkid >/dev/null 2>&1; then
-    _subsig="$(blkid "${DISK}"* 2>/dev/null | head -n5 || true)"
+    _subsig="$(disk_devices "$DISK" | while IFS= read -r _p; do [ -b "$_p" ] && blkid "$_p" 2>/dev/null || true; done | head -n5)"
     case "$_subsig" in
         *iso9660*) _iso_signature=1 ;;
     esac
@@ -465,8 +495,8 @@ fi
 #   mkfs 一定报 "apparently in use"。
 release_disk() {
     _d="$1"
-    # 1) 按设备名卸（含各分区）
-    for _p in "${_d}"*; do
+    # 1) 按精确设备名卸（仅含目标盘及其分区，避免 "${_d}"* 误伤其它磁盘）
+    disk_devices "$_d" | while IFS= read -r _p; do
         [ -b "$_p" ] && { umount "$_p" >/dev/null 2>&1 || true; }
     done
     # 2) 按挂载点卸（关键：umount /dev/vda1 有时会漏，得按挂载点来）
