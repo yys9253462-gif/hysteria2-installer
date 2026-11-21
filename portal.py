@@ -2641,6 +2641,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     # meta 字段先清洗再用（2026-11-06 修）：server_name / public_ip 为数字、列表或 null 时
     # 下面的 html.escape 抛 AttributeError，整个管理页 500；is_insecure 写成字符串 "false"
     # 时被当成真，标题换成公网 IP 并显示伪装 SNI 提示。
+    m = m if isinstance(m, dict) else {}
     is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 自签模式下 server_name 是**伪装 SNI**（如 www.bing.com），机主既不拥有它、
     # 它也不指向本机。此前 <h1> 直接显示 server_name，于是每个自签节点的门户
@@ -7601,8 +7602,14 @@ def _valid_port(value):
     """
     if isinstance(value, bool):
         return 0
-    if isinstance(value, float) and not value.is_integer():
-        return 0
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return 0
+    if isinstance(value, str):
+        s = value.strip()
+        if not (s.isascii() and s.isdigit()):
+            return 0
+        value = s
     try:
         port = int(value)
     except (TypeError, ValueError, OverflowError):
@@ -7645,7 +7652,7 @@ def clean_hop_range(value):
     """端口跳跃区间规范成 (起, 止)；格式不对或越界返回 None（按未开启处理）。"""
     if not isinstance(value, str):
         return None
-    hit = re.fullmatch(r'\s*(\d{1,5})\s*[-:]\s*(\d{1,5})\s*', value)
+    hit = re.fullmatch(r'\s*([0-9]{1,5})\s*[-:]\s*([0-9]{1,5})\s*', value)
     if not hit:
         return None
     lo, hi = int(hit.group(1)), int(hit.group(2))
@@ -7665,6 +7672,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     改返回结构会让任何漏改的一处静默错位。VMess 的 vmess:// 直链由
     vmess_uri_for_user() 单独生成，在需要的端点里作为额外字段下发。
     """
+    m = m if isinstance(m, dict) else {}
     is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 标签会进 quote() 与客户端配置；非字符串（调用方传错或数据被改坏）
     # 会抛 TypeError，把整页渲染和订阅下载一起打断。
@@ -7914,6 +7922,8 @@ def sync_pin(m, root, meta_path):
     Self-signed   -> a valid lowercase HEX64 pin, recomputed from cert/server.crt
                      whenever it is missing or malformed.
     """
+    if not isinstance(m, dict):
+        return
     # is_insecure 写成字符串 "false" 时不能当成自签（2026-11-06 修），否则会给可信证书节点写 pin。
     if clean_node_identity(m)[0]:
         cur = m.get('pin_sha256')
@@ -7933,14 +7943,16 @@ def sync_pin(m, root, meta_path):
 
 
 def prepare(meta_path, port, node_api_key=None):
-    if isinstance(port, bool):
+    port_num = _valid_port(port)
+    if not port_num:
         raise ValueError('门户端口必须是 1-65535 的整数')
-    try:
-        port_num = int(port)
-    except (TypeError, ValueError):
-        raise ValueError('门户端口必须是 1-65535 的整数') from None
-    if not (1 <= port_num <= 65535):
-        raise ValueError('门户端口必须是 1-65535 的整数')
+    if node_api_key is not None:
+        if not isinstance(node_api_key, str):
+            raise ValueError('node_api_key 必须是字符串')
+        if node_api_key:
+            if (not node_api_key.isascii()
+                    or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in node_api_key)):
+                raise ValueError('node_api_key 不能包含空白、控制字符或非 ASCII 字符')
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     if not isinstance(m, dict):
