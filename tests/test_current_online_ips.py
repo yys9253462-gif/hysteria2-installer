@@ -141,4 +141,66 @@ class MappedIpTests(unittest.TestCase):
   self.assertTrue(result['reality_ok'])
   self.assertEqual([item['ip'] for item in result['ips']],['203.0.113.12','2001:db8::9'])
 
+ def test_go_null_users_and_ips_do_not_invalidate_snapshot(self):
+  """Go 序列化空切片或空映射产出 null 时按空集合处理，不拖垮全机在线采集。"""
+  import io
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test-secret'},'reality':{'binary':'/usr/local/bin/xray','address':'127.0.0.1:19997'}}
+  def read(path,*args,**kwargs):
+   if path.name=='usage-meter-config.json':return json.dumps(cfg)
+   if path.name=='xray.json':return json.dumps({'policy':{'levels':{'0':{'statsUserOnline':True}}}})
+   return json.dumps({'users':{'u1':{},'u2':{}}})
+  core_payload={'revision':'teyir-live-ips-v1','users':{'u1':{'connections':0,'ips':None}}}
+  # 情况一：Reality statsgetallonlineusers 返回 {"users": null}
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m,'service_running',return_value=True),patch.object(m.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(core_payload).encode())),patch.object(m,'cmd',return_value=json.dumps({'users':None})):
+   users=m.read_live_connections()['users']
+  self.assertTrue(users['u1']['hysteria_ok'])
+  self.assertEqual(users['u1']['ips'],[])
+  self.assertTrue(users['u1']['reality_ok'])
+  self.assertTrue(users['u2']['reality_ok'])
+  # 情况二：Reality statsonlineiplist 返回 {"ips": null}
+  def command_null_ips(args):
+   if 'statsgetallonlineusers' in args:return json.dumps({'users':['u1']})
+   if 'statsonlineiplist' in args:return json.dumps({'ips':None})
+   raise AssertionError(args)
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m,'service_running',return_value=True),patch.object(m.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(core_payload).encode())),patch.object(m,'cmd',side_effect=command_null_ips):
+   users2=m.read_live_connections()['users']
+  self.assertTrue(users2['u1']['reality_ok'])
+  self.assertEqual(users2['u1']['ips'],[])
+
+ def test_dual_stack_duplicate_ips_are_deduplicated(self):
+  """同协议下 IPv4 与 ::ffff:IPv4 同时出现时去重，Reality 保留较新的活跃时间戳。"""
+  import io
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test-secret'},'reality':{'binary':'/usr/local/bin/xray','address':'127.0.0.1:19997'}}
+  def read(path,*args,**kwargs):
+   if path.name=='usage-meter-config.json':return json.dumps(cfg)
+   if path.name=='xray.json':return json.dumps({'policy':{'levels':{'0':{'statsUserOnline':True}}}})
+   return json.dumps({'users':{'u1':{}}})
+  core_payload={'revision':'teyir-live-ips-v1','users':{'u1':{'connections':2,'ips':['203.0.113.5','::ffff:203.0.113.5']}}}
+  def command_dup(args):
+   if 'statsgetallonlineusers' in args:return json.dumps({'users':['u1']})
+   if 'statsonlineiplist' in args:return json.dumps({'ips':{'203.0.113.5':100,'::ffff:203.0.113.5':250}})
+   raise AssertionError(args)
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.pathlib.Path,'is_file',return_value=True),patch.object(m,'service_running',return_value=True),patch.object(m.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(core_payload).encode())),patch.object(m,'cmd',side_effect=command_dup):
+   ips=m.read_live_connections()['users']['u1']['ips']
+  hy2_ips=[item for item in ips if item['protocol']=='Hy2']
+  reality_ips=[item for item in ips if item['protocol']=='Reality']
+  self.assertEqual([item['ip'] for item in hy2_ips],['203.0.113.5'])
+  self.assertEqual(reality_ips,[{'ip':'203.0.113.5','protocol':'Reality','last_seen':250}])
+
+ def test_parse_events_rejects_non_dict_json_fields(self):
+  """连接日志负载解析出非对象 JSON 时按约定抛出 ValueError 而非 AttributeError。"""
+  with self.assertRaises(ValueError):
+   m.parse_events([{'MESSAGE':'2026-10-12T00:00:00Z\tINFO\tclient connected\t[1,2,3]'}])
+
+ def test_live_ips_oversized_response_rejected(self):
+  """核心 /online/ips 响应超过 4 MiB 上限时拒收并标记失败。"""
+  import io
+  cfg={'hysteria':{'url':'http://127.0.0.1:19996','secret':'test-secret'}}
+  def read(path,*args,**kwargs):return json.dumps(cfg if path.name=='usage-meter-config.json' else {'users':{'u1':{}}})
+  valid_head='{"revision":"teyir-live-ips-v1","users":{"u1":{"connections":0,"ips":[]}},"pad":"'
+  oversized=(valid_head + 'x' * (4 * 1024 * 1024 + 64) + '"}').encode()
+  with patch.object(m.pathlib.Path,'read_text',read),patch.object(m.urllib.request,'urlopen',return_value=io.BytesIO(oversized)):
+   users=m.read_live_connections()['users']
+  self.assertFalse(users['u1']['hysteria_ok'])
+
 if __name__=='__main__':unittest.main()
