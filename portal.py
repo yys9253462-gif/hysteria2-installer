@@ -10688,17 +10688,36 @@ if __name__ == '__main__':
                 # 先解析出客户端地址再限流：限流按来源分桶（H4，2026-11-02）。
                 try:
                     length = int(self.headers.get('Content-Length', 0))
-                    body = self.rfile.read(length).decode('utf-8', errors='replace')
+                    if length < 0 or length > 65536:
+                        raise ValueError('invalid auth content-length')
+                    body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                     req_data = json.loads(body)
+                    if not isinstance(req_data, dict):
+                        raise ValueError('auth payload must be an object')
                     client_auth = req_data.get('auth', '')
                     if not isinstance(client_auth, str):
                         raise ValueError('auth must be a string')
                     client_addr = req_data.get('addr', '')
+                    if client_addr is None:
+                        client_addr = ''
+                    if not isinstance(client_addr, str):
+                        raise ValueError('addr must be a string')
                     # ⚠️ hysteria HTTP auth 的 tx/rx 是客户端**带宽声明**，
                     # 不是实际传输字节。把它累加进用量会让数字虚高且离谱。
                     # 真实用量由计量模块从 hysteria trafficStats / xray stats
                     # 的单调计数器累计（见 usage-meter-core）。
-                    client_ip = client_addr.rsplit(':', 1)[0].strip('[]') if client_addr else ''
+                    raw_addr = client_addr.strip()
+                    client_ip = ''
+                    if raw_addr:
+                        if raw_addr.startswith('[') and ']' in raw_addr:
+                            client_ip = raw_addr[1:raw_addr.index(']')]
+                        else:
+                            try:
+                                # 先直接解析裸 IPv4 / 裸 IPv6，避免 rsplit(':') 截断无端口 IPv6。
+                                ipaddress.ip_address(raw_addr)
+                                client_ip = raw_addr
+                            except ValueError:
+                                client_ip = raw_addr.rsplit(':', 1)[0].strip('[]')
                     try:  # 与计量模块同一写法，避免 IPv6 表示不同导致同一设备被算两次
                         _addr = ipaddress.ip_address(client_ip) if client_ip else None
                         # 双栈监听时 IPv4 客户端报成 ::ffff:a.b.c.d（2026-11-06 修）：拦截名单与
@@ -10755,7 +10774,7 @@ if __name__ == '__main__':
                                 raw_tracker = ip_tracker.get(matched_uid)
                                 active_ips = (
                                     {ip: t for ip, t in raw_tracker.items()
-                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                                     if isinstance(raw_tracker, dict) else {}
                                 )
                                 ip_tracker[matched_uid] = active_ips
@@ -10774,7 +10793,7 @@ if __name__ == '__main__':
                                 tracker = ip_tracker.get(matched_uid)
                                 tracker = (
                                     {ip: t for ip, t in tracker.items()
-                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                                     if isinstance(tracker, dict) else {}
                                 )
                                 tracker[client_ip] = now_ts
@@ -10799,6 +10818,8 @@ if __name__ == '__main__':
 
                 try:
                     length = int(self.headers.get('Content-Length', 0))
+                    if length < 0 or length > 1048576:
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
                     body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '{}'
                     params = json.loads(body)
                 except Exception:
@@ -10823,6 +10844,11 @@ if __name__ == '__main__':
                                 value = params[key]
                                 if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
                                     raise ValueError()
+                                if isinstance(value, str):
+                                    sval = value.strip()
+                                    if not (sval.isascii() and sval.isdigit()):
+                                        raise ValueError()
+                                    value = sval
                                 params[key] = int(value)
                                 if params[key] < (1 if key == 'duration_days' else 0):
                                     raise ValueError()
@@ -10830,6 +10856,8 @@ if __name__ == '__main__':
                             # 与上面的整数字段一样拒绝 bool（2026-11-04 修）：float(True) == 1.0，
                             # {"traffic_gb": true} 被当成 1 GB 配额写进去。
                             if isinstance(params['traffic_gb'], bool):
+                                raise ValueError()
+                            if isinstance(params['traffic_gb'], str) and not params['traffic_gb'].isascii():
                                 raise ValueError()
                             params['traffic_gb'] = float(params['traffic_gb'])
                             if not math.isfinite(params['traffic_gb']) or params['traffic_gb'] < 0:
