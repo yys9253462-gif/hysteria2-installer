@@ -1745,11 +1745,13 @@ def git_blob_sha(data):
 def safe_tar_members(names, wanted):
     """校验 tar 成员名，并返回与 wanted 同名的**包内实际成员名**。
 
-    拒绝绝对路径与含 `..` 的成员（防以 root 写出临时目录），
+    拒绝绝对路径、反斜杠、空字节与含 `..` 的成员（防以 root 写出临时目录），
     且只接受一个精确同名的常规文件（不做"第一个可执行文件"兜底）。
     """
     hits = []
     for name in names:
+        if not isinstance(name, str) or '\\' in name or '\x00' in name:
+            raise ValueError('tar 包内含不安全路径成员: %r' % (name,))
         clean = name[2:] if name.startswith('./') else name
         if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
             raise ValueError('tar 包内含不安全路径成员: %s' % name)
@@ -1764,6 +1766,8 @@ def safe_zip_members(names, wanted):
     """校验 zip 成员名并返回唯一精确匹配的成员名。"""
     hits = []
     for name in names:
+        if not isinstance(name, str) or '\\' in name or '\x00' in name:
+            raise ValueError('zip 包内含不安全路径成员: %r' % (name,))
         clean = name[2:] if name.startswith('./') else name
         if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
             raise ValueError('zip 包内含不安全路径成员: %s' % name)
@@ -16450,8 +16454,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return True
             if not self.heavy_slots.acquire(blocking=False):
                 return False
+            duplicate = False
             with self.deadline_lock:
-                self._heavy[request] = True
+                if request in self._heavy:
+                    duplicate = True
+                else:
+                    self._heavy[request] = True
+            if duplicate:
+                self.heavy_slots.release()
             return True
 
         def extend_deadline(self, request, seconds):
@@ -16476,14 +16486,21 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         def watch_deadlines(self):
             while True:
                 time.sleep(0.25)
-                with self.deadline_lock:
-                    for connection, deadline in list(self.deadlines.items()):
-                        if time.monotonic() >= deadline:
-                            try:
-                                connection.shutdown(socket.SHUT_RDWR)
-                            except OSError:
-                                pass
-                            self.deadlines.pop(connection, None)
+                try:
+                    now = time.monotonic()
+                    expired = []
+                    with self.deadline_lock:
+                        for connection, deadline in list(self.deadlines.items()):
+                            if now >= deadline:
+                                self.deadlines.pop(connection, None)
+                                expired.append(connection)
+                    for connection in expired:
+                        try:
+                            connection.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                except Exception:
+                    pass
 
         def process_request(self, request, address):
             if not self.quick_slots.acquire(blocking=False):
@@ -16550,7 +16567,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # 但如果不提示，用户只会觉得「节点突然少了一个」（2026-10-29 加）。
     try:
         with data_lock:
-            _enabled = {k: bool((data.get(k) or {}).get('enabled'))
+            _enabled = {k: bool(config_section(data, k).get('enabled'))
                         for k in ('reality_config', 'vmess_config',
                                   'vlessenc_config', 'anytls_config', 'tuic_config')}
         _missing = []
