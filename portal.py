@@ -235,6 +235,8 @@ def _unlock_read(resp, limit):
         raw = resp.read(limit)
     except http.client.IncompleteRead as e:
         raw = e.partial
+    if not raw:
+        return ''
     return raw.decode('utf-8', 'replace')
 
 
@@ -246,10 +248,16 @@ def _unlock_fetch(url, timeout=8, limit=400000):
             return resp.status, resp.geturl(), _unlock_read(resp, limit)
     except urllib.error.HTTPError as e:
         try:
-            body = _unlock_read(e, 200000)
-        except Exception:
-            body = ''
-        return e.code, e.geturl() or url, body
+            try:
+                body = _unlock_read(e, 200000)
+            except Exception:
+                body = ''
+            return e.code, e.geturl() or url, body
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
 
 
 def _unlock_netflix():
@@ -343,8 +351,11 @@ def run_unlock_checks():
                for i, (k, n, f) in enumerate(UNLOCK_CHECKS)]
     for t in threads:
         t.start()
+    # 所有探测线程共享同一轮 30 秒总截止时间，避免逐线程串联等待把总阻塞放大到 180 秒。
+    deadline = time.monotonic() + 30.0
     for t in threads:
-        t.join(30)
+        remaining = max(0.0, deadline - time.monotonic())
+        t.join(remaining)
     return [r or {'key': k, 'name': n, 'status': 'unknown', 'region': '', 'note': '检测超时'}
             for r, (k, n, _) in zip(results, UNLOCK_CHECKS)]
 
@@ -4493,10 +4504,11 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
     if selfheal_state_path and Path(selfheal_state_path).exists():
         try:
             st = json.loads(Path(selfheal_state_path).read_text(encoding='utf-8'))
-            info['healed_at'] = int(st.get('healed_at') or 0)
-            info['heal_count'] = int(st.get('heal_count') or 0)
-            if st.get('last_pin'):
-                info['pin_sha256'] = st['last_pin']
+            if isinstance(st, dict):
+                info['healed_at'] = int(st.get('healed_at') or 0)
+                info['heal_count'] = int(st.get('heal_count') or 0)
+                if isinstance(st.get('last_pin'), str) and st.get('last_pin'):
+                    info['pin_sha256'] = st['last_pin']
         except Exception as exc:
             _log_ignored('cert_info.heal_state', exc)
 
