@@ -198,15 +198,21 @@ hy2_tar_listing_safe() {
     return 0
 }
 
-# 在包内查找与 $2 同名的成员，输出**包内实际成员名**（可能是 ./name）。
+# 在包内查找与 $2 唯一同名的成员，输出**包内实际成员名**（可能是 ./name）。
+# 先捕获 tar 清单并校验退出码，拒绝截断损坏包与同名重复成员。
 hy2_tar_find_member() {
-    local member
+    local listing member hit="" count=0
     [[ -f "${1:-}" ]] || return 1
+    listing="$(tar -tzf - <"$1" 2>/dev/null)" || return 1
     while IFS= read -r member; do
         member="${member%$'\r'}"
-        [[ "${member#./}" == "$2" ]] && { printf '%s\n' "$member"; return 0; }
-    done < <(tar -tzf - <"$1" 2>/dev/null)
-    return 1
+        if [[ "${member#./}" == "$2" ]]; then
+            count=$((count + 1))
+            hit="$member"
+        fi
+    done <<<"$listing"
+    [[ "$count" -eq 1 ]] || return 1
+    printf '%s\n' "$hit"
 }
 
 # 把 HY2_ARCH 映射成 Hysteria 官方资产后缀。
@@ -3194,7 +3200,7 @@ METEREOF2
                     _cs="$(jq -r '.server_name // empty' "$HY2_DIR/client_meta.json" 2>/dev/null || true)"
                     _cp="$(jq -r '.pin_sha256 // empty' "$HY2_DIR/client_meta.json" 2>/dev/null || true)"
                     if [[ "$_ct" != "$_nt" || "$_ci" != "$_ni" || "$_cs" != "$_nsn" || "$_cp" != "$_np" ]]; then
-                        _tmp_meta="$HY2_DIR/client_meta.json.tmp.$$"
+                        _tmp_meta="$(umask 077 && mktemp "$HY2_DIR/.client_meta.json.XXXXXX")"
                         if jq --arg t "$_nt" --argjson i "$_ni" --arg s "$_nsn" --arg p "$_np" \
                               '.cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p' \
                               "$HY2_DIR/client_meta.json" > "$_tmp_meta" 2>/dev/null && [[ -s "$_tmp_meta" ]]; then
@@ -4158,10 +4164,15 @@ sync_cert_meta() {
     if [[ "$new_pin" != "$cur_pin" ]]; then
         log_warn "  pin_sha256: ${cur_pin:-<空>} -> ${new_pin:-<清空>}"
     fi
-    local tmp_meta="${HY2_META_FILE}.tmp.$$"
+    local tmp_meta
+    tmp_meta="$(umask 077 && mktemp "${HY2_META_FILE}.XXXXXX")" || {
+        log_err "无法创建临时元数据文件，client_meta.json 保持不变。"
+        return 1
+    }
     if jq --arg t "$new_type" --argjson i "$new_insecure" --arg s "$new_sn" --arg p "$new_pin" \
           '.cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p' \
           "$HY2_META_FILE" > "$tmp_meta" 2>/dev/null && [[ -s "$tmp_meta" ]]; then
+        chmod 600 "$tmp_meta"
         mv -f "$tmp_meta" "$HY2_META_FILE"
         log_info "证书信任模型已自愈。"
     else
