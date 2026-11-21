@@ -3527,19 +3527,13 @@ EOF
     if [[ -n "$HY2_LOG_LEVEL_EXPLICIT" || ! -f "$HY2_LOG_DROPIN" ]]; then
         mkdir -p "${HY2_LOG_DROPIN%/*}"
         _dropin_tmp="$(mktemp "${HY2_LOG_DROPIN}.XXXXXX")" || return 1
-        if ! cat > "$_dropin_tmp" <<EOF
+        {
+            cat > "$_dropin_tmp" <<EOF
 # 由 hysteria2-installer 生成：Hysteria 服务端日志级别（debug|info|warn|error）
 [Service]
 Environment=HYSTERIA_LOG_LEVEL=${HY2_LOG_LEVEL}
 EOF
-        then
-            rm -f "$_dropin_tmp"
-            return 1
-        fi
-        if ! chmod 644 "$_dropin_tmp" || ! mv -f "$_dropin_tmp" "$HY2_LOG_DROPIN"; then
-            rm -f "$_dropin_tmp"
-            return 1
-        fi
+        } && chmod 644 "$_dropin_tmp" && mv -f "$_dropin_tmp" "$HY2_LOG_DROPIN" || { rm -f "$_dropin_tmp"; return 1; }
     fi
 
     systemctl daemon-reload

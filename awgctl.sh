@@ -1196,16 +1196,23 @@ cmd_install() {
     # 混淆参数（已存在则保留 —— 否则所有客户端立刻失效）。
     # 例外同 cmd_update：在 2.x 安装上 install --line 3 时，旧 S1~S4 任一项 < 12 均不满足
     # 3.x 头部保护，沿用会让服务起不来、事务回滚，换协议线永远装不上。
+    local _s4
+    _s4="$(meta_get S4)"
     if [[ -n "$(meta_get S1)" && "$line" == "3" ]]; then
         local _sk _sv _need_regen=0
-        for _sk in S1 S2 S3 S4; do
-            _sv="$(meta_get "$_sk")"
-            if [[ ! "$_sv" =~ ^[0-9]+$ ]] || (( 10#$_sv < 12 )); then
-                log_warn "旧 ${_sk}=${_sv} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
-                _need_regen=1
-                break
-            fi
-        done
+        if [[ ! "$_s4" =~ ^[0-9]+$ ]] || (( 10#$_s4 < 12 )); then
+            log_warn "旧 S4=${_s4} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
+            _need_regen=1
+        else
+            for _sk in S1 S2 S3; do
+                _sv="$(meta_get "$_sk")"
+                if [[ -n "$_sv" ]] && { [[ ! "$_sv" =~ ^[0-9]+$ ]] || (( 10#$_sv < 12 )); }; then
+                    log_warn "旧 ${_sk}=${_sv} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
+                    _need_regen=1
+                    break
+                fi
+            done
+        fi
         if [[ "$_need_regen" == "1" ]]; then
             meta_set S1 ""
         fi
