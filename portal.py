@@ -8996,26 +8996,29 @@ def serve(path):
         wanted = set(node_default_ifaces())
         rx = tx = 0
         seen = []
-        with open('/proc/net/dev', encoding='utf-8', errors='replace') as fh:
-            for line in fh:
-                if ':' not in line:
-                    continue
-                name, rest = line.split(':', 1)
-                name = name.strip()
-                if name not in wanted:
-                    continue
-                cols = rest.split()
-                if len(cols) < 9:
-                    continue
-                try:
-                    rx_val, tx_val = int(cols[0]), int(cols[8])
-                except ValueError:
-                    continue
-                if rx_val < 0 or tx_val < 0:
-                    continue
-                rx += rx_val
-                tx += tx_val
-                seen.append(name)
+        try:
+            with open('/proc/net/dev', encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    if ':' not in line:
+                        continue
+                    name, rest = line.split(':', 1)
+                    name = name.strip()
+                    if name not in wanted:
+                        continue
+                    cols = rest.split()
+                    if len(cols) < 9:
+                        continue
+                    try:
+                        rx_val, tx_val = int(cols[0]), int(cols[8])
+                    except ValueError:
+                        continue
+                    if rx_val < 0 or tx_val < 0:
+                        continue
+                    rx += rx_val
+                    tx += tx_val
+                    seen.append(name)
+        except OSError:
+            pass
         try:
             boot_id = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8', errors='replace').strip()
         except OSError:
@@ -9166,11 +9169,18 @@ def serve(path):
     SPEED_WINDOW_SECONDS = 15
 
     def _meter_speed_sample(uid, tx, rx, elapsed, source):
-        if elapsed <= 0:
+        for val in (tx, rx, elapsed):
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
+                return
+        if elapsed <= 0 or tx < 0 or rx < 0:
+            return
+        tx_rate = tx / elapsed
+        rx_rate = rx / elapsed
+        if not (math.isfinite(tx_rate) and math.isfinite(rx_rate)):
             return
         with data_lock:
             speed_tracker.setdefault(uid, {})[source] = (
-                time.monotonic(), tx / elapsed, rx / elapsed)
+                time.monotonic(), tx_rate, rx_rate)
 
     # 计量模块不改变 UUID/密码/状态；旧记账值另存，used_bytes 同步真实累计。
     usage_meter = None
@@ -9206,12 +9216,23 @@ def serve(path):
             return set()
         snapshot = getattr(usage_meter, 'live_snapshot', None)
         sampled_at = getattr(usage_meter, 'live_sampled_at', 0)
-        if not snapshot or time.time() - sampled_at >= 45:
+        if (not isinstance(snapshot, dict)
+                or isinstance(sampled_at, bool)
+                or not isinstance(sampled_at, (int, float))
+                or not math.isfinite(sampled_at)
+                or time.time() - sampled_at >= 45):
             return set()
-        row = (snapshot.get('users') or {}).get(uid) or {}
-        if not row.get('hysteria_ok'):
+        users_map = snapshot.get('users')
+        row = users_map.get(uid) if isinstance(users_map, dict) else None
+        if not isinstance(row, dict) or not row.get('hysteria_ok'):
             return set()
-        return {str(item.get('ip')) for item in row.get('ips') or [] if item.get('ip')}
+        raw_ips = row.get('ips')
+        if not isinstance(raw_ips, (list, tuple, set)):
+            return set()
+        return {
+            item['ip'] for item in raw_ips
+            if isinstance(item, dict) and isinstance(item.get('ip'), str) and item['ip']
+        }
 
     # ---- Reality 设备上限（2026-10-23）----
     # Hy2 的上限在 /auth 里拦；Reality 不经过 /auth，由这个循环每轮读 Xray 在线 IP、
@@ -9237,7 +9258,10 @@ def serve(path):
         binary = address = ''
         while True:
             try:
-                _raw_cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+                try:
+                    _raw_cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.is_file() else {}
+                except (OSError, ValueError):
+                    _raw_cfg = {}
                 rcfg = _raw_cfg.get('reality') if isinstance(_raw_cfg, dict) else {}
                 rcfg = rcfg if isinstance(rcfg, dict) else {}
                 binary = rcfg.get('binary', '') if isinstance(rcfg.get('binary'), str) else ''
@@ -9264,6 +9288,8 @@ def serve(path):
                         try:
                             enable_retry_at = time.monotonic() + 600
                             spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
+                            if spec is None or spec.loader is None:
+                                raise RuntimeError('missing_iplimit_module')
                             mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
                             # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
                             # 否则两边同时改 xray.json，会有一方以「并发修改」失败一轮（jp 上线时踩过）。
@@ -9273,7 +9299,7 @@ def serve(path):
                             os.close(_core_fd)
                     finally:
                         core_operation_lock.release()
-                    if outcome.get('changed'):
+                    if isinstance(outcome, dict) and outcome.get('changed'):
                         print('[iplimit] 已为 Reality 开启设备上限路由接口，备份: %s' % outcome.get('backup'),
                               file=sys.stderr)
                     ready = True
@@ -9394,15 +9420,11 @@ def serve(path):
                 if not isinstance(svc, dict):
                     continue
                 ptype = svc.get('type') if isinstance(svc.get('type'), str) else 'socks5'
-                raw_port = svc.get('port')
-                if isinstance(raw_port, bool):
+                port = _valid_port(svc.get('port'))
+                if not port:
                     continue
-                try:
-                    port = int(raw_port or 0)
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                if port <= 0 or port > 65535:
-                    continue
+                raw_user = svc.get('username', '')
+                raw_pass = svc.get('password', '')
                 handler_type = 'socks5' if ptype == 'socks5' else 'http'
                 entry = {
                     'name': f'proxy-{idx}',
@@ -9410,8 +9432,8 @@ def serve(path):
                     'handler': {
                         'type': handler_type,
                         'auth': {
-                            'username': svc.get('username', ''),
-                            'password': svc.get('password', ''),
+                            'username': raw_user if isinstance(raw_user, str) else '',
+                            'password': raw_pass if isinstance(raw_pass, str) else '',
                         },
                     },
                     'listener': {'type': 'tcp'},
