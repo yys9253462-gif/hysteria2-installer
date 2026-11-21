@@ -1,3 +1,16 @@
+## 2026-11-22 — 第五十批十项修复，门户 2.60
+
+- `/auth` 与 `/api/v1/*` 请求体长度边界、裸 IPv6 完整解析与全角数字拦截（`portal.py`）：`/auth` 限制请求体长度 `0..65536` 并校验对象形态，优先直解析裸 IPv4/IPv6 地址避免无端口 IPv6 被 `rsplit(':')` 截断绕过跨节点设备黑名单，同时为 `ip_tracker` 过滤补齐 `math.isfinite`；`POST /api/v1/*` 限制请求体长度 `0..1048576` 防负长度绕过与大包内存耗尽，用户参数解析拒绝全角数字字符串。
+- REST 用户删除并发回滚保护、退役用户还原与 API 密码控制字符拦截（`portal.py`）：`POST /api/v1/users/delete` 与 `_h_post_manage_user` 在落盘失败回滚时仅撤回当前用户的待撤销标记与单用户 `usage_meter.totals`/`adjustments`/`retired_users`，保留并发新增的其它待撤销用户与最新累计计量；`users/create` 与 `users/update` 统一拒绝含控制字符的密码并返回 `400`，`users/create` 补齐 `reconcile_meter_usage`/`restore_meter_user` 失败回滚，`users/ip-deny` 过滤补齐 `math.isfinite`。
+- 端口跳跃参数校验与单元原子落盘、YAML 字段安全转义及纯 ASCII 端口解析（`install.sh`）：`setup_iptables_port_hopping` 内联校验监听与起止端口位于 `1..65535` 且起点不大于终点，防注入 `ExecStart`，并将 `hy2-iptables.service` 改为同目录 `mktemp` 原子落盘；`generate_server_config` 对 `SERVER_NAME`/`ACME_EMAIL`/`CERT_FILE`/`KEY_FILE` 经 `jq -Rn` 安全转义输出 YAML；`select_subscription_port` 校验端口字符串纯 ASCII 数字。
+- 整机停用恢复 `reset-failed` 超时隔离、自更新脚本参数界限与出站纯 ASCII 端口校验（`portal.py`）：`_set_traffic_suspension` 在恢复启动与落盘失败补偿拉起中将 `systemctl reset-failed` 独立隔离，超时不再跳过 `systemctl start`；`portal_update_restart_script` 校验 `port`（`1..65535`）与 `wait_seconds`（`1..600`）并拒绝布尔值；`validate_outbound` 将 SOCKS5 端口正则收紧为 `[0-9]{1,5}` 拦截全角数字。
+- 防火墙端口前置校验、无管道策略解析与门户文件身份映射过滤加固（`install.sh`）：`setup_system_firewall` 校验主监听、订阅端口与跳跃区间合法性，为 `ufw status` 补 `2>/dev/null`，并将裸 `iptables`/`ip6tables` 策略解析改为单次 `awk` 提取避免大输出 SIGPIPE；`portal_remote_blob_shas` 与 `portal_ensure_py` 在 `umask 077` 下创建临时文件与目录，并过滤非字符串 `sha` 与含空白/换行的异常 `name`。
+- 计量核心退役用户坏累计清理与参数校验及运行时坏二进制路径容错（`usage-meter-core-20261007-v1.py`、`usage-meter-runtime-20261007-v1.py`）：`apply_sample` 拒绝误传字符串/字节串或非可迭代的 `active_users`，并先剔除清理已退役用户的残留脏 `totals` 再校验活跃用户，防止已删用户坏条目卡死全机计量；运行时 `configured_sources()` 捕获 `binary` 路径 `OSError`/`ValueError` 并拦截空字节，`summary()` 为采样时间补齐 `math.isfinite`。
+- 混淆隧道控制脚本防火墙端口校验、peer 随机私密备份清理与自删参数安全传递（`awgctl.sh`）：`allow_firewall` 与 `revoke_firewall` 校验端口处于 `1..65535`；`cmd_peer_add` 与 `cmd_peer_del` 改为 `umask 077 && mktemp` 随机备份文件并注册 `RETURN` 清理陷阱杜绝明文私钥备份残留；`cmd_uninstall` 自删通过位置参数 `$1` 安全传递路径。
+- 端口与跳跃区间纯 ASCII 校验、`artifacts`/`page_html`/`sync_pin` 非字典容错与 `prepare` 密钥校验（`portal.py`）：`_valid_port` 与 `clean_hop_range` 拒绝全角数字、正负号及非有限浮点；`artifacts`、`page_html` 与 `sync_pin` 入口容忍非字典 `client_meta` 避免 `AttributeError`；`prepare` 复用 `_valid_port` 并拒绝含空白、控制字符或非 ASCII 的 `node_api_key`。
+- 前端 BBR、服务器重启、证书与核心管理非 JSON 错误页及坏字段容错（`portal_assets.py`）：`checkCertStatus`、`loadCores`、`btnRebootServer` 与 `.btn-apply-bbr` 兼容反代 502 等非 JSON HTML 响应并输出含 HTTP 状态码的清晰提示；`certShortIssuer` 与 `pin_sha256` 安全转字符串防非字符串字段崩溃；`.btn-apply-bbr`、`installCore` 与 `uninstallCore` 补齐防双击保护。
+- 实时网速非有限与负速率过滤、伪装端口坏编码容错及出站替换前失败防误回滚（`portal.py`）：`_h_get_traffic_speed` 过滤 `NaN`/`Inf` 与负速率样本，确保响应始终为严格合法 JSON；`read_masquerade_port` 捕获 `UnicodeDecodeError` 并校验纯 ASCII 数字端口；`apply_egress_config` 仅在已 `os.replace` 替换配置后才触发 `_rollback_outbounds`，替换前写盘失败不再惊扰正在运行的服务，并在替换后刷盘父目录。
+
 ## 2026-11-22 — 第四十九批十项修复，门户 2.59
 
 - 协议启停死线续期与 AnyTLS/TUIC 停用核心锁序及停服超时回滚（`portal.py`）：五大协议启停接口（Reality / VMess / VLESS Encryption / AnyTLS / TUIC）在持锁前补齐 `self._extend_deadline(120)` 防触发 30 秒连接死线；AnyTLS 与 TUIC 停用及回滚统一纳入 `core_operation_lock` 与跨进程文件锁 `core_operation_file_lock()`；`systemctl disable --now` 捕获超时与 `OSError` 并经 `_restore_systemd_service_state` 完整回滚。
