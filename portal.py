@@ -1058,22 +1058,38 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
     """
     proxy_url = ''
     if kind == 'socks5' and addr:
-        proxy_url = 'socks5h://' + addr
+        proxy_url = 'socks5h://' + str(addr)
     elif kind == 'http' and addr:
-        proxy_url = addr
+        proxy_url = str(addr)
     elif kind == 'warp':
         proxy_url = 'socks5h://127.0.0.1:19898'
+    if proxy_url and any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in proxy_url):
+        return ''
     try:
         seconds = max(1, float(timeout))
         # urllib's ProxyHandler speaks HTTP CONNECT, not the SOCKS5 protocol.
         # Explicitly override no_proxy: '*' would silently bypass this proxy.
         args = ['curl', '--disable', '--silent', '--show-error', '--fail',
-                '--connect-timeout', str(min(3, seconds)), '--max-time', str(seconds),
-                '--proxy', proxy_url, '--noproxy', '' if proxy_url else '*']
+                '--connect-timeout', str(min(3, seconds)), '--max-time', str(seconds)]
+        stdin_cfg = None
+        if proxy_url:
+            if '@' in proxy_url:
+                # 含认证凭据时经 stdin 传入 curl 配置，避免明文密码暴露在进程列表。
+                escaped = proxy_url.replace('\\', '\\\\').replace('"', '\\"')
+                args.extend(['--config', '-'])
+                stdin_cfg = 'proxy = "%s"\n' % escaped
+            else:
+                args.extend(['--proxy', proxy_url])
+            args.extend(['--noproxy', ''])
+        else:
+            args.extend(['--noproxy', '*'])
         if proxy_insecure:
             args.append('--proxy-insecure')
         args.append('https://api4.ipify.org?format=json')
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=seconds + 2)
+        run_kwargs = {'capture_output': True, 'text': True, 'timeout': seconds + 2}
+        if stdin_cfg is not None:
+            run_kwargs['input'] = stdin_cfg
+        proc = subprocess.run(args, **run_kwargs)
         if proc.returncode != 0:
             return ''
         payload = proc.stdout.strip()
