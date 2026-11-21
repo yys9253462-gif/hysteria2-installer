@@ -1763,7 +1763,11 @@ setup_cert_via_dns_api() {
     # Global API Key 要走 CF_Key + CF_Email，旧实现只能塞进 CF_Token，被当成 Bearer 认证失败。
     if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
         provider="Cloudflare"; prov_env="HY2_CF_TOKEN"
-    elif [[ -n "${HY2_CF_KEY:-}" && -n "${HY2_CF_EMAIL:-}" ]]; then
+    elif [[ -n "${HY2_CF_KEY:-}" ]]; then
+        if [[ -z "${HY2_CF_EMAIL:-}" ]]; then
+            log_err "Cloudflare Global API Key 需要 HY2_CF_KEY 与 HY2_CF_EMAIL 两项，缺 HY2_CF_EMAIL。"
+            return 1
+        fi
         provider="Cloudflare"; prov_env="HY2_CF_KEY + HY2_CF_EMAIL"
     elif [[ -n "${HY2_ALICLOUD_KEY:-}" ]]; then
         # 缺 Secret 时直接说清楚，旧实现照样去签发，最后只报一句看不出原因的认证失败。
@@ -1787,7 +1791,7 @@ setup_cert_via_dns_api() {
     # 真正生效的是 account.conf 里的 AUTO_UPGRADE='0'（安装/检查时已写入）。
     # 这里保留导出只是为了兼容旧脚本行为，不要指望它阻止升级。
     export SKIP_ACME_SH_UPGRADE=1
-    local ok=0
+    local rc=0
     case "$provider" in
         # acme.sh 的 DNS 插件从环境变量读凭据（2026-11-04 修）：旧实现传 --dns_cf_token
         # 之类的参数，acme.sh 不认识，直接报 Unknown parameter 退出，DNS API 签发从未成功过。
@@ -1795,24 +1799,25 @@ setup_cert_via_dns_api() {
         Cloudflare)
             if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
                 CF_Token="$HY2_CF_TOKEN" CF_Email="${HY2_CF_EMAIL:-}" \
-                    "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+                    "$acct" --issue --dns dns_cf -d "$domain" || rc=$?
             else
                 CF_Key="$HY2_CF_KEY" CF_Email="$HY2_CF_EMAIL" \
-                    "$acct" --issue --dns dns_cf -d "$domain" || ok=1
+                    "$acct" --issue --dns dns_cf -d "$domain" || rc=$?
             fi
             ;;
         阿里云)
             Ali_Key="$HY2_ALICLOUD_KEY" Ali_Secret="$HY2_ALICLOUD_SECRET" \
-                "$acct" --issue --dns dns_ali -d "$domain" || ok=1
+                "$acct" --issue --dns dns_ali -d "$domain" || rc=$?
             ;;
         DuckDNS)
             DuckDNS_Token="$HY2_DP_TOKEN" \
-                "$acct" --issue --dns dns_duckdns -d "$domain" || ok=1
+                "$acct" --issue --dns dns_duckdns -d "$domain" || rc=$?
             ;;
     esac
 
-    if [[ $ok -ne 0 ]]; then
-        log_err "${provider} DNS API 签发失败（凭据来源：${prov_env}）。"
+    # 与借 Nginx 签发保持一致：acme.sh 返回 2 表示证书仍在有效期内本次跳过，同样算成功。
+    if [[ $rc -ne 0 && $rc -ne 2 ]]; then
+        log_err "${provider} DNS API 签发失败（凭据来源：${prov_env}，退出码：${rc}）。"
         log_err "常见原因：token 权限不足 / 域名未托管在该 DNS 服务商下。"
         return 1
     fi
@@ -4764,28 +4769,49 @@ install_gost() {
     local had_gost=0 old_gost="" old_unit="" old_check="" old_owner="" had_unit=0 had_check=0 had_owner=0
     local old_config="" old_cert="" old_key="" had_config=0 had_cert=0 had_key=0
     local old_active=0 old_enabled=0 active_state
-    [[ -f "$GOST_BIN" ]] && { had_gost=1; old_gost="$(mktemp)"; cp -p "$GOST_BIN" "$old_gost" || return 1; }
-    [[ -f "$GOST_UNIT" ]] && { had_unit=1; old_unit="$(mktemp)"; cp -p "$GOST_UNIT" "$old_unit" || return 1; }
-    [[ -f /usr/local/lib/hy2-gost-selfcheck ]] && { had_check=1; old_check="$(mktemp)"; cp -p /usr/local/lib/hy2-gost-selfcheck "$old_check" || return 1; }
-    [[ -f "$HY2_DIR/.hy2-gost-owned" ]] && { had_owner=1; old_owner="$(mktemp)"; cp -p "$HY2_DIR/.hy2-gost-owned" "$old_owner" || return 1; }
+    _backup_gost_asset() {
+        local _src="$1" _out_var="$2" _tmp=""
+        _tmp="$(umask 077; mktemp)" || {
+            rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+            return 1
+        }
+        if ! cp -p "$_src" "$_tmp"; then
+            rm -f "$_tmp" "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+            return 1
+        fi
+        printf -v "$_out_var" '%s' "$_tmp"
+    }
+    [[ -f "$GOST_BIN" ]] && { had_gost=1; _backup_gost_asset "$GOST_BIN" old_gost || return 1; }
+    [[ -f "$GOST_UNIT" ]] && { had_unit=1; _backup_gost_asset "$GOST_UNIT" old_unit || return 1; }
+    [[ -f /usr/local/lib/hy2-gost-selfcheck ]] && { had_check=1; _backup_gost_asset /usr/local/lib/hy2-gost-selfcheck old_check || return 1; }
+    [[ -f "$HY2_DIR/.hy2-gost-owned" ]] && { had_owner=1; _backup_gost_asset "$HY2_DIR/.hy2-gost-owned" old_owner || return 1; }
     active_state="$(systemctl is-active gost 2>/dev/null || true)"
     [[ "$active_state" == active ]] && old_active=1
     active_state="$(systemctl is-enabled gost 2>/dev/null || true)"
     [[ "$active_state" == enabled ]] && old_enabled=1
-    [[ -f "$GOST_CONFIG" ]] && { had_config=1; old_config="$(mktemp)"; cp -p "$GOST_CONFIG" "$old_config" || return 1; }
-    [[ -f "$HY2_DIR/gost-cert/cert.pem" ]] && { had_cert=1; old_cert="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/cert.pem" "$old_cert" || return 1; }
-    [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; old_key="$(mktemp)"; cp -p "$HY2_DIR/gost-cert/key.pem" "$old_key" || return 1; }
+    [[ -f "$GOST_CONFIG" ]] && { had_config=1; _backup_gost_asset "$GOST_CONFIG" old_config || return 1; }
+    [[ -f "$HY2_DIR/gost-cert/cert.pem" ]] && { had_cert=1; _backup_gost_asset "$HY2_DIR/gost-cert/cert.pem" old_cert || return 1; }
+    [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; _backup_gost_asset "$HY2_DIR/gost-cert/key.pem" old_key || return 1; }
     log_info "目标版本: ${GOST_LATEST} (${GOST_ASSET})"
     log_step "下载并解压 gost 二进制..."
     TMP_DIR=$(mktemp -d)
     _restore_gost_install() {
-        if [[ "$had_gost" == 1 ]]; then cp -p "$old_gost" "$GOST_BIN"; else rm -f "$GOST_BIN"; fi
-        if [[ "$had_unit" == 1 ]]; then cp -p "$old_unit" "$GOST_UNIT"; else rm -f "$GOST_UNIT"; fi
-        if [[ "$had_check" == 1 ]]; then cp -p "$old_check" /usr/local/lib/hy2-gost-selfcheck; else rm -f /usr/local/lib/hy2-gost-selfcheck; fi
-        if [[ "$had_owner" == 1 ]]; then cp -p "$old_owner" "$HY2_DIR/.hy2-gost-owned"; else rm -f "$HY2_DIR/.hy2-gost-owned"; fi
-        if [[ "$had_config" == 1 ]]; then cp -p "$old_config" "$GOST_CONFIG"; else rm -f "$GOST_CONFIG"; fi
-        if [[ "$had_cert" == 1 ]]; then cp -p "$old_cert" "$HY2_DIR/gost-cert/cert.pem"; else rm -f "$HY2_DIR/gost-cert/cert.pem"; fi
-        if [[ "$had_key" == 1 ]]; then cp -p "$old_key" "$HY2_DIR/gost-cert/key.pem"; else rm -f "$HY2_DIR/gost-cert/key.pem"; fi
+        # 同目录临时文件原子替换：避免覆写运行中 gost 二进制报 ETXTBSY，并防止中途失败中断后续恢复。
+        _restore_gost_asset() {
+            local _bak="$1" _dst="$2" _rb_tmp=""
+            _rb_tmp="$(umask 077; mktemp "${_dst}.rb.XXXXXX")" || return 1
+            if ! cp -p "$_bak" "$_rb_tmp" || ! mv -f "$_rb_tmp" "$_dst"; then
+                rm -f "$_rb_tmp"
+                return 1
+            fi
+        }
+        if [[ "$had_gost" == 1 ]]; then _restore_gost_asset "$old_gost" "$GOST_BIN" || true; else rm -f "$GOST_BIN"; fi
+        if [[ "$had_unit" == 1 ]]; then _restore_gost_asset "$old_unit" "$GOST_UNIT" || true; else rm -f "$GOST_UNIT"; fi
+        if [[ "$had_check" == 1 ]]; then _restore_gost_asset "$old_check" /usr/local/lib/hy2-gost-selfcheck || true; else rm -f /usr/local/lib/hy2-gost-selfcheck; fi
+        if [[ "$had_owner" == 1 ]]; then _restore_gost_asset "$old_owner" "$HY2_DIR/.hy2-gost-owned" || true; else rm -f "$HY2_DIR/.hy2-gost-owned"; fi
+        if [[ "$had_config" == 1 ]]; then _restore_gost_asset "$old_config" "$GOST_CONFIG" || true; else rm -f "$GOST_CONFIG"; fi
+        if [[ "$had_cert" == 1 ]]; then _restore_gost_asset "$old_cert" "$HY2_DIR/gost-cert/cert.pem" || true; else rm -f "$HY2_DIR/gost-cert/cert.pem"; fi
+        if [[ "$had_key" == 1 ]]; then _restore_gost_asset "$old_key" "$HY2_DIR/gost-cert/key.pem" || true; else rm -f "$HY2_DIR/gost-cert/key.pem"; fi
         systemctl daemon-reload >/dev/null 2>&1 || true
         if [[ "$old_enabled" == 1 ]]; then
             systemctl enable gost >/dev/null 2>&1 || true
@@ -4851,6 +4877,7 @@ install_gost() {
     fi
     rm -rf "$TMP_DIR"
     if ! mv -f "${GOST_BIN}.new" "$GOST_BIN"; then
+        rm -f "${GOST_BIN}.new"
         _restore_gost_install
         log_err "gost 二进制替换失败，已恢复原部署。"
         return 1
@@ -5166,7 +5193,14 @@ awg_ensure_ctl() {
         fi
     fi
 
-    if ! install -m 0755 "$src" "$AWG_CTL_BIN"; then
+    local staged=""
+    staged="$(umask 077; mktemp "${AWG_CTL_BIN}.new.XXXXXX")" || {
+        [[ -n "$tmp" ]] && rm -f "$tmp"
+        log_err "安装 ${AWG_CTL_BIN} 失败"
+        return 1
+    }
+    if ! install -m 0755 "$src" "$staged" || ! mv -f "$staged" "$AWG_CTL_BIN"; then
+        rm -f "$staged"
         if [[ -n "$tmp" ]]; then
             rm -f "$tmp"
         fi

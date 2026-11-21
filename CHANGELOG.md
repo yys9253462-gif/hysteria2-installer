@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十一批十项修复，门户 2.51
+
+- 辅助协议服务单元原子落盘与回滚隔离（`portal.py` 的 AnyTLS / TUIC 启用路径）：写入服务单元文件改用 `_restore_systemd_unit_file` 同目录临时文件原子替换；启用失败回滚时逐项隔离配置恢复、单元恢复与 `systemctl daemon-reload` 异常，防止重载超时或非零退出跳过原有服务状态恢复。
+- 门户在线自更新与代理服务单元原子写入（`portal.py` 的 `do-upgrade`、`write_xray_unit` 与 `ensure_gost_unit`）：门户自更新的备份与失败回滚改用同目录临时文件落盘、刷盘并原子替换，新建文件清理逐个隔离文件系统异常；Xray 与 GOST 系统服务单元写入统一改为原子替换，消除半写入残片窗口。
+- 订阅产物畸形配置容错与单节点分流去冗余（`portal.py` 的 `artifacts`）：校验 `vmess`、`vlessenc`、`anytls`、`tuic` 子段必为对象且核心字符串字段合法，防止手工损坏配置引发全站订阅 500；`sing-box` 订阅仅在存在真实 `sing-box` 可用备用节点（`sing_alternates`）时才生成 `urltest` 自动测速组，修复仅启用 Hy2 加 VLESS-Enc 时生成单节点空转测速组的问题。
+- 网页端用户管理锁粒度与页面一致性修复（`portal.py` 的 `_h_post_manage_user`）：移除持有 `data_lock` 期间调用 `save_data()` 的阻塞路径；调整为先落盘再同步 Reality 客户端，消除成功路径重复两次重建订阅页；修复创建用户同步失败回滚后 `data['page']` 残留幽灵用户的问题，删除同步失败回滚时同样重建页面保持一致。
+- 集群接口落盘锁释放与损坏用量限额容错（`portal.py` 的 `apply_access`、`users/set_status`、`users/create` 与 `users/renew`）：`apply_access` 失败持久化待撤销队列时移出 `data_lock` 并捕获落盘异常防阻塞鉴权与抛穿；`users/set_status` 补齐落盘持久性不确定时的跳过护栏防穿透 `AtomicWriteDurabilityError`；创建与续期接口安全容忍已有用量或限额为空值及损坏值。
+- 门户前端安全属性、数值格式化与异常恢复修复（`portal_assets.py`）：所有新标签页链接与窗口补齐 `rel="noopener noreferrer"` / `noopener,noreferrer` 与 `opener = null` 防反控；速率格式化函数 `fmtUnits` 对非有限数与负数归零，避免界面显示 `NaN B/s`；出站规则域名去重改用 `Set` 消除对象原型属性污染；重启等待轮询 `waitPortalBack` 与混淆隧道删除接口补齐异步异常捕获恢复按钮状态。
+- 安装脚本入站代理二进制原子回滚与残留清理（`install.sh` 的 `install_gost`）：新增私有掩码备份辅助函数 `_backup_gost_asset`（中途失败立即清理临时备份）与同目录临时文件原子回滚函数 `_restore_gost_asset`，免疫回滚覆写运行中 `gost` 二进制触发 `ETXTBSY`（文本文件忙）；替换失败时立即删除 `gost.new` 暂存文件。
+- 证书域名接口退出码兼容与混淆隧道控制脚本原子部署（`install.sh` 的 `setup_cert_via_dns_api` 与 `awg_ensure_ctl`）：准确捕获 `acme.sh` 真实退出码并将退出码 `2`（有效证书未到期跳过）按成功处理；配置 `HY2_CF_KEY` 但缺少 `HY2_CF_EMAIL` 时返回非零并明确报错；部署 `awgctl.sh` 改用同目录临时文件原子替换目标脚本。
+- 流量计量读取器结构校验与句柄释放加固（`usage-meter-readers-20261007-v1.py`）：`parse_xray` 对非对象根节点、行项或名称统一抛出 `ValueError`；`parse_events` 校验每行必为对象且时间戳合法，并以容错 `utf-8` 解码日志防止非 UTF-8 字节崩溃；`read_live_connections` 在 404 回退分支于 `finally` 中关闭 `HTTPError` 句柄，显式按 `utf-8` 读取配置并校验嵌套结构。
+- 入站代理管理控制字符校验、回滚容错与端口快照加锁（`portal.py` 的 `_manage_proxy_operation` 与 `write_gost_config`）：拒绝代理账号或密码中包含换行及控制字符（返回 400）；`reload_gost` 失败与防火墙放行失败回滚均独立隔离 `save_data()` 和二次 `reload_gost()` 异常，确保落盘失败也能还原运行中的 `gost.yml`；`write_gost_config` 在 `data_lock` 内更新 `gost_written_ports`，删除回收防火墙前持锁拍取数据快照。
+
 ## 2026-11-22 — 第四十批十项修复，门户 2.50
 
 - 混淆隧道控制脚本（`awgctl.sh`）三项稳定性与权限修复：`cmd_uninstall` 卸载前检查服务单元是否存在，跳过从未安装过的服务单元避免半装残留卡死卸载；`cmd_install` 与 `cmd_update` 在比较 `S4 < 12` 前先校验纯数字格式，防止畸形参数触发算术表达式报错；`cmd_peer_add` 与 `cmd_peer_del` 生成空备份占位文件时纳入 `umask 077` 私有掩码。

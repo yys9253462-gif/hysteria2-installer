@@ -43,6 +43,7 @@ def read_hysteria(url, secret):
 
 def parse_xray(raw):
     obj=json.loads(raw)
+    if not isinstance(obj,dict): raise ValueError('invalid xray response')
     rows=obj.get('stat', obj.get('stats'))
     if rows is None:
         # statsquery 对空统计返回 {}；只允许空对象作为合法空响应。
@@ -52,7 +53,9 @@ def parse_xray(raw):
     out={}
     seen=set()
     for row in rows:
+        if not isinstance(row,dict): raise ValueError('invalid xray stat row')
         name=row.get('name','')
+        if not isinstance(name,str): raise ValueError('invalid xray stat name')
         parts=name.split('>>>')
         if len(parts)!=4 or parts[0]!='user' or parts[2]!='traffic': continue
         if parts[3] not in ('uplink','downlink'): continue
@@ -138,12 +141,17 @@ def parse_events(rows):
     """
     active={}
     unmatched=set()
-    rows=sorted(rows,key=lambda row:int(row.get('__MONOTONIC_TIMESTAMP',row.get('__REALTIME_TIMESTAMP',0))))
+    if any(not isinstance(row,dict) for row in rows):
+        raise ValueError('invalid_connection_event')
+    try:
+        rows=sorted(rows,key=lambda row:int(row.get('__MONOTONIC_TIMESTAMP',row.get('__REALTIME_TIMESTAMP',0))))
+    except (TypeError,ValueError):
+        raise ValueError('invalid_connection_event') from None
     for row in rows:
         message=row.get('MESSAGE','')
         if isinstance(message,list):
             if any(type(x)!=int or not 0<=x<=255 for x in message):raise ValueError('invalid_journal_message')
-            message=bytes(message).decode('utf-8')
+            message=bytes(message).decode('utf-8',errors='replace')
         if not isinstance(message,str):raise ValueError('missing_journal_message')
         clean=re.sub(r'\x1b\[[0-9;]*m','',message)
         event=None
@@ -187,14 +195,16 @@ def cmd(args):
     return subprocess.run(args,capture_output=True,text=True,timeout=8,check=True).stdout
 
 def read_live_connections():
-    cfg=json.loads(pathlib.Path('/etc/hysteria/usage-meter-config.json').read_text())
-    portal=json.loads(pathlib.Path('/etc/hysteria/portal.json').read_text())
+    cfg=json.loads(pathlib.Path('/etc/hysteria/usage-meter-config.json').read_text(encoding='utf-8'))
+    if not isinstance(cfg,dict):raise ValueError('invalid_meter_config')
+    portal=json.loads(pathlib.Path('/etc/hysteria/portal.json').read_text(encoding='utf-8'))
     users=portal.get('users') if isinstance(portal,dict) and isinstance(portal.get('users'),dict) else {}
     output={'users':{},'sampled_at':int(time.time())}
     for uid in users:output['users'][uid]={'ips':[],'ok':False,'error':'Hy2 online IP unavailable','hysteria_ok':False,'reality_ok':False}
     core_counts=None
     try:
-        h=cfg['hysteria']
+        h=cfg.get('hysteria')
+        if not isinstance(h,dict):raise ValueError('invalid_hysteria_config')
         parsed=urlparse(h['url'])
         if parsed.scheme!='http' or parsed.hostname not in ('127.0.0.1','::1') or parsed.path not in ('','/'):raise ValueError('stats_not_loopback')
         live_req=urllib.request.Request(h['url'].rstrip('/')+'/online/ips',headers={'Authorization':h['secret']})
@@ -204,8 +214,14 @@ def read_live_connections():
             if len(raw)>4*1024*1024:raise ValueError('live_ips_response_too_large')
             live=json.loads(raw)
         except urllib.error.HTTPError as exc:
-            if exc.code!=404:raise
-            live=None
+            try:
+                if exc.code!=404:raise
+                live=None
+            finally:
+                try:
+                    exc.close()
+                except Exception:
+                    pass
         if live is not None:
             if not isinstance(live,dict) or live.get('revision')!='teyir-live-ips-v1' or not isinstance(live.get('users'),dict):raise ValueError('invalid_core_live_response')
             for uid,out in output['users'].items():
@@ -252,12 +268,15 @@ def read_live_connections():
                 out['ips']=[ip for ip in out['ips'] if ip['protocol']!='Hy2']
     # Reality 若已启用核心在线统计且服务正在运行则读取；装了 Xray 但未运行时按空闲处理，
     # 避免每 15 秒报「Reality在线IP读取失败」。未启用时明确说明，不用历史 access 日志猜。
-    rcfg=cfg.get('reality',{})
-    binary=rcfg.get('binary','')
+    rcfg=cfg.get('reality') if isinstance(cfg.get('reality'),dict) else {}
+    binary=rcfg.get('binary','') if isinstance(rcfg.get('binary'),str) else ''
     if binary and pathlib.Path(binary).is_file() and service_running('xray'):
         try:
-            xcfg=json.loads(pathlib.Path('/etc/hysteria/xray.json').read_text())
-            enabled=xcfg.get('policy',{}).get('levels',{}).get('0',{}).get('statsUserOnline',False)
+            xcfg=json.loads(pathlib.Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+            policy=xcfg.get('policy') if isinstance(xcfg,dict) else None
+            levels=policy.get('levels') if isinstance(policy,dict) else None
+            level0=levels.get('0') if isinstance(levels,dict) else None
+            enabled=level0.get('statsUserOnline',False) if isinstance(level0,dict) else False
             if not enabled:raise ValueError('online_statistics_not_enabled')
             address=rcfg['address']
             if not address.startswith('127.0.0.1:'):raise ValueError('stats_not_loopback')

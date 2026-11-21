@@ -1194,8 +1194,8 @@ function renderOutboundRules(rules, outs, builtin) {
   const configured = (builtin || []).filter(name => name && !customNames.has(name))
     .map(name => ({ name: name, type: builtinTypes[name] || '' }));
   const all = configured.concat([{ name: 'direct', type: 'direct' }, { name: 'reject', type: '' }], outs || []);
-  const seen = {}; const uniq = [];
-  all.forEach(o => { if (o && o.name && !seen[o.name]) { seen[o.name] = 1; uniq.push(o); } });
+  const seen = new Set(); const uniq = [];
+  all.forEach(o => { if (o && o.name && !seen.has(o.name)) { seen.add(o.name); uniq.push(o); } });
 
   if (obEls.ruleOutbound) {
     const cur = obEls.ruleOutbound.value;
@@ -2644,7 +2644,13 @@ if (btnRebootServer) {
         if (countdown <= 0) {
           clearInterval(timer);
           btnRebootServer.textContent = '⏳ 等待服务器恢复...';
-          if (await waitPortalBack()) {
+          let back = false;
+          try {
+            back = await waitPortalBack();
+          } catch (_) {
+            back = false;
+          }
+          if (back) {
             location.reload();
             return;
           }
@@ -3076,6 +3082,7 @@ const txTagEl = document.getElementById('tx-active-tag');
 // 首屏服务端渲染的「1.00 MB」两秒后就被轮询改写成「1024.00 KB」。digits[i] 是第 i 级单位的小数位。
 function fmtUnits(value, units, digits) {
   let n = Number(value || 0), i = 0;
+  if (!Number.isFinite(n) || n < 0) n = 0;
   while (i < units.length - 1 && Number(n.toFixed(digits[i])) >= 1024) { n /= 1024; i++; }
   return n.toFixed(digits[i]) + ' ' + units[i];
 }
@@ -3503,7 +3510,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
           <div class="input-with-action">
             <input type="text" id="um-share-url" aria-label="专属连接页面链接" value="${obEsc(shareUrl)}" readonly style="font-size:12px;height:38px">
             <button class="button primary" style="padding:0 12px;height:38px;font-size:12px" type="button" data-modal-copy="um-share-url">复制页面链接</button>
-            <a class="button" style="padding:0 12px;height:38px;font-size:12px" href="${obEsc(shareUrl)}" target="_blank">打开页面 ↗</a>
+            <a class="button" style="padding:0 12px;height:38px;font-size:12px" href="${obEsc(shareUrl)}" target="_blank" rel="noopener noreferrer">打开页面 ↗</a>
           </div>
         </div>
 
@@ -3686,14 +3693,14 @@ function renderAwgPeers(peers) {
     b.addEventListener('click', () => {
       const row = b.closest('tr');
       const endpoint = row && row.dataset.awgEndpoint ? '&endpoint=' + encodeURIComponent(row.dataset.awgEndpoint) : '';
-      window.open(location.pathname + 'awg-conf?name=' + b.getAttribute('data-awg-conf') + endpoint, '_blank');
+      window.open(location.pathname + 'awg-conf?name=' + b.getAttribute('data-awg-conf') + endpoint, '_blank', 'noopener,noreferrer');
     });
   });
   awgPeerTbody.querySelectorAll('[data-awg-qr]').forEach(b => {
     b.addEventListener('click', () => {
       const row = b.closest('tr');
       const endpoint = row && row.dataset.awgEndpoint ? '&endpoint=' + encodeURIComponent(row.dataset.awgEndpoint) : '';
-      window.open(location.pathname + 'awg-qr.svg?name=' + b.getAttribute('data-awg-qr') + endpoint, '_blank');
+      window.open(location.pathname + 'awg-qr.svg?name=' + b.getAttribute('data-awg-qr') + endpoint, '_blank', 'noopener,noreferrer');
     });
   });
   awgPeerTbody.querySelectorAll('[data-awg-del]').forEach(b => {
@@ -3713,6 +3720,8 @@ function renderAwgPeers(peers) {
         const json = await awgPost('manage-amneziawg', { action: 'peer_del', name: n });
         if (json.ok) { showToast('已删除客户端 ' + n, 'success'); loadAwgState(); }
         else { alert(json.error || '删除失败'); }
+      } catch (err) {
+        alert('删除失败: ' + (err && err.message ? err.message : err));
       } finally { b.disabled = false; }
     });
   });
@@ -3761,6 +3770,7 @@ if (btnAddAwgPeer) {
     // Open the tab synchronously in the click gesture; browsers block window.open
     // after an await because it no longer has transient user activation.
     const confTab = window.open('about:blank', '_blank');
+    try { if (confTab) confTab.opener = null; } catch (_) {}
     btnAddAwgPeer.disabled = true;
     try {
       const json = await awgPost('manage-amneziawg', { action: 'peer_add', name: name, endpoint: endpoint });

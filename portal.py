@@ -212,7 +212,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.50'
+PORTAL_VERSION = '2.51'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -5690,7 +5690,7 @@ def write_xray_unit():
     开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
     unit = Path('/etc/systemd/system/xray.service')
     if not unit.exists() or unit.read_text(encoding='utf-8') != XRAY_UNIT_CONTENT:
-        unit.write_text(XRAY_UNIT_CONTENT, encoding='utf-8')
+        _restore_systemd_unit_file(unit, XRAY_UNIT_CONTENT.encode('utf-8'), 0o644)
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
 
 
@@ -7510,12 +7510,14 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 握手，VMess 必须真的出示证书。因此只在启用且拿到域名时才追加。
     vmess_proxy = None
     vmess_sing = None
-    if vmess and user_id and vmess.get('domain') and _valid_port(vmess.get('port')):
+    if isinstance(vmess, dict) and user_id \
+            and isinstance(vmess.get('domain'), str) and vmess.get('domain').strip() \
+            and _valid_port(vmess.get('port')):
         v_name = name + '-VMess'
         v_uuid = vmess_uuid_for_user(user_id)
-        v_host = vmess['domain']
-        v_sni = vmess.get('sni') or v_host
-        v_path = vmess.get('ws_path') or '/'
+        v_host = vmess['domain'].strip()
+        v_sni = vmess.get('sni').strip() if isinstance(vmess.get('sni'), str) and vmess.get('sni').strip() else v_host
+        v_path = vmess.get('ws_path') if isinstance(vmess.get('ws_path'), str) and vmess.get('ws_path') else '/'
         v_port = _valid_port(vmess.get('port'))
         vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
                            port=v_port, uuid=v_uuid, alterId=0,
@@ -7535,13 +7537,16 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 同样是 TCP + 自有证书，但比 VMess 多了后量子密钥交换。
     vlessenc_proxy = None
     vlessenc_sing = None
-    if vlessenc and user_id and vlessenc.get('domain') \
-            and _valid_port(vlessenc.get('port')) and vlessenc.get('encryption'):
+    if isinstance(vlessenc, dict) and user_id \
+            and isinstance(vlessenc.get('domain'), str) and vlessenc.get('domain').strip() \
+            and _valid_port(vlessenc.get('port')) \
+            and isinstance(vlessenc.get('encryption'), str) and vlessenc.get('encryption').strip():
         e_name = name + '-VLESS-Enc'
         e_uuid = reality_uuid_for_user(user_id)
-        e_host = vlessenc['domain']
-        e_sni = vlessenc.get('sni') or e_host
-        e_enc = vlessenc['encryption']
+        e_host = vlessenc['domain'].strip()
+        e_sni = (vlessenc.get('sni').strip()
+                 if isinstance(vlessenc.get('sni'), str) and vlessenc.get('sni').strip() else e_host)
+        e_enc = vlessenc['encryption'].strip()
         e_port = _valid_port(vlessenc.get('port'))
         vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
                               port=e_port, uuid=e_uuid, udp=True,
@@ -7558,11 +7563,14 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
     anytls_proxy = None
     anytls_sing = None
-    if anytls and user_id and anytls.get('domain') \
-            and _valid_port(anytls.get('port')) and anytls.get('secret'):
+    if isinstance(anytls, dict) and user_id \
+            and isinstance(anytls.get('domain'), str) and anytls.get('domain').strip() \
+            and _valid_port(anytls.get('port')) \
+            and isinstance(anytls.get('secret'), str) and anytls.get('secret'):
         a_name = name + '-AnyTLS'
-        a_host = anytls['domain']
-        a_sni = anytls.get('sni') or a_host
+        a_host = anytls['domain'].strip()
+        a_sni = (anytls.get('sni').strip()
+                 if isinstance(anytls.get('sni'), str) and anytls.get('sni').strip() else a_host)
         a_pwd = anytls_password_for_user(anytls['secret'], user_id)
         a_port = _valid_port(anytls.get('port'))
         anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
@@ -7577,11 +7585,13 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # QUIC（UDP）+ 自有证书，由 sing-box 承载。
     tuic_proxy = None
     tuic_sing = None
-    if tuic and user_id and tuic.get('domain') \
+    if isinstance(tuic, dict) and user_id \
+            and isinstance(tuic.get('domain'), str) and tuic.get('domain').strip() \
             and _valid_port(tuic.get('port')) and isinstance(tuic.get('secret'), str) and tuic.get('secret'):
         t_name = name + '-TUIC'
-        t_host = tuic['domain']
-        t_sni = tuic.get('sni') or t_host
+        t_host = tuic['domain'].strip()
+        t_sni = (tuic.get('sni').strip()
+                 if isinstance(tuic.get('sni'), str) and tuic.get('sni').strip() else t_host)
         t_uuid, t_pwd = tuic_credentials_for_user(tuic['secret'], user_id)
         t_port = _valid_port(tuic.get('port'))
         tuic_proxy = dict(name=t_name, type='tuic', server=t_host, port=t_port,
@@ -7605,6 +7615,8 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
                      ([tuic_sing] if tuic_sing else [])
     alternates = [p['name'] for p in (reality_proxy, vmess_proxy, vlessenc_proxy, anytls_proxy,
                                       tuic_proxy) if p]
+    sing_alternates = [o['tag'] for o in (reality_sing, vmess_sing, vlessenc_sing, anytls_sing,
+                                          tuic_sing) if o]
 
     if alternates:
         # url-test：客户端定时探测多条链路，自动选延迟低的。
@@ -7620,13 +7632,12 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
              'proxies': proxies, 'proxy-groups': [group],
              'rules': ['MATCH,PROXY']}
     sing_doc = {'outbounds': sing_outbounds}
-    if alternates:
-        # sing-box 侧同样给一个 urltest outbound，让 SFA/SFI 自动择优。
+    if sing_alternates:
+        # sing-box 侧仅在确实有 sing-box 备用节点时才附带 urltest 组，
+        # 避免仅启用 VLESS-Enc（sing-box 不下发）时生成单节点空转 urltest。
         sing_doc['outbounds'].append({
             'type': 'urltest', 'tag': 'PROXY',
-            'outbounds': [sing['tag']] + [o['tag'] for o in
-                                          (reality_sing, vmess_sing, vlessenc_sing, anytls_sing,
-                                           tuic_sing) if o],
+            'outbounds': [sing['tag']] + sing_alternates,
             'url': 'https://www.gstatic.com/generate_204',
             'interval': '5m', 'tolerance': 50,
         })
@@ -8415,13 +8426,19 @@ def serve(path):
                 enforce_node_access(portal_path.parent,snapshot,pending,reality_apply_lock,
                                     skip_anytls=False, skip_tuic=False)
             except Exception as exc:
+                need_save_pending = False
                 with data_lock:
                     queued = sorted(pending_revocations(data) | pending)
                     # 队列没变就不重写：旧实现每次失败都整份重写 portal.json 并 fsync，
                     # 只有到期用户、队列为空时也写一个空列表，等于每 5 秒落盘一次（2026-11-12 修）。
                     if queued and data.get('_pending_revocations') != queued:
                         data['_pending_revocations'] = queued
+                        need_save_pending = True
+                if need_save_pending:
+                    try:
                         save_data()
+                    except Exception as save_exc:
+                        _log_ignored('apply_access.save_pending', save_exc)
                 reason = type(exc).__name__ + ': ' + ' '.join(str(exc).split())[:300]
                 now = time.monotonic()
                 if reason != last_enforce_error[0] or now - last_enforce_error[1] >= 3600:
@@ -8970,9 +8987,9 @@ def serve(path):
                     entry['listener'] = {'type': 'tls', 'tls': {
                         'certFile': cert_file, 'keyFile': key_file}}
                 services.append(entry)
+            # 记下真正写进配置的端口（持数据锁更新，避免与就绪探针并发读写竞争）。
+            gost_written_ports[:] = [int(s['addr'].lstrip(':')) for s in services]
 
-        # 记下真正写进配置的端口，gost_ports_ready 只等这些（2026-11-03 修）。
-        gost_written_ports[:] = [int(s['addr'].lstrip(':')) for s in services]
         cfg = {'services': services,
                'bypasses': [{'name': GOST_PRIVATE_BYPASS,
                              'matchers': list(PRIVATE_REJECT_RULES) + ['localhost', '*.localhost']}]}
@@ -9176,7 +9193,19 @@ def serve(path):
                 return                               # 留着旧单元，至少还能启动
             if all(s in current for s in needed):
                 return                               # 只是补回脚本，单元不用动
-            unit_path.write_text(GOST_UNIT_CONTENT, encoding='utf-8')
+            tmp_unit = unit_path.with_name(unit_path.name + '.tmp.' + os.urandom(4).hex())
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, 'O_NOFOLLOW'):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(str(tmp_unit), flags, 0o644)
+                with os.fdopen(fd, 'wb') as fh:
+                    fh.write(GOST_UNIT_CONTENT.encode('utf-8'))
+                os.chmod(str(tmp_unit), 0o644)
+                os.replace(str(tmp_unit), str(unit_path))
+            except BaseException:
+                tmp_unit.unlink(missing_ok=True)
+                raise
             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=5)
         except Exception as exc:
             _log_ignored('gost_unit_install', exc)
@@ -10555,7 +10584,10 @@ if __name__ == '__main__':
                                 # （2026-10-29 修：旧实现无条件保留旧 status/用量，
                                 # 控制台对账时传 active=false 或 limit_bytes 会被静默忽略）。
                                 if 'used_bytes' not in params:
-                                    record['used_bytes'] = int(existing.get('used_bytes', 0))
+                                    try:
+                                        record['used_bytes'] = int(existing.get('used_bytes') or 0)
+                                    except (TypeError, ValueError):
+                                        record['used_bytes'] = 0
                                 record['created_at'] = existing.get('created_at', now_ts)
                                 if 'legacy_auth_value' in existing:
                                     record['legacy_auth_value'] = existing['legacy_auth_value']
@@ -10816,7 +10848,7 @@ if __name__ == '__main__':
                                     new_expiry = int(base_time) + days * 86400
                                 # limit_bytes=0 表示不限量：加流量不能把它变成「只有本次加的量」，
                                 # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
-                                old_limit = int(u.get('limit_bytes', 0))
+                                old_limit = int(u.get('limit_bytes') or 0)
                                 new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
                                 if ((new_expiry is not None and not 0 <= new_expiry <= 253402300799)
                                         or not 0 <= new_limit <= 2**63 - 1):
@@ -10991,7 +11023,8 @@ if __name__ == '__main__':
                     if missing:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                    regenerate_page()
+                    if not durability_uncertain:
+                        regenerate_page()
                     # ⚠️ 2026-10-04 补：停用/启用必须同步到 xray。
                     #
                     # 原因：status 只在 hy2 的 handle_auth 里被检查，
@@ -11314,7 +11347,19 @@ if __name__ == '__main__':
                                 # 回滚脚本 portal_update_restart_script 拿的是
                                 # backups 列表里的具体路径，改名字不影响它。
                                 bak = dest.with_name('%s.bak-%s' % (dest.name, stamp))
-                                shutil.copy2(str(dest), str(bak))
+                                old_bytes = dest.read_bytes()
+                                old_mode = dest.stat().st_mode & 0o777
+                                bak_tmp = dest.with_name('%s.bak-tmp-%s' % (dest.name, os.urandom(4).hex()))
+                                try:
+                                    with open(bak_tmp, 'wb') as bfh:
+                                        bfh.write(old_bytes)
+                                        bfh.flush()
+                                        os.fsync(bfh.fileno())
+                                    os.chmod(bak_tmp, old_mode)
+                                    os.replace(bak_tmp, str(bak))
+                                finally:
+                                    if bak_tmp.exists():
+                                        bak_tmp.unlink(missing_ok=True)
                                 backups.append((dest, bak))
                             else:
                                 created.append(dest)
@@ -11343,14 +11388,31 @@ if __name__ == '__main__':
                                 restart_prefix, portal_update_restart_script(data['port'], backups, created),
                                 update_lock_fd)
                     except Exception as e:
-                        # 出错就把已替换的恢复回去，绝不留下半新半旧的状态
+                        # 出错就把已替换的经同目录临时文件原子恢复回去，绝不留下半新半旧或半截文件
                         for dest, bak in backups:
+                            rb_tmp = None
                             try:
-                                shutil.copy2(str(bak), str(dest))
+                                bak_path = Path(bak)
+                                bak_bytes = bak_path.read_bytes()
+                                bak_mode = bak_path.stat().st_mode & 0o777
+                                rb_tmp = Path(dest).with_name(
+                                    '%s.rb-%s' % (Path(dest).name, os.urandom(4).hex()))
+                                with open(rb_tmp, 'wb') as rfh:
+                                    rfh.write(bak_bytes)
+                                    rfh.flush()
+                                    os.fsync(rfh.fileno())
+                                os.chmod(rb_tmp, bak_mode)
+                                os.replace(rb_tmp, str(dest))
+                                rb_tmp = None
                             except Exception as exc:
+                                if rb_tmp is not None:
+                                    rb_tmp.unlink(missing_ok=True)
                                 _log_ignored('portal_update.rollback', exc)
                         for dest in created:
-                            Path(dest).unlink(missing_ok=True)
+                            try:
+                                Path(dest).unlink(missing_ok=True)
+                            except OSError as exc:
+                                _log_ignored('portal_update.rollback_unlink', exc)
                         return self.reply_json(500, {'ok': False, 'error':
                             '更新过程中出错，已回滚到原版本：%s' % e})
 
@@ -11510,8 +11572,12 @@ if __name__ == '__main__':
                     if not selected:
                         return 400, {'ok': False, 'error': '指定端口已占用，或无法找到空闲端口'}
                     port = selected
-                    username = str(params.get('username') or '').strip()[:64] or ('user_' + secrets.token_hex(4))
-                    password = str(params.get('password') or '').strip() or secrets.token_hex(12)
+                    raw_user = str(params.get('username') or '')
+                    raw_pass = str(params.get('password') or '')
+                    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_user + raw_pass):
+                        return 400, {'ok': False, 'error': '代理账号或密码不能包含换行或控制字符'}
+                    username = raw_user.strip()[:64] or ('user_' + secrets.token_hex(4))
+                    password = raw_pass.strip() or secrets.token_hex(12)
                     if ptype in ('http', 'https') and ':' in username:
                         return 400, {'ok': False, 'error': 'HTTP Basic 认证用户名不能包含冒号'}
                     if ptype == 'socks5' and (len(username.encode('utf-8')) > 255 or len(password.encode('utf-8')) > 255):
@@ -11541,14 +11607,22 @@ if __name__ == '__main__':
                 if not reload_gost():
                     with data_lock:
                         data['proxy_services'] = previous
-                    save_data()
-                    reload_gost()
+                    try:
+                        save_data()
+                    except Exception as rb_exc:
+                        _log_ignored('proxy_rollback_save', rb_exc)
+                    try:
+                        reload_gost()
+                    except Exception as rb_exc:
+                        _log_ignored('proxy_rollback_reload', rb_exc)
                     return 500, {'ok': False, 'applied': False,
                         'error': 'GOST 配置未成功应用或端口未监听，代理记录已恢复；请检查服务日志'}
                 if action == 'delete':
+                    with data_lock:
+                        data_snapshot = dict(data)
                     for item in working:
                         if item.get('id') == proxy_id and not protocol_port_in_use(
-                                item.get('port'), 'tcp', data, exclude_key='proxy_services'):
+                                item.get('port'), 'tcp', data_snapshot, exclude_key='proxy_services'):
                             if not firewall_port(item.get('port'), 'tcp', open_=False):
                                 return 500, {'ok': False, 'applied': True,
                                     'error': '代理已删除，但端口防火墙规则未能回收'}
@@ -11557,8 +11631,14 @@ if __name__ == '__main__':
                 if not firewall_port(port, 'tcp', open_=True):
                     with data_lock:
                         data['proxy_services'] = previous
-                    save_data()
-                    reload_gost()
+                    try:
+                        save_data()
+                    except Exception as rb_exc:
+                        _log_ignored('proxy_fw_rollback_save', rb_exc)
+                    try:
+                        reload_gost()
+                    except Exception as rb_exc:
+                        _log_ignored('proxy_fw_rollback_reload', rb_exc)
                     return 500, {'ok': False, 'applied': False,
                         'error': '防火墙放行失败，代理记录已恢复；请检查本机防火墙状态'}
                 m = read_meta_file(meta_path)
@@ -13024,7 +13104,7 @@ if __name__ == '__main__':
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                 try:
                     if previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8'):
-                        unit_path.write_text(ANYTLS_UNIT_CONTENT, encoding='utf-8')
+                        _restore_systemd_unit_file(unit_path, ANYTLS_UNIT_CONTENT.encode('utf-8'), 0o644)
                         unit_changed = True
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30, check=True)
                     apply_anytls_config(build_anytls_config(new_cfg, users, cert_file, key_file),
@@ -13044,15 +13124,28 @@ if __name__ == '__main__':
                             data['anytls_config'] = previous_cfg
                         else:
                             data.pop('anytls_config', None)
-                    if previous_file is None:
-                        cfg_path.unlink(missing_ok=True)
-                    else:
-                        _restore_config_atomically(cfg_path, previous_file)
+                    rollback_failed = False
+                    try:
+                        if previous_file is None:
+                            cfg_path.unlink(missing_ok=True)
+                        else:
+                            _restore_config_atomically(cfg_path, previous_file)
+                    except OSError as rb_exc:
+                        rollback_failed = True
+                        _log_ignored('anytls_enable_rollback_cfg', rb_exc)
                     if unit_changed:
-                        _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
-                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
-                                       timeout=30, check=True)
-                    if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                        try:
+                            _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
+                        except OSError as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('anytls_enable_rollback_unit', rb_exc)
+                        try:
+                            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
+                                           timeout=30, check=True)
+                        except Exception as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('anytls_enable_rollback_reload', rb_exc)
+                    if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state) or rollback_failed:
                         raise RuntimeError('AnyTLS 启用失败，且原服务状态未能完整恢复')
                     raise
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
@@ -13228,7 +13321,7 @@ if __name__ == '__main__':
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
                     if unit_changed:
-                        unit_path.write_text(TUIC_UNIT_CONTENT, encoding='utf-8')
+                        _restore_systemd_unit_file(unit_path, TUIC_UNIT_CONTENT.encode('utf-8'), 0o644)
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30, check=True)
                     apply_anytls_config(build_tuic_config(new_cfg, users, cert_file, key_file),
                                         cfg_path, restart=True, service=TUIC_SERVICE)
@@ -13245,15 +13338,28 @@ if __name__ == '__main__':
                     if 'cfg_path' in locals():
                         if 'previous_file' not in locals():
                             raise
-                        if previous_file is None:
-                            cfg_path.unlink(missing_ok=True)
-                        else:
-                            _restore_config_atomically(cfg_path, previous_file)
+                        rollback_failed = False
+                        try:
+                            if previous_file is None:
+                                cfg_path.unlink(missing_ok=True)
+                            else:
+                                _restore_config_atomically(cfg_path, previous_file)
+                        except OSError as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('tuic_enable_rollback_cfg', rb_exc)
                         if unit_changed:
-                            _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
-                            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
-                                           timeout=30, check=True)
-                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                            try:
+                                _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
+                            except OSError as rb_exc:
+                                rollback_failed = True
+                                _log_ignored('tuic_enable_rollback_unit', rb_exc)
+                            try:
+                                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
+                                               timeout=30, check=True)
+                            except Exception as rb_exc:
+                                rollback_failed = True
+                                _log_ignored('tuic_enable_rollback_reload', rb_exc)
+                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state) or rollback_failed:
                             raise RuntimeError('TUIC 启用失败，且原服务状态未能完整恢复')
                     raise
             regenerate_page()
@@ -13771,11 +13877,10 @@ if __name__ == '__main__':
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply(404, '该用户已不存在（可能已在别处删除），请刷新页面'.encode('utf-8'))
 
-                regenerate_page()
+                save_data()
                 if not self._sync_reality_clients():
                     with data_lock:
                         if action == 'delete':
-                            save_data()
                             revoked_pending = True
                         else:
                             revoked_pending = False
@@ -13783,11 +13888,12 @@ if __name__ == '__main__':
                                 data.get('users', {}).pop(user_id, None)
                             else:
                                 data.setdefault('users', {})[user_id] = previous_user
-                    save_data()
                     if revoked_pending:
-                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        # 锁外重建页面并持久化：用户已删仅待断开连接，页面状态须与最新 users 对齐。
+                        regenerate_page()
                         return self.reply(503, '用户已删除，但节点上的旧连接还没确认断开，后台会自动重试；请稍后刷新页面确认'
                                           .encode('utf-8'))
+                    save_data()
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
                 regenerate_page()
