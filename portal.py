@@ -13024,7 +13024,7 @@ if __name__ == '__main__':
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                 try:
                     if previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8'):
-                        unit_path.write_text(ANYTLS_UNIT_CONTENT, encoding='utf-8')
+                        _restore_systemd_unit_file(unit_path, ANYTLS_UNIT_CONTENT.encode('utf-8'), 0o644)
                         unit_changed = True
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30, check=True)
                     apply_anytls_config(build_anytls_config(new_cfg, users, cert_file, key_file),
@@ -13044,15 +13044,28 @@ if __name__ == '__main__':
                             data['anytls_config'] = previous_cfg
                         else:
                             data.pop('anytls_config', None)
-                    if previous_file is None:
-                        cfg_path.unlink(missing_ok=True)
-                    else:
-                        _restore_config_atomically(cfg_path, previous_file)
+                    rollback_failed = False
+                    try:
+                        if previous_file is None:
+                            cfg_path.unlink(missing_ok=True)
+                        else:
+                            _restore_config_atomically(cfg_path, previous_file)
+                    except OSError as rb_exc:
+                        rollback_failed = True
+                        _log_ignored('anytls_enable_rollback_cfg', rb_exc)
                     if unit_changed:
-                        _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
-                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
-                                       timeout=30, check=True)
-                    if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                        try:
+                            _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
+                        except OSError as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('anytls_enable_rollback_unit', rb_exc)
+                        try:
+                            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
+                                           timeout=30, check=True)
+                        except Exception as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('anytls_enable_rollback_reload', rb_exc)
+                    if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state) or rollback_failed:
                         raise RuntimeError('AnyTLS 启用失败，且原服务状态未能完整恢复')
                     raise
             # 启用后重建页面：连接页的 Clash/sing-box 文本与二维码要立刻
@@ -13228,7 +13241,7 @@ if __name__ == '__main__':
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
                     if unit_changed:
-                        unit_path.write_text(TUIC_UNIT_CONTENT, encoding='utf-8')
+                        _restore_systemd_unit_file(unit_path, TUIC_UNIT_CONTENT.encode('utf-8'), 0o644)
                         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30, check=True)
                     apply_anytls_config(build_tuic_config(new_cfg, users, cert_file, key_file),
                                         cfg_path, restart=True, service=TUIC_SERVICE)
@@ -13245,15 +13258,28 @@ if __name__ == '__main__':
                     if 'cfg_path' in locals():
                         if 'previous_file' not in locals():
                             raise
-                        if previous_file is None:
-                            cfg_path.unlink(missing_ok=True)
-                        else:
-                            _restore_config_atomically(cfg_path, previous_file)
+                        rollback_failed = False
+                        try:
+                            if previous_file is None:
+                                cfg_path.unlink(missing_ok=True)
+                            else:
+                                _restore_config_atomically(cfg_path, previous_file)
+                        except OSError as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('tuic_enable_rollback_cfg', rb_exc)
                         if unit_changed:
-                            _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
-                            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
-                                           timeout=30, check=True)
-                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                            try:
+                                _restore_systemd_unit_file(unit_path, previous_unit, unit_mode)
+                            except OSError as rb_exc:
+                                rollback_failed = True
+                                _log_ignored('tuic_enable_rollback_unit', rb_exc)
+                            try:
+                                subprocess.run(['systemctl', 'daemon-reload'], capture_output=True,
+                                               timeout=30, check=True)
+                            except Exception as rb_exc:
+                                rollback_failed = True
+                                _log_ignored('tuic_enable_rollback_reload', rb_exc)
+                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state) or rollback_failed:
                             raise RuntimeError('TUIC 启用失败，且原服务状态未能完整恢复')
                     raise
             regenerate_page()
