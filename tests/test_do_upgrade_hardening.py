@@ -104,7 +104,10 @@ class DoUpgradeHardeningTests(unittest.TestCase):
         start = src.index('def _h_post_do_upgrade_impl(self, prefix):')
         end = src.index('def _manage_proxy_operation(self, action, params):', start)
         block = src[start:end]
-        self.assertNotIn("portal_update_restart_script(data['port']", block)
+        p_start = block.index("if target == 'portal':")
+        p_end = block.index("if target == 'awg':", p_start)
+        p_block = block[p_start:p_end]
+        self.assertIn('with data_lock:\n                                    restart_script = portal_update_restart_script(', p_block)
 
 
 if __name__ == '__main__':

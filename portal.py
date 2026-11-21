@@ -11526,12 +11526,10 @@ if __name__ == '__main__':
                             # scope 内脚本 ready/go 握手完成才交接；失败也走整包回滚。
                             try:
                                 with data_lock:
-                                    portal_port = data['port']
+                                    restart_script = portal_update_restart_script(data['port'], backups, created)
                             except NameError:
-                                portal_port = data['port']
-                            portal_start_update(
-                                restart_prefix, portal_update_restart_script(portal_port, backups, created),
-                                update_lock_fd)
+                                restart_script = portal_update_restart_script(data['port'], backups, created)
+                            portal_start_update(restart_prefix, restart_script, update_lock_fd)
                     except Exception as e:
                         # 出错就把已替换的经同目录临时文件原子恢复回去，绝不留下半新半旧或半截文件
                         for dest, bak in backups:
@@ -15540,7 +15538,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
             if query.get('force', ['0'])[0] == '1':
-                with _ver_cache_lock:
+                try:
+                    with _ver_cache_lock:
+                        _ver_cache['t'] = 0.0
+                        _core_ver_cache['t'] = 0.0
+                except NameError:
                     _ver_cache['t'] = 0.0
                     _core_ver_cache['t'] = 0.0
             core_curr, core_latest, core_has_update = '未知', '', False
@@ -15553,7 +15555,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             except Exception as exc:
                 _log_ignored('core_version', exc)
             now = time.time()
-            with _ver_cache_lock:
+            try:
+                with _ver_cache_lock:
+                    core_cached_t = _core_ver_cache['t']
+                    core_cached_tag = _core_ver_cache['tag']
+            except NameError:
                 core_cached_t = _core_ver_cache['t']
                 core_cached_tag = _core_ver_cache['tag']
             if now - core_cached_t >= (300 if core_cached_tag else 30):
@@ -15568,7 +15574,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     )
                 except Exception:
                     new_tag = ''
-                with _ver_cache_lock:
+                try:
+                    with _ver_cache_lock:
+                        _core_ver_cache['tag'] = new_tag
+                        _core_ver_cache['t'] = now
+                except NameError:
                     _core_ver_cache['tag'] = new_tag
                     _core_ver_cache['t'] = now
                 core_latest = new_tag
