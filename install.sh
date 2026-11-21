@@ -1487,6 +1487,7 @@ setup_cert_via_existing_caddy() {
     log_info "已备份 Caddyfile -> ${bak}"
 
     # 幂等：已存在该域名块就不重复追加
+    local appended=0
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
         cat >> "$cf" <<CEOF
 
@@ -1497,6 +1498,7 @@ ${domain} {
 $(caddy_decoy_directives "$domain")
 }
 CEOF
+        appended=1
     fi
     if ! caddy validate --config "$cf" >/dev/null 2>&1; then
         log_err "追加后的 Caddyfile 校验不通过，已回滚。"
@@ -1520,6 +1522,11 @@ CEOF
         fi
         sleep 5
     done
+    if [[ "$appended" == 1 ]]; then
+        cp -a "$bak" "$cf" 2>/dev/null || true
+        systemctl reload caddy 2>/dev/null || true
+        log_warn "签发超时，已从备份回滚本次自动追加到 Caddyfile 的占位站点块。"
+    fi
     log_err "等待 60 秒仍未拿到证书。请查看: journalctl -u caddy -n 50"
     return 1
 }
@@ -4010,19 +4017,35 @@ portal_write_meter_config() {
         # 不追加到文件末尾：其他段的位置不影响 hysteria 解析，但保持可读性插入到
         # masquerade 之前；若找不到锚点则追加到末尾（hysteria 对顶层键顺序不敏感）。
         python3 - "$HY2_CONFIG" "$METER_SECRET" <<'PYEOF'
-import io, re, sys
+import io, os, re, secrets, stat, sys
 path, secret = sys.argv[1], sys.argv[2]
+st_mode = stat.S_IMODE(os.stat(path).st_mode)
 s = io.open(path, encoding='utf-8').read()
 block = ("\n# 真实计量：/traffic 只读端点，供 usage-meter 采集。必须回环监听，\n"
          "# 且 secret 与 usage-meter-config.json 的 hysteria.secret 逐字符一致。\n"
          "trafficStats:\n  listen: 127.0.0.1:19996\n  secret: %s\n" % secret)
-if not re.search(r'^trafficStats:', s, re.M):
-    anchor = 'masquerade:'
-    if anchor in s:
-        s = s.replace(anchor, block.lstrip('\n') + '\n' + anchor, 1)
+if not re.search(r'^trafficStats:\s*(?:#.*)?$', s, re.M):
+    m = re.search(r'^masquerade:\s*(?:#.*)?$', s, re.M)
+    if m:
+        s = s[:m.start()] + block.lstrip('\n') + '\n' + s[m.start():]
     else:
         s = s.rstrip('\n') + '\n' + block
-io.open(path, 'w', encoding='utf-8', newline='\n').write(s)
+tmp = path + '.tmp.' + secrets.token_hex(4)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, 'O_NOFOLLOW'):
+    flags |= os.O_NOFOLLOW
+fd = os.open(tmp, flags, 0o600)
+try:
+    with os.fdopen(fd, 'wb') as fh:
+        fh.write(s.encode('utf-8'))
+    os.chmod(tmp, st_mode)
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PYEOF
         _meter_secret="$(traffic_stats_secret "$HY2_CONFIG")"
     fi
@@ -4031,10 +4054,22 @@ PYEOF
         log_err "拒绝以静默降级的方式继续安装（界面会永远显示「未开始计量」）。"
         return 1
     fi
-    cat > "${dest_dir}/usage-meter-config.json" <<METEREOF
+    local _meter_tmp
+    _meter_tmp="$(umask 077; mktemp "${dest_dir}/usage-meter-config.json.tmp.XXXXXX")" || return 1
+    if ! cat > "$_meter_tmp" <<METEREOF
 {"hysteria": {"url": "http://127.0.0.1:19996", "secret": "${_meter_secret}"}, "reality": {"binary": "/usr/local/bin/xray", "address": "127.0.0.1:19997"}}
 METEREOF
-    chmod 600 "${dest_dir}/usage-meter-config.json"
+    then
+        rm -f "$_meter_tmp"
+        unset _meter_secret
+        return 1
+    fi
+    chmod 600 "$_meter_tmp"
+    if ! mv -f "$_meter_tmp" "${dest_dir}/usage-meter-config.json"; then
+        rm -f "$_meter_tmp"
+        unset _meter_secret
+        return 1
+    fi
     unset _meter_secret
     log_info "门户程序已就位: ${dest_dir}/portal.py + portal_assets.py + 计量模块"
 }
