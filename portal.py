@@ -7715,6 +7715,18 @@ def reality_client_params(rcfg):
     return port, sni.strip(), pbk, sid
 
 
+def _clean_host_scalar(value):
+    """清洗主机名/IP 标量：拒绝非字符串及含控制字符或内部空白的脏值。"""
+    if not isinstance(value, str):
+        return ''
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+        return ''
+    text = value.strip()
+    if not text or any(ch.isspace() for ch in text):
+        return ''
+    return text
+
+
 def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     """给某个用户拼他自己的 VLESS-Reality 直链。
 
@@ -7725,12 +7737,13 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     # 同 VMess / VLESS-Encryption：非 dict 配置在订阅路径上直接抛
     # AttributeError，用户拿不到任何节点。
     params = reality_client_params(rcfg)
-    if params is None:
+    clean_ip = _clean_host_scalar(public_ip)
+    if params is None or not clean_ip:
         return ''
     port, dest_sni, pub_key, short_id = params
     uid_uuid = reality_uuid_for_user(user_id)
-    tag = label or ('VLESS-Reality-' + str(user_id))
-    return (f"vless://{uid_uuid}@{_host_for_url(public_ip)}:{port}"
+    tag = label if isinstance(label, str) and label else ('VLESS-Reality-' + str(user_id))
+    return (f"vless://{uid_uuid}@{_host_for_url(clean_ip)}:{port}"
             f"?security=reality&encryption=none&pbk={pub_key}"
             f"&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision"
             f"&sni={dest_sni}&sid={short_id}#{quote(tag)}")
@@ -7784,19 +7797,18 @@ def clean_node_identity(m):
     m = m if isinstance(m, dict) else {}
     flag = m.get('is_insecure', False)
     is_insecure = flag is True or (isinstance(flag, str) and flag.strip().lower() == 'true')
-    sn, ip = m.get('server_name'), m.get('public_ip')
-    sn = sn.strip() if isinstance(sn, str) else ''
-    ip = ip.strip() if isinstance(ip, str) else ''
+    sn = _clean_host_scalar(m.get('server_name'))
+    ip = _clean_host_scalar(m.get('public_ip'))
     server_name = sn or ip or 'localhost'
     public_ip = ip or server_name
     return is_insecure, server_name, public_ip, (public_ip if is_insecure else server_name)
 
 
 def clean_hop_range(value):
-    """端口跳跃区间规范成 (起, 止)；格式不对或越界返回 None（按未开启处理）。"""
+    """端口跳跃区间规范成 (起, 止)；格式不对、带前导零或越界返回 None（按未开启处理）。"""
     if not isinstance(value, str):
         return None
-    hit = re.fullmatch(r'\s*([0-9]{1,5})\s*[-:]\s*([0-9]{1,5})\s*', value)
+    hit = re.fullmatch(r'\s*([1-9][0-9]{0,4})\s*[-:]\s*([1-9][0-9]{0,4})\s*', value, re.ASCII)
     if not hit:
         return None
     lo, hi = int(hit.group(1)), int(hit.group(2))
@@ -7922,98 +7934,98 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 握手，VMess 必须真的出示证书。因此只在启用且拿到域名时才追加。
     vmess_proxy = None
     vmess_sing = None
-    if isinstance(vmess, dict) and user_id \
-            and isinstance(vmess.get('domain'), str) and vmess.get('domain').strip() \
-            and _valid_port(vmess.get('port')):
-        v_name = name + '-VMess'
-        v_uuid = vmess_uuid_for_user(user_id)
-        v_host = vmess['domain'].strip()
-        v_sni = vmess.get('sni').strip() if isinstance(vmess.get('sni'), str) and vmess.get('sni').strip() else v_host
-        v_path = vmess.get('ws_path') if isinstance(vmess.get('ws_path'), str) and vmess.get('ws_path') else '/'
+    if isinstance(vmess, dict) and user_id:
+        v_host = _clean_host_scalar(vmess.get('domain'))
         v_port = _valid_port(vmess.get('port'))
-        vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
-                           port=v_port, uuid=v_uuid, alterId=0,
-                           cipher='auto', udp=True, tls=True, servername=v_sni,
-                           network='ws', **{'ws-opts': {'path': v_path,
-                                                        'headers': {'Host': v_sni}}},
-                           **{'client-fingerprint': 'chrome'})
-        vmess_sing = dict(type='vmess', tag=v_name, server=v_host,
-                          server_port=v_port, uuid=v_uuid,
-                          security='auto', alter_id=0,
-                          transport=dict(type='ws', path=v_path,
-                                         headers={'Host': v_sni}),
-                          tls=dict(enabled=True, server_name=v_sni,
-                                   utls=dict(enabled=True, fingerprint='chrome')))
+        raw_v_path = vmess.get('ws_path')
+        if raw_v_path in (None, ''):
+            v_path = '/'
+        elif (isinstance(raw_v_path, str)
+              and not any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_v_path)):
+            v_path = raw_v_path
+        else:
+            v_path = ''
+        if v_host and v_port and v_path:
+            v_name = name + '-VMess'
+            v_uuid = vmess_uuid_for_user(user_id)
+            v_sni = _clean_host_scalar(vmess.get('sni')) or v_host
+            vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
+                               port=v_port, uuid=v_uuid, alterId=0,
+                               cipher='auto', udp=True, tls=True, servername=v_sni,
+                               network='ws', **{'ws-opts': {'path': v_path,
+                                                            'headers': {'Host': v_sni}}},
+                               **{'client-fingerprint': 'chrome'})
+            vmess_sing = dict(type='vmess', tag=v_name, server=v_host,
+                              server_port=v_port, uuid=v_uuid,
+                              security='auto', alter_id=0,
+                              transport=dict(type='ws', path=v_path,
+                                             headers={'Host': v_sni}),
+                              tls=dict(enabled=True, server_name=v_sni,
+                                       utls=dict(enabled=True, fingerprint='chrome')))
 
     # ---- VLESS Encryption（可选）----
     # 同样是 TCP + 自有证书，但比 VMess 多了后量子密钥交换。
     vlessenc_proxy = None
     vlessenc_sing = None
-    if isinstance(vlessenc, dict) and user_id \
-            and isinstance(vlessenc.get('domain'), str) and vlessenc.get('domain').strip() \
-            and _valid_port(vlessenc.get('port')) \
-            and isinstance(vlessenc.get('encryption'), str) and vlessenc.get('encryption').strip():
-        e_name = name + '-VLESS-Enc'
-        e_uuid = reality_uuid_for_user(user_id)
-        e_host = vlessenc['domain'].strip()
-        e_sni = (vlessenc.get('sni').strip()
-                 if isinstance(vlessenc.get('sni'), str) and vlessenc.get('sni').strip() else e_host)
-        e_enc = vlessenc['encryption'].strip()
+    if isinstance(vlessenc, dict) and user_id:
+        e_host = _clean_host_scalar(vlessenc.get('domain'))
         e_port = _valid_port(vlessenc.get('port'))
-        vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
-                              port=e_port, uuid=e_uuid, udp=True,
-                              tls=True, servername=e_sni, network='tcp',
-                              encryption=e_enc,
-                              **{'client-fingerprint': 'chrome'})
-        # sing-box 的 VLESS 出站没有 encryption（那是 Xray 独有的）：带上它，
-        # sing-box 1.14.4 报 unknown field，整份 sing-box.json 加载失败，连 Hy2
-        # 节点一起用不了；去掉它又连不上 VLESS Encryption 入站。所以 sing-box
-        # 订阅里不下发这一条（2026-11-03 修，SE 上用真 sing-box check 确认）。
-        vlessenc_sing = None
+        e_enc = _clean_host_scalar(vlessenc.get('encryption'))
+        if e_host and e_port and e_enc:
+            e_name = name + '-VLESS-Enc'
+            e_uuid = reality_uuid_for_user(user_id)
+            e_sni = _clean_host_scalar(vlessenc.get('sni')) or e_host
+            vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
+                                  port=e_port, uuid=e_uuid, udp=True,
+                                  tls=True, servername=e_sni, network='tcp',
+                                  encryption=e_enc,
+                                  **{'client-fingerprint': 'chrome'})
+            # sing-box 的 VLESS 出站没有 encryption（那是 Xray 独有的）：带上它，
+            # sing-box 1.14.4 报 unknown field，整份 sing-box.json 加载失败，连 Hy2
+            # 节点一起用不了；去掉它又连不上 VLESS Encryption 入站。所以 sing-box
+            # 订阅里不下发这一条（2026-11-03 修，SE 上用真 sing-box check 确认）。
+            vlessenc_sing = None
 
     # ---- AnyTLS（可选，2026-10-28 加）----
     # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
     anytls_proxy = None
     anytls_sing = None
-    if isinstance(anytls, dict) and user_id \
-            and isinstance(anytls.get('domain'), str) and anytls.get('domain').strip() \
-            and _valid_port(anytls.get('port')) \
-            and isinstance(anytls.get('secret'), str) and anytls.get('secret'):
-        a_name = name + '-AnyTLS'
-        a_host = anytls['domain'].strip()
-        a_sni = (anytls.get('sni').strip()
-                 if isinstance(anytls.get('sni'), str) and anytls.get('sni').strip() else a_host)
-        a_pwd = anytls_password_for_user(anytls['secret'], user_id)
+    if isinstance(anytls, dict) and user_id:
+        a_host = _clean_host_scalar(anytls.get('domain'))
         a_port = _valid_port(anytls.get('port'))
-        anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
-                            port=a_port, password=a_pwd, udp=True,
-                            sni=a_sni, **{'client-fingerprint': 'chrome'})
-        anytls_sing = dict(type='anytls', tag=a_name, server=a_host,
-                           server_port=a_port, password=a_pwd,
-                           tls=dict(enabled=True, server_name=a_sni,
-                                    utls=dict(enabled=True, fingerprint='chrome')))
+        a_secret = anytls.get('secret')
+        if a_host and a_port and isinstance(a_secret, str) and a_secret:
+            a_name = name + '-AnyTLS'
+            a_sni = _clean_host_scalar(anytls.get('sni')) or a_host
+            a_pwd = anytls_password_for_user(a_secret, user_id)
+            anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
+                                port=a_port, password=a_pwd, udp=True,
+                                sni=a_sni, **{'client-fingerprint': 'chrome'})
+            anytls_sing = dict(type='anytls', tag=a_name, server=a_host,
+                               server_port=a_port, password=a_pwd,
+                               tls=dict(enabled=True, server_name=a_sni,
+                                        utls=dict(enabled=True, fingerprint='chrome')))
 
     # ---- TUIC v5（可选，2026-10-31 加）----
     # QUIC（UDP）+ 自有证书，由 sing-box 承载。
     tuic_proxy = None
     tuic_sing = None
-    if isinstance(tuic, dict) and user_id \
-            and isinstance(tuic.get('domain'), str) and tuic.get('domain').strip() \
-            and _valid_port(tuic.get('port')) and isinstance(tuic.get('secret'), str) and tuic.get('secret'):
-        t_name = name + '-TUIC'
-        t_host = tuic['domain'].strip()
-        t_sni = (tuic.get('sni').strip()
-                 if isinstance(tuic.get('sni'), str) and tuic.get('sni').strip() else t_host)
-        t_uuid, t_pwd = tuic_credentials_for_user(tuic['secret'], user_id)
+    if isinstance(tuic, dict) and user_id:
+        t_host = _clean_host_scalar(tuic.get('domain'))
         t_port = _valid_port(tuic.get('port'))
-        tuic_proxy = dict(name=t_name, type='tuic', server=t_host, port=t_port,
-                          uuid=t_uuid, password=t_pwd, alpn=['h3'], sni=t_sni,
-                          udp=True, **{'congestion-controller': 'bbr',
-                                       'udp-relay-mode': 'native'})
-        tuic_sing = dict(type='tuic', tag=t_name, server=t_host, server_port=t_port,
-                         uuid=t_uuid, password=t_pwd, congestion_control='bbr',
-                         udp_relay_mode='native',
-                         tls=dict(enabled=True, server_name=t_sni, alpn=['h3']))
+        t_secret = tuic.get('secret')
+        if t_host and t_port and isinstance(t_secret, str) and t_secret:
+            t_name = name + '-TUIC'
+            t_sni = _clean_host_scalar(tuic.get('sni')) or t_host
+            t_uuid, t_pwd = tuic_credentials_for_user(t_secret, user_id)
+            tuic_proxy = dict(name=t_name, type='tuic', server=t_host, port=t_port,
+                              uuid=t_uuid, password=t_pwd, alpn=['h3'], sni=t_sni,
+                              udp=True, **{'congestion-controller': 'bbr',
+                                           'udp-relay-mode': 'native'})
+            tuic_sing = dict(type='tuic', tag=t_name, server=t_host, server_port=t_port,
+                             uuid=t_uuid, password=t_pwd, congestion_control='bbr',
+                             udp_relay_mode='native',
+                             tls=dict(enabled=True, server_name=t_sni, alpn=['h3']))
 
     proxies = [proxy] + ([reality_proxy] if reality_proxy else []) + \
               ([vmess_proxy] if vmess_proxy else []) + \
@@ -8101,6 +8113,9 @@ def prepare(meta_path, port, node_api_key=None):
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
+    master_pw = m.get('auth_password')
+    if not isinstance(master_pw, str) or not master_pw.strip():
+        raise ValueError('client_meta.json 缺少有效的 auth_password')
     # 先修信任模型（cert_type/server_name/is_insecure/pin），再对齐 pin。
     # 顺序不能反：sync_pin 依赖 is_insecure 判断 pin 该不该留，而 is_insecure
     # 本身可能正漂移着（自签证书被换成正式证书后仍是 true）。
@@ -8115,7 +8130,7 @@ def prepare(meta_path, port, node_api_key=None):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                             capture_output=True, timeout=20)
-        qr_svg = qr.stdout if qr.returncode == 0 else b''
+        qr_svg = qr.stdout if (qr.returncode == 0 and b'<svg' in qr.stdout) else b''
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
@@ -8169,7 +8184,7 @@ def qr_svg_for(uri, timeout=20):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                             input=str(uri).encode(), capture_output=True, timeout=timeout)
-        if qr.returncode == 0 and qr.stdout:
+        if qr.returncode == 0 and qr.stdout and b'<svg' in qr.stdout:
             return qr.stdout.decode('utf-8', 'replace')
     except Exception as exc:
         _log_ignored('qr_refresh', exc)  # 保留旧图，别把框清空
