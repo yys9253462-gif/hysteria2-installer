@@ -6351,6 +6351,21 @@ def active_ip_deny(table, uid, now):
     return set(row)
 
 
+def _valid_loopback_stats_url(url):
+    if not isinstance(url, str):
+        return False
+    m = re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):([0-9]{1,5})', url)
+    if not m:
+        return False
+    port_text = m.group(1)
+    return not port_text.startswith('0') and 1 <= int(port_text) <= 65535
+
+
+def _valid_stats_secret(secret):
+    return (isinstance(secret, str) and bool(secret)
+            and not any(ord(ch) < 32 or ord(ch) == 127 for ch in secret))
+
+
 def kick_hy2_users(root, uids):
     """让 Hy2 核心断开这些用户的全部会话（被拦 IP 断开后重连会在 /auth 被拒，放行的设备会自动重连）。"""
     cfg_path = Path(root) / 'usage-meter-config.json'
@@ -6366,8 +6381,7 @@ def kick_hy2_users(root, uids):
     secret = hc.get('secret')
     url = hc.get('url')
     url = url.rstrip('/') if isinstance(url, str) else ''
-    if (not uids or not isinstance(secret, str) or not secret
-            or not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url)):
+    if not uids or not _valid_stats_secret(secret) or not _valid_loopback_stats_url(url):
         return False
     req = urllib.request.Request(url + '/kick', data=json.dumps(sorted(uids)).encode(),
                                  headers={'Authorization': secret, 'Content-Type': 'application/json'})
@@ -6899,14 +6913,27 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
         hc = hc if isinstance(hc, dict) else {}
         url = hc.get('url')
         url = url.rstrip('/') if isinstance(url, str) else ''
-        if not re.fullmatch(r'http://(?:127\.0\.0\.1|\[::1\]):[0-9]+', url):
+        secret = hc.get('secret')
+        if not _valid_loopback_stats_url(url):
             raise RuntimeError('cannot confirm Hy2 revocation: loopback stats unavailable')
+        if not _valid_stats_secret(secret):
+            raise RuntimeError('cannot confirm Hy2 revocation: loopback stats secret unavailable')
         def request_stats(path, payload=None):
             req = urllib.request.Request(url + path, data=json.dumps(payload).encode() if payload is not None else None,
-                                         headers={'Authorization': hc['secret'], 'Content-Type':'application/json'})
+                                         headers={'Authorization': secret, 'Content-Type':'application/json'})
             with urllib.request.urlopen(req, timeout=4) as response:
-                raw=response.read()
+                raw=_read_bounded_bytes(response, 4 * 1024 * 1024)
             return json.loads(raw) if raw.strip() else {}
+        def _online_count(online_map, uid):
+            if not isinstance(online_map, dict):
+                raise RuntimeError('invalid Hy2 /online response; cannot confirm revocation')
+            val = online_map.get(uid, 0)
+            if isinstance(val, bool):
+                raise RuntimeError('invalid Hy2 /online count; cannot confirm revocation')
+            try:
+                return int(val)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError('invalid Hy2 /online count; cannot confirm revocation') from exc
         try:
             online=request_stats('/online')
         except OSError:
@@ -6919,12 +6946,14 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
                 online={}
             else:
                 raise
-        active=[uid for uid in blocked if int(online.get(uid, 0)) > 0]
+        if not isinstance(online, dict):
+            raise RuntimeError('invalid Hy2 /online response; cannot confirm revocation')
+        active=[uid for uid in blocked if _online_count(online, uid) > 0]
         if active:
             request_stats('/kick', active)
             time.sleep(0.2)
             online=request_stats('/online')
-            if any(int(online.get(uid, 0)) > 0 for uid in active):
+            if any(_online_count(online, uid) > 0 for uid in active):
                 # 标准核心只在下一次传输消费 kick；闲置/多实例需确保全部会话关闭。
                 # 走 _restart_hy2（2026-11-04 修）：直接 restart 不清失败计数，一阵连续收回就撞上
                 # StartLimitBurst，服务锁死、全员掉线。重启后统计接口要稍等才绑好端口：Type=simple
@@ -6940,7 +6969,7 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
                         time.sleep(0.2)
                 if online is None:
                     raise RuntimeError('Hy2 stats API not reachable after restart; cannot confirm revocation')
-                if any(int(online.get(uid, 0)) > 0 for uid in active):
+                if any(_online_count(online, uid) > 0 for uid in active):
                     raise RuntimeError('Hy2 sessions still present after revocation')
     xj=root/'xray.json'
     if not xj.exists():
