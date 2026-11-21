@@ -10960,16 +10960,26 @@ if __name__ == '__main__':
                                 raise ValueError()
                             changes['password'] = params['password']
                         if 'expires_at' in params:
-                            changes['expires_at'] = int(params['expires_at'])
+                            raw_exp = params['expires_at']
+                            if isinstance(raw_exp, bool) or isinstance(raw_exp, float):
+                                raise ValueError()
+                            if isinstance(raw_exp, str) and (not raw_exp.isascii() or not raw_exp.isdigit()):
+                                raise ValueError()
+                            changes['expires_at'] = int(raw_exp)
                             # 与 create / renew 使用同一上界（9999-12-31）。
                             if not 0 <= changes['expires_at'] <= 253402300799: raise ValueError()
                         if 'ip_limit' in params:
-                            changes['ip_limit'] = int(params['ip_limit'])
+                            raw_ipl = params['ip_limit']
+                            if isinstance(raw_ipl, bool) or isinstance(raw_ipl, float):
+                                raise ValueError()
+                            if isinstance(raw_ipl, str) and (not raw_ipl.isascii() or not raw_ipl.isdigit()):
+                                raise ValueError()
+                            changes['ip_limit'] = int(raw_ipl)
                             if not 0 <= changes['ip_limit'] <= 1000: raise ValueError()
                         if 'status' in params:
                             if params['status'] not in ('active', 'disabled'): raise ValueError()
                             changes['status'] = params['status']
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError, OverflowError):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid attribute'})
                     conflict = None
                     durability_uncertain = False
@@ -11052,6 +11062,8 @@ if __name__ == '__main__':
                                 # 旧实现 int(None or 0) 当成早已过期，写成「今天 + N 天」，extend_days
                                 # 缺省 30 —— 商城只想加流量时，永久用户被悄悄改成 30 天后停。
                                 raw_expiry = u.get('expires_at')
+                                if isinstance(raw_expiry, bool):
+                                    raise ValueError()
                                 if raw_expiry is None:
                                     new_expiry = None
                                 else:
@@ -11059,7 +11071,10 @@ if __name__ == '__main__':
                                     new_expiry = int(base_time) + days * 86400
                                 # limit_bytes=0 表示不限量：加流量不能把它变成「只有本次加的量」，
                                 # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
-                                old_limit = int(u.get('limit_bytes') or 0)
+                                raw_limit = u.get('limit_bytes')
+                                if isinstance(raw_limit, bool):
+                                    raise ValueError()
+                                old_limit = int(raw_limit or 0)
                                 new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
                                 if ((new_expiry is not None and not 0 <= new_expiry <= 253402300799)
                                         or not 0 <= new_limit <= 2**63 - 1):
@@ -11328,6 +11343,8 @@ if __name__ == '__main__':
                     # 主控制台的节点流量限额：超额时停代理服务，新周期恢复。
                     if not isinstance(params.get('suspended'), bool):
                         return self.reply_json(400, {'ok': False, 'error': 'suspended must be a boolean'})
+                    # 停用或恢复涉及多个 systemd 单元启停，续期死线避免撞上默认 30 秒超时。
+                    self._extend_deadline(120)
                     state, results = set_traffic_suspension(params['suspended'])
                     failed = [u for u, ok in results.items() if not ok]
                     return self.reply_json(200 if not failed else 500, {
