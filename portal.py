@@ -4586,8 +4586,22 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
         try:
             st = json.loads(Path(selfheal_state_path).read_text(encoding='utf-8'))
             if isinstance(st, dict):
-                info['healed_at'] = int(st.get('healed_at') or 0)
-                info['heal_count'] = int(st.get('heal_count') or 0)
+                raw_healed_at = st.get('healed_at')
+                if not isinstance(raw_healed_at, bool):
+                    try:
+                        val = int(raw_healed_at or 0)
+                        if val >= 0:
+                            info['healed_at'] = val
+                    except (TypeError, ValueError):
+                        pass
+                raw_heal_count = st.get('heal_count')
+                if not isinstance(raw_heal_count, bool):
+                    try:
+                        val = int(raw_heal_count or 0)
+                        if val >= 0:
+                            info['heal_count'] = val
+                    except (TypeError, ValueError):
+                        pass
                 if isinstance(st.get('last_pin'), str) and st.get('last_pin'):
                     info['pin_sha256'] = st['last_pin']
         except Exception as exc:
@@ -5757,7 +5771,13 @@ def write_xray_unit():
     """写 xray.service 并 daemon-reload；不 enable —— 没有任何协议配置时
     开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
     unit = Path('/etc/systemd/system/xray.service')
-    if not unit.exists() or unit.read_text(encoding='utf-8') != XRAY_UNIT_CONTENT:
+    current_text = None
+    if unit.exists():
+        try:
+            current_text = unit.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            current_text = None
+    if current_text != XRAY_UNIT_CONTENT:
         _restore_systemd_unit_file(unit, XRAY_UNIT_CONTENT.encode('utf-8'), 0o644)
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
 
@@ -9597,13 +9617,25 @@ if __name__ == '__main__':
                         return True
                 except Exception:
                     pass
-            fd, tmp_name = tempfile.mkstemp(prefix='hy2-awgctl-', suffix='.sh')
-            os.close(fd)
-            with open(tmp_name, 'wb') as fh:
-                fh.write(content)
-            os.chmod(tmp_name, 0o755)
-            shutil.move(tmp_name, AWG_CTL)
-            os.chmod(AWG_CTL, 0o755)
+            target_path = Path(AWG_CTL)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix='.hy2-awgctl-', suffix='.sh.tmp', dir=str(target_path.parent))
+            replaced = False
+            try:
+                with os.fdopen(fd, 'wb') as fh:
+                    fh.write(content)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.chmod(tmp_name, 0o755)
+                os.replace(tmp_name, str(target_path))
+                replaced = True
+            finally:
+                if not replaced:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
             return True
         except Exception:
             return False
