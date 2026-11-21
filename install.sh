@@ -5049,24 +5049,38 @@ install_gost() {
         return 1
     fi
     if [[ ! -f "$GOST_CERT_DIR/cert.pem" ]]; then
-        if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+        if ! (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
                 -keyout "$GOST_CERT_DIR/key.pem" -out "$GOST_CERT_DIR/cert.pem" \
-                -days 3650 -subj "/CN=gost-proxy" >/dev/null 2>&1; then
+                -days 3650 -subj "/CN=gost-proxy" >/dev/null 2>&1); then
             _restore_gost_install
             log_err "GOST HTTPS 证书生成失败，已恢复原部署。"
             return 1
         fi
+        chmod 600 "$GOST_CERT_DIR/key.pem" || { _restore_gost_install; return 1; }
     fi
 
     # 生成初始配置（services 由 Web 控制台动态管理）
     if [[ ! -f "$GOST_CONFIG" ]]; then
-        if ! cat > "$GOST_CONFIG" <<'EOF'
+        local _gost_cfg_tmp=""
+        _gost_cfg_tmp="$(umask 077; mktemp "${GOST_CONFIG}.XXXXXX")" || {
+            _restore_gost_install
+            log_err "GOST 初始配置临时文件创建失败，已恢复原部署。"
+            return 1
+        }
+        if ! cat > "$_gost_cfg_tmp" <<'EOF'
 # gost 入站代理配置（由 Web 控制台动态管理，勿手动编辑）
 services: []
 EOF
         then
+            rm -f "$_gost_cfg_tmp"
             _restore_gost_install
             log_err "GOST 初始配置写入失败，已恢复原部署。"
+            return 1
+        fi
+        if ! chmod 600 "$_gost_cfg_tmp" || ! mv -f "$_gost_cfg_tmp" "$GOST_CONFIG"; then
+            rm -f "$_gost_cfg_tmp"
+            _restore_gost_install
+            log_err "GOST 初始配置落盘失败，已恢复原部署。"
             return 1
         fi
     fi
@@ -5075,7 +5089,13 @@ EOF
     # ⚠️ 内容必须与 portal.py 的 GOST_SELFCHECK_SCRIPT 常量一致
     # (tests/test_portal_gost_reload.py 有断言钉死).
     mkdir -p /usr/local/lib || { _restore_gost_install; return 1; }
-    if ! cat > /usr/local/lib/hy2-gost-selfcheck <<'PYSELFCHECK'
+    local _selfcheck_tmp=""
+    _selfcheck_tmp="$(mktemp "/usr/local/lib/hy2-gost-selfcheck.XXXXXX")" || {
+        _restore_gost_install
+        log_err "GOST 自检脚本临时文件创建失败，已恢复原部署。"
+        return 1
+    }
+    if ! cat > "$_selfcheck_tmp" <<'PYSELFCHECK'
 #!/usr/bin/env python3
 """确认 /etc/hysteria/gost.yml 里声明监听的服务端口都真的在监听.
 
@@ -5137,11 +5157,17 @@ if __name__ == '__main__':
     sys.exit(main())
 PYSELFCHECK
     then
+        rm -f "$_selfcheck_tmp"
         _restore_gost_install
         log_err "GOST 自检脚本写入失败，已恢复原部署。"
         return 1
     fi
-    chmod 755 /usr/local/lib/hy2-gost-selfcheck || { _restore_gost_install; return 1; }
+    if ! chmod 755 "$_selfcheck_tmp" || ! mv -f "$_selfcheck_tmp" /usr/local/lib/hy2-gost-selfcheck; then
+        rm -f "$_selfcheck_tmp"
+        _restore_gost_install
+        log_err "GOST 自检脚本落盘失败，已恢复原部署。"
+        return 1
+    fi
 
     # 创建 systemd 守护服务
     # ⚠️ 这份内容必须与 portal.py 的 GOST_UNIT_CONTENT 常量**完全一致**
@@ -5179,7 +5205,7 @@ EOF
         log_err "GOST systemd unit 写入失败，已恢复原部署。"
         return 1
     fi
-    if ! : > "$HY2_DIR/.hy2-gost-owned" || ! chmod 600 "$HY2_DIR/.hy2-gost-owned"; then
+    if ! (umask 077; : > "$HY2_DIR/.hy2-gost-owned" && chmod 600 "$HY2_DIR/.hy2-gost-owned"); then
         _restore_gost_install
         log_err "GOST 所有权标记写入失败，已恢复原部署。"
         return 1
