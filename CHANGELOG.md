@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十六批十项修复，门户 2.56
+
+- 核心升级候选刷盘、回滚异常隔离与核心锁描述符防泄漏（`portal.py` 的 `_upgrade_core_binary_locked` 与 `acquire_core_operation_lock`）：候选核心落盘后执行 `flush()` 与 `os.fsync()` 刷盘再替换；回滚阶段的 `tempfile.mkstemp` 与文件写入移入独立 `try` 块，避免磁盘写满掩盖原升级失败并跳过 `_restart_hy2()` 恢复；`acquire_core_operation_lock` 遇非 `BlockingIOError` 异常同样关闭 `lock_fd` 消除文件描述符泄漏。
+- AnyTLS 配置应用回滚异常隔离（`portal.py` 的 `apply_anytls_config`）：将启动失败回滚阶段的旧配置删除（`unlink`）与恢复（`_restore_config_atomically`）包裹在独立异常捕获中，确保磁盘异常不掩盖原始启动失败且继续尝试重启恢复旧服务。
+- sing-box 与 Xray 核心安装版本号校验、归档成员链接拦截与落盘刷盘（`portal.py` 的 `install_singbox` 与 `install_xray_binary`）：`install_singbox` 前置校验远端 `tag_name` 符合安全版本格式且不含 `..`，解压前遍历全部 tar 成员拦截路径穿越、反斜杠、空字节及符号/硬链接；两处核心二进制写入暂存文件后均执行 `flush()` 与 `os.fsync()` 刷盘再校验替换。
+- 网页端 GOST 安装版本号校验、归档链接拦截、单元原子落盘与回滚完整度加固（`portal.py` 的 `_h_post_install_gost`）：远端 `tag_name` 经安全正则校验不合法即回退固定安全版；解压前全量拦截符号/硬链接与非法路径成员；暂存二进制与回滚文件写入均执行 `os.fsync()` 刷盘；`gost.service` 改用 `_atomic_write_text` 原子落盘；`restore_gost_assets` 单资产失败不早退，尽力恢复其余资产、内存数据与服务状态后再抛出异常。
+- 引擎拉取同目录原子刷盘落盘、证书自愈状态容错与 Xray 单元编码自愈（`portal.py` 的 `ensure_awgctl`、`cert_status` 与 `write_xray_unit`）：`ensure_awgctl` 改在目标同目录创建临时文件并用 `os.fdopen` 写入、`os.fsync()` 刷盘、`os.replace` 原子替换且失败必清理临时文件（消除 `/tmp` 跨分区非原子覆写与残留）；`cert_status` 对 `healed_at`/`heal_count` 逐项校验并拒绝布尔值避免丢失 `last_pin`；`write_xray_unit` 捕获坏编码 `UnicodeDecodeError` 自动触发自愈覆写。
+- 混淆隧道控制脚本渲染清理、MTU 下限钳位与原子落盘（`awgctl.sh`）：`render_server_config` 与 `render_client_config` 对损坏 `S4` 实施 `MTU >= 1280` 下限钳位；`render_server_config` 在 `umask 077` 下创建临时文件且渲染/落盘失败即刻删除含明文私钥的临时文件；`write_service` 与 `peers_init` 改为同目录 `mktemp` 原子替换；`peer_apply_live_add` 为预共享密钥临时文件增加 `umask 077` 与 `RETURN` 清理陷阱。
+- 主安装脚本核心下载版本号校验与证书私钥原子落盘（`install.sh`）：`install_binary` 前置校验 `LATEST_TAG` 安全格式并用同目录随机 `mktemp` 替代固定 `${HY2_BIN}.new`；`setup_cert_via_dns_api` 在 `umask 077` 子壳内安装证书消除私钥 `0644` 暴露窗口；`generate_self_signed_cert` 改用 `umask 077` 同目录临时文件生成密钥与证书并双步校验后原子替换；`setup_acme_certificate` 修正未定义变量 `$acct` 为 `${HOME}/.acme.sh/acme.sh`。
+- 归档成员反斜杠/空字节拦截、服务器死线看门狗锁外关闭与启动校验类型安全（`portal.py`）：`safe_tar_members` 与 `safe_zip_members` 拦截非字符串、反斜杠与 `\x00`；`ThreadingHTTPServer.claim_heavy` 二次加锁判重归还多余信号量防重型槽泄漏；`watch_deadlines` 改为锁内摘出超时连接、锁外执行 `shutdown` 并兜底异常防后台线程死亡；`serve()` 启动一致性检查改用 `config_section(data, k)` 容忍非字典配置。
+- 前端纯 IPv6 代理链接修复、核心卸载按钮恢复与 BBR 空字段容错（`portal_assets.py`）：`loadProxyServices` 对纯 IPv6 主机补全方括号 `[host]` 并校验 `json.services` 为数组，修复纯 IPv6 节点列表展示与一键复制链接无法解析的缺陷；`uninstallCore` 在 `finally` 恢复按钮状态与原文字防永久灰显锁死；`checkBbrStatus` 对缺失的 `configured`/`current` 转字符串再调用 `.toUpperCase()` 避免空值报错覆盖整张卡片。
+- 流量计量读取器回环地址与日志时间戳严格校验（`usage-meter-readers-20261007-v1.py`）：`read_hysteria`、`read_hysteria_online` 与 `read_live_connections` 统一经 `_validate_loopback_http_base` 拦截查询串、片段、userinfo、非法端口及含换行/空字节的 `secret`；`read_xray` 与在线统计经 `_validate_loopback_xray_addr` 严格校验 `127.0.0.1:1..65535` 防止参数注入；`parse_events` 在 `__MONOTONIC_TIMESTAMP` 为 `None` 时正确回退 `__REALTIME_TIMESTAMP` 并拦截布尔时间戳；`read_live_connections` 校验 `raw_ips` 仅含字符串。
+
 ## 2026-11-22 — 第四十五批十项修复，门户 2.55
 
 - AnyTLS 与 TUIC 启用路径加锁与回滚键清理（`portal.py` 的 `_apply_anytls_enable` 与 `_apply_tuic_enable`）：将 `_apply_anytls_enable` 对 `data['anytls_config']` 的深拷贝移入 `data_lock`（数据锁）内部消除并发迭代隐患；`_apply_tuic_enable` 启用失败回滚时，若原无 `tuic_config` 则执行 `data.pop('tuic_config', None)` 而非残留空字典。

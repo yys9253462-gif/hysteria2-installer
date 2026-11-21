@@ -2374,14 +2374,16 @@ async function checkBbrStatus() {
     if (bbrQdiscText) bbrQdiscText.textContent = json.qdisc || 'fq_codel';
     if (bbrKernelText) bbrKernelText.textContent = json.kernel || '--';
 
-    const isBbrActive = (json.current && json.current.includes('bbr'));
+    const curAlgo = String(json.current || '');
+    const cfgAlgo = String(json.configured || 'bbr');
+    const isBbrActive = curAlgo.includes('bbr');
     if (bbrBadge) {
       if (isBbrActive) {
-        bbrBadge.textContent = '● 已开启 ' + json.current.toUpperCase();
+        bbrBadge.textContent = '● 已开启 ' + curAlgo.toUpperCase();
         bbrBadge.style.background = '#eaf3de';
         bbrBadge.style.color = '#27500a';
       } else {
-        bbrBadge.textContent = '○ 未开启 BBR (' + json.current + ')';
+        bbrBadge.textContent = '○ 未开启 BBR (' + (curAlgo || 'cubic') + ')';
         bbrBadge.style.background = '#f1efe8';
         bbrBadge.style.color = '#5f5e5a';
       }
@@ -2392,11 +2394,11 @@ async function checkBbrStatus() {
       if (Array.isArray(json.overridden_by) && json.overridden_by.length) {
         bbrRebootTip.style.display = 'block';
         bbrRebootTip.textContent = '⚠️ /etc/sysctl.conf 里的「' + json.overridden_by.join('；')
-          + '」会在开机时覆盖 BBR 设置，请删除或改成 ' + json.configured + ' 后再重启。';
+          + '」会在开机时覆盖 BBR 设置，请删除或改成 ' + cfgAlgo + ' 后再重启。';
         btnRebootServer.style.display = 'none';
       } else if (json.need_reboot) {
         bbrRebootTip.style.display = 'block';
-        bbrRebootTip.textContent = '⚠️ 已成功配置 ' + json.configured.toUpperCase() + '，需要重启服务器后生效！';
+        bbrRebootTip.textContent = '⚠️ 已成功配置 ' + cfgAlgo.toUpperCase() + '，需要重启服务器后生效！';
         btnRebootServer.style.display = 'inline-flex';
       } else {
         bbrRebootTip.style.display = 'none';
@@ -2865,6 +2867,7 @@ async function uninstallCore(core, btn) {
   });
   if (!confirmed) return;
   btn.disabled = true;
+  const orig = btn.textContent;
   btn.textContent = '⏳ 正在卸载...';
   try {
     const res = await fetch(location.pathname + 'uninstall-core', {
@@ -2880,6 +2883,8 @@ async function uninstallCore(core, btn) {
   } catch (e) {
     alert('请求异常: ' + e.message);
   } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
     await loadCores();
   }
 }
@@ -3351,15 +3356,17 @@ async function loadProxyServices() {
       }
     }
 
-    const services = json.services || [];
+    const services = Array.isArray(json.services) ? json.services : [];
     if (services.length === 0) {
       proxyTbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">暂无代理服务，点击上方「添加代理服务」创建</td></tr>';
       return;
     }
     if (json.host) curProxyServerHost = json.host;
+    const rawHost = String(curProxyServerHost || '');
+    const proxyHostPart = (rawHost.includes(':') && !rawHost.startsWith('[')) ? ('[' + rawHost + ']') : rawHost;
     const typeLabel = { socks5: 'SOCKS5', http: 'HTTP', https: 'HTTPS' };
     proxyTbody.innerHTML = services.map(s => {
-      const fullUrl = `${s.type || ''}://${encodeURIComponent(s.username || '')}:${encodeURIComponent(s.password || '')}@${curProxyServerHost}:${s.port}`;
+      const fullUrl = `${s.type || ''}://${encodeURIComponent(s.username || '')}:${encodeURIComponent(s.password || '')}@${proxyHostPart}:${s.port}`;
       return `
       <tr>
         <td><span class="proxy-type ${obEsc(s.type)}">${obEsc(typeLabel[s.type] || s.type)}</span></td>
@@ -3368,7 +3375,7 @@ async function loadProxyServices() {
         <td><code style="font-size:12px">${obEsc(s.password)}</code></td>
         <td>
           <div style="display:flex;align-items:center;gap:6px">
-            <code style="font-size:11px;background:#f5f8f7;padding:2px 6px;border-radius:4px;word-break:break-all">${obEsc(s.type)}://${obEsc(s.username)}:****@${obEsc(curProxyServerHost)}:${obEsc(s.port)}</code>
+            <code style="font-size:11px;background:#f5f8f7;padding:2px 6px;border-radius:4px;word-break:break-all">${obEsc(s.type)}://${obEsc(s.username)}:****@${obEsc(proxyHostPart)}:${obEsc(s.port)}</code>
             <button class="button" style="padding:2px 8px;font-size:11px;white-space:nowrap" type="button" data-copy-link="${obEsc(fullUrl)}">复制链接</button>
           </div>
         </td>

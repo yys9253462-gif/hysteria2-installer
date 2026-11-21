@@ -966,6 +966,10 @@ install_binary() {
             return 1
         fi
     fi
+    if [[ "$LATEST_TAG" == *".."* || ! "$LATEST_TAG" =~ ^(app/)?v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+        log_err "获取到异常的 Hysteria 2 版本号 (${LATEST_TAG})，已放弃安装。"
+        return 1
+    fi
 
     log_info "目标版本: ${LATEST_TAG} (${asset})"
     log_step "下载二进制文件至 ${HY2_BIN}..."
@@ -1004,14 +1008,20 @@ install_binary() {
         log_err "校验通过但二进制无法运行（架构不匹配？），已放弃安装。"
         return 1
     fi
-    if ! install -m 0755 "${tmpdir}/${asset}" "${HY2_BIN}.new"; then
+    local staged
+    staged="$(mktemp "$(dirname "$HY2_BIN")/.hysteria.new.XXXXXX")" || {
         rm -rf "$tmpdir"
-        log_err "写入 ${HY2_BIN}.new 失败，现有二进制未改动。"
+        log_err "无法在 $(dirname "$HY2_BIN") 创建临时二进制文件，现有二进制未改动。"
+        return 1
+    }
+    if ! install -m 0755 "${tmpdir}/${asset}" "$staged"; then
+        rm -rf "$tmpdir" "$staged"
+        log_err "写入临时二进制文件失败，现有二进制未改动。"
         return 1
     fi
     rm -rf "$tmpdir"
-    if ! mv -f "${HY2_BIN}.new" "$HY2_BIN"; then
-        rm -f "${HY2_BIN}.new"
+    if ! mv -f "$staged" "$HY2_BIN"; then
+        rm -f "$staged"
         log_err "替换 ${HY2_BIN} 失败，现有二进制未改动。"
         return 1
     fi
@@ -1842,9 +1852,9 @@ setup_cert_via_dns_api() {
     # Hysteria 仍会在内存里继续提供旧证书直到重启。
     local out_cert="${HY2_CERT_DIR}/acme-${domain}.crt" out_key="${HY2_CERT_DIR}/acme-${domain}.key"
     mkdir -p "$HY2_CERT_DIR"
-    if ! "$acct" --install-cert -d "$domain" --ecc \
+    if ! (umask 077; "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
-            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null; then
+            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null); then
         log_err "DNS API 证书已签发，但安装或续期重载钩子配置失败。"
         return 1
     fi
@@ -1854,6 +1864,7 @@ setup_cert_via_dns_api() {
         log_err "acme.sh 报告安装成功，但 ${out_cert} 或 ${out_key} 不存在或为空。"
         return 1
     fi
+    chmod 644 "$out_cert" 2>/dev/null || true
     chmod 600 "$out_key" || { log_err "无法收紧私钥权限: ${out_key}"; return 1; }
     log_info "acme.sh DNS API 证书续期后会自动安装并重启相关服务。"
     echo "$out_cert|$out_key" >&3
@@ -1977,7 +1988,7 @@ setup_acme_certificate() {
             log_info "已使用 DNS API 签发的正式证书: ${CERT_FILE}"
             log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
             log_info "续期：acme.sh --cron 需常驻，建议 crontab -e 加入："
-            log_info "  ${acct:-/root/.acme.sh/acme.sh} --cron --home ${HOME}/.acme.sh > /dev/null 2>&1"
+            log_info "  ${HOME}/.acme.sh/acme.sh --cron --home ${HOME}/.acme.sh > /dev/null 2>&1"
             log_info "证书将安装到 Hysteria 固定读取路径，acme.sh 续期后会自动重启相关服务。"
             return 0
         elif [[ $_dnsres -eq 2 ]]; then
@@ -2078,9 +2089,22 @@ generate_self_signed_cert() {
         return 0
     fi
     log_step "正在生成高拟真自签名 ECC 证书 (伪装 SNI: ${SERVER_NAME})..."
-    openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE"
-    openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=${SERVER_NAME}" >/dev/null 2>&1
-    chmod 600 "$KEY_FILE"
+    mkdir -p "$HY2_CERT_DIR"
+    local tmp_key tmp_cert
+    tmp_key="$(umask 077 && mktemp "${HY2_CERT_DIR}/.server.key.XXXXXX")" || { log_err "无法创建临时私钥文件。"; return 1; }
+    tmp_cert="$(umask 077 && mktemp "${HY2_CERT_DIR}/.server.crt.XXXXXX")" || { rm -f "$tmp_key"; log_err "无法创建临时证书文件。"; return 1; }
+    if ! (umask 077; openssl ecparam -genkey -name prime256v1 -out "$tmp_key") \
+            || ! openssl req -new -x509 -days 3650 -key "$tmp_key" -out "$tmp_cert" -subj "/CN=${SERVER_NAME}" >/dev/null 2>&1; then
+        rm -f "$tmp_key" "$tmp_cert"
+        log_err "自签名证书生成失败，未改动现有证书。"
+        return 1
+    fi
+    chmod 600 "$tmp_key" && chmod 644 "$tmp_cert" \
+        && mv -f "$tmp_key" "$KEY_FILE" && mv -f "$tmp_cert" "$CERT_FILE" || {
+        rm -f "$tmp_key" "$tmp_cert"
+        log_err "落盘自签名证书失败。"
+        return 1
+    }
     log_info "自签名证书生成成功。"
 }
 

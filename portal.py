@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.55'
+PORTAL_VERSION = '2.56'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1745,11 +1745,13 @@ def git_blob_sha(data):
 def safe_tar_members(names, wanted):
     """校验 tar 成员名，并返回与 wanted 同名的**包内实际成员名**。
 
-    拒绝绝对路径与含 `..` 的成员（防以 root 写出临时目录），
+    拒绝绝对路径、反斜杠、空字节与含 `..` 的成员（防以 root 写出临时目录），
     且只接受一个精确同名的常规文件（不做"第一个可执行文件"兜底）。
     """
     hits = []
     for name in names:
+        if not isinstance(name, str) or '\\' in name or '\x00' in name:
+            raise ValueError('tar 包内含不安全路径成员: %r' % (name,))
         clean = name[2:] if name.startswith('./') else name
         if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
             raise ValueError('tar 包内含不安全路径成员: %s' % name)
@@ -1764,6 +1766,8 @@ def safe_zip_members(names, wanted):
     """校验 zip 成员名并返回唯一精确匹配的成员名。"""
     hits = []
     for name in names:
+        if not isinstance(name, str) or '\\' in name or '\x00' in name:
+            raise ValueError('zip 包内含不安全路径成员: %r' % (name,))
         clean = name[2:] if name.startswith('./') else name
         if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
             raise ValueError('zip 包内含不安全路径成员: %s' % name)
@@ -1880,6 +1884,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         req = urllib.request.Request(url, headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=90) as source, open(candidate, 'wb') as dest:
             shutil.copyfileobj(source, dest)
+            dest.flush()
+            os.fsync(dest.fileno())
         if not verify_sha256(candidate, expected):
             raise RuntimeError('候选核心的 SHA256 与官方 hashes.txt 不一致，原核心未更改')
         with candidate.open('rb') as stream:
@@ -1917,17 +1923,20 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         if replaced and backup is not None:
             # 经同目录临时文件原子替换回滚：直接向运行中的可执行文件 copy2 在 Linux 上
             # 会触发 ETXTBSY（Text file busy），导致回滚失败并掩盖真正的升级异常。
-            rb_fd, rb_name = tempfile.mkstemp(prefix='.hysteria-rollback-', dir=str(binary.parent))
-            os.close(rb_fd)
-            rb_tmp = Path(rb_name)
+            rb_tmp = None
             try:
+                rb_fd, rb_name = tempfile.mkstemp(prefix='.hysteria-rollback-', dir=str(binary.parent))
+                os.close(rb_fd)
+                rb_tmp = Path(rb_name)
                 shutil.copy2(backup, rb_tmp)
                 rb_tmp.chmod(0o755)
                 os.replace(rb_tmp, binary)
+                rb_tmp = None
             except Exception as rb_exc:
                 _log_ignored('upgrade_core_rollback_replace', rb_exc)
             finally:
-                rb_tmp.unlink(missing_ok=True)
+                if rb_tmp is not None:
+                    rb_tmp.unlink(missing_ok=True)
             try:
                 _restart_hy2()
             except Exception as rb_exc:
@@ -2006,6 +2015,9 @@ def acquire_core_operation_lock(directory='/etc/hysteria'):
         except BlockingIOError:
             os.close(lock_fd)
             raise RuntimeError('another core operation is running')
+        except BaseException:
+            os.close(lock_fd)
+            raise
     return lock_fd
 
 
@@ -4578,8 +4590,22 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
         try:
             st = json.loads(Path(selfheal_state_path).read_text(encoding='utf-8'))
             if isinstance(st, dict):
-                info['healed_at'] = int(st.get('healed_at') or 0)
-                info['heal_count'] = int(st.get('heal_count') or 0)
+                raw_healed_at = st.get('healed_at')
+                if not isinstance(raw_healed_at, bool):
+                    try:
+                        val = int(raw_healed_at or 0)
+                        if val >= 0:
+                            info['healed_at'] = val
+                    except (TypeError, ValueError):
+                        pass
+                raw_heal_count = st.get('heal_count')
+                if not isinstance(raw_heal_count, bool):
+                    try:
+                        val = int(raw_heal_count or 0)
+                        if val >= 0:
+                            info['heal_count'] = val
+                    except (TypeError, ValueError):
+                        pass
                 if isinstance(st.get('last_pin'), str) and st.get('last_pin'):
                     info['pin_sha256'] = st['last_pin']
         except Exception as exc:
@@ -5453,10 +5479,13 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
                 capture_output=True, timeout=5, check=True)
     except Exception:
         if replaced:
-            if original is None:
-                config_path.unlink(missing_ok=True)
-            else:
-                _restore_config_atomically(config_path, original)
+            try:
+                if original is None:
+                    config_path.unlink(missing_ok=True)
+                else:
+                    _restore_config_atomically(config_path, original)
+            except OSError as rb_exc:
+                _log_ignored('anytls_config_rollback_file', rb_exc)
             if restart and original is not None:
                 try:
                     run(['systemctl', 'reset-failed', service], capture_output=True, timeout=5)
@@ -5746,7 +5775,13 @@ def write_xray_unit():
     """写 xray.service 并 daemon-reload；不 enable —— 没有任何协议配置时
     开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
     unit = Path('/etc/systemd/system/xray.service')
-    if not unit.exists() or unit.read_text(encoding='utf-8') != XRAY_UNIT_CONTENT:
+    current_text = None
+    if unit.exists():
+        try:
+            current_text = unit.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError):
+            current_text = None
+    if current_text != XRAY_UNIT_CONTENT:
         _restore_systemd_unit_file(unit, XRAY_UNIT_CONTENT.encode('utf-8'), 0o644)
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
 
@@ -5840,7 +5875,10 @@ def install_xray_binary():
                     staged = Path('/usr/local/bin/xray.new.%s' % secrets.token_hex(6))
                     replaced = False
                     try:
-                        shutil.copyfile(str(bin_path), str(staged))
+                        with open(bin_path, 'rb') as src_f, open(staged, 'wb') as dst_f:
+                            shutil.copyfileobj(src_f, dst_f)
+                            dst_f.flush()
+                            os.fsync(dst_f.fileno())
                         os.chmod(str(staged), 0o755)
                         # 换上之前先确认新二进制能跑（2026-11-03 修）：旧实现直接 os.replace，
                         # 新文件起不来时旧核心已被覆盖，正在跑的 Reality / VMess / VLESS-Enc
@@ -5887,8 +5925,10 @@ def install_singbox():
         return False, '取不到 sing-box 最新版本信息: %s' % exc
     if not isinstance(release, dict):
         return False, '取不到 sing-box 最新版本信息: 响应结构不是 JSON 对象'
-    tag = str(release.get('tag_name') or '')
+    tag = str(release.get('tag_name') or '').strip()
     ver = tag.lstrip('v')
+    if not tag or not ver or '..' in tag or not re.fullmatch(r'v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}', tag):
+        return False, 'sing-box 最新版本号格式非法，已放弃安装'
     asset_name = f'sing-box-{ver}-linux-{arch}.tar.gz'
     raw_assets = release.get('assets')
     assets = raw_assets if isinstance(raw_assets, list) else []
@@ -5914,11 +5954,28 @@ def install_singbox():
                 replaced = False
                 try:
                     with tarfile.open(str(archive), 'r:gz') as tar:
-                        member_name = safe_tar_members([m.name for m in tar.getmembers() if m.isfile()],
-                                                       'sing-box')
+                        all_members = tar.getmembers()
+                        regular_names = []
+                        for m in all_members:
+                            mname = m.name or ''
+                            clean = mname[2:] if mname.startswith('./') else mname
+                            if (mname.startswith('/') or clean.startswith('/')
+                                    or '\\' in mname or '\x00' in mname
+                                    or '..' in clean.split('/')):
+                                raise ValueError('tar 包内含不安全路径成员: %s' % mname)
+                            if m.issym() or m.islnk():
+                                raise ValueError('tar 包内含不允许的链接成员: %s' % mname)
+                            if m.isfile():
+                                regular_names.append(mname)
+                        member_name = safe_tar_members(regular_names, 'sing-box')
                         member = tar.getmember(member_name)
-                        with tar.extractfile(member) as src, open(staged, 'wb') as dst:
+                        extracted = tar.extractfile(member)
+                        if extracted is None:
+                            raise ValueError('tar 包内无法读取 sing-box 成员')
+                        with extracted as src, open(staged, 'wb') as dst:
                             shutil.copyfileobj(src, dst)
+                            dst.flush()
+                            os.fsync(dst.fileno())
                     os.chmod(str(staged), 0o755)
                     version = _singbox_version(str(staged))
                     if not version or version < ANYTLS_MIN_SINGBOX:
@@ -9564,13 +9621,25 @@ if __name__ == '__main__':
                         return True
                 except Exception:
                     pass
-            fd, tmp_name = tempfile.mkstemp(prefix='hy2-awgctl-', suffix='.sh')
-            os.close(fd)
-            with open(tmp_name, 'wb') as fh:
-                fh.write(content)
-            os.chmod(tmp_name, 0o755)
-            shutil.move(tmp_name, AWG_CTL)
-            os.chmod(AWG_CTL, 0o755)
+            target_path = Path(AWG_CTL)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix='.hy2-awgctl-', suffix='.sh.tmp', dir=str(target_path.parent))
+            replaced = False
+            try:
+                with os.fdopen(fd, 'wb') as fh:
+                    fh.write(content)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                os.chmod(tmp_name, 0o755)
+                os.replace(tmp_name, str(target_path))
+                replaced = True
+            finally:
+                if not replaced:
+                    try:
+                        os.unlink(tmp_name)
+                    except OSError:
+                        pass
             return True
         except Exception:
             return False
@@ -11874,14 +11943,15 @@ if __name__ == '__main__':
                 else:
                     arch = 'linux_amd64'
 
-                # 动态探测最新版本
+                # 动态探测最新版本（严格校验版本号格式，防止异常响应注入路径段）
                 tag = 'v3.3.0'
                 try:
                     req = urllib.request.Request('https://api.github.com/repos/go-gost/gost/releases/latest', headers={'User-Agent': 'Mozilla/5.0'})
                     with urllib.request.urlopen(req, timeout=8) as r:
                         rel_data = json.loads(_read_bounded_bytes(r).decode('utf-8', errors='replace'))
-                        if isinstance(rel_data, dict) and isinstance(rel_data.get('tag_name'), str) and rel_data['tag_name'].strip():
-                            tag = rel_data['tag_name'].strip()
+                        raw_tag = rel_data.get('tag_name').strip() if (isinstance(rel_data, dict) and isinstance(rel_data.get('tag_name'), str)) else ''
+                        if raw_tag and '..' not in raw_tag and re.fullmatch(r'v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}', raw_tag) and raw_tag.lstrip('v'):
+                            tag = raw_tag
                 except Exception:
                     tag = 'v3.3.0'
 
@@ -11944,18 +12014,36 @@ if __name__ == '__main__':
                                 continue
                             src_bin = Path(tmpdir) / 'gost'
                             with tarfile.open(str(archive_path), 'r:gz') as tar:
-                                # 拒绝绝对路径 / `..`，且只接受唯一精确同名的常规成员
-                                member_name = safe_tar_members(
-                                    [m.name for m in tar.getmembers()], 'gost')
-                                member = next(m for m in tar.getmembers()
+                                # 全量校验成员路径并拦截符号/硬链接，再只接受唯一精确同名的常规成员
+                                all_members = tar.getmembers()
+                                regular_names = []
+                                for m in all_members:
+                                    mname = m.name or ''
+                                    clean = mname[2:] if mname.startswith('./') else mname
+                                    if (mname.startswith('/') or clean.startswith('/')
+                                            or '\\' in mname or '\x00' in mname
+                                            or '..' in clean.split('/')):
+                                        raise ValueError('tar 包内含不安全路径成员: %s' % mname)
+                                    if m.issym() or m.islnk():
+                                        raise ValueError('tar 包内含不允许的链接成员: %s' % mname)
+                                    if m.isfile():
+                                        regular_names.append(mname)
+                                member_name = safe_tar_members(regular_names, 'gost')
+                                member = next(m for m in all_members
                                               if m.name == member_name and m.isfile())
-                                with tar.extractfile(member) as source, open(src_bin, 'wb') as dest:
+                                extracted = tar.extractfile(member)
+                                if extracted is None:
+                                    raise ValueError('tar 包内无法读取 gost 成员')
+                                with extracted as source, open(src_bin, 'wb') as dest:
                                     shutil.copyfileobj(source, dest)
                             if src_bin.exists():
                                 staged = Path('/usr/local/bin/gost.new.%s' % os.urandom(6).hex())
                                 replaced = False
                                 try:
-                                    shutil.copyfile(str(src_bin), str(staged))
+                                    with open(src_bin, 'rb') as src_f, open(staged, 'wb') as dst_f:
+                                        shutil.copyfileobj(src_f, dst_f)
+                                        dst_f.flush()
+                                        os.fsync(dst_f.fileno())
                                     os.chmod(str(staged), 0o755)
                                     # 先确认新文件能跑再替换（2026-11-04 修，与 Xray 安装一致）：
                                     # 摘要对得上不代表能执行（架构判错、noexec、依赖缺失），
@@ -11984,31 +12072,39 @@ if __name__ == '__main__':
                 def restore_gost_assets():
                     nonlocal assets_modified
                     assets_modified = True
+                    first_restore_error = None
                     for asset_path, old_asset in old_assets.items():
                         if old_asset is None:
                             try:
                                 asset_path.unlink(missing_ok=True)
-                            except OSError:
-                                pass
+                            except OSError as exc:
+                                if first_restore_error is None:
+                                    first_restore_error = exc
                         else:
                             contents, mode = old_asset
-                            asset_path.parent.mkdir(parents=True, exist_ok=True)
-                            # 同目录私有临时文件 + 原子替换：避免覆写运行中二进制报 ETXTBSY，
-                            # 同时消除敏感配置文件与私钥的默认 umask 暴露窗口。
                             tmp_asset = asset_path.with_name(
                                 asset_path.name + '.rollback.' + os.urandom(4).hex())
                             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                             if hasattr(os, 'O_NOFOLLOW'):
                                 flags |= os.O_NOFOLLOW
                             try:
+                                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                                # 同目录私有临时文件 + 刷盘 + 原子替换：避免覆写运行中二进制报 ETXTBSY，
+                                # 同时消除敏感配置文件与私钥的默认 umask 暴露窗口。
                                 fd = os.open(str(tmp_asset), flags, 0o600)
                                 with os.fdopen(fd, 'wb') as fh:
                                     fh.write(contents)
+                                    fh.flush()
+                                    os.fsync(fh.fileno())
                                 os.chmod(str(tmp_asset), mode)
                                 os.replace(str(tmp_asset), str(asset_path))
-                            except BaseException:
-                                tmp_asset.unlink(missing_ok=True)
-                                raise
+                            except Exception as exc:
+                                try:
+                                    tmp_asset.unlink(missing_ok=True)
+                                except OSError:
+                                    pass
+                                if first_restore_error is None:
+                                    first_restore_error = exc
                     if not had_cert_dir and cert_dir.exists():
                         try:
                             cert_dir.rmdir()
@@ -12057,6 +12153,8 @@ if __name__ == '__main__':
                                 subprocess.run(['systemctl', 'stop', 'gost'], capture_output=True, timeout=30)
                             except Exception:
                                 pass
+                    if first_restore_error is not None:
+                        raise first_restore_error
 
                 if not installed:
                     # 把【每个源】的错误都报出来。
@@ -12072,7 +12170,7 @@ if __name__ == '__main__':
                     raise RuntimeError('无法写入启动自检脚本 %s（单元的 ExecStartPost 依赖它，写不进去 gost 必然启动失败）'
                                        % GOST_SELFCHECK_PATH)
                 service_content = GOST_UNIT_CONTENT
-                Path('/etc/systemd/system/gost.service').write_text(service_content, encoding='utf-8')
+                _atomic_write_text(Path('/etc/systemd/system/gost.service'), service_content, mode=0o644)
                 owner_marker = Path('/etc/hysteria/.hy2-gost-owned')
                 owner_marker.touch(mode=0o600, exist_ok=True)
                 owner_marker.chmod(0o600)
@@ -16356,8 +16454,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return True
             if not self.heavy_slots.acquire(blocking=False):
                 return False
+            duplicate = False
             with self.deadline_lock:
-                self._heavy[request] = True
+                if request in self._heavy:
+                    duplicate = True
+                else:
+                    self._heavy[request] = True
+            if duplicate:
+                self.heavy_slots.release()
             return True
 
         def extend_deadline(self, request, seconds):
@@ -16382,14 +16486,21 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         def watch_deadlines(self):
             while True:
                 time.sleep(0.25)
-                with self.deadline_lock:
-                    for connection, deadline in list(self.deadlines.items()):
-                        if time.monotonic() >= deadline:
-                            try:
-                                connection.shutdown(socket.SHUT_RDWR)
-                            except OSError:
-                                pass
-                            self.deadlines.pop(connection, None)
+                try:
+                    now = time.monotonic()
+                    expired = []
+                    with self.deadline_lock:
+                        for connection, deadline in list(self.deadlines.items()):
+                            if now >= deadline:
+                                self.deadlines.pop(connection, None)
+                                expired.append(connection)
+                    for connection in expired:
+                        try:
+                            connection.shutdown(socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                except Exception:
+                    pass
 
         def process_request(self, request, address):
             if not self.quick_slots.acquire(blocking=False):
@@ -16456,7 +16567,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # 但如果不提示，用户只会觉得「节点突然少了一个」（2026-10-29 加）。
     try:
         with data_lock:
-            _enabled = {k: bool((data.get(k) or {}).get('enabled'))
+            _enabled = {k: bool(config_section(data, k).get('enabled'))
                         for k in ('reality_config', 'vmess_config',
                                   'vlessenc_config', 'anytls_config', 'tuic_config')}
         _missing = []
