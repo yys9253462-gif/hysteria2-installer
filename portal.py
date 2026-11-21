@@ -13280,13 +13280,13 @@ if __name__ == '__main__':
                 # 用户表在协议锁内取（2026-11-04 修）：旧实现在锁外取，期间撤销流程同步完
                 # anytls.json，本次再用旧名单覆盖，刚被停用 / 到期的用户又能连上直到下次同步。
                 with data_lock:
+                    previous_cfg = copy.deepcopy(config_section(data, 'anytls_config'))
                     preview = dict(data)
                     preview['anytls_config'] = new_cfg
                     users = anytls_users(preview)
                 previous_unit = unit_path.read_bytes() if unit_path.exists() else None
                 unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                 unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
-                previous_cfg = copy.deepcopy(config_section(data, 'anytls_config'))
                 cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
                 previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
@@ -13534,7 +13534,10 @@ if __name__ == '__main__':
                     raise
                 except Exception:
                     with data_lock:
-                        data['tuic_config'] = old
+                        if old:
+                            data['tuic_config'] = old
+                        else:
+                            data.pop('tuic_config', None)
                     if 'cfg_path' in locals():
                         if 'previous_file' not in locals():
                             raise
