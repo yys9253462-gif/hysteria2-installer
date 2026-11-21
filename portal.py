@@ -13957,6 +13957,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 def flush(self):
                     return real.flush()
 
+            self._head_body_started = False
             self.wfile = _HeadersOnly(self)
             original_end_headers = self.end_headers
 
@@ -13968,6 +13969,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             try:
                 return self.do_GET()
             finally:
+                self._head_body_started = False
                 self.wfile = real
                 self.end_headers = original_end_headers
 
