@@ -12295,7 +12295,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
@@ -12320,7 +12325,10 @@ if __name__ == '__main__':
                     warp_not_installed = (data.get('warp_enabled') and not previous_warp_state
                                           and not warp_backend_installed())
                     if warp_not_installed:
-                        data['warp_enabled'] = previous_warp_state
+                        if previous_warp_state_exists:
+                            data['warp_enabled'] = previous_warp_state
+                        else:
+                            data.pop('warp_enabled', None)
                     # 没保存过名单时与页面显示同一口径（routing_state）：WARP 开着、或这次被打开 /
                     # 关掉，才落成默认名单。旧实现无条件从默认名单起步 —— WARP 关着时页面显示
                     # 「0 个已配置」，点「+ Netflix」后却冒出整套默认域名（2026-11-12 修）。
@@ -12342,8 +12350,8 @@ if __name__ == '__main__':
                         rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
                         keep = {r['domain'] for r in rules}
                         rules.extend({'domain': d, 'outbound': 'warp_socks'} for d in DEFAULT_WARP_DOMAINS if d not in keep)
-                    # 域名不合法时直接回 400、不落盘，内存里也不能先改（否则与磁盘不一致到重启）。
-                    if not bad_domain and (rules or previous_warp_rules_exists):
+                    # 域名不合法或未安装 WARP 时直接拒绝、不落盘，锁内也不能先写脏规则。
+                    if not bad_domain and not warp_not_installed and (rules or previous_warp_rules_exists):
                         data['warp_rules'] = rules
                     new_state = bool(data.get('warp_enabled'))
                     current_rules = [r['domain'] for r in rules if r['outbound'] in ('warp', 'warp_socks')]
@@ -12352,12 +12360,6 @@ if __name__ == '__main__':
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
                 if warp_not_installed:
-                    # 规则改动（如果有）与开关一起作废，不落盘。
-                    with data_lock:
-                        if previous_warp_rules_exists:
-                            data['warp_rules'] = previous_warp_rules
-                        else:
-                            data.pop('warp_rules', None)
                     return self.reply_json(409, {'ok': False, 'error':
                         '本机尚未安装 WARP（wireproxy），请先在「出站分流」里安装 WARP 再开启'})
                 try:
@@ -12452,7 +12454,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
@@ -12850,7 +12857,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
@@ -13302,7 +13314,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
                 enabled = _active_anytls_config() is not None
@@ -13521,7 +13538,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
                 enabled = _active_tuic_config() is not None
@@ -13645,7 +13667,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
@@ -15834,7 +15861,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
             except Exception:
