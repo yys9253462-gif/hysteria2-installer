@@ -2299,9 +2299,22 @@ setup_system_firewall() {
     local port="$1"
     local s_port="$2"
     local e_port="$3"
-    
+
+    if [[ ! "$port" =~ ^[0-9]+$ || ! "${HY2_SUB_PORT:-}" =~ ^[0-9]+$ ]] \
+            || (( 10#$port < 1 || 10#$port > 65535 || 10#$HY2_SUB_PORT < 1 || 10#$HY2_SUB_PORT > 65535 )); then
+        log_err "防火墙放行参数非法（监听端口=${port:-空}，订阅端口=${HY2_SUB_PORT:-空}），已中止。"
+        return 1
+    fi
+    if [[ -n "$s_port" || -n "$e_port" ]]; then
+        if [[ ! "$s_port" =~ ^[0-9]+$ || ! "$e_port" =~ ^[0-9]+$ ]] \
+                || (( 10#$s_port < 1 || 10#$s_port > 65535 || 10#$e_port < 1 || 10#$e_port > 65535 || 10#$s_port > 10#$e_port )); then
+            log_err "防火墙端口跳跃区间非法（${s_port:-空}-${e_port:-空}），已中止。"
+            return 1
+        fi
+    fi
+
     log_step "自动放行系统内部防火墙 (ufw / firewalld / nftables / iptables)..."
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw allow "${HY2_SUB_PORT}/tcp" >/dev/null 2>&1 || true
         ufw allow "${port}/udp" >/dev/null 2>&1 || true
         if [[ "$CERT_TYPE" == "acme" ]]; then
@@ -2402,7 +2415,7 @@ setup_system_firewall() {
             command -v "$_ipt" >/dev/null 2>&1 || continue
             _ipt_list="$("$_ipt" -L INPUT -n 2>/dev/null || true)"
             [[ -n "$_ipt_list" ]] || continue
-            _ipt_policy="$(printf '%s\n' "$_ipt_list" | head -n1 | grep -o 'policy [A-Z]*' | awk '{print $2}' || true)"
+            _ipt_policy="$(awk 'NR==1 { if (match($0, /policy [A-Z]+/)) { print substr($0, RSTART+7, RLENGTH-7) } exit }' <<<"$_ipt_list" || true)"
             if [[ "$_ipt_policy" == "DROP" || "$_ipt_policy" == "REJECT" ]] \
                || printf '%s\n' "$_ipt_list" | grep -qE '^[[:space:]]*(DROP|REJECT)[[:space:]]'; then
                 "$_ipt" -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 \
@@ -3895,7 +3908,7 @@ portal_fetch_files() {
 portal_remote_blob_shas() {
     local ref="${1:-}" json
     [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
-    json="$(mktemp)"
+    json="$(umask 077; mktemp)" || return 1
     if ! curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${AWG_REPO}/contents/?ref=${ref}" -o "$json" 2>/dev/null; then
         rm -f "$json"
@@ -3913,8 +3926,8 @@ rows = []
 for it in items:
     if not isinstance(it, dict):
         continue
-    name, sha = it.get("name"), it.get("sha") or ""
-    if name and re.fullmatch(r"[0-9a-f]{40}", sha):
+    name, sha = it.get("name"), it.get("sha")
+    if isinstance(name, str) and name and not any(c.isspace() for c in name) and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
         rows.append(name + " " + sha)
 print("\n".join(rows))
 ' "$json" || { rm -f "$json"; return 1; }
@@ -3958,9 +3971,11 @@ portal_fetch_py() {
     # 于是「锁定一次提交、三源取同一份」的保证不变，又不会因为限流装不上。
     PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/commits/main" 2>/dev/null |
         python3 -c 'import json,re,sys
-try: s=json.load(sys.stdin).get("sha","")
+try:
+    obj=json.load(sys.stdin)
+    s=obj.get("sha","") if isinstance(obj, dict) else ""
 except Exception: s=""
-assert re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || PORTAL_FETCH_REF=""
+assert isinstance(s, str) and re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || PORTAL_FETCH_REF=""
     if [[ ! "$PORTAL_FETCH_REF" =~ ^[0-9a-f]{40}$ ]]; then
         # 次选：仓库的 commits Atom feed。它由 github.com 直接提供、不计 API 额度，
         # 且条目里带完整 40 位 commit —— 一样能锁定到具体提交。
@@ -4047,7 +4062,7 @@ portal_ensure_py() {
     fi
 
     if [[ -z "$srcdir" ]]; then
-        tmpdir="$(mktemp -d)"
+        tmpdir="$(umask 077; mktemp -d)"
         if portal_fetch_py "$tmpdir"; then
             srcdir="$tmpdir"
         else
