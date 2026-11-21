@@ -40,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 try:
     import fcntl
@@ -1128,23 +1128,29 @@ def _unreachable_outbounds(outs, timeout=2):
         if not isinstance(ob, dict):
             continue
         name = ob.get('name')
-        target = None
+        host = ''
+        port = None
         if ob.get('type') == 'socks5':
             addr = ob.get('addr')
-            target = addr if isinstance(addr, str) else ''
+            target = addr.strip() if isinstance(addr, str) else ''
+            if ':' in target:
+                raw_host, raw_port = target.rsplit(':', 1)
+                if raw_host.startswith('[') and raw_host.endswith(']'):
+                    raw_host = raw_host[1:-1]
+                try:
+                    host, port = raw_host, int(raw_port)
+                except ValueError:
+                    continue
         elif ob.get('type') == 'http':
             url = ob.get('url')
-            m = re.match(r'^[a-zA-Z]+://([^/:]+)(?::(\d+))?', url) if isinstance(url, str) else None
-            if m:
-                target = '%s:%s' % (m.group(1), m.group(2) or '80')
-        if not target or ':' not in target:
-            continue
-        host, port = target.rsplit(':', 1)
-        try:
-            port = int(port)
-        except ValueError:
-            continue
-        if not (0 < port < 65536):
+            if isinstance(url, str) and url.strip():
+                try:
+                    parsed = urlsplit(url.strip())
+                    host = parsed.hostname or ''
+                    port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 80)
+                except ValueError:
+                    continue
+        if not host or port is None or not (0 < port < 65536):
             continue
         sock = None
         try:
