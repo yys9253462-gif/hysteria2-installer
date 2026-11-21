@@ -8480,7 +8480,7 @@ def serve(path):
     def node_default_ifaces():
         ifaces = set()
         try:
-            with open('/proc/net/route', encoding='ascii') as fh:
+            with open('/proc/net/route', encoding='utf-8', errors='replace') as fh:
                 next(fh, None)
                 for line in fh:
                     parts = line.split()
@@ -8489,7 +8489,7 @@ def serve(path):
         except OSError:
             pass
         try:
-            with open('/proc/net/ipv6_route', encoding='ascii') as fh:
+            with open('/proc/net/ipv6_route', encoding='utf-8', errors='replace') as fh:
                 for line in fh:
                     parts = line.split()
                     if len(parts) >= 10 and parts[0] == '0' * 32 and parts[1] == '00':
@@ -8503,7 +8503,7 @@ def serve(path):
         wanted = set(node_default_ifaces())
         rx = tx = 0
         seen = []
-        with open('/proc/net/dev', encoding='ascii') as fh:
+        with open('/proc/net/dev', encoding='utf-8', errors='replace') as fh:
             for line in fh:
                 if ':' not in line:
                     continue
@@ -8512,11 +8512,19 @@ def serve(path):
                 if name not in wanted:
                     continue
                 cols = rest.split()
-                rx += int(cols[0])
-                tx += int(cols[8])
+                if len(cols) < 9:
+                    continue
+                try:
+                    rx_val, tx_val = int(cols[0]), int(cols[8])
+                except ValueError:
+                    continue
+                if rx_val < 0 or tx_val < 0:
+                    continue
+                rx += rx_val
+                tx += tx_val
                 seen.append(name)
         try:
-            boot_id = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
+            boot_id = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8', errors='replace').strip()
         except OSError:
             boot_id = ''
         return {'rx_bytes': rx, 'tx_bytes': tx, 'interfaces': seen, 'boot_id': boot_id}
@@ -10270,9 +10278,12 @@ if __name__ == '__main__':
                         if deny is None:
                             # -------- 同时在线 IP 限制检查 -------- #
                             if ip_limit > 0 and client_ip:
-                                tracker = ip_tracker.setdefault(matched_uid, {})
-                                active_ips = {ip: t for ip, t in tracker.items()
-                                              if now_ts - t < IP_TIMEOUT_SECONDS}
+                                raw_tracker = ip_tracker.get(matched_uid)
+                                active_ips = (
+                                    {ip: t for ip, t in raw_tracker.items()
+                                     if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                    if isinstance(raw_tracker, dict) else {}
+                                )
                                 ip_tracker[matched_uid] = active_ips
                                 # 已连着的设备即使超过 180 秒没重新鉴权也要算在内。
                                 # Reality 放行中的 IP 也占名额：两个协议共用同一个设备上限。
@@ -10287,8 +10298,11 @@ if __name__ == '__main__':
                                 # 换 IP 频繁的长期在线用户（移动网络 / CGNAT）表项无界增长，
                                 # users/list 与 /traffic-speed 每次都要遍历。
                                 tracker = ip_tracker.get(matched_uid)
-                                tracker = {ip: t for ip, t in tracker.items()
-                                           if now_ts - t < IP_TIMEOUT_SECONDS} if isinstance(tracker, dict) else {}
+                                tracker = (
+                                    {ip: t for ip, t in tracker.items()
+                                     if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                    if isinstance(tracker, dict) else {}
+                                )
                                 tracker[client_ip] = now_ts
                                 ip_tracker[matched_uid] = tracker
 
