@@ -493,7 +493,7 @@ def validate_outbound(entry):
             return False, None, "SOCKS5 地址不能包含控制字符"
         # 支持 host:port 与 [IPv6]:port 两种形式，且必须带合法端口
         if addr.startswith('['):
-            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:(\d{1,5})', addr)
+            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:([0-9]{1,5})', addr)
             if not m_v6:
                 return False, None, "SOCKS5 IPv6 地址格式应为 [IPv6]:port，例如 [::1]:1080"
             try:
@@ -504,7 +504,7 @@ def validate_outbound(entry):
                 return False, None, "SOCKS5 方括号内必须是 IPv6 地址"
             port_str = m_v6.group(2)
         else:
-            if not re.fullmatch(r'[^\s:\[\]]+:\d{1,5}', addr):
+            if not re.fullmatch(r'[^\s:\[\]]+:[0-9]{1,5}', addr):
                 return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
             _, port_str = addr.rsplit(':', 1)
         if not (0 < int(port_str) < 65536):
@@ -1554,9 +1554,19 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20,
     全节点用户连不上，控制台也没法远程修 —— 所以重启后轮询 /api/health，
     限时内没有响应就把 .bak 换回去、删掉本次新增的文件，再重启一次。
     """
+    if isinstance(port, bool):
+        raise ValueError('invalid portal port')
+    port_num = int(port)
+    if not 1 <= port_num <= 65535:
+        raise ValueError('invalid portal port')
+    if isinstance(wait_seconds, bool):
+        raise ValueError('invalid wait_seconds')
+    wait_num = int(wait_seconds)
+    if not 1 <= wait_num <= 600:
+        raise ValueError('invalid wait_seconds')
     probe = ("import urllib.request; "
              "urllib.request.urlopen('http://127.0.0.1:%d/api/health', timeout=2).read()"
-             % int(port))
+             % port_num)
     restore = ' '.join('cp -p -f %s %s;' % (shlex.quote(str(bak)), shlex.quote(str(dest)))
                        for dest, bak in backups)
     remove = ' '.join('rm -f %s;' % shlex.quote(str(dest)) for dest in created)
@@ -1579,7 +1589,7 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20,
             '{ logger -t hysteria-portal "回滚后已恢复"; exit 0; }; done; '
             'logger -t hysteria-portal "回滚后仍未启动，需要人工介入"; '
             'echo "portal rollback failed at $(date -Is)" > %s'
-            % (int(wait_seconds), shlex.quote(probe), marker, restore, remove,
+            % (wait_num, shlex.quote(probe), marker, restore, remove,
                shlex.quote(probe), marker))
 
 
@@ -8968,6 +8978,9 @@ def serve(path):
                     continue
                 try:
                     subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError) as rf_exc:
+                    _log_ignored('traffic_resume_reset_failed', rf_exc)
+                try:
                     r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
                     results[u] = r.returncode == 0
                 except Exception:
@@ -8998,10 +9011,13 @@ def serve(path):
                 if not succeeded or (not suspend and unit in _retired):
                     continue
                 compensate = 'start' if suspend else 'stop'
-                try:
-                    if compensate == 'start':
+                if compensate == 'start':
+                    try:
                         subprocess.run(['systemctl', 'reset-failed', unit],
                                        capture_output=True, timeout=5)
+                    except (OSError, subprocess.SubprocessError) as rf_exc:
+                        _log_ignored('traffic_compensate_reset_failed', rf_exc)
+                try:
                     subprocess.run(['systemctl', compensate, unit],
                                    capture_output=True, timeout=20)
                 except Exception:
