@@ -1993,13 +1993,32 @@ def _unit_failure_hint(unit, lines=6):
     return ('：' + ' | '.join(line[:140] for line in tail[-3:])) if tail else ''
 
 
+def _write_private_bytes(target, payload, mode=0o600):
+    """以指定权限直接创建并落盘敏感配置，避免默认 umask 先落明文再改权。"""
+    target = Path(target)
+    mode = (mode & 0o777) or 0o600
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            fd = None
+            handle.write(payload)
+            handle.flush()
+            if hasattr(os, 'fchmod'):
+                os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+    finally:
+        if fd is not None:
+            os.close(fd)
+    os.chmod(str(target), mode)
+
+
 def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                   binary='/usr/local/bin/xray', restart=True,
                                   enable=True):
     """Validate a candidate before replacing; restore prior config on start failure."""
     path = Path(config_path)
     original = path.read_bytes() if path.exists() else None
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    mode = (path.stat().st_mode & 0o777) or 0o600 if path.exists() else 0o600
     candidate = path.with_name(path.name + '.portal-candidate.json')
     was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
                                 text=True, timeout=5).stdout.strip() == 'active'
@@ -2007,8 +2026,7 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                  text=True, timeout=5).stdout.strip() == 'enabled'
     replaced = False
     try:
-        candidate.write_text(json.dumps(config, indent=2), encoding='utf-8')
-        candidate.chmod(mode)
+        _write_private_bytes(candidate, json.dumps(config, indent=2).encode('utf-8'), mode)
         test = subprocess.run([binary, 'run', '-test', '-c', str(candidate)],
                               capture_output=True, text=True, timeout=10)
         if test.returncode != 0:
@@ -2046,18 +2064,20 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
             if original is None:
                 path.unlink(missing_ok=True)
             else:
-                candidate.write_bytes(original)
-                candidate.chmod(mode)
+                _write_private_bytes(candidate, original, mode)
                 os.replace(candidate, path)
-            if was_enabled:
-                subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
-            else:
-                subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
-            if original is not None and was_active:
-                subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
-                subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
-            elif not was_active:
-                subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
+            try:
+                if was_enabled:
+                    subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
+                else:
+                    subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
+                if original is not None and was_active:
+                    subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+                    subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
+                elif not was_active:
+                    subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
+            except (OSError, subprocess.SubprocessError) as rb_exc:
+                _log_ignored('xray_transaction_rollback', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -4575,10 +4595,7 @@ def record_cert_heal(root, state, before, after):
             'fields': [k for k in ('cert_type', 'server_name', 'is_insecure', 'pin_sha256')
                        if before.get(k) != after.get(k)],
         })
-        tmp = state_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
-        tmp.chmod(0o600)
-        tmp.replace(state_path)
+        atomic_write_private(state_path, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
     except Exception as e:
         print('[portal] 写入证书自愈痕迹失败: %s' % str(e)[:120], file=sys.stderr)
 
@@ -5318,10 +5335,9 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
     config_path = Path(config_path)
     original = config_path.read_bytes() if config_path.exists() else None
     candidate = config_path.with_name(config_path.stem + '.candidate.json')
-    candidate.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding='utf-8')
-    os.chmod(str(candidate), 0o600)
     replaced = False
     try:
+        _write_private_bytes(candidate, json.dumps(config, indent=2, ensure_ascii=False).encode('utf-8'), 0o600)
         run([ANYTLS_BINARY, 'check', '-c', str(candidate)],
             capture_output=True, timeout=15, check=True)
         candidate.replace(config_path)
@@ -6781,17 +6797,19 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         idx,_inbound=managed_inbound_index(xcfg,tag)
         xcfg['inbounds'][idx].setdefault('settings',{})['clients']=wanted
     candidate=xj.with_name('xray.expiry-candidate.json')
-    candidate.write_text(json.dumps(xcfg,indent=2),encoding='utf-8')
-    candidate.chmod(orig_mode)
+    last_good=xj.with_name('xray.expiry-last-good.json')
+    last_good_tmp=xj.with_name('xray.expiry-last-good.json.tmp')
     reality_cfg=meter_config.get('reality') if isinstance(meter_config, dict) else None
     reality_cfg=reality_cfg if isinstance(reality_cfg, dict) else {}
     binary=reality_cfg.get('binary','/usr/local/bin/xray')
     replaced=False
     try:
+        _write_private_bytes(candidate, json.dumps(xcfg,indent=2).encode('utf-8'), orig_mode)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
         if xj.read_bytes()!=original:
             raise RuntimeError('Xray configuration changed concurrently; retry')
-        shutil.copy2(xj,xj.with_name('xray.expiry-last-good.json'))
+        _write_private_bytes(last_good_tmp, original, orig_mode)
+        os.replace(last_good_tmp, last_good)
         candidate.replace(xj); replaced=True
         state=subprocess.run(['systemctl','is-active','xray'],capture_output=True,text=True,timeout=4).stdout.strip()
         if state in ('inactive','failed'):
@@ -6806,14 +6824,17 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     except Exception:
         if replaced:
-            candidate.write_bytes(original)
-            candidate.chmod(orig_mode)
+            _write_private_bytes(candidate, original, orig_mode)
             candidate.replace(xj)
-            subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
-            subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
+            try:
+                subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
+                subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
+            except (OSError, subprocess.SubprocessError) as rb_exc:
+                _log_ignored('xray_access_rollback', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
+        last_good_tmp.unlink(missing_ok=True)
 
 
 
