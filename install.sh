@@ -4769,15 +4769,14 @@ install_gost() {
     local had_gost=0 old_gost="" old_unit="" old_check="" old_owner="" had_unit=0 had_check=0 had_owner=0
     local old_config="" old_cert="" old_key="" had_config=0 had_cert=0 had_key=0
     local old_active=0 old_enabled=0 active_state
-    _finish_gost_install() {
-        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
-    }
     _backup_gost_asset() {
         local _src="$1" _out_var="$2" _tmp=""
-        _tmp="$(umask 077; mktemp)" || { _finish_gost_install; return 1; }
+        _tmp="$(umask 077; mktemp)" || {
+            rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+            return 1
+        }
         if ! cp -p "$_src" "$_tmp"; then
-            rm -f "$_tmp"
-            _finish_gost_install
+            rm -f "$_tmp" "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
             return 1
         fi
         printf -v "$_out_var" '%s' "$_tmp"
@@ -4796,16 +4795,16 @@ install_gost() {
     log_info "目标版本: ${GOST_LATEST} (${GOST_ASSET})"
     log_step "下载并解压 gost 二进制..."
     TMP_DIR=$(mktemp -d)
-    _restore_gost_asset() {
-        local _bak="$1" _dst="$2" _rb_tmp=""
-        _rb_tmp="$(umask 077; mktemp "${_dst}.rb.XXXXXX")" || return 1
-        if ! cp -p "$_bak" "$_rb_tmp" || ! mv -f "$_rb_tmp" "$_dst"; then
-            rm -f "$_rb_tmp"
-            return 1
-        fi
-    }
     _restore_gost_install() {
         # 同目录临时文件原子替换：避免覆写运行中 gost 二进制报 ETXTBSY，并防止中途失败中断后续恢复。
+        _restore_gost_asset() {
+            local _bak="$1" _dst="$2" _rb_tmp=""
+            _rb_tmp="$(umask 077; mktemp "${_dst}.rb.XXXXXX")" || return 1
+            if ! cp -p "$_bak" "$_rb_tmp" || ! mv -f "$_rb_tmp" "$_dst"; then
+                rm -f "$_rb_tmp"
+                return 1
+            fi
+        }
         if [[ "$had_gost" == 1 ]]; then _restore_gost_asset "$old_gost" "$GOST_BIN" || true; else rm -f "$GOST_BIN"; fi
         if [[ "$had_unit" == 1 ]]; then _restore_gost_asset "$old_unit" "$GOST_UNIT" || true; else rm -f "$GOST_UNIT"; fi
         if [[ "$had_check" == 1 ]]; then _restore_gost_asset "$old_check" /usr/local/lib/hy2-gost-selfcheck || true; else rm -f /usr/local/lib/hy2-gost-selfcheck; fi
@@ -4825,7 +4824,10 @@ install_gost() {
         else
             systemctl stop gost >/dev/null 2>&1 || true
         fi
-        _finish_gost_install
+        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+    }
+    _finish_gost_install() {
+        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
     }
     # 先从该版本的官方 checksums.txt 取摘要，再下载校验；取不到就不装。
     if ! GOST_SUM="$(hy2_expected_sha256 \
