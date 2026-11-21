@@ -6309,15 +6309,18 @@ class AuthLimiter:
         if len(self.global_requests) >= self.global_rate:
             return True
         requests, failures = self._bucket(key)
+        # 失败：同一来源 60 秒内失败满 per_ip_failures 次就直接拒，
+        # 不得继续消耗 global_requests 配额，避免已封禁攻击者拖死全节点合法用户。
+        self._prune(failures, now, self.failure_window)
+        if len(failures) >= self.per_ip_failures:
+            return True
         # 速率：同一来源 1 秒内超过 per_ip_rate 次直接拒
         self._prune(requests, now, 1)
         too_fast = len(requests) >= self.per_ip_rate
         if not too_fast:
             requests.append(now)
             self.global_requests.append(now)
-        # 失败：同一来源 60 秒内失败满 per_ip_failures 次就拒（哪怕速率不超）
-        self._prune(failures, now, self.failure_window)
-        return too_fast or len(failures) >= self.per_ip_failures
+        return too_fast
 
     def record_failure(self, key, now):
         self._bucket(key)[1].append(now)
@@ -10292,8 +10295,9 @@ if __name__ == '__main__':
             # api_key 为空/非字符串时一律拒绝（2026-10-29 修）：
             # 旧实现拼出常量 "Bearer "，而 HTTP 头允许尾随空格，
             # 一个 `Authorization: Bearer ` 就能通过 —— 等于 API 全开。
-            key = data.get('api_key')
-            if not isinstance(key, str) or not key:
+            with data_lock:
+                key = data.get('api_key')
+            if not isinstance(key, str) or not key or not key.isascii():
                 return False
             expected = 'Bearer ' + key
             # ⚠️ 必须先挡非 ASCII（2026-10-09 修）：hmac.compare_digest 遇到
@@ -10312,9 +10316,12 @@ if __name__ == '__main__':
             if len(auth) > 1024:
                 return False
             if auth.startswith('Basic '):
-                digest = hashlib.sha256(auth.removeprefix('Basic ').encode()).hexdigest()
-                if hmac.compare_digest(digest, data['auth_hash']):
-                    return True
+                with data_lock:
+                    stored_hash = data.get('auth_hash')
+                if isinstance(stored_hash, str) and stored_hash and stored_hash.isascii():
+                    digest = hashlib.sha256(auth.removeprefix('Basic ').encode()).hexdigest()
+                    if hmac.compare_digest(digest, stored_hash):
+                        return True
             return verify_session(self.headers.get('Cookie', ''))
 
         def reply_json(self, code, payload):
