@@ -4052,6 +4052,8 @@ def subscription_userinfo(user):
     计量只记每个用户上下行的合计，按惯例全部计在 download；不限量写 total=0，
     未设到期（永久）写 expire=0。坏值（布尔 / 负数 / 无法解析）一律按 0。
     """
+    if not isinstance(user, dict):
+        user = {}
     def _num(value):
         n = 0 if isinstance(value, bool) else _safe_int(value)
         return n if n > 0 else 0
@@ -4066,8 +4068,9 @@ def subscription_profile_headers(meta, user_id, ext):
     分不清；24 小时自动更新让节点改端口 / 换协议后客户端自己跟上。文件名只留安全字符。
     """
     name = re.sub(r'[^A-Za-z0-9._-]', '_', '%s-%s' % (clean_node_identity(meta)[3], user_id)).strip('._')
+    safe_ext = re.sub(r'[^A-Za-z0-9]', '', str(ext or ''))[:16] or 'txt'
     return (('profile-update-interval', '24'),
-            ('Content-Disposition', 'attachment; filename="%s.%s"' % ((name or 'subscription')[:80], ext)))
+            ('Content-Disposition', 'attachment; filename="%s.%s"' % ((name or 'subscription')[:80], safe_ext)))
 
 
 def _extra_link_boxes(extra_links):
@@ -15598,7 +15601,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         missing_user = not isinstance(u, dict)
                         result = None
                         if not missing_user:
-                            result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
+                            result = {k: copy.deepcopy(v) for k, v in u.items() if k not in ('password', 'view_nonce')}
                             # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
                             result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
                             result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
@@ -15777,6 +15780,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
                     except Exception:
                         qr_svg = ''
+                    if '<svg' not in qr_svg:
+                        qr_svg = ''
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
                     _insecure, server_name, _pub_clean, host = clean_node_identity(m)
@@ -15876,6 +15881,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
+                if '<svg' not in qr_svg:
+                    qr_svg = ""
 
                 denial = user_access_denial(u_copy)
                 return self.reply_json(200, {
@@ -15937,10 +15944,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not any(p.get('name') == name for p in peers_now):
                     return self.reply(404, ('客户端「%s」不存在，可能已被删除，请刷新页面' % name).encode('utf-8'))
 
-                # 连接地址优先用查询参数，其次用安装时记录的 endpoint
+                # 连接地址优先用查询参数，其次用安装时记录的 endpoint（过滤非字符串脏值）
                 endpoint = ((query.get('endpoint', [''])[0] or '').strip()
-                            or next((p.get('endpoint', '') for p in peers_now
-                                     if p.get('name') == name and p.get('endpoint')), '')
+                            or next((p.get('endpoint').strip() for p in peers_now
+                                     if p.get('name') == name and isinstance(p.get('endpoint'), str)
+                                     and p.get('endpoint').strip()), '')
                             or awg_state()['endpoint'])
                 if not endpoint:
                     return self.reply(400, '没有可用的连接地址：请在新增客户端时填写连接地址，'
@@ -16096,14 +16104,30 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 access_file = root / 'portal-access.json'
                 access = read_access_file(access_file)
                 host = meta_display_host(m)
+                now_ts = int(time.time())
+                users = {}
                 with data_lock:
-                    users = {uid: dict(u) for uid, u in users_list_rows(user_table(data))
-                             if isinstance(u, dict)}
+                    for uid, u in users_list_rows(user_table(data)):
+                        if not isinstance(u, dict):
+                            continue
+                        u_copy = dict(u)
+                        tracked = ip_tracker.get(uid)
+                        u_copy['online_ips'] = (
+                            {ip: t for ip, t in tracked.items()
+                             if isinstance(t, (int, float)) and not isinstance(t, bool)
+                             and t == t and (t - t == 0)
+                             and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                            if isinstance(tracked, dict) else {}
+                        )
+                        users[uid] = u_copy
                     _api_key = data.get('api_key')
-                    _token = data['token']
+                    raw_token = data.get('token')
+                    _token = raw_token if isinstance(raw_token, str) else ''
+                _sub_user = quote(str(access.get('username', '')), safe='')
+                _sub_pass = quote(str(access.get('password', '')), safe='')
                 subscription = (
                     "https://%s:%s@%s:%d/%s/clash.yaml"
-                    % (access.get('username', ''), access.get('password', ''),
+                    % (_sub_user, _sub_pass,
                        _host_for_url(host), resolve_subscription_port(m)[0], _token))
                 return page_html(m, uri, subscription, clash, sing, users=users,
                                  api_key=_api_key, token=_token,
