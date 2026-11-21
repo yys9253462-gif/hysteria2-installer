@@ -10614,7 +10614,8 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     password_changed = False
                     with data_lock:
-                        users_map = user_table(data)
+                        _raw_users = data.get('users')
+                        users_map = _raw_users if isinstance(_raw_users, dict) else {}
                         existing = users_map.get(user_id)
                         # 条目被改坏时按「不存在」覆盖掉（2026-11-06 修）：否则
                         # `'view_nonce' in existing` / existing.get 抛 TypeError/AttributeError，
@@ -10842,7 +10843,8 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     password_changed = False
                     with data_lock:
-                        users_map = user_table(data)
+                        _raw_users = data.get('users')
+                        users_map = _raw_users if isinstance(_raw_users, dict) else {}
                         u = users_map.get(user_id)
                         if not isinstance(u, dict):   # 条目改坏同样按不存在（2026-11-06 修）
                             conflict = (404, 'User not found')
@@ -10903,7 +10905,8 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     with data_lock:
-                        u = user_table(data).get(user_id)
+                        _raw_users = data.get('users')
+                        u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
                         # 条目被改成数字 / 字符串时按不存在处理（2026-11-06 修）：`not u` 放行后
                         # u.get 抛 AttributeError，续费在锁内 500。
                         if not isinstance(u, dict):
@@ -10998,7 +11001,8 @@ if __name__ == '__main__':
                     if user_id == MASTER_USER_ID:
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot delete the master account'})
                     with data_lock:
-                        users_map = user_table(data)
+                        _raw_users = data.get('users')
+                        users_map = _raw_users if isinstance(_raw_users, dict) else {}
                         previous_global_deny = copy.deepcopy(global_ip_deny.get(user_id))
                         previous = {
                             'user': copy.deepcopy(users_map.get(user_id)),
@@ -11079,7 +11083,8 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     with data_lock:
-                        u = user_table(data).get(user_id)
+                        _raw_users = data.get('users')
+                        u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
                         # 同上：`not u` 对 7 / "x" 为假，随后 u.get / u['status'] 抛异常，
                         # 滥用用户根本停不掉（2026-11-06 修）。
                         missing = not isinstance(u, dict)
@@ -14789,7 +14794,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                     with data_lock:
-                        u = user_table(data).get(user_id)
+                        _raw_users = data.get('users')
+                        u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
                         # 条目不是对象时按不存在返回 404（2026-11-06 修），旧实现 u.items() 抛异常
                         missing_user = not isinstance(u, dict)
                         result = None
