@@ -2158,16 +2158,22 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                         'systemctl enable exited with %d' % enabled.returncode))
     except Exception:
         if replaced:
-            if original is None:
-                path.unlink(missing_ok=True)
-            else:
-                _write_priv(candidate, original, mode)
-                os.replace(candidate, path)
+            try:
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _write_priv(candidate, original, mode)
+                    os.replace(candidate, path)
+            except OSError as rb_exc:
+                _log_ignored('xray_transaction_rollback_file', rb_exc)
             try:
                 if was_enabled:
                     subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
                 else:
                     subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
+            except (OSError, subprocess.SubprocessError) as rb_exc:
+                _log_ignored('xray_transaction_rollback_enable', rb_exc)
+            try:
                 if original is not None and was_active:
                     subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
                     subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
