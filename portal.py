@@ -5851,7 +5851,10 @@ def install_xray_binary():
                     staged = Path('/usr/local/bin/xray.new.%s' % secrets.token_hex(6))
                     replaced = False
                     try:
-                        shutil.copyfile(str(bin_path), str(staged))
+                        with open(bin_path, 'rb') as src_f, open(staged, 'wb') as dst_f:
+                            shutil.copyfileobj(src_f, dst_f)
+                            dst_f.flush()
+                            os.fsync(dst_f.fileno())
                         os.chmod(str(staged), 0o755)
                         # 换上之前先确认新二进制能跑（2026-11-03 修）：旧实现直接 os.replace，
                         # 新文件起不来时旧核心已被覆盖，正在跑的 Reality / VMess / VLESS-Enc
@@ -5898,8 +5901,10 @@ def install_singbox():
         return False, '取不到 sing-box 最新版本信息: %s' % exc
     if not isinstance(release, dict):
         return False, '取不到 sing-box 最新版本信息: 响应结构不是 JSON 对象'
-    tag = str(release.get('tag_name') or '')
+    tag = str(release.get('tag_name') or '').strip()
     ver = tag.lstrip('v')
+    if not tag or not ver or '..' in tag or not re.fullmatch(r'v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}', tag):
+        return False, 'sing-box 最新版本号格式非法，已放弃安装'
     asset_name = f'sing-box-{ver}-linux-{arch}.tar.gz'
     raw_assets = release.get('assets')
     assets = raw_assets if isinstance(raw_assets, list) else []
@@ -5925,11 +5930,28 @@ def install_singbox():
                 replaced = False
                 try:
                     with tarfile.open(str(archive), 'r:gz') as tar:
-                        member_name = safe_tar_members([m.name for m in tar.getmembers() if m.isfile()],
-                                                       'sing-box')
+                        all_members = tar.getmembers()
+                        regular_names = []
+                        for m in all_members:
+                            mname = m.name or ''
+                            clean = mname[2:] if mname.startswith('./') else mname
+                            if (mname.startswith('/') or clean.startswith('/')
+                                    or '\\' in mname or '\x00' in mname
+                                    or '..' in clean.split('/')):
+                                raise ValueError('tar 包内含不安全路径成员: %s' % mname)
+                            if m.issym() or m.islnk():
+                                raise ValueError('tar 包内含不允许的链接成员: %s' % mname)
+                            if m.isfile():
+                                regular_names.append(mname)
+                        member_name = safe_tar_members(regular_names, 'sing-box')
                         member = tar.getmember(member_name)
-                        with tar.extractfile(member) as src, open(staged, 'wb') as dst:
+                        extracted = tar.extractfile(member)
+                        if extracted is None:
+                            raise ValueError('tar 包内无法读取 sing-box 成员')
+                        with extracted as src, open(staged, 'wb') as dst:
                             shutil.copyfileobj(src, dst)
+                            dst.flush()
+                            os.fsync(dst.fileno())
                     os.chmod(str(staged), 0o755)
                     version = _singbox_version(str(staged))
                     if not version or version < ANYTLS_MIN_SINGBOX:
