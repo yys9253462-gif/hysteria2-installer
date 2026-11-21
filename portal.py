@@ -12052,14 +12052,14 @@ if __name__ == '__main__':
                     if unit_suspended(AWG_SVC_NAME):
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
+                    # awgctl update 要联网刷新脚本并下载核验二进制（超时 420 秒），先申请重型死线槽。
+                    if not self._extend_deadline(480, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     # 先刷新控制脚本自身，再更新二进制。不需要重启面板。
                     if not ensure_awgctl(force=True):
                         return self.reply_json(500, {'ok': False,
                             'error': 'AmneziaWG 管理脚本刷新失败，已中止更新，请检查网络或查看门户日志'})
-                    # awgctl update 要下载并核验二进制，超时 420 秒。
-                    if not self._extend_deadline(480, heavy=True):
-                        return self.reply_json(409, {'ok': False, 'error':
-                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     rc, out, err = awg_run(['update'], timeout=420)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False,
@@ -12118,7 +12118,20 @@ if __name__ == '__main__':
                     self.reply_json(200, {'ok': True, 'target': 'core', 'applying': True,
                         'message': '核心更新任务已接受，下载、应用和回滚结果将单独核验'})
                 finally:
-                    threading.Thread(target=upgrade_worker, daemon=True).start()
+                    try:
+                        threading.Thread(target=upgrade_worker, daemon=True).start()
+                    except Exception as thr_exc:
+                        with data_lock:
+                            data['core_upgrade'] = {
+                                'state': 'failed',
+                                'error': '启动核心更新工作线程失败: %s' % str(thr_exc)[:160],
+                                'finished_at': int(time.time()),
+                            }
+                        try:
+                            save_data()
+                        except Exception as save_exc:
+                            print('[portal] core upgrade thread start failure not saved: %s'
+                                  % type(save_exc).__name__, file=sys.stderr, flush=True)
                 return
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
@@ -16338,9 +16351,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                                  headers={'User-Agent': 'hysteria2-installer'})
                     with urllib.request.urlopen(req, timeout=3) as response:
                         release = json.loads(_read_bounded_bytes(response).decode('utf-8', errors='replace'))
+                    raw_tag = release.get('tag_name') if isinstance(release, dict) else None
                     new_tag = (
-                        str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
-                        if isinstance(release, dict) else ''
+                        raw_tag.strip().removeprefix('app/').removeprefix('v')
+                        if isinstance(raw_tag, str) else ''
                     )
                 except Exception:
                     new_tag = ''
@@ -16432,6 +16446,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                             input=_ruri.encode('utf-8'), capture_output=True, timeout=3)
                     if qr_res.returncode == 0:
                         qr_svg = qr_res.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception:
                     qr_svg = ''
 
@@ -16448,7 +16464,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'short_id': rcfg.get('short_id', ''),
                     'flow': 'xtls-rprx-vision',
                     'sni': rcfg.get('dest_sni', 'www.apple.com'),
-                    'port': rcfg.get('port', 443) if is_active else 0,
+                    'port': (_valid_port(rcfg.get('port')) or 443) if is_active else 0,
                     'qr_svg': qr_svg if is_active else ''
                 }
             })
