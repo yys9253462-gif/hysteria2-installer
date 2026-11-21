@@ -15299,9 +15299,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     #      否则知道门户 token 的人可以逐个试出哪些 user_id 存在；
                     #   2. hmac.compare_digest 遇到非 ASCII 的 str 会抛 TypeError
                     #      （do_GET 没有兜底，连接直接被重置），所以先挡非 ASCII。
-                    ok_key = (bool(k_val) and k_val.isascii() and u_copy is not None
+                    ok_key = (bool(k_val) and k_val.isascii() and isinstance(expected_k, str)
+                              and expected_k.isascii() and u_copy is not None
                               and hmac.compare_digest(k_val, expected_k))
                     if not ok_key:
+                        self.record_failure()
                         return self.reply(403, b'Access denied: invalid key')
                 elif u_copy is None:
                     return self.reply(404, b'User not found')
@@ -15355,9 +15357,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 elif action_file == 'qr.svg':
                     try:
                         qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
-                        return self.reply(200, qr_bytes, 'image/svg+xml')
                     except Exception:
-                        return self.reply(500, b'QR generation failed')
+                        qr_bytes = b''
+                    if b'<svg' not in qr_bytes:
+                        qr_bytes = QR_UNAVAILABLE_SVG.encode('utf-8')
+                    return self.reply(200, qr_bytes, 'image/svg+xml')
                 elif action_file == '':
                     try:
                         qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
@@ -15366,9 +15370,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
                     _insecure, server_name, _pub_clean, host = clean_node_identity(m)
-                    listen_port = m.get('listen_port', 19984)
+                    listen_port = _valid_port(m.get('listen_port')) or 19984
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
-                    page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0],
+                    page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, _portal_tok, expected_k, resolve_subscription_port(m)[0],
                                           extra_links=self._user_extra_links(target_uid, _pub_clean, with_qr=True))
                     return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
                 else:
