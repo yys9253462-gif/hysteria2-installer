@@ -6006,6 +6006,7 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
 # WARP 出口 IP 探测结果缓存：前端每 10 秒轮询，而每次探测都要走一次外网。
 _warp_probe_cache = {}
 _warp_probe_lock = threading.Lock()
+_warp_install_lock = threading.Lock()
 
 
 _ACCESS_APPLIED = {}
@@ -14223,6 +14224,8 @@ if __name__ == '__main__':
             """POST /install-warp 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if not _warp_install_lock.acquire(blocking=False):
+                return self.reply_json(409, {'ok': False, 'error': 'WARP 正在安装中，请等待当前任务完成'})
             try:
                 # 安装脚本 subprocess 超时 180 秒，必须同步抬连接死线。
                 if not self._extend_deadline(240, heavy=True):
@@ -14274,8 +14277,15 @@ fi
 # 会被下次网页安装直接覆盖、被卸载当成本项目的删掉。
 claim_warp_assets() {
     if [ ! -f "$WARP_OWNED_MARKER" ]; then
-        : > "$WARP_OWNED_MARKER"
-        chmod 600 "$WARP_OWNED_MARKER"
+        (umask 077; : > "$WARP_OWNED_MARKER" && chmod 600 "$WARP_OWNED_MARKER")
+    fi
+}
+atomic_write_mode() {
+    local dst="$1" mode="$2" tmp
+    tmp=$(mktemp "${dst}.XXXXXX") || return 1
+    if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
     fi
 }
 
@@ -14338,9 +14348,9 @@ if [ ! -x "$WGCF_BIN" ]; then
     if ! verify_sha "${TD}/${WG_DL}" "$WANT"; then
         rm -rf "$TD"; echo "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致" >&2; exit 1
     fi
-    install -m 755 "${TD}/${WG_DL}" "${WGCF_BIN}.new" || { rm -rf "$TD"; exit 1; }
+    install -m 755 "${TD}/${WG_DL}" "${WGCF_BIN}.new" || { rm -rf "$TD" "${WGCF_BIN}.new"; exit 1; }
     rm -rf "$TD"; trap - EXIT
-    mv -f "${WGCF_BIN}.new" "$WGCF_BIN"
+    mv -f "${WGCF_BIN}.new" "$WGCF_BIN" || { rm -f "${WGCF_BIN}.new"; exit 1; }
 fi
 
 if [ ! -x "$WP_BIN" ]; then
@@ -14378,25 +14388,35 @@ if [ ! -x "$WP_BIN" ]; then
     if ! tar -xzf "${TD}/${WP_DL}" -C "${TD}/x" "$MEMBER" 2>/dev/null; then
         rm -rf "$TD"; echo "wireproxy 解压失败" >&2; exit 1
     fi
-    install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD"; exit 1; }
+    install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD" "${WP_BIN}.new"; exit 1; }
     rm -rf "$TD"; trap - EXIT
     claim_warp_assets
-    mv -f "${WP_BIN}.new" "$WP_BIN"
+    mv -f "${WP_BIN}.new" "$WP_BIN" || { rm -f "${WP_BIN}.new"; exit 1; }
 fi
 
 mkdir -p "$WG_DIR"
+chmod 700 "$WG_DIR" 2>/dev/null || true
 if [ ! -f "$WGCF_ACCT" ]; then
     log "匿名注册 Cloudflare WARP 设备..."
-    if ! "$WGCF_BIN" --config "$WGCF_ACCT" register --accept-tos >/tmp/wgcf-register.log 2>&1; then
-        echo "WARP 匿名注册失败，详见 /tmp/wgcf-register.log" >&2
+    WGCF_LOG=$(umask 077; mktemp)
+    if ! (umask 077; "$WGCF_BIN" --config "$WGCF_ACCT" register --accept-tos >"$WGCF_LOG" 2>&1); then
+        tail -n 20 "$WGCF_LOG" >&2 || true
+        rm -f "$WGCF_LOG"
+        echo "WARP 匿名注册失败" >&2
         exit 1
     fi
+    rm -f "$WGCF_LOG"
 fi
+chmod 600 "$WGCF_ACCT" 2>/dev/null || true
 if [ ! -f "$WGCF_CONF" ]; then
-    if ! ( cd "$WG_DIR" && "$WGCF_BIN" --config "$WGCF_ACCT" generate >/tmp/wgcf-generate.log 2>&1 ); then
-        echo "WARP 配置生成失败，详见 /tmp/wgcf-generate.log" >&2
+    WGCF_LOG=$(umask 077; mktemp)
+    if ! (umask 077; cd "$WG_DIR" && "$WGCF_BIN" --config "$WGCF_ACCT" generate >"$WGCF_LOG" 2>&1); then
+        tail -n 20 "$WGCF_LOG" >&2 || true
+        rm -f "$WGCF_LOG"
+        echo "WARP 配置生成失败" >&2
         exit 1
     fi
+    rm -f "$WGCF_LOG"
 fi
 [ -f "${WG_DIR}/wgcf-profile.conf" ] && [ ! -f "$WGCF_CONF" ] && mv -f "${WG_DIR}/wgcf-profile.conf" "$WGCF_CONF"
 [ -f /root/wgcf-profile.conf ] && [ ! -f "$WGCF_CONF" ] && mv -f /root/wgcf-profile.conf "$WGCF_CONF"
@@ -14404,6 +14424,7 @@ if [ ! -f "$WGCF_CONF" ]; then
     echo "未找到 wgcf 生成的 WireGuard 配置" >&2
     exit 1
 fi
+chmod 600 "$WGCF_CONF" 2>/dev/null || true
 
 WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF")
 WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF")
@@ -14443,7 +14464,7 @@ WPEOF
     trap - EXIT
 )
 
-cat > /etc/systemd/system/wireproxy.service <<'WPSVCEOF'
+atomic_write_mode /etc/systemd/system/wireproxy.service 644 <<'WPSVCEOF'
 [Unit]
 Description=WireProxy (Cloudflare WARP SOCKS5)
 After=network-online.target
@@ -14480,7 +14501,7 @@ if systemctl list-unit-files 2>/dev/null | grep -q '^warp-svc'; then
     systemctl disable --now warp-svc >/dev/null 2>&1 || true
 fi
 
-cat > /usr/local/bin/hy2-warp-watchdog.sh <<'WDE'
+atomic_write_mode /usr/local/bin/hy2-warp-watchdog.sh 755 <<'WDE'
 #!/usr/bin/env bash
 set -u
 # 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
@@ -14491,9 +14512,8 @@ if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
 WDE
-chmod 755 /usr/local/bin/hy2-warp-watchdog.sh
 
-cat > /etc/systemd/system/hy2-warp-watchdog.service <<'WDSE'
+atomic_write_mode /etc/systemd/system/hy2-warp-watchdog.service 644 <<'WDSE'
 [Unit]
 Description=Cloudflare WARP Watchdog for Hysteria 2
 After=network.target
@@ -14503,7 +14523,7 @@ Type=oneshot
 ExecStart=/usr/local/bin/hy2-warp-watchdog.sh
 WDSE
 
-cat > /etc/systemd/system/hy2-warp-watchdog.timer <<'WDTE'
+atomic_write_mode /etc/systemd/system/hy2-warp-watchdog.timer 644 <<'WDTE'
 [Unit]
 Description=Run WARP Watchdog every 3 minutes
 
@@ -14552,14 +14572,35 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # Install success is not routing success: apply the domain ACL
                 # directly, never call the legacy script with mismatched arguments.
                 with data_lock:
+                    previous_warp_enabled_exists = 'warp_enabled' in data
+                    previous_warp_rules_exists = 'warp_rules' in data
+                    previous_warp_enabled = copy.deepcopy(data.get('warp_enabled'))
+                    previous_warp_rules = copy.deepcopy(data.get('warp_rules'))
                     data['warp_enabled'] = True
-                    data.setdefault('warp_rules', list(DEFAULT_WARP_DOMAINS))
-                save_data()
+                    if not isinstance(data.get('warp_rules'), list):
+                        data['warp_rules'] = list(DEFAULT_WARP_DOMAINS)
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        if previous_warp_enabled_exists:
+                            data['warp_enabled'] = previous_warp_enabled
+                        else:
+                            data.pop('warp_enabled', None)
+                        if previous_warp_rules_exists:
+                            data['warp_rules'] = previous_warp_rules
+                        else:
+                            data.pop('warp_rules', None)
+                    raise
                 return self._reply_with_warp_apply({
                     'message': 'WARP 通道安装完成，正在应用分流配置。',
                 })
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
+            finally:
+                _warp_install_lock.release()
 
         def do_HEAD(self):
             """HEAD 与 GET 走同一套路由，只是不发正文（2026-11-04 修）。
