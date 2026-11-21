@@ -7828,6 +7828,8 @@ def sync_download_artifacts(data, uri, clash, sing, qr=_QR_UNSET):
 def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', precomputed_qr=None):
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    if not isinstance(m, dict):
+        raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先修信任模型再对齐 pin。
     # 顺序有依赖：sync_pin 依赖 is_insecure 判断 pin 去留，而 is_insecure 本身
     # 可能正漂移着（自签被换成正式证书后仍是 true）。
@@ -7836,6 +7838,8 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
 
     path = root / 'portal.json'
     data = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('portal.json 顶层必须是 JSON 对象')
     original_data = copy.deepcopy(data)
     # 凭据文件缺失/损坏时重建（保 token、API Key、用户），而不是让
     # 「刷新页面」「证书自愈」这类日常操作直接抛异常（2026-10-30 修）。
@@ -7849,17 +7853,19 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     # 空串等于「任何人都能算出任意用户的 k」（`in` 判断只看键在不在）。
     if not isinstance(data.get('session_secret'), str) or not data['session_secret']:
         data['session_secret'] = secrets.token_hex(32)
-    if 'api_key' not in data:
-        data['api_key'] = access.get('api_key') or secrets.token_hex(24)
+    if not isinstance(data.get('api_key'), str) or not data['api_key'].strip():
+        access_key = access.get('api_key')
+        data['api_key'] = (access_key.strip() if isinstance(access_key, str) and access_key.strip()
+                           else secrets.token_hex(24))
         access['api_key'] = data['api_key']
         # 与其他路径一致：portal-access.json 含用户名/密码/api_key，
         # write_text 会先按 umask 建出 0644 再补权限（2026-10-29 修）。
         atomic_write_private(root / 'portal-access.json',
                              json.dumps(access, ensure_ascii=False).encode('utf-8'))
-    if 'users' not in data:
+    if not isinstance(data.get('users'), dict):
         data['users'] = {
             MASTER_USER_ID: {
-                'password': m['auth_password'],
+                'password': m.get('auth_password', ''),
                 'expires_at': MASTER_EXPIRES_AT,
                 'ip_limit': 0,
                 'limit_bytes': 0,
@@ -7869,7 +7875,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
                 'note': 'Master Admin'
             }
         }
-    if 'proxy_services' not in data:
+    if not isinstance(data.get('proxy_services'), list):
         data['proxy_services'] = []
     # 🔴 2026-10-31：只存摘要，不存整页 HTML（见 regenerate_page 的详细说明）。
     # 页面由 users / meta / clash / qr 完全可重建，存整份纯属写放大。
@@ -8092,8 +8098,12 @@ def adopt(meta_path, port, node_api_key=None):
 def _adopt_locked(meta_path, port, node_api_key=None):
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    if not isinstance(m, dict):
+        raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     path = root / 'portal.json'
     data = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('portal.json 顶层必须是 JSON 对象')
     access_path = root / 'portal-access.json'
     access, _rebuilt = ensure_portal_access(root, m, data)
     data['port'] = int(port)
