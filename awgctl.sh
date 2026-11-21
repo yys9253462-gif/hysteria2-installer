@@ -176,6 +176,35 @@ awg_transaction_snapshot() {
     fi
 }
 
+# 通过同目录临时文件原子复制还原目标，避免覆盖运行中二进制触发 ETXTBSY 或留下半截配置。
+awg_atomic_copy_file() {
+    local src="$1" dst="$2" tmp
+    mkdir -p "$(dirname "$dst")" || return 1
+    tmp="$(umask 077 && mktemp "${dst}.restore.XXXXXX")" || return 1
+    if ! cp -a "$src" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+awg_atomic_install_bin() {
+    local src="$1" dst="$2" tmp
+    mkdir -p "$(dirname "$dst")" || return 1
+    tmp="$(mktemp "${dst}.new.XXXXXX")" || return 1
+    if ! install -m 0755 "$src" "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
 awg_transaction_restore() {
     local index=0 path state_file active enabled unit_dir
     local -a paths=("$AWG_META_FILE" "$AWG_CONFIG" "$AWG_PEERS_FILE" "$AWG_SERVICE")
@@ -190,8 +219,7 @@ awg_transaction_restore() {
     fi
     for path in "${paths[@]}"; do
         if [[ -f "$AWG_TRANSACTION_DIR/$index.present" ]]; then
-            mkdir -p "$(dirname "$path")" || return 1
-            cp -a "$AWG_TRANSACTION_DIR/$index" "$path" || return 1
+            awg_atomic_copy_file "$AWG_TRANSACTION_DIR/$index" "$path" || return 1
         else
             rm -f "$path" || return 1
         fi
@@ -206,8 +234,7 @@ awg_transaction_restore() {
     index=4
     for path in "${binaries[@]}"; do
         if [[ -f "$AWG_TRANSACTION_DIR/bin.$index.present" ]]; then
-            mkdir -p "$(dirname "$path")" || return 1
-            cp -a "$AWG_TRANSACTION_DIR/bin.$index" "$path" || return 1
+            awg_atomic_copy_file "$AWG_TRANSACTION_DIR/bin.$index" "$path" || return 1
         else
             rm -f "$path" || return 1
         fi
@@ -463,10 +490,16 @@ download_binaries() {
         fi
     done
 
+    # 替换现役二进制前先在临时目录冒烟校验新 awg 可执行（架构不对/文件损坏时不触碰现役文件）。
+    chmod 0755 "${tmpd}/awg" 2>/dev/null || true
+    if ! { "${tmpd}/awg" --version >/dev/null 2>&1 || "${tmpd}/awg" version >/dev/null 2>&1; }; then
+        rm -rf "$tmpd"
+        log_err "新二进制无法执行（架构不符或文件损坏），原二进制未改动"
+        return 1
+    fi
+
     mkdir -p "$AWG_DIR"
-    # 覆盖现役二进制前先备份，装完立刻验证新文件真的能执行；
-    # 任一步失败就整组恢复。旧实现直接覆盖，新版架构不符或损坏时
-    # 旧版本已经没了，AWG 直接不可用、只能重装（2026-10-29 修）。
+    # 覆盖现役二进制前先备份，并使用同目录临时文件原子替换，避免覆写运行中程序触发 ETXTBSY。
     local bakd f
     bakd="$(mktemp -d "${AWG_DIR}/.binbak.XXXXXX")"
     for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
@@ -474,23 +507,19 @@ download_binaries() {
     done
     _restore_bins() {
         for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
-            [[ -e "$bakd/$(basename "$f")" ]] && install -m 0755 "$bakd/$(basename "$f")" "$f"
+            [[ -e "$bakd/$(basename "$f")" ]] && awg_atomic_install_bin "$bakd/$(basename "$f")" "$f"
         done
         rm -rf "$bakd"
     }
-    if ! install -m 0755 "${tmpd}/amneziawg-go" "$AWG_GO_BIN"        || ! install -m 0755 "${tmpd}/awg"          "$AWG_BIN"        || ! install -m 0755 "${tmpd}/awg-quick"    "$AWG_QUICK_BIN"; then
+    if ! awg_atomic_install_bin "${tmpd}/amneziawg-go" "$AWG_GO_BIN" \
+            || ! awg_atomic_install_bin "${tmpd}/awg" "$AWG_BIN" \
+            || ! awg_atomic_install_bin "${tmpd}/awg-quick" "$AWG_QUICK_BIN"; then
         _restore_bins; rm -rf "$tmpd"
         log_err "写入二进制失败，已恢复原有版本"
         return 1
     fi
-    # 冒烟：新二进制必须至少能跑起来（--version / version 任一成功即可）。
-    if ! { "$AWG_BIN" --version >/dev/null 2>&1 || "$AWG_BIN" version >/dev/null 2>&1; }; then
-        _restore_bins; rm -rf "$tmpd"
-        log_err "新二进制无法执行（架构不符或文件损坏），已恢复原有版本"
-        return 1
-    fi
     if [[ -f "${tmpd}/VERSION" ]]; then
-        cp -f "${tmpd}/VERSION" "$AWG_VERSION_FILE"
+        awg_atomic_copy_file "${tmpd}/VERSION" "$AWG_VERSION_FILE"
         chmod 600 "$AWG_VERSION_FILE"
     fi
     rm -rf "$bakd" "$tmpd"
@@ -868,9 +897,9 @@ peer_apply_live_del() {
 
 restore_peer_files() {
     local peers_backup="$1" config_backup="$2" had_config="$3"
-    cp -p "$peers_backup" "$AWG_PEERS_FILE" || return 1
+    awg_atomic_copy_file "$peers_backup" "$AWG_PEERS_FILE" || return 1
     if [[ "$had_config" == "1" ]]; then
-        cp -p "$config_backup" "$AWG_CONFIG" || return 1
+        awg_atomic_copy_file "$config_backup" "$AWG_CONFIG" || return 1
     else
         rm -f "$AWG_CONFIG"
     fi
