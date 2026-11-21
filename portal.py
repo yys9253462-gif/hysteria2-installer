@@ -8389,10 +8389,29 @@ def merge_cli_owned_state(data, disk):
     """把 adopt / refresh 写到磁盘的键并进运行中门户的内存 data（原地修改）。
 
     只取 CLI 负责的键与机主的密码 / 到期时间；用户、用量、代理服务仍以内存为准。
+    关键键做类型守卫，避免磁盘上被改坏的空值/非字符串覆写运行中正常状态。
     """
+    if not isinstance(data, dict) or not isinstance(disk, dict):
+        return
     for key in CLI_OWNED_PORTAL_KEYS:
-        if key in disk:
-            data[key] = disk[key]
+        if key not in disk:
+            continue
+        val = disk[key]
+        if key == 'port':
+            valid_p = _valid_port(val)
+            if not valid_p:
+                continue
+            data[key] = valid_p
+        elif key in ('auth_hash', 'session_secret', 'api_key'):
+            if not isinstance(val, str) or not val:
+                continue
+            data[key] = val
+        elif key == 'session_epoch':
+            if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                continue
+            data[key] = val
+        else:
+            data[key] = val
     disk_users = disk.get('users')
     disk_master = disk_users.get(MASTER_USER_ID) if isinstance(disk_users, dict) else None
     users = data.get('users')
@@ -8418,7 +8437,9 @@ def ensure_portal_access(root, meta, data):
     if path.exists():
         try:
             access = json.loads(path.read_text(encoding='utf-8'))
-            if isinstance(access, dict):
+            if (isinstance(access, dict)
+                    and isinstance(access.get('username'), str) and access['username']
+                    and isinstance(access.get('password'), str) and access['password']):
                 return access, False
         except (OSError, ValueError):
             pass
@@ -8454,7 +8475,7 @@ def restore_egress_into_config(root, config_path=None):
         return False
     state = routing_state(data)
     # 没保存过任何有效出口设置就不动：渲染总会顺带重排 ACL 头部，不该无故改写刚生成的配置。
-    has_outbounds = bool(clean_outbounds(state['custom_outbounds']))
+    has_outbounds = bool(_renderable_outbounds(state['custom_outbounds']))
     has_rules = bool(normalize_route_rules(state['warp_rules']))
     if not (state['warp_enabled'] or has_outbounds or has_rules
             or (state['outbound_mode'] == 'global' and has_outbounds)):
@@ -8491,14 +8512,9 @@ def adopt(meta_path, port, node_api_key=None):
 
 
 def _adopt_locked(meta_path, port, node_api_key=None):
-    if isinstance(port, bool):
-        raise ValueError('门户端口不能是布尔值')
-    try:
-        port_int = int(port)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError('门户端口必须是整数') from exc
-    if not (1 <= port_int <= 65535):
-        raise ValueError('门户端口必须在 1-65535 之间')
+    port_int = _valid_port(port)
+    if not port_int:
+        raise ValueError('门户端口必须是 1-65535 的整数')
     if node_api_key is not None and node_api_key != '':
         if (not isinstance(node_api_key, str) or not node_api_key.isascii()
                 or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in node_api_key)):
@@ -16766,7 +16782,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 四档，丢一个包就跳 33%。10 包间隔 1 秒约 11 秒，超时给 20 秒。
                 proc = subprocess.run(
                     ['ping', '-n', '-c', '10', '-W', '2', host],
-                    capture_output=True, text=True, timeout=20,
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=20,
                     env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
             except Exception:
                 return None, None
@@ -16776,15 +16792,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             m = re.search(r'([0-9]+(?:\.[0-9]+)?)%\s*packet loss', out)
             if m:
                 try:
-                    loss = min(100.0, max(0.0, float(m.group(1))))
+                    val = float(m.group(1))
+                    if math.isfinite(val):
+                        loss = min(100.0, max(0.0, val))
                 except ValueError:
                     loss = None
 
             avg = None
-            m = re.search(r'=\s*([0-9.]+)/([0-9.]+)/[0-9.]+', out)
+            m = re.search(r'=\s*[0-9]+(?:\.[0-9]+)?/([0-9]+(?:\.[0-9]+)?)/[0-9]+(?:\.[0-9]+)?', out)
             if m:
                 try:
-                    avg = min(60000.0, max(0.0, float(m.group(2))))
+                    val = float(m.group(1))
+                    if math.isfinite(val):
+                        avg = min(60000.0, max(0.0, val))
                 except ValueError:
                     avg = None
             return avg, loss
