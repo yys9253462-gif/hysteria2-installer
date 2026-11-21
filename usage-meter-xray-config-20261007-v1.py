@@ -104,6 +104,25 @@ def iplimit_routing_ready(cfg):
             bool(rules) and rules[0]==API_RULE)
 
 
+def _write_private_bytes(target, payload, mode):
+    """以指定权限创建并落盘文件，避免先默认掩码创建再改权产生私钥暴露窗口。"""
+    target = pathlib.Path(target)
+    mode = (mode & 0o777) or 0o600
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            fd = None
+            handle.write(payload)
+            handle.flush()
+            if hasattr(os, 'fchmod'):
+                os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+    finally:
+        if fd is not None:
+            os.close(fd)
+    os.chmod(target, mode)
+
+
 def _restart_xray(check=True):
     # 先清失败计数，与门户其它重启 Xray 的地方一致：刚连续重启过、撞上 StartLimitBurst 时
     # restart 会被直接拒绝，回滚那次同样起不来，Xray 一直停着（2026-11-12 修）。
@@ -111,12 +130,19 @@ def _restart_xray(check=True):
     return subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15,check=check)
 
 
+def _rollback_restart_xray():
+    try:
+        _restart_xray(check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def enable_iplimit_routing(config_path, binary, address):
     """幂等开启设备上限所需的路由接口；预检后替换，重启失败恢复原配置。不触碰 clients。"""
     if not address.startswith('127.0.0.1:'):raise ValueError('stats endpoint must be loopback')
     path=pathlib.Path(config_path)
     original=path.read_bytes()
-    orig_mode=path.stat().st_mode & 0o777
+    orig_mode=(path.stat().st_mode & 0o777) or 0o600
     config=json.loads(original)
     if iplimit_routing_ready(config):
         return {'enabled':True,'changed':False,'backup':None}
@@ -131,13 +157,14 @@ def enable_iplimit_routing(config_path, binary, address):
     # /etc/hysteria 下会无界累积备份文件（实测已出现）。
     # 固定文件名既保留回滚能力，又不会随重启增长。
     backup=path.with_name(path.name+'.before-iplimit')
+    backup_tmp=path.with_name(path.name+'.before-iplimit.tmp')
     replaced=False
     try:
-        candidate.write_text(json.dumps(config,indent=2),encoding='utf-8')
-        os.chmod(candidate,orig_mode)
+        _write_private_bytes(candidate, json.dumps(config,indent=2).encode('utf-8'), orig_mode)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
         if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
-        shutil.copy2(path,backup)
+        _write_private_bytes(backup_tmp, original, orig_mode)
+        os.replace(backup_tmp, backup)
         os.replace(candidate,path);replaced=True
         _restart_xray()
         subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
@@ -148,13 +175,13 @@ def enable_iplimit_routing(config_path, binary, address):
         else:raise RuntimeError('routing api unavailable after restart')
     except Exception:
         if replaced:
-            candidate.write_bytes(original)
-            os.chmod(candidate,orig_mode)
+            _write_private_bytes(candidate, original, orig_mode)
             os.replace(candidate,path)
-            _restart_xray(check=False)
+            _rollback_restart_xray()
         raise
     finally:
         candidate.unlink(missing_ok=True)
+        backup_tmp.unlink(missing_ok=True)
     return {'enabled':True,'changed':True,'backup':str(backup)}
 
 
@@ -162,7 +189,7 @@ def enable_reality_online(config_path, binary, address):
     """只开启在线统计；校验后替换，失败恢复原配置，不触碰用户或 Reality 参数。"""
     path=pathlib.Path(config_path)
     original=path.read_bytes()
-    orig_mode=path.stat().st_mode & 0o777
+    orig_mode=(path.stat().st_mode & 0o777) or 0o600
     config=json.loads(original)
     levels=config.setdefault('policy',{}).setdefault('levels',{})
     used={'0'}
@@ -175,15 +202,16 @@ def enable_reality_online(config_path, binary, address):
     # 固定备份名，与 before-iplimit 同理（2026-11-03 修）：时间戳文件名每次改动
     # 新建一份，/etc/hysteria 下无界累积。
     backup=path.with_name(path.name+'.before-reality-online')
+    backup_tmp=path.with_name(path.name+'.before-reality-online.tmp')
     if not address.startswith('127.0.0.1:'):raise ValueError('stats endpoint must be loopback')
     if changed:
-        candidate.write_text(json.dumps(config,indent=2),encoding='utf-8')
-        os.chmod(candidate,orig_mode)
         replaced=False
         try:
+            _write_private_bytes(candidate, json.dumps(config,indent=2).encode('utf-8'), orig_mode)
             subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
             if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
-            shutil.copy2(path,backup)
+            _write_private_bytes(backup_tmp, original, orig_mode)
+            os.replace(backup_tmp, backup)
             os.replace(candidate,path);replaced=True
             _restart_xray()
             subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
@@ -199,14 +227,14 @@ def enable_reality_online(config_path, binary, address):
                     time.sleep(0.5)
         except Exception:
             if replaced:
-                candidate.write_bytes(original)
-                os.chmod(candidate,orig_mode)
+                _write_private_bytes(candidate, original, orig_mode)
                 os.replace(candidate,path)
-                # 回滚后的重启不带 check：它失败时抛出的异常会顶掉真正的失败原因。
-                _restart_xray(check=False)
+                # 回滚后的重启不带 check 且隔离超时异常，避免顶掉真正的失败原因。
+                _rollback_restart_xray()
             raise
         finally:
             candidate.unlink(missing_ok=True)
+            backup_tmp.unlink(missing_ok=True)
     else:
         subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
         subprocess.run([binary,'api','statsgetallonlineusers','--server='+address],capture_output=True,timeout=5,check=True)
