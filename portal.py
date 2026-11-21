@@ -6336,9 +6336,17 @@ def _restore_systemd_service_state(unit, snapshot):
                 results.append(subprocess.run(
                     ['systemctl', action, unit], capture_output=True, timeout=30))
         if enabled != 'not-found':
-            results.append(subprocess.run(
-                ['systemctl', 'start' if active == 'active' else 'stop', unit],
-                capture_output=True, timeout=30))
+            if active == 'active':
+                # 回滚恢复运行态前先清理失败计数并执行 restart（而非 start）：
+                # 1) 刚因新配置崩溃撞上 StartLimitBurst 时，直接 start 会被 systemd 拒绝；
+                # 2) 服务若正跑着新配置（同为 active），start 会静默空操作而不会重新加载刚回滚的旧配置。
+                subprocess.run(['systemctl', 'reset-failed', unit],
+                               capture_output=True, timeout=15)
+                results.append(subprocess.run(
+                    ['systemctl', 'restart', unit], capture_output=True, timeout=30))
+            else:
+                results.append(subprocess.run(
+                    ['systemctl', 'stop', unit], capture_output=True, timeout=30))
     except (OSError, subprocess.SubprocessError):
         return False
     if any(result.returncode != 0 for result in results):

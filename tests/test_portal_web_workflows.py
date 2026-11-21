@@ -2238,7 +2238,7 @@ class WebWorkflowTests(unittest.TestCase):
             if args[:3] == ['systemctl', 'enable', '--runtime']:
                 state['enabled'] = 'enabled-runtime'
                 return SimpleNamespace(returncode=0)
-            if args[:2] == ['systemctl', 'start']:
+            if args[:2] in (['systemctl', 'start'], ['systemctl', 'restart']):
                 state['active'] = 'active'
                 return SimpleNamespace(returncode=0)
             return SimpleNamespace(returncode=0)
