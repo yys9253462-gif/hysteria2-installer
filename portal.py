@@ -1641,6 +1641,8 @@ def portal_bundle_version(local_shas, remote_shas):
 
 _MAX_REMOTE_META_BYTES = 2 * 1024 * 1024
 _MAX_PORTAL_FILE_BYTES = 4 * 1024 * 1024
+_MAX_BINARY_ARCHIVE_BYTES = 160 * 1024 * 1024
+_MAX_BINARY_EXTRACT_BYTES = 256 * 1024 * 1024
 
 
 def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
@@ -1652,6 +1654,29 @@ def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
     if len(raw) > limit:
         raise ValueError('响应体积过大（超过 %d 字节）' % limit)
     return raw
+
+
+def _copy_stream_bounded(src, dst, limit, chunk_size=65536):
+    """按块受限复制流，防止异常或恶意镜像与压缩炸弹写爆磁盘。"""
+    total = 0
+    while True:
+        try:
+            chunk = src.read(chunk_size)
+        except TypeError:
+            chunk = src.read()
+            if chunk:
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError('下载或解压体积超过上限（%d 字节）' % limit)
+                dst.write(chunk)
+            break
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise ValueError('下载或解压体积超过上限（%d 字节）' % limit)
+        dst.write(chunk)
+    return total
 
 
 def resolve_update_ref(ref):
@@ -5977,7 +6002,7 @@ def install_xray_binary():
             try:
                 req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=45) as resp, open(zpath, 'wb') as out_f:
-                    shutil.copyfileobj(resp, out_f)
+                    _copy_stream_bounded(resp, out_f, _MAX_BINARY_ARCHIVE_BYTES)
                 if not verify_sha256(zpath, expected):
                     errors.append('%s: SHA256 与官方 .dgst 不一致' % host)
                     continue
@@ -5986,14 +6011,16 @@ def install_xray_binary():
                     continue
                 with zipfile.ZipFile(zpath, 'r') as zf:
                     member = safe_zip_members(zf.namelist(), 'xray')
-                    zf.extract(member, path=tmpdir)
-                bin_path = Path(tmpdir) / member
-                if bin_path.exists():
+                    info = zf.getinfo(member)
+                    if info.is_dir():
+                        raise ValueError('zip 内 xray 成员是目录而非可执行文件')
+                    if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                        raise ValueError('zip 内含不允许的符号链接成员: %s' % member)
                     staged = Path('/usr/local/bin/xray.new.%s' % secrets.token_hex(6))
                     replaced = False
                     try:
-                        with open(bin_path, 'rb') as src_f, open(staged, 'wb') as dst_f:
-                            shutil.copyfileobj(src_f, dst_f)
+                        with zf.open(info, 'r') as src_f, open(staged, 'wb') as dst_f:
+                            _copy_stream_bounded(src_f, dst_f, _MAX_BINARY_EXTRACT_BYTES)
                             dst_f.flush()
                             os.fsync(dst_f.fileno())
                         os.chmod(str(staged), 0o755)
@@ -6010,7 +6037,6 @@ def install_xray_binary():
                     finally:
                         if not replaced:
                             staged.unlink(missing_ok=True)
-                errors.append('%s: 包内没有 xray' % host)
             except Exception as exc:
                 errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
 
@@ -6063,7 +6089,7 @@ def install_singbox():
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'hy2-portal'})
                 with urllib.request.urlopen(req, timeout=180) as resp, open(archive, 'wb') as out:
-                    shutil.copyfileobj(resp, out)
+                    _copy_stream_bounded(resp, out, _MAX_BINARY_ARCHIVE_BYTES)
                 if not verify_sha256(archive, expected):
                     errors.append('%s: SHA256 与官方不一致' % host)
                     continue
@@ -6085,12 +6111,12 @@ def install_singbox():
                             if m.isfile():
                                 regular_names.append(mname)
                         member_name = safe_tar_members(regular_names, 'sing-box')
-                        member = tar.getmember(member_name)
+                        member = next(m for m in all_members if m.name == member_name and m.isfile())
                         extracted = tar.extractfile(member)
                         if extracted is None:
                             raise ValueError('tar 包内无法读取 sing-box 成员')
                         with extracted as src, open(staged, 'wb') as dst:
-                            shutil.copyfileobj(src, dst)
+                            _copy_stream_bounded(src, dst, _MAX_BINARY_EXTRACT_BYTES)
                             dst.flush()
                             os.fsync(dst.fileno())
                     os.chmod(str(staged), 0o755)
@@ -12114,13 +12140,18 @@ if __name__ == '__main__':
                     ptype = str(params.get('protocol') or params.get('type') or 'socks5').lower()
                     if ptype not in ('socks5', 'http', 'https'):
                         return 400, {'ok': False, 'error': '代理类型只能是 SOCKS5、HTTP 或 HTTPS'}
-                    raw_port = str(params.get('port') or '').strip()
-                    try:
-                        port = int(raw_port) if raw_port else 0
-                    except (TypeError, ValueError):
-                        port = -1
-                    if raw_port and not 1 <= port <= 65535:
+                    raw_port_in = params.get('port')
+                    if isinstance(raw_port_in, bool):
                         return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
+                    raw_port = str(raw_port_in if raw_port_in is not None else '').strip()
+                    if raw_port:
+                        if not re.fullmatch(r'[0-9]{1,5}', raw_port):
+                            return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
+                        port = int(raw_port)
+                        if not 1 <= port <= 65535:
+                            return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
+                    else:
+                        port = 0
                     if ptype == 'https':
                         # 没有可用证书时给 400 + 可读原因，而不是 500 的
                         # 「proxy add failed: ...」（2026-10-30 修）。
@@ -12171,8 +12202,15 @@ if __name__ == '__main__':
                     if not selected:
                         return 400, {'ok': False, 'error': '指定端口已占用，或无法找到空闲端口'}
                     port = selected
-                    raw_user = str(params.get('username') or '')
-                    raw_pass = str(params.get('password') or '')
+                    raw_user_in = params.get('username')
+                    raw_pass_in = params.get('password')
+                    raw_note_in = params.get('note')
+                    if (raw_user_in is not None and not isinstance(raw_user_in, str)) or (
+                            raw_pass_in is not None and not isinstance(raw_pass_in, str)) or (
+                            raw_note_in is not None and not isinstance(raw_note_in, str)):
+                        return 400, {'ok': False, 'error': '代理账号、密码与备注必须是字符串'}
+                    raw_user = raw_user_in or ''
+                    raw_pass = raw_pass_in or ''
                     if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_user + raw_pass):
                         return 400, {'ok': False, 'error': '代理账号或密码不能包含换行或控制字符'}
                     username = raw_user.strip()[:64] or ('user_' + secrets.token_hex(4))
@@ -12183,7 +12221,7 @@ if __name__ == '__main__':
                         return 400, {'ok': False, 'error': 'SOCKS5 账号或密码不能超过 255 字节'}
                     entry = {'id': 'proxy_' + secrets.token_hex(6), 'type': ptype, 'port': port,
                              'username': username, 'password': password, 'created_at': int(time.time()),
-                             'note': str(params.get('note') or '').strip()[:200]}
+                             'note': (raw_note_in or '').strip()[:200]}
                     with data_lock:
                         data['proxy_services'] = working + [entry]
                 else:
@@ -12203,7 +12241,12 @@ if __name__ == '__main__':
                     with data_lock:
                         data['proxy_services'] = previous
                     raise
-                if not reload_gost():
+                try:
+                    reloaded = reload_gost()
+                except Exception as exc:
+                    _log_ignored('proxy_reload', exc)
+                    reloaded = False
+                if not reloaded:
                     with data_lock:
                         data['proxy_services'] = previous
                     try:
@@ -12251,6 +12294,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
                 return 200, dict(entry, ok=True, applied=True, host=host, url=uri, qr=qr_svg,
@@ -12292,13 +12337,17 @@ if __name__ == '__main__':
                         managed_unit = (gost_unit.is_file() and
                             'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
                             in gost_unit.read_text(encoding='utf-8'))
-                    except OSError:
+                    except (OSError, UnicodeDecodeError):
                         pass
                     if not (gost_owner.is_file() and managed_unit):
                         return self.reply_json(409, {'ok': False, 'error':
                             '检测到已有 GOST 文件或服务但无法确认归属；为避免覆盖宿主服务，已停止安装'})
-                    version = subprocess.run(['/usr/local/bin/gost', '-V'], capture_output=True, timeout=5)
-                    if version.returncode == 0:
+                    try:
+                        version = subprocess.run(['/usr/local/bin/gost', '-V'], capture_output=True, timeout=5)
+                        old_bin_ok = version.returncode == 0
+                    except Exception:
+                        old_bin_ok = False
+                    if old_bin_ok:
                         if not reload_gost():
                             return self.reply_json(500, {'ok': False, 'error': 'GOST 修复失败或端口未就绪，请检查日志'})
                         return self.reply_json(200, {'ok': True, 'applied': True, 'message': 'GOST 已恢复运行，监听端口已核对'})
@@ -12307,10 +12356,10 @@ if __name__ == '__main__':
                     arch = 'linux_amd64'
                 elif 'aarch64' in machine or 'arm64' in machine:
                     arch = 'linux_arm64'
-                elif 'armv7' in machine:
+                elif 'armv7' in machine or 'armhf' in machine:
                     arch = 'linux_armv7'
                 else:
-                    arch = 'linux_amd64'
+                    return self.reply_json(400, {'ok': False, 'error': '不支持的 CPU 架构，无法安装 GOST: %s' % machine})
 
                 # 动态探测最新版本（严格校验版本号格式，防止异常响应注入路径段）
                 tag = 'v3.3.0'
@@ -12355,9 +12404,12 @@ if __name__ == '__main__':
                 cert_files = (cert_dir / 'cert.pem', cert_dir / 'key.pem')
                 had_cert_dir = cert_dir.exists()
                 old_gost_active = _systemd_state('gost') == 'active'
-                old_gost_enabled = subprocess.run(
-                    ['systemctl', 'is-enabled', 'gost'], capture_output=True,
-                    text=True, timeout=5).stdout.strip() == 'enabled'
+                try:
+                    old_gost_enabled = subprocess.run(
+                        ['systemctl', 'is-enabled', 'gost'], capture_output=True,
+                        text=True, timeout=5).stdout.strip() == 'enabled'
+                except Exception:
+                    old_gost_enabled = False
                 with data_lock:
                     had_proxy_services = 'proxy_services' in data
                     previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
@@ -12374,7 +12426,7 @@ if __name__ == '__main__':
                             req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
                             # 超时给足：包有 ~17MB，30 秒在慢线路上不够
                             with urllib.request.urlopen(req, timeout=180) as resp, open(archive_path, 'wb') as out_f:
-                                shutil.copyfileobj(resp, out_f)
+                                _copy_stream_bounded(resp, out_f, _MAX_BINARY_ARCHIVE_BYTES)
                             if not verify_sha256(archive_path, expected):
                                 errors.append('%s: SHA256 与官方 checksums.txt 不一致' % host)
                                 continue
@@ -12404,7 +12456,7 @@ if __name__ == '__main__':
                                 if extracted is None:
                                     raise ValueError('tar 包内无法读取 gost 成员')
                                 with extracted as source, open(src_bin, 'wb') as dest:
-                                    shutil.copyfileobj(source, dest)
+                                    _copy_stream_bounded(source, dest, _MAX_BINARY_EXTRACT_BYTES)
                             if src_bin.exists():
                                 staged = Path('/usr/local/bin/gost.new.%s' % os.urandom(6).hex())
                                 replaced = False
@@ -12547,7 +12599,12 @@ if __name__ == '__main__':
                 subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
 
                 # 重新生成 gost.yml 并启动服务
-                if not reload_gost():
+                try:
+                    reloaded = reload_gost()
+                except Exception as exc:
+                    _log_ignored('proxy_reload', exc)
+                    reloaded = False
+                if not reloaded:
                     restore_gost_assets()
                     if old_gost_active:
                         reload_gost()
@@ -13562,6 +13619,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vmess_qr', exc)
             return self.reply_json(200, {
@@ -14028,6 +14087,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('anytls_qr', exc)
             return self.reply_json(200, {
@@ -14260,6 +14321,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('tuic_qr', exc)
             return self.reply_json(200, {
@@ -14401,6 +14464,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vlessenc_qr', exc)
             return self.reply_json(200, {
