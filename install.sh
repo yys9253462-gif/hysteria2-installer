@@ -4342,7 +4342,10 @@ setup_portal() {
             return 1
         fi
     fi
-    cat > /etc/systemd/system/hysteria-portal.service <<EOF
+    local _portal_svc_tmp=""
+    _portal_svc_tmp="$(mktemp /etc/systemd/system/hysteria-portal.service.XXXXXX)" || return 1
+    {
+        cat > "$_portal_svc_tmp" <<EOF
 [Unit]
 Description=Private HY2 information page (loopback only)
 After=network.target
@@ -4359,6 +4362,10 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
+    } && chmod 644 "$_portal_svc_tmp" && mv -f "$_portal_svc_tmp" /etc/systemd/system/hysteria-portal.service || {
+        rm -f "$_portal_svc_tmp"
+        return 1
+    }
     # 目录 700：门户与所有配置只允许 root 访问。portal.py 本身是 644，
     # 但目录不可遍历时本机其他用户既列不出也读不到（2026-10-30 修）。
     chmod 700 "$HY2_DIR"
@@ -4413,7 +4420,10 @@ exit 0
 EOCS
     chmod 755 /usr/local/bin/hy2-cert-selfheal.sh || return 1
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.service <<'EOCU' || return 1
+    local _sh_svc_tmp="" _sh_tmr_tmp="" _sh_pth_tmp=""
+    _sh_svc_tmp="$(mktemp /etc/systemd/system/hy2-cert-selfheal.service.XXXXXX)" || return 1
+    {
+        cat > "$_sh_svc_tmp" <<'EOCU'
 [Unit]
 Description=Hysteria 2 certificate trust-model self-heal
 After=network.target
@@ -4422,8 +4432,14 @@ After=network.target
 Type=oneshot
 ExecStart=/usr/local/bin/hy2-cert-selfheal.sh
 EOCU
+    } && chmod 644 "$_sh_svc_tmp" && mv -f "$_sh_svc_tmp" /etc/systemd/system/hy2-cert-selfheal.service || {
+        rm -f "$_sh_svc_tmp"
+        return 1
+    }
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.timer <<'EOCT' || return 1
+    _sh_tmr_tmp="$(mktemp /etc/systemd/system/hy2-cert-selfheal.timer.XXXXXX)" || return 1
+    {
+        cat > "$_sh_tmr_tmp" <<'EOCT'
 [Unit]
 Description=Run certificate self-heal every 30 minutes
 
@@ -4435,6 +4451,10 @@ Unit=hy2-cert-selfheal.service
 [Install]
 WantedBy=timers.target
 EOCT
+    } && chmod 644 "$_sh_tmr_tmp" && mv -f "$_sh_tmr_tmp" /etc/systemd/system/hy2-cert-selfheal.timer || {
+        rm -f "$_sh_tmr_tmp"
+        return 1
+    }
 
     # path 单元：监听证书目录（config.yaml 里 tls.cert 所在目录）。
     # 用目录而非单文件：Caddy/acme.sh 续期是「写新文件再 rename 覆盖」，
@@ -4451,7 +4471,9 @@ EOCT
     fi
     [[ -d "$cert_watch_dir" ]] || cert_watch_dir="$HY2_CERT_DIR"
 
-    cat > /etc/systemd/system/hy2-cert-selfheal.path <<EOCP || return 1
+    _sh_pth_tmp="$(mktemp /etc/systemd/system/hy2-cert-selfheal.path.XXXXXX)" || return 1
+    {
+        cat > "$_sh_pth_tmp" <<EOCP
 [Unit]
 Description=Watch certificate dir and self-heal trust model on change
 
@@ -4462,6 +4484,10 @@ Unit=hy2-cert-selfheal.service
 [Install]
 WantedBy=paths.target
 EOCP
+    } && chmod 644 "$_sh_pth_tmp" && mv -f "$_sh_pth_tmp" /etc/systemd/system/hy2-cert-selfheal.path || {
+        rm -f "$_sh_pth_tmp"
+        return 1
+    }
 
     systemctl daemon-reload
     # 看结果再报（2026-11-12 修）：旧实现两条 enable 失败都吞掉、照报「已启用」并返回 0，
@@ -4477,7 +4503,21 @@ EOCP
 # 装一次 WARP 就把所有在线用户断开一次。
 warp_migrate_legacy_outbound() {
     [[ -f "$HY2_CONFIG" ]] && grep -qF 'addr: 127.0.0.1:40000' "$HY2_CONFIG" || return 0
-    sed -i "s|addr: 127.0.0.1:40000|addr: $1|g" "$HY2_CONFIG"
+    local _wm_tmp=""
+    _wm_tmp="$(umask 077; mktemp "${HY2_CONFIG}.migrate.XXXXXX")" || return 1
+    NEW_ADDR="$1" awk '
+        {
+            idx = index($0, "addr: 127.0.0.1:40000")
+            while (idx > 0) {
+                $0 = substr($0, 1, idx - 1) "addr: " ENVIRON["NEW_ADDR"] substr($0, idx + 21)
+                idx = index($0, "addr: 127.0.0.1:40000")
+            }
+            print
+        }
+    ' "$HY2_CONFIG" > "$_wm_tmp" && chmod 600 "$_wm_tmp" && mv -f "$_wm_tmp" "$HY2_CONFIG" || {
+        rm -f "$_wm_tmp"
+        return 1
+    }
     systemctl reset-failed hysteria-server 2>/dev/null || true
     systemctl restart hysteria-server 2>/dev/null || true
 }
