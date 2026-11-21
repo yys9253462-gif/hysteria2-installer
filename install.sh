@@ -2230,6 +2230,10 @@ setup_ports_and_obfs() {
         read -rsp "请输入机主账号连接密码 [回车自动生成]: " AUTH_PASSWORD || true; echo
         AUTH_PASSWORD=${AUTH_PASSWORD:-$RANDOM_PASS}
     fi
+    if [[ "$AUTH_PASSWORD" =~ [[:cntrl:]] ]]; then
+        log_err "认证密码不能包含换行或控制字符，已中止安装。"
+        return 1
+    fi
 
     # 运行模式：本项目只提供商城版（Agent）节点。
     # 这里不再询问模式，只沿用/生成节点通信 API Key。已装机时**必须**沿用旧 Key，
@@ -2249,6 +2253,10 @@ setup_ports_and_obfs() {
         read -rsp "请设置节点通信 API Key [回车自动生成]: " NODE_API_KEY || true; echo
         NODE_API_KEY=${NODE_API_KEY:-$RANDOM_API_KEY}
         log_info "已生成新的节点通信 API Key。"
+    fi
+    if [[ ! "$NODE_API_KEY" =~ ^[!-~]+$ ]]; then
+        log_err "NODE_API_KEY 必须是不含空白和控制字符的纯 ASCII 字符串，已中止安装。"
+        return 1
     fi
 
     # ⚠️ 主监听端口占用检测（2026-10-09 修）：
@@ -2536,11 +2544,12 @@ select_subscription_port() {
     fi
     HY2_SUB_PORT=$(python3 - "$HY2_DIR/portal.json" <<'PYPORT'
 import json, socket, secrets, sys
-RESERVED = {8443, 19898, 22, 80, 443, 40000, 56195}
+RESERVED = {8443, 19898, 19996, 19997, 22, 80, 443, 40000, 56195}
 # 门户托管协议记下的端口也要避开（2026-11-04 修）：协议此刻停着时 bind 能成功，
 # 订阅端口占了它的位置，之后再启用该协议就撞车。
 try:
-    _data = json.load(open(sys.argv[1], encoding='utf-8'))
+    with open(sys.argv[1], encoding='utf-8') as _fh:
+        _data = json.load(_fh)
 except (OSError, ValueError):
     _data = {}
 if isinstance(_data, dict):
@@ -2548,23 +2557,27 @@ if isinstance(_data, dict):
         _sec = _data.get(_key)
         if isinstance(_sec, dict):
             _p = _sec.get('port')
-            if isinstance(_p, int) and not isinstance(_p, bool):
+            if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
                 RESERVED.add(_p)
             elif isinstance(_p, str):
                 _ps = _p.strip()
                 if _ps.isascii() and _ps.isdigit():
-                    RESERVED.add(int(_ps))
+                    _pi = int(_ps)
+                    if 1 <= _pi <= 65535:
+                        RESERVED.add(_pi)
     _proxies = _data.get('proxy_services')
     if isinstance(_proxies, list):
         for _item in _proxies:
             if isinstance(_item, dict):
                 _p = _item.get('port')
-                if isinstance(_p, int) and not isinstance(_p, bool):
+                if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
                     RESERVED.add(_p)
                 elif isinstance(_p, str):
                     _ps = _p.strip()
                     if _ps.isascii() and _ps.isdigit():
-                        RESERVED.add(int(_ps))
+                        _pi = int(_ps)
+                        if 1 <= _pi <= 65535:
+                            RESERVED.add(_pi)
 for _ in range(100):
     port = 10000 + secrets.randbelow(50000)
     if port in RESERVED or 20000 <= port <= 40000:
@@ -2589,17 +2602,42 @@ PYPORT
         log_err "请释放部分端口后重试，或检查 python3 是否已安装。"
         return 1
     fi
-    # 本地端口必须避开刚选中的订阅端口：上一个 bind 成功后 socket 已关闭，
-    # 内核完全可能把同一个端口再分给 127.0.0.1 的绑定。那样 Hysteria 的
-    # masquerade 与门户会抢同一个端口，装完直接起不来（2026-10-29 修）。
-    PORTAL_LOCAL_PORT=$(python3 - "${HY2_SUB_PORT}" <<'PYPORT'
-import socket, sys
-avoid = {int(sys.argv[1])} if sys.argv[1].isdigit() else set()
-for _ in range(20):
+    # 本地端口必须避开刚选中的订阅端口、计量/WARP 回环端口、跳跃区间与已登记托管协议端口：
+    # 内核 bind(0) 可能分到这些端口，导致门户与 masquerade/计量/托管协议互抢端口起不来。
+    PORTAL_LOCAL_PORT=$(python3 -I - "${HY2_SUB_PORT}" "$HY2_DIR/portal.json" <<'PYPORT'
+import json, socket, sys
+avoid = {8443, 19898, 19996, 19997, 22, 80, 443, 40000, 56195}
+if len(sys.argv) > 1 and sys.argv[1].isascii() and sys.argv[1].isdigit():
+    avoid.add(int(sys.argv[1]))
+if len(sys.argv) > 2:
+    try:
+        with open(sys.argv[2], encoding='utf-8') as _fh:
+            _data = json.load(_fh)
+    except (OSError, ValueError):
+        _data = {}
+    if isinstance(_data, dict):
+        for _key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config', 'tuic_config'):
+            _sec = _data.get(_key)
+            if isinstance(_sec, dict):
+                _p = _sec.get('port')
+                if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
+                    avoid.add(_p)
+                elif isinstance(_p, str) and _p.strip().isascii() and _p.strip().isdigit():
+                    avoid.add(int(_p.strip()))
+        _proxies = _data.get('proxy_services')
+        if isinstance(_proxies, list):
+            for _item in _proxies:
+                if isinstance(_item, dict):
+                    _p = _item.get('port')
+                    if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
+                        avoid.add(_p)
+                    elif isinstance(_p, str) and _p.strip().isascii() and _p.strip().isdigit():
+                        avoid.add(int(_p.strip()))
+for _ in range(100):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
-    if port not in avoid:
+    if port not in avoid and not (20000 <= port <= 40000):
         print(port)
         break
 else:
