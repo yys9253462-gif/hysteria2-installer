@@ -14059,7 +14059,7 @@ if __name__ == '__main__':
             """POST /login 的处理逻辑（从 do_POST 机械搬移而来）。"""
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                if length > 4096:
+                if length < 0 or length > 4096:
                     return self.reply(400, b'Bad request')
                 body = self.rfile.read(length).decode('utf-8', errors='ignore')
                 params = parse_qs(body)
@@ -14069,9 +14069,13 @@ if __name__ == '__main__':
             except Exception:
                 return self.reply(400, b'Bad request')
 
+            with data_lock:
+                portal_token = str(data.get('token') or '')
+                expected_hash = data.get('auth_hash')
+
             if self.login_rate_limited():
                 # 与密码错误用同一页面形态，不给爆破者「已被限流」的区分信号。
-                page = login_html(data['token'],
+                page = login_html(portal_token,
                                   error_msg='尝试次数过多，请 10 分钟后再试', username=user)
                 return self.reply(429, page.encode('utf-8'), 'text/html; charset=utf-8')
 
@@ -14081,13 +14085,14 @@ if __name__ == '__main__':
             if (user.strip(), pwd.strip()) != (user, pwd):
                 attempts.append((user.strip(), pwd.strip()))
             matched = False
-            for _user, _pwd in attempts:
-                submitted_digest = hashlib.sha256(base64.b64encode(f'{_user}:{_pwd}'.encode())).hexdigest()
-                matched = hmac.compare_digest(submitted_digest, data['auth_hash']) or matched
+            if isinstance(expected_hash, str) and expected_hash and expected_hash.isascii():
+                for _user, _pwd in attempts:
+                    submitted_digest = hashlib.sha256(base64.b64encode(f'{_user}:{_pwd}'.encode())).hexdigest()
+                    matched = hmac.compare_digest(submitted_digest, expected_hash) or matched
 
             if not matched:
                 self.record_login_failure()
-                page = login_html(data['token'], error_msg='用户名或密码不正确，请重新输入', username=user)
+                page = login_html(portal_token, error_msg='用户名或密码不正确，请重新输入', username=user)
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
             # 🔴 2026-10-31：登录成功必须清空失败桶。
@@ -14095,7 +14100,7 @@ if __name__ == '__main__':
             # 而且这个桶是全局的（所有请求都从 127.0.0.1 经 masquerade 进来，
             # 无法按来源区分），知道 token 的人刷 10 次就能把管理员锁出去。
             self.clear_login_failures()
-            sess_val = sign_session(data['token'])
+            sess_val = sign_session(portal_token)
             max_age = f'; Max-Age={SESSION_MAX_AGE}' if remember else ''
             # 🔴 2026-10-31：Secure 只在**真的是 HTTPS** 时加。
             # 门户本体监听 127.0.0.1 的明文 HTTP，运维排障时常用
@@ -14105,13 +14110,17 @@ if __name__ == '__main__':
             # 判断依据只看本请求是否经 TLS（masquerade 会带
             # X-Forwarded-Proto），不看配置 —— 配置读错会把所有人锁在门外。
             secure = '; Secure' if self._is_https_request() else ''
-            cookie = (f'hy2_session={sess_val}; Path=/{data["token"]}/; '
+            cookie = (f'hy2_session={sess_val}; Path=/{portal_token}/; '
                       f'HttpOnly; SameSite=Strict{secure}{max_age}')
             self.send_response(302)
             self._responded = True
             self.send_header('Location', prefix)
             self.send_header('Set-Cookie', cookie)
             self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Connection', 'close')
             self.end_headers()
             return
 
