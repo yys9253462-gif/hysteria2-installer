@@ -6007,6 +6007,7 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
 _warp_probe_cache = {}
 _warp_probe_lock = threading.Lock()
 _warp_install_lock = threading.Lock()
+_ver_cache_lock = threading.Lock()
 
 
 _ACCESS_APPLIED = {}
@@ -9123,9 +9124,16 @@ def serve(path):
         now = time.time()
         # 失败也缓存 60 秒（2026-11-06 修）：旧实现失败不记缓存，每次打开页面都再请求两次
         # GitHub（各 8 秒超时）；限流后一直被限流，GitHub 不通时页面多等 16 秒。
-        ttl = 300 if _ver_cache['data'] is not None else 60
-        if _ver_cache['t'] and now - _ver_cache['t'] < ttl:
-            return _ver_cache['data']
+        try:
+            with _ver_cache_lock:
+                cached_t = _ver_cache['t']
+                cached_data = _ver_cache['data']
+        except NameError:
+            cached_t = _ver_cache['t']
+            cached_data = _ver_cache['data']
+        ttl = 300 if cached_data is not None else 60
+        if cached_t and now - cached_t < ttl:
+            return cached_data
         try:
             req = urllib.request.Request(
                 'https://api.github.com/repos/' + AWG_REPO + '/contents/?ref=main',
@@ -9146,13 +9154,23 @@ def serve(path):
                      if isinstance(it, dict) and it.get('name')}
                     if isinstance(items, list) else {})
             if shas:
-                _ver_cache['t'] = now
-                _ver_cache['data'] = shas
+                try:
+                    with _ver_cache_lock:
+                        _ver_cache['t'] = now
+                        _ver_cache['data'] = shas
+                except NameError:
+                    _ver_cache['t'] = now
+                    _ver_cache['data'] = shas
                 return shas
         except Exception as exc:
             _log_ignored('version_check', exc)
-        _ver_cache['t'] = now
-        _ver_cache['data'] = None
+        try:
+            with _ver_cache_lock:
+                _ver_cache['t'] = now
+                _ver_cache['data'] = None
+        except NameError:
+            _ver_cache['t'] = now
+            _ver_cache['data'] = None
         return None
 
     def _version_triple(local_path, remote_name):
@@ -11601,6 +11619,10 @@ if __name__ == '__main__':
                         job = {'state': 'failed', 'error': str(exc)}
                     with data_lock:
                         data['core_upgrade'] = dict(job, finished_at=int(time.time()))
+                    try:
+                        with _ver_cache_lock:
+                            _core_ver_cache['t'] = 0.0
+                    except NameError:
                         _core_ver_cache['t'] = 0.0
                     # 结果已在内存，界面能读到；落盘失败只记日志（2026-11-04 修）：旧实现让
                     # 线程带着 traceback 死掉，磁盘上的任务一直是 running，重启后被当成中断任务。
@@ -15510,8 +15532,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
             if query.get('force', ['0'])[0] == '1':
-                _ver_cache['t'] = 0.0
-                _core_ver_cache['t'] = 0.0
+                with _ver_cache_lock:
+                    _ver_cache['t'] = 0.0
+                    _core_ver_cache['t'] = 0.0
             core_curr, core_latest, core_has_update = '未知', '', False
             try:
                 out = subprocess.run(['/usr/local/bin/hysteria', 'version'], capture_output=True, text=True, timeout=3).stdout
@@ -15522,20 +15545,27 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             except Exception as exc:
                 _log_ignored('core_version', exc)
             now = time.time()
-            if now - _core_ver_cache['t'] >= (300 if _core_ver_cache['tag'] else 30):
+            with _ver_cache_lock:
+                core_cached_t = _core_ver_cache['t']
+                core_cached_tag = _core_ver_cache['tag']
+            if now - core_cached_t >= (300 if core_cached_tag else 30):
                 try:
                     req = urllib.request.Request('https://api.github.com/repos/apernet/hysteria/releases/latest',
                                                  headers={'User-Agent': 'hysteria2-installer'})
                     with urllib.request.urlopen(req, timeout=3) as response:
                         release = json.loads(_read_bounded_bytes(response).decode('utf-8', errors='replace'))
-                    _core_ver_cache['tag'] = (
+                    new_tag = (
                         str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
                         if isinstance(release, dict) else ''
                     )
                 except Exception:
-                    _core_ver_cache['tag'] = ''
-                _core_ver_cache['t'] = now
-            core_latest = _core_ver_cache['tag']
+                    new_tag = ''
+                with _ver_cache_lock:
+                    _core_ver_cache['tag'] = new_tag
+                    _core_ver_cache['t'] = now
+                core_latest = new_tag
+            else:
+                core_latest = core_cached_tag
             if core_version_key(core_curr) and core_version_key(core_latest):
                 core_has_update = core_version_key(core_latest) > core_version_key(core_curr)
 
