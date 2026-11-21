@@ -11009,7 +11009,15 @@ if __name__ == '__main__':
                             global_ip_deny[user_id] = dict(entries)
                         else:
                             global_ip_deny.pop(user_id, None)
-                        recent = {ip for ip, t in ip_tracker.get(user_id, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
+                        if len(global_ip_deny) > 4096:
+                            for _stale_uid in list(global_ip_deny):
+                                active_ip_deny(global_ip_deny, _stale_uid, now_ts)
+                        _raw_tracker = ip_tracker.get(user_id)
+                        recent = ({
+                            ip for ip, t in _raw_tracker.items()
+                            if isinstance(t, (int, float)) and not isinstance(t, bool)
+                            and 0 <= now_ts - t < IP_TIMEOUT_SECONDS
+                        } if isinstance(_raw_tracker, dict) else set())
                     # 只对「新加入拦截、且此刻在线」的 IP 踢一次：控制台每轮续期不会反复踢人。
                     fresh = set(entries) - before
                     online = recent | live_online_ips(user_id)
