@@ -1813,8 +1813,23 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         return {'changed': True, 'version': newer, 'backup': str(backup)}
     except Exception:
         if replaced and backup is not None:
-            shutil.copy2(backup, binary)
-            _restart_hy2()
+            # 经同目录临时文件原子替换回滚：直接向运行中的可执行文件 copy2 在 Linux 上
+            # 会触发 ETXTBSY（Text file busy），导致回滚失败并掩盖真正的升级异常。
+            rb_fd, rb_name = tempfile.mkstemp(prefix='.hysteria-rollback-', dir=str(binary.parent))
+            os.close(rb_fd)
+            rb_tmp = Path(rb_name)
+            try:
+                shutil.copy2(backup, rb_tmp)
+                rb_tmp.chmod(0o755)
+                os.replace(rb_tmp, binary)
+            except Exception as rb_exc:
+                _log_ignored('upgrade_core_rollback_replace', rb_exc)
+            finally:
+                rb_tmp.unlink(missing_ok=True)
+            try:
+                _restart_hy2()
+            except Exception as rb_exc:
+                _log_ignored('upgrade_core_rollback_restart', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
