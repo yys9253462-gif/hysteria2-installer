@@ -8669,9 +8669,9 @@ def serve(path):
                 # 文件已经替换；不恢复待撤权标记，否则重启后的内存与磁盘不一致。
                 raise
             except OSError:
-                # 保留撤权重试记录并尽力重新落盘。调用方收到失败后也不能报告删除成功。
+                # 保留撤权重试记录并尽力重新落盘；合并锁外期间并发新增的待撤销用户，避免覆盖丢失。
                 with data_lock:
-                    data['_pending_revocations'] = sorted(previous_pending | pending)
+                    data['_pending_revocations'] = sorted(pending_revocations(data) | previous_pending | pending)
                 try:
                     save_data()
                 except OSError:
@@ -11869,8 +11869,11 @@ if __name__ == '__main__':
                     # 用已清洗的工作副本（2026-11-03 修）：previous 是原始值，容器是
                     # null / 数字时 `for item in previous` 抛 TypeError，新增代理一律 500。
                     for item in working:
+                        raw_item_port = item.get('port')
+                        if isinstance(raw_item_port, bool):
+                            continue
                         try:
-                            existing.add(int(item['port']))
+                            existing.add(int(raw_item_port))
                         except (KeyError, TypeError, ValueError):
                             continue
                     # 自动选端口时必须避开本机已知的端口：
@@ -11879,7 +11882,8 @@ if __name__ == '__main__':
                     # 「保存成功但 gost 起不来」，然后回滚（2026-10-30 修）。
                     _meta_now = read_meta_file(meta_path)
                     try:
-                        _cfg_now = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                        _cfg_parsed = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                        _cfg_now = _cfg_parsed if isinstance(_cfg_parsed, dict) else None
                     except (OSError, ValueError):
                         _cfg_now = None
                     with data_lock:
@@ -11953,8 +11957,9 @@ if __name__ == '__main__':
                     with data_lock:
                         data_snapshot = dict(data)
                     for item in working:
+                        # data_snapshot 已剔除被删除的代理；不传 exclude_key 以免跳过其余仍在运行的同端口代理。
                         if item.get('id') == proxy_id and not protocol_port_in_use(
-                                item.get('port'), 'tcp', data_snapshot, exclude_key='proxy_services'):
+                                item.get('port'), 'tcp', data_snapshot):
                             if not firewall_port(item.get('port'), 'tcp', open_=False):
                                 return 500, {'ok': False, 'applied': True,
                                     'error': '代理已删除，但端口防火墙规则未能回收'}
