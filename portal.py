@@ -13019,6 +13019,7 @@ if __name__ == '__main__':
             """GET /vmess-status —— 状态以**实际入站**为准，不看 data 里的残留配置。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(30)
             installed = Path('/usr/local/bin/xray').exists()
             xray_path = Path('/etc/hysteria/xray.json')
             active = False
@@ -13490,6 +13491,7 @@ if __name__ == '__main__':
             """GET /anytls-status —— 以 sing-box 服务实际状态为准。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(30)
             acfg = _active_anytls_config() or {}
             running = bool(acfg) and _systemd_state(ANYTLS_SERVICE) == 'active'
             version = _singbox_version()
@@ -13716,6 +13718,7 @@ if __name__ == '__main__':
             """GET /tuic-status —— 以 hy2-tuic 服务实际状态为准。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(30)
             tcfg = _active_tuic_config() or {}
             running = bool(tcfg) and _systemd_state(TUIC_SERVICE) == 'active'
             version = _singbox_version()
@@ -13843,6 +13846,7 @@ if __name__ == '__main__':
             """GET /vlessenc-status —— 与 VMess 一致，以实际入站为准。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(30)
             installed = Path('/usr/local/bin/xray').exists()
             xray_path = Path('/etc/hysteria/xray.json')
             active = False
