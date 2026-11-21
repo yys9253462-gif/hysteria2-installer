@@ -137,6 +137,8 @@ def _rollback_sample(current, before, applied):
 
 class PortalMeter:
     def __init__(self, data, lock, save, config, read=None, epoch=None, on_speed=None, running=None):
+        if not isinstance(config, dict):
+            raise ValueError('invalid usage meter config')
         self.data, self.lock, self.save, self.config=data,lock,save,config
         self.read=read or self._read
         self.user_allowed = None
@@ -361,11 +363,15 @@ class PortalMeter:
             now_ts=time.time()
             live_fresh=(isinstance(self.live_snapshot, dict)
                         and isinstance(self.live_snapshot.get('users'), dict)
+                        and isinstance(self.live_sampled_at, (int, float))
+                        and not isinstance(self.live_sampled_at, bool)
                         and 0 <= now_ts - self.live_sampled_at < 45)
             live_entry=self.live_snapshot['users'].get(uid, {}) if live_fresh else None
             if not isinstance(live_entry, dict):
                 live_entry={'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'}
             online_fresh=(isinstance(online_counts, dict)
+                          and isinstance(online_sampled_at, (int, float))
+                          and not isinstance(online_sampled_at, bool)
                           and 0 <= now_ts - online_sampled_at < 30)
             return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),
