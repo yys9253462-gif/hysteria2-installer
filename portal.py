@@ -5690,7 +5690,7 @@ def write_xray_unit():
     开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
     unit = Path('/etc/systemd/system/xray.service')
     if not unit.exists() or unit.read_text(encoding='utf-8') != XRAY_UNIT_CONTENT:
-        unit.write_text(XRAY_UNIT_CONTENT, encoding='utf-8')
+        _restore_systemd_unit_file(unit, XRAY_UNIT_CONTENT.encode('utf-8'), 0o644)
         subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
 
 
@@ -9176,7 +9176,19 @@ def serve(path):
                 return                               # 留着旧单元，至少还能启动
             if all(s in current for s in needed):
                 return                               # 只是补回脚本，单元不用动
-            unit_path.write_text(GOST_UNIT_CONTENT, encoding='utf-8')
+            tmp_unit = unit_path.with_name(unit_path.name + '.tmp.' + os.urandom(4).hex())
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, 'O_NOFOLLOW'):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(str(tmp_unit), flags, 0o644)
+                with os.fdopen(fd, 'wb') as fh:
+                    fh.write(GOST_UNIT_CONTENT.encode('utf-8'))
+                os.chmod(str(tmp_unit), 0o644)
+                os.replace(str(tmp_unit), str(unit_path))
+            except BaseException:
+                tmp_unit.unlink(missing_ok=True)
+                raise
             subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=5)
         except Exception as exc:
             _log_ignored('gost_unit_install', exc)
@@ -11314,7 +11326,19 @@ if __name__ == '__main__':
                                 # 回滚脚本 portal_update_restart_script 拿的是
                                 # backups 列表里的具体路径，改名字不影响它。
                                 bak = dest.with_name('%s.bak-%s' % (dest.name, stamp))
-                                shutil.copy2(str(dest), str(bak))
+                                old_bytes = dest.read_bytes()
+                                old_mode = dest.stat().st_mode & 0o777
+                                bak_tmp = dest.with_name('%s.bak-tmp-%s' % (dest.name, os.urandom(4).hex()))
+                                try:
+                                    with open(bak_tmp, 'wb') as bfh:
+                                        bfh.write(old_bytes)
+                                        bfh.flush()
+                                        os.fsync(bfh.fileno())
+                                    os.chmod(bak_tmp, old_mode)
+                                    os.replace(bak_tmp, str(bak))
+                                finally:
+                                    if bak_tmp.exists():
+                                        bak_tmp.unlink(missing_ok=True)
                                 backups.append((dest, bak))
                             else:
                                 created.append(dest)
@@ -11343,14 +11367,31 @@ if __name__ == '__main__':
                                 restart_prefix, portal_update_restart_script(data['port'], backups, created),
                                 update_lock_fd)
                     except Exception as e:
-                        # 出错就把已替换的恢复回去，绝不留下半新半旧的状态
+                        # 出错就把已替换的经同目录临时文件原子恢复回去，绝不留下半新半旧或半截文件
                         for dest, bak in backups:
+                            rb_tmp = None
                             try:
-                                shutil.copy2(str(bak), str(dest))
+                                bak_path = Path(bak)
+                                bak_bytes = bak_path.read_bytes()
+                                bak_mode = bak_path.stat().st_mode & 0o777
+                                rb_tmp = Path(dest).with_name(
+                                    '%s.rb-%s' % (Path(dest).name, os.urandom(4).hex()))
+                                with open(rb_tmp, 'wb') as rfh:
+                                    rfh.write(bak_bytes)
+                                    rfh.flush()
+                                    os.fsync(rfh.fileno())
+                                os.chmod(rb_tmp, bak_mode)
+                                os.replace(rb_tmp, str(dest))
+                                rb_tmp = None
                             except Exception as exc:
+                                if rb_tmp is not None:
+                                    rb_tmp.unlink(missing_ok=True)
                                 _log_ignored('portal_update.rollback', exc)
                         for dest in created:
-                            Path(dest).unlink(missing_ok=True)
+                            try:
+                                Path(dest).unlink(missing_ok=True)
+                            except OSError as exc:
+                                _log_ignored('portal_update.rollback_unlink', exc)
                         return self.reply_json(500, {'ok': False, 'error':
                             '更新过程中出错，已回滚到原版本：%s' % e})
 
