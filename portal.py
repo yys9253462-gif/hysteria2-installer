@@ -10484,7 +10484,7 @@ if __name__ == '__main__':
                                 raw_tracker = ip_tracker.get(matched_uid)
                                 active_ips = (
                                     {ip: t for ip, t in raw_tracker.items()
-                                     if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                                     if isinstance(raw_tracker, dict) else {}
                                 )
                                 ip_tracker[matched_uid] = active_ips
@@ -10503,7 +10503,7 @@ if __name__ == '__main__':
                                 tracker = ip_tracker.get(matched_uid)
                                 tracker = (
                                     {ip: t for ip, t in tracker.items()
-                                     if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                                     if isinstance(tracker, dict) else {}
                                 )
                                 tracker[client_ip] = now_ts
@@ -11809,8 +11809,13 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '')
                 params = {key: values[0] for key, values in form.items()}
                 status, payload = self._manage_proxy_operation(params.pop('action', ''), params)
                 return self.reply_json(status, payload)
@@ -12093,8 +12098,13 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8', errors='replace')
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 # 先去空白再取默认值：写成 (value or '3').strip() 的话，
                 # 纯空格能通过 or 判定、再被 strip 成空串，导致误判为非法协议线。
@@ -12141,8 +12151,13 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8', errors='replace')
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = (form.get('action', [''])[0] or '').strip()
 
@@ -13863,8 +13878,13 @@ if __name__ == '__main__':
 
         def _set_bbr_locked(self):
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '')
                 ver = form.get('version', ['v1'])[0].lower()
                 if ver not in ('v1', 'v2', 'v3'):
                     return self.reply_json(400, {'ok': False, 'error': '不支持的 BBR 版本（仅支持 v1、v2 或 v3）'})
@@ -13998,8 +14018,13 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply(401, '登录已失效，请刷新页面重新登录'.encode('utf-8'))
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8', errors='replace')
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                if length < 0 or length > 65536:
+                    return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', [''])[0]
                 user_id = form.get('user_id', [''])[0].strip()
