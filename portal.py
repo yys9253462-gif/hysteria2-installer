@@ -10023,20 +10023,28 @@ if __name__ == '__main__':
 
     def sign_session(token, issued_at=None):
         issued_at = int(time.time()) if issued_at is None else int(issued_at)
-        return f'{token}.{issued_at}.{_session_sig(token, issued_at, session_epoch())}'
+        with data_lock:
+            ep = session_epoch()
+        return f'{token}.{issued_at}.{_session_sig(token, issued_at, ep)}'
 
     def verify_session(cookie_header):
         if not cookie_header:
             return False
+        raw_cookie = str(cookie_header)
+        if len(raw_cookie) > 16384:
+            return False
         # 不用 SimpleCookie（2026-11-04 修）：同一 Cookie 头里只要有一个不合 RFC 的值
         # （同域其它应用 / 统计脚本写的带空格或裸 JSON 的 cookie），load() 会把**全部**
         # cookie 丢掉且不抛异常，管理员登录后刷新就回到登录页，日志里什么也没有。
-        # 收集所有同名 hy2_session 候选值逐个验签，防止排在后面的旧路径失效 Cookie 覆盖有效会话。
+        # 收集前 16 个同名 hy2_session 候选值逐个验签，防止排在后面的旧路径失效 Cookie 覆盖有效会话，
+        # 同时避免超长 Cookie 头引发 HMAC 哈希放大。
         candidates = []
-        for part in str(cookie_header).split(';'):
+        for part in raw_cookie.split(';'):
             name, sep, val = part.strip().partition('=')
             if sep and name == 'hy2_session':
                 candidates.append(val.strip().strip('"'))
+                if len(candidates) >= 16:
+                    break
         if not candidates:
             return False
         with data_lock:
@@ -10047,7 +10055,8 @@ if __name__ == '__main__':
         now = time.time()
         for value in candidates:
             parts = value.split('.')
-            if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
+            if (len(parts) != 3 or not (parts[1].isascii() and parts[1].isdigit())
+                    or not parts[0].isascii() or not parts[2].isascii()):
                 continue
             t, issued_at, sig = parts
             if not 0 <= now - int(issued_at) <= SESSION_MAX_AGE:
@@ -14371,7 +14380,16 @@ if __name__ == '__main__':
                 if not self._extend_deadline(30, heavy=True):
                     return self.reply_json(409, {'ok': False, 'error':
                         '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                subprocess.Popen(['bash', '-c', 'sleep 1 && reboot'],
+                systemctl_bin = shutil.which('systemctl')
+                reboot_bin = shutil.which('reboot') or (
+                    '/sbin/reboot' if Path('/sbin/reboot').exists() else '')
+                if systemctl_bin:
+                    reboot_cmd = [systemctl_bin, 'reboot']
+                elif reboot_bin:
+                    reboot_cmd = [reboot_bin]
+                else:
+                    return self.reply_json(500, {'ok': False, 'error': '未找到可用的重启命令（systemctl / reboot）'})
+                subprocess.Popen(['bash', '-c', 'sleep 1 && exec "$@"', '_', *reboot_cmd],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
                 return self.reply_json(200, {'ok': True, 'message': '服务器正在重启中'})
