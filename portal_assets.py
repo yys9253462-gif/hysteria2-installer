@@ -1044,6 +1044,7 @@ if (btnResetWarpRules) {
       isDanger: true
     });
     if (!confirmed) return;
+    btnResetWarpRules.disabled = true;
     try {
       const res = await fetch(location.pathname + 'manage-warp', {
         method: 'POST',
@@ -1059,6 +1060,8 @@ if (btnResetWarpRules) {
       await checkWarpStatus();
     } catch (e) {
       alert('重置失败: ' + e.message);
+    } finally {
+      btnResetWarpRules.disabled = false;
     }
   });
 }
@@ -3140,7 +3143,7 @@ async function pollTrafficSpeed() {
   } catch (_) {} finally { trafficPollPending = false; }
 }
 
-setInterval(() => { if (panelVisible('users')) pollTrafficSpeed(); }, 2000);
+setInterval(() => { if (!document.hidden && !portalSessionExpired && panelVisible('users')) pollTrafficSpeed(); }, 2000);
 pollTrafficSpeed();
 
 // 入站代理服务管理 (gost 驱动)
@@ -3753,6 +3756,8 @@ if (btnDoInstallAwg) {
       const json = await awgPost('install-amneziawg', { line: line, endpoint: endpoint });
       if (json.ok) { showToast(json.message || '安装完成', 'success'); loadAwgState(); }
       else { alert(json.error || '安装失败'); }
+    } catch (err) {
+      alert('安装失败: ' + (err && err.message ? err.message : err));
     } finally {
       btnDoInstallAwg.disabled = false;
       btnDoInstallAwg.textContent = orig;
@@ -3788,7 +3793,7 @@ if (btnAddAwgPeer) {
       }
     } catch (e) {
       if (confTab) confTab.close();
-      throw e;
+      alert('新增失败: ' + (e && e.message ? e.message : e));
     } finally {
       btnAddAwgPeer.disabled = false;
     }
@@ -3816,6 +3821,8 @@ if (btnSwitchAwgLine) {
       const json = await awgPost('manage-amneziawg', { action: 'set_line', line: target });
       if (json.ok) { showToast(json.message || '已切换协议线', 'success'); loadAwgState(); }
       else { alert(json.error || '切换失败'); }
+    } catch (err) {
+      alert('切换失败: ' + (err && err.message ? err.message : err));
     } finally { btnSwitchAwgLine.disabled = false; }
   });
 }
@@ -3835,6 +3842,8 @@ if (btnUpdateAwg) {
       const json = await awgPost('manage-amneziawg', { action: 'update' });
       if (json.ok) { showToast(json.message || '更新完成', 'success'); loadAwgState(); }
       else { alert(json.error || '更新失败'); }
+    } catch (err) {
+      alert('更新失败: ' + (err && err.message ? err.message : err));
     } finally { btnUpdateAwg.disabled = false; }
   });
 }
