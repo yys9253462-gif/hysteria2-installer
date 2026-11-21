@@ -9628,18 +9628,20 @@ if __name__ == '__main__':
         access_file = root / 'portal-access.json'
         access = read_access_file(access_file)
         host = meta_display_host(m)
-        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
-        
+
         now_ts = int(time.time())
         display_users = {}
         # 只把「拍快照」放在锁内，渲染与落盘放到锁外（2026-10-25 修）。
         # page_html 在 2000 用户时约 27 ms，/auth 每个连接都要拿 data_lock，
         # 持锁渲染会短暂阻塞新连接鉴权；而渲染本身不依赖锁。
         with data_lock:
-            # 清理离线已久的 ip_tracker 键
-            dead_uids = [u for u, tr in ip_tracker.items()
-                         if not isinstance(tr, dict)
-                         or not any(now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())]
+            # 清理离线已久或时间戳已损坏的 ip_tracker 键，避免非数字时间戳导致 TypeError 白屏。
+            dead_uids = [
+                u for u, tr in ip_tracker.items()
+                if not isinstance(tr, dict)
+                or not any(isinstance(t, (int, float)) and not isinstance(t, bool)
+                           and 0 <= now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())
+            ]
             for du in dead_uids:
                 ip_tracker.pop(du, None)
 
@@ -9650,12 +9652,17 @@ if __name__ == '__main__':
                     continue
                 u_copy = dict(uinfo)
                 tracked = ip_tracker.get(uid)
-                u_copy['online_ips'] = ({ip: t for ip, t in tracked.items()
-                                         if now_ts - t < IP_TIMEOUT_SECONDS}
-                                        if isinstance(tracked, dict) else {})
+                u_copy['online_ips'] = (
+                    {ip: t for ip, t in tracked.items()
+                     if isinstance(t, (int, float)) and not isinstance(t, bool)
+                     and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                    if isinstance(tracked, dict) else {}
+                )
                 display_users[uid] = u_copy
             _api_key = data.get('api_key')
             _token = data['token']
+
+        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{_token}/clash.yaml"
 
         # 渲染与二维码都在锁外做（2026-10-29 修，注释此前与实现不符）：
         # page_html 在上千用户时约 27 ms，qrencode 最坏 20 秒，而 /auth
@@ -14720,7 +14727,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 authed = self.is_authenticated()
                 with data_lock:
-                    u = data.get('users', {}).get(target_uid)
+                    u = user_table(data).get(target_uid)
                     # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
                     u_copy = dict(u) if isinstance(u, dict) else None
 
@@ -14758,9 +14765,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
                 # 与其它带子进程的端点一致：先续期再干活。
                 self._extend_deadline(60)
-                # meta 损坏时 artifacts 会退回 localhost/默认端口，生成一条
-                # 永远连不上的链接却返回 200（2026-10-29 修）。
-                if not (m.get('server_name') or m.get('public_ip')):
+                # meta 损坏（含非字符串或纯空白 server_name/public_ip）时 artifacts 会退回 localhost，
+                # 生成一条永远连不上的链接却返回 200，这里只接受清洗后的非空字符串身份。
+                _raw_sn = m.get('server_name').strip() if isinstance(m.get('server_name'), str) else ''
+                _raw_ip = m.get('public_ip').strip() if isinstance(m.get('public_ip'), str) else ''
+                if not (_raw_sn or _raw_ip):
                     return self.reply(503, share_unavailable_html(
                         '节点元信息缺失或损坏，请联系管理员检查 client_meta.json').encode('utf-8'),
                         'text/html; charset=utf-8')
@@ -14867,7 +14876,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not VALID_USER_ID_RE.match(target_uid):
                     return self.reply_json(400, {'ok': False, 'error': '用户标识格式不合法'})
                 with data_lock:
-                    u = data.get('users', {}).get(target_uid)
+                    u = user_table(data).get(target_uid)
                     # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
                     u_copy = dict(u) if isinstance(u, dict) else None
                 if not u_copy:
