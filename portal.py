@@ -7056,8 +7056,10 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
     epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
-    current={tag:xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings',{}).get('clients')
-             for tag in wanted_by_tag}
+    current={}
+    for tag in wanted_by_tag:
+        inbound_settings=xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings')
+        current[tag]=inbound_settings.get('clients') if isinstance(inbound_settings, dict) else None
     if current==wanted_by_tag and _ACCESS_APPLIED.get(str(root))==(signature,epoch):
         return True
     # 首次升级/删除请求也核验实际重载，不能仅比较磁盘配置。
@@ -7065,13 +7067,17 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     for tag,wanted in wanted_by_tag.items():
         idx,_inbound=managed_inbound_index(xcfg,tag)
-        xcfg['inbounds'][idx].setdefault('settings',{})['clients']=wanted
+        inbound_obj=xcfg['inbounds'][idx]
+        if not isinstance(inbound_obj.get('settings'), dict):
+            inbound_obj['settings']={}
+        inbound_obj['settings']['clients']=wanted
     candidate=xj.with_name('xray.expiry-candidate.json')
     last_good=xj.with_name('xray.expiry-last-good.json')
     last_good_tmp=xj.with_name('xray.expiry-last-good.json.tmp')
     reality_cfg=meter_config.get('reality') if isinstance(meter_config, dict) else None
     reality_cfg=reality_cfg if isinstance(reality_cfg, dict) else {}
-    binary=reality_cfg.get('binary','/usr/local/bin/xray')
+    raw_binary=reality_cfg.get('binary')
+    binary=raw_binary.strip() if isinstance(raw_binary, str) and raw_binary.strip() else '/usr/local/bin/xray'
     replaced=False
     try:
         _write_private_bytes(candidate, json.dumps(xcfg,indent=2).encode('utf-8'), orig_mode, call_path_chmod=True)
@@ -7094,13 +7100,19 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     except Exception:
         if replaced:
-            _write_private_bytes(candidate, original, orig_mode, call_path_chmod=True)
-            candidate.replace(xj)
+            restored=False
             try:
-                subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
-                subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
-            except (OSError, subprocess.SubprocessError) as rb_exc:
-                _log_ignored('xray_access_rollback', rb_exc)
+                _write_private_bytes(candidate, original, orig_mode, call_path_chmod=True)
+                candidate.replace(xj)
+                restored=True
+            except OSError as rb_io_exc:
+                _log_ignored('xray_access_rollback_write', rb_io_exc)
+            if restored:
+                try:
+                    subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
+                    subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
+                except (OSError, subprocess.SubprocessError) as rb_exc:
+                    _log_ignored('xray_access_rollback', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -7120,11 +7132,19 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None, keep_disab
     meta = meta if isinstance(meta, dict) else {}
     data = data if isinstance(data, dict) else {}
     ports = set()
-    for value in (meta.get('listen_port'), meta.get('subscription_port')):
+
+    def _add_port(value):
+        if isinstance(value, bool):
+            return
         try:
-            ports.add(int(value))
+            port = int(value)
         except (TypeError, ValueError):
-            pass
+            return
+        if 1 <= port <= 65535:
+            ports.add(port)
+
+    for value in (meta.get('listen_port'), meta.get('subscription_port')):
+        _add_port(value)
     for key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
         # AnyTLS / Reality / VMess / VLESS Encryption 停用后都会保留端口、再启用要沿用：
         # 选新端口的调用方传 keep_disabled=True 时全部都要避开；只问「此刻谁占着」时停用段不算。
@@ -7139,28 +7159,25 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None, keep_disab
             # 于是一次无关的启停就把 Reality 从 443 换到 2053
             # （2026-10-25 实测踩到）。
             continue
-        try:
-            ports.add(int((data or {}).get(key, {}).get('port')))
-        except (TypeError, ValueError, AttributeError):
-            pass
+        if isinstance(section, dict):
+            _add_port(section.get('port'))
     # gost 代理服务的端口（2026-11-04 补）：gost 停着时这些端口不在监听表里，新启用的
     # TCP 协议可能选中它，gost 一恢复就和那条代理抢端口。
     for item in proxy_services(data):
-        try:
-            ports.add(int(item.get('port')))
-        except (TypeError, ValueError):
-            pass
+        if isinstance(item, dict):
+            _add_port(item.get('port'))
     own_tags = {REALITY_INBOUND_TAG: 'reality_config',
                 VMESS_INBOUND_TAG: 'vmess_config',
                 VLESSENC_INBOUND_TAG: 'vlessenc_config'}
-    for inbound in ((config or {}).get('inbounds') or []):
-        # 同理：自己那一条入站的端口不算冲突。
-        if exclude_key and own_tags.get((inbound or {}).get('tag')) == exclude_key:
-            continue
-        try:
-            ports.add(int(inbound.get('port')))
-        except (TypeError, ValueError, AttributeError):
-            pass
+    inbounds = config.get('inbounds') if isinstance(config, dict) else None
+    if isinstance(inbounds, list):
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                continue
+            # 同理：自己那一条入站的端口不算冲突。
+            if exclude_key and own_tags.get(inbound.get('tag')) == exclude_key:
+                continue
+            _add_port(inbound.get('port'))
     ports.discard(0)
     return ports
 
@@ -7174,16 +7191,26 @@ def apply_xray_config_with_meter(config, config_path, meter_cfg_path, portal_dir
     """
     config_path = Path(config_path)
     if meter_cfg_path.exists():
-        meter = json.loads(meter_cfg_path.read_text(encoding='utf-8')).get('reality') or {}
+        raw_meter = json.loads(meter_cfg_path.read_text(encoding='utf-8'))
+        meter = raw_meter.get('reality') if isinstance(raw_meter, dict) else None
+        meter = meter if isinstance(meter, dict) else {}
         address = meter.get('address', '')
-        if address:
-            if not address.startswith('127.0.0.1:'):
+        if address not in ('', None):
+            if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
                 raise ValueError('统计接口必须为回环地址')
+            port_text = address.rsplit(':', 1)[1]
+            if not (port_text.isascii() and port_text.isdigit()):
+                raise ValueError('统计接口端口非法')
+            stats_port = int(port_text)
+            if not 1 <= stats_port <= 65535:
+                raise ValueError('统计接口端口越界')
             stats_path = Path(portal_dir) / 'usage-meter-xray-config-20261007-v1.py'
             spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError('无法加载计量配置模块')
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+            config = mod.add_stats(config, stats_port)
     config = add_private_network_guard(config)
     # ⚠️ 必须用模块级 `_unit_suspended`，不能直接调 `unit_suspended`。
     #
