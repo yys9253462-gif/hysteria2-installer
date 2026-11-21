@@ -455,7 +455,11 @@ SCRIPT = r"""
     if (this.status === 401) return { ok: false, error: '登录已过期，请刷新页面重新登录' };
     const copy = this.clone();
     try {
-      return await parseJson.call(this);
+      const parsed = await parseJson.call(this);
+      if (parsed === null || typeof parsed !== 'object') {
+        return { ok: false, error: '服务器返回了无效数据结构（HTTP ' + this.status + '）' };
+      }
+      return parsed;
     } catch (err) {
       let text = '';
       try { text = (await copy.text()).trim().slice(0, 200); } catch (_) {}
@@ -3345,7 +3349,7 @@ async function loadProxyServices() {
     if (json.host) curProxyServerHost = json.host;
     const typeLabel = { socks5: 'SOCKS5', http: 'HTTP', https: 'HTTPS' };
     proxyTbody.innerHTML = services.map(s => {
-      const fullUrl = `${obEsc(s.type)}://${encodeURIComponent(s.username)}:${encodeURIComponent(s.password)}@${obEsc(curProxyServerHost)}:${obEsc(s.port)}`;
+      const fullUrl = `${s.type || ''}://${encodeURIComponent(s.username || '')}:${encodeURIComponent(s.password || '')}@${curProxyServerHost}:${s.port}`;
       return `
       <tr>
         <td><span class="proxy-type ${obEsc(s.type)}">${obEsc(typeLabel[s.type] || s.type)}</span></td>
@@ -3489,9 +3493,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       
       uModalBody.innerHTML = `${userStatusBanner(json.status_text)}
         <div class="user-meta-bar">
-          <span>📅 到期: <b>${expireText}</b></span>
-          <span>📊 流量: <b>${trafficText}</b></span>
-          <span>📱 IP限制: <b>${ipText}</b></span>
+          <span>📅 到期: <b>${obEsc(expireText)}</b></span>
+          <span>📊 流量: <b>${obEsc(trafficText)}</b></span>
+          <span>📱 IP限制: <b>${obEsc(ipText)}</b></span>
         </div>
         
         <div style="background:#eaf5ef;border:1px solid #c3ddd5;border-radius:12px;padding:12px 14px">
