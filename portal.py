@@ -4319,7 +4319,7 @@ def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ''
     in_tls = False
     for raw in text.split('\n'):
@@ -4350,7 +4350,7 @@ def _parse_cert_subject(cert_file):
     right but whose SAN is empty/wrong will still fail `CRYPTO_ERROR 0x150`.
     """
     cert_file = Path(cert_file)
-    if not cert_file.exists():
+    if not cert_file.is_file():
         return '', [], False
     try:
         # fullchain.pem holds the leaf first; openssl x509 reads the first block.
@@ -4380,9 +4380,14 @@ def _parse_cert_subject(cert_file):
         sans = []
         for line in p_san.stdout.splitlines():
             line = line.strip()
-            if line.startswith('DNS:'):
-                sans = [d.strip() for d in line[len('DNS:'):].split(',') if d.strip()]
-                break
+            if 'DNS:' not in line:
+                continue
+            for item in line.split(','):
+                item = item.strip()
+                if item.startswith('DNS:'):
+                    dns_val = item[len('DNS:'):].strip()
+                    if dns_val:
+                        sans.append(dns_val)
 
         self_signed = bool(issuer_line) and issuer_line == subject_line
         return cn, sans, self_signed
@@ -4398,8 +4403,14 @@ def _config_acme_cert_path(config_path):
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
+    def _split_yaml_value(raw_val):
+        try:
+            return shlex.split(raw_val, comments=True)
+        except ValueError:
+            cleaned = raw_val.split('#', 1)[0].strip().strip('"').strip("'")
+            return [cleaned] if cleaned else []
     in_acme = False
     found_acme = False
     in_domains = False
@@ -4418,7 +4429,7 @@ def _config_acme_cert_path(config_path):
             continue
         line = raw.strip()
         if line.startswith('-') and in_domains:
-            values = shlex.split(line[1:].strip(), comments=True)
+            values = _split_yaml_value(line[1:].strip())
             if values:
                 domains.append(values[0].lower())
             continue
@@ -4426,7 +4437,7 @@ def _config_acme_cert_path(config_path):
         if not sep:
             continue
         in_domains = key == 'domains'
-        values = shlex.split(value.strip(), comments=True)
+        values = _split_yaml_value(value.strip())
         scalar = ' '.join(values)
         if key == 'dir':
             storage = scalar
@@ -4550,7 +4561,7 @@ def _find_cert_key(cert_file, cfg_dir):
     candidates = []
     try:
         text = (cfg_dir / 'config.yaml').read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         text = ''
     in_tls = False
     for raw in text.splitlines():
@@ -4560,9 +4571,14 @@ def _find_cert_key(cert_file, cfg_dir):
             in_tls = raw.split(':', 1)[0].strip() == 'tls'
             continue
         if in_tls and raw.strip().startswith('key:'):
-            value = raw.strip().split(':', 1)[1].strip().strip('"').strip("'")
-            path = Path(value)
-            candidates.append(path if path.is_absolute() else cfg_dir / path)
+            raw_val = raw.strip().split(':', 1)[1]
+            try:
+                value = ' '.join(shlex.split(raw_val, comments=True))
+            except ValueError:
+                value = raw_val.split('#', 1)[0].strip().strip('"').strip("'")
+            if value:
+                path = Path(value)
+                candidates.append(path if path.is_absolute() else cfg_dir / path)
             break
     candidates.extend(_cert_key_candidates(cert_file))
     seen = set()
@@ -4822,11 +4838,11 @@ def record_cert_heal(root, state, before, after):
 
 
 def _is_dns_name(value):
-    value = (value or '').strip()
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
     if not value or len(value) > 253:
         return False
-    if value.startswith('www.bing.com'):
-        return True
     return bool(re.match(r'^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
                          r'(\.[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)+$', value))
 
@@ -4863,7 +4879,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     config_has_acme = False
     try:
         config_has_acme = bool(re.search(r'^acme:', Path(config_path).read_text(encoding='utf-8'), re.M))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         pass
 
     # 证书解析统一走 _resolve_live_cert —— 自愈与界面显示必须是同一张证书，
@@ -4877,13 +4893,16 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         configured_path = Path(configured)
         if not configured_path.is_absolute():
             configured_path = Path(config_path).parent / configured_path
-        if not configured_path.exists():
+        if not configured_path.is_file():
             print('[portal] 证书自愈跳过：config.yaml 指向的证书 %s 不存在' % configured_path,
                   file=sys.stderr)
             return False
     cert_file, cn, sans, self_signed = _resolve_live_cert(root, config_path)
-    if not cert_file.exists():
+    if not cert_file.is_file():
         # 证书都读不到，不做任何猜测 —— 交给原来的行为。
+        return False
+    if not cn and not sans and not self_signed:
+        # 证书文件已损坏/截断或 openssl 解析失败时，绝不能按非自签覆盖现有信任配置。
         return False
 
     # server_name 取值：SAN 首选（现代客户端只看 SAN），CN 兜底。
@@ -4892,11 +4911,13 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     # 一张证书常覆盖多个域名，直接取第一个非通配 SAN 会在换证后把 SNI 悄悄
     # 换成另一个域名 —— 已发出的订阅全部连不上。install.sh 的 sync_cert_meta
     # 已经是这个优先级，两处必须一致。
-    current_sn = str(m.get('server_name') or '').strip().lower()
+    raw_sn = m.get('server_name')
+    clean_meta_sn = raw_sn.strip() if isinstance(raw_sn, str) else ''
+    current_sn = clean_meta_sn.lower()
     san_lower = [str(x).strip().lower() for x in (sans or [])]
     candidate = ''
     if current_sn and certificate_covers_domain(current_sn, san_lower, str(cn or '')):
-        candidate = str(m.get('server_name')).strip()
+        candidate = clean_meta_sn
     if not candidate:
         for san in sans or []:
             if san.startswith('*.'):
@@ -4916,7 +4937,9 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         new_insecure = False
         new_pin = ''
 
-    new_sn = candidate or m.get('server_name') or m.get('public_ip', 'localhost')
+    raw_pub_ip = m.get('public_ip')
+    clean_pub_ip = raw_pub_ip.strip() if isinstance(raw_pub_ip, str) else ''
+    new_sn = candidate or clean_meta_sn or clean_pub_ip or 'localhost'
 
     changed = False
     if m.get('cert_type') != new_type:
