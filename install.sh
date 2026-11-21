@@ -1645,9 +1645,13 @@ setup_cert_via_nginx() {
         log_step "为 ${domain} 新增只响应 ACME 验证路径的 Nginx 配置: ${conf}"
         mkdir -p "$HY2_ACME_WEBROOT/.well-known/acme-challenge"
         chmod 755 "$HY2_ACME_WEBROOT" "$HY2_ACME_WEBROOT/.well-known" "$HY2_ACME_WEBROOT/.well-known/acme-challenge"
-        local listen6="    listen [::]:80;"
+        local listen6="    listen [::]:80;" _nginx_tmp=""
         [[ -f /proc/net/if_inet6 ]] || listen6=""
-        cat > "$conf" <<EOF
+        _nginx_tmp="$(mktemp "${conf}.XXXXXX")" || {
+            log_warn "无法为 ${conf} 创建临时文件，跳过自动建站。"
+            return 1
+        }
+        if ! cat > "$_nginx_tmp" <<EOF
 # 由 hysteria2-installer 生成：只用于 Let's Encrypt 签发与续期 ${domain}，请勿删除。
 server {
     listen 80;
@@ -1663,7 +1667,13 @@ ${listen6}
     }
 }
 EOF
-        chmod 644 "$conf"
+        then
+            rm -f "$_nginx_tmp"
+            log_warn "写入 ${conf} 失败，跳过自动建站。"
+            return 1
+        fi
+        chmod 644 "$_nginx_tmp"
+        mv -f "$_nginx_tmp" "$conf"
         created_owned_conf=1
         if ! nginx_reload_checked; then
             # IPv6 监听不可用时再试一次只监听 IPv4。
@@ -1707,9 +1717,9 @@ EOF
     # 都只在启动时读证书，续期后不重启就一直用旧证书，到期即全部握手失败。
     local out_cert="${HY2_CERT_DIR}/acme-${domain}.crt" out_key="${HY2_CERT_DIR}/acme-${domain}.key"
     mkdir -p "$HY2_CERT_DIR"
-    if ! "$acct" --install-cert -d "$domain" --ecc \
+    if ! (umask 077; "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
-            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null; then
+            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null); then
         # 与签发失败同样撤掉本次新增的验证配置（2026-11-03 修）：旧实现直接 return，
         # 留下一个没有归属标记的 server 块 —— Nginx 继续为该域名回 404，下次运行
         # 撞上「无法确认归属」永久走不通，卸载也认不出它。
@@ -1723,8 +1733,7 @@ EOF
     chmod 600 "$out_key"
     if [[ "$created_owned_conf" == 1 ]]; then
         mkdir -p "$HY2_DIR"
-        touch "$HY2_DIR/.hy2-nginx-acme-${domain}.owned"
-        chmod 600 "$HY2_DIR/.hy2-nginx-acme-${domain}.owned"
+        (umask 077; : > "$HY2_DIR/.hy2-nginx-acme-${domain}.owned" && chmod 600 "$HY2_DIR/.hy2-nginx-acme-${domain}.owned")
     fi
     log_info "借 Nginx 签发成功；续期由 acme.sh 定时任务自动完成，续期后自动重启相关服务。"
     echo "$out_cert|$out_key" >&3
@@ -5040,24 +5049,38 @@ install_gost() {
         return 1
     fi
     if [[ ! -f "$GOST_CERT_DIR/cert.pem" ]]; then
-        if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+        if ! (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
                 -keyout "$GOST_CERT_DIR/key.pem" -out "$GOST_CERT_DIR/cert.pem" \
-                -days 3650 -subj "/CN=gost-proxy" >/dev/null 2>&1; then
+                -days 3650 -subj "/CN=gost-proxy" >/dev/null 2>&1); then
             _restore_gost_install
             log_err "GOST HTTPS 证书生成失败，已恢复原部署。"
             return 1
         fi
+        chmod 600 "$GOST_CERT_DIR/key.pem" || { _restore_gost_install; return 1; }
     fi
 
     # 生成初始配置（services 由 Web 控制台动态管理）
     if [[ ! -f "$GOST_CONFIG" ]]; then
-        if ! cat > "$GOST_CONFIG" <<'EOF'
+        local _gost_cfg_tmp=""
+        _gost_cfg_tmp="$(umask 077; mktemp "${GOST_CONFIG}.XXXXXX")" || {
+            _restore_gost_install
+            log_err "GOST 初始配置临时文件创建失败，已恢复原部署。"
+            return 1
+        }
+        if ! cat > "$_gost_cfg_tmp" <<'EOF'
 # gost 入站代理配置（由 Web 控制台动态管理，勿手动编辑）
 services: []
 EOF
         then
+            rm -f "$_gost_cfg_tmp"
             _restore_gost_install
             log_err "GOST 初始配置写入失败，已恢复原部署。"
+            return 1
+        fi
+        if ! chmod 600 "$_gost_cfg_tmp" || ! mv -f "$_gost_cfg_tmp" "$GOST_CONFIG"; then
+            rm -f "$_gost_cfg_tmp"
+            _restore_gost_install
+            log_err "GOST 初始配置落盘失败，已恢复原部署。"
             return 1
         fi
     fi
@@ -5066,7 +5089,13 @@ EOF
     # ⚠️ 内容必须与 portal.py 的 GOST_SELFCHECK_SCRIPT 常量一致
     # (tests/test_portal_gost_reload.py 有断言钉死).
     mkdir -p /usr/local/lib || { _restore_gost_install; return 1; }
-    if ! cat > /usr/local/lib/hy2-gost-selfcheck <<'PYSELFCHECK'
+    local _selfcheck_tmp=""
+    _selfcheck_tmp="$(mktemp "/usr/local/lib/hy2-gost-selfcheck.XXXXXX")" || {
+        _restore_gost_install
+        log_err "GOST 自检脚本临时文件创建失败，已恢复原部署。"
+        return 1
+    }
+    if ! cat > "$_selfcheck_tmp" <<'PYSELFCHECK'
 #!/usr/bin/env python3
 """确认 /etc/hysteria/gost.yml 里声明监听的服务端口都真的在监听.
 
@@ -5128,11 +5157,17 @@ if __name__ == '__main__':
     sys.exit(main())
 PYSELFCHECK
     then
+        rm -f "$_selfcheck_tmp"
         _restore_gost_install
         log_err "GOST 自检脚本写入失败，已恢复原部署。"
         return 1
     fi
-    chmod 755 /usr/local/lib/hy2-gost-selfcheck || { _restore_gost_install; return 1; }
+    if ! chmod 755 "$_selfcheck_tmp" || ! mv -f "$_selfcheck_tmp" /usr/local/lib/hy2-gost-selfcheck; then
+        rm -f "$_selfcheck_tmp"
+        _restore_gost_install
+        log_err "GOST 自检脚本落盘失败，已恢复原部署。"
+        return 1
+    fi
 
     # 创建 systemd 守护服务
     # ⚠️ 这份内容必须与 portal.py 的 GOST_UNIT_CONTENT 常量**完全一致**
@@ -5170,7 +5205,7 @@ EOF
         log_err "GOST systemd unit 写入失败，已恢复原部署。"
         return 1
     fi
-    if ! : > "$HY2_DIR/.hy2-gost-owned" || ! chmod 600 "$HY2_DIR/.hy2-gost-owned"; then
+    if ! (umask 077; : > "$HY2_DIR/.hy2-gost-owned" && chmod 600 "$HY2_DIR/.hy2-gost-owned"); then
         _restore_gost_install
         log_err "GOST 所有权标记写入失败，已恢复原部署。"
         return 1
@@ -5916,6 +5951,7 @@ uninstall_all() {
 
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         acquire_installer_core_lock || return 1
+        trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi' RETURN
         log_step "正在停止并删除系统服务..."
         systemctl stop hysteria-server 2>/dev/null || true
         systemctl disable hysteria-server 2>/dev/null || true
@@ -6255,7 +6291,7 @@ flow_update_core() {
         return 1
     fi
     local rollback_file
-    rollback_file="$(mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
+    rollback_file="$(umask 077; mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
         exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "创建核心备份失败，现有二进制未改动。"; return 1; }
     if ! cp -p "$HY2_BIN" "$rollback_file"; then

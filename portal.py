@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.54'
+PORTAL_VERSION = '2.55'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2033,7 +2033,10 @@ def gost_tls_paths(root):
             if not raw.startswith((' ', '\t')):
                 in_tls = raw.split(':', 1)[0] == 'tls'
             elif in_tls and raw.strip().startswith('key:'):
-                values = shlex.split(raw.strip().split(':', 1)[1], comments=True)
+                try:
+                    values = shlex.split(raw.strip().split(':', 1)[1], comments=True)
+                except ValueError:
+                    values = []
                 key = values[0] if values else ''
     if cert:
         cert = Path(os.path.expandvars(str(cert)))
@@ -2045,8 +2048,10 @@ def gost_tls_paths(root):
         if cert.is_file() and key.is_file() and cert.stat().st_size and key.stat().st_size:
             return str(cert), str(key)
     legacy = root / 'gost-cert'
-    if (legacy / 'cert.pem').is_file() and (legacy / 'key.pem').is_file():
-        return str(legacy / 'cert.pem'), str(legacy / 'key.pem')
+    legacy_cert, legacy_key = legacy / 'cert.pem', legacy / 'key.pem'
+    if (legacy_cert.is_file() and legacy_key.is_file()
+            and legacy_cert.stat().st_size and legacy_key.stat().st_size):
+        return str(legacy_cert), str(legacy_key)
     raise RuntimeError('HTTPS 代理缺少可用证书和私钥，请先配置节点证书')
 
 
@@ -2153,16 +2158,22 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                         'systemctl enable exited with %d' % enabled.returncode))
     except Exception:
         if replaced:
-            if original is None:
-                path.unlink(missing_ok=True)
-            else:
-                _write_priv(candidate, original, mode)
-                os.replace(candidate, path)
+            try:
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    _write_priv(candidate, original, mode)
+                    os.replace(candidate, path)
+            except OSError as rb_exc:
+                _log_ignored('xray_transaction_rollback_file', rb_exc)
             try:
                 if was_enabled:
                     subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
                 else:
                     subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
+            except (OSError, subprocess.SubprocessError) as rb_exc:
+                _log_ignored('xray_transaction_rollback_enable', rb_exc)
+            try:
                 if original is not None and was_active:
                     subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
                     subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
@@ -8910,20 +8921,22 @@ def serve(path):
                         tr = ip_tracker.get(uid)
                         hy2[uid] = (
                             {ip for ip, t in tr.items()
-                             if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                             if isinstance(t, (int, float)) and not isinstance(t, bool)
+                             and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                             if isinstance(tr, dict) else set()
                         )
                 for uid in limits:
                     hy2[uid] |= live_online_ips(uid)
                 reality = read_reality_online_ips(binary, address, limits)
                 with data_lock:
-                    blocked = plan_reality_iplimit(limits, reality, hy2, reality_iplimit_state, time.time())
+                    now_plan = time.time()
+                    blocked = plan_reality_iplimit(limits, reality, hy2, reality_iplimit_state, now_plan)
                     # 控制台下发的跨节点超额 IP 一并拦截（与本机名额判断取并集）。
                     for _uid in list(global_ip_deny):
-                        _ips = active_ip_deny(global_ip_deny, _uid, time.time())
+                        _ips = active_ip_deny(global_ip_deny, _uid, now_plan)
                         if _ips:
                             blocked.setdefault(_uid, set()).update(_ips)
-                    reality_ip_snapshot.update(ips=reality, at=time.time())
+                    reality_ip_snapshot.update(ips=reality, at=now_plan)
                 added, removed = apply_reality_iplimit(binary, address, reality_iplimit_rules(blocked))
                 if added or removed:
                     print('[iplimit] Reality 拦截规则更新: +%d -%d，当前拦截 %d 个用户'
@@ -10484,7 +10497,7 @@ if __name__ == '__main__':
                                 raw_tracker = ip_tracker.get(matched_uid)
                                 active_ips = (
                                     {ip: t for ip, t in raw_tracker.items()
-                                     if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                                     if isinstance(raw_tracker, dict) else {}
                                 )
                                 ip_tracker[matched_uid] = active_ips
@@ -10503,7 +10516,7 @@ if __name__ == '__main__':
                                 tracker = ip_tracker.get(matched_uid)
                                 tracker = (
                                     {ip: t for ip, t in tracker.items()
-                                     if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                                     if isinstance(tracker, dict) else {}
                                 )
                                 tracker[client_ip] = now_ts
@@ -11809,8 +11822,13 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '')
                 params = {key: values[0] for key, values in form.items()}
                 status, payload = self._manage_proxy_operation(params.pop('action', ''), params)
                 return self.reply_json(status, payload)
@@ -12093,8 +12111,13 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8', errors='replace')
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 # 先去空白再取默认值：写成 (value or '3').strip() 的话，
                 # 纯空格能通过 or 判定、再被 strip 成空串，导致误判为非法协议线。
@@ -12111,12 +12134,29 @@ if __name__ == '__main__':
                 endpoint_error = awg_endpoint_error(endpoint)
                 if endpoint_error:
                     return self.reply_json(400, {'ok': False, 'error': endpoint_error})
-                # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃冲突的取值
+                # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃或主监听端口冲突的取值
                 if port:
                     if not port.isdigit() or not (1 <= int(port) <= 65535):
                         return self.reply_json(400, {'ok': False, 'error': '端口必须是 1-65535 的数字'})
-                    if 20000 <= int(port) <= 40000:
+                    port_num = int(port)
+                    if 20000 <= port_num <= 40000:
                         return self.reply_json(400, {'ok': False, 'error': '该端口落在 Hysteria2 的端口跳跃区间 20000-40000 内，会导致 AWG 收不到握手包，请改用 50000-59000'})
+                    try:
+                        m_now = read_meta_file(meta_path)
+                    except Exception:
+                        m_now = {}
+                    if isinstance(m_now, dict):
+                        hy2_listen = _valid_port(m_now.get('listen_port'))
+                        if hy2_listen and port_num == hy2_listen:
+                            return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 已被 Hysteria2 主监听端口占用，请更换其它 UDP 端口'})
+                        hop_range = str(m_now.get('hop_port_range') or '').strip()
+                        hop_match = re.fullmatch(r'(\d{1,5})-(\d{1,5})', hop_range)
+                        if hop_match:
+                            hs, he = int(hop_match.group(1)), int(hop_match.group(2))
+                            if 1 <= hs <= he <= 65535 and hs <= port_num <= he:
+                                return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 落在当前 Hysteria2 端口跳跃区间 {hs}-{he} 内，请更换其它 UDP 端口'})
+                if unit_suspended(AWG_SVC_NAME):
+                    return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，请在控制台恢复节点后再安装 AmneziaWG'})
                 if not ensure_awgctl():
                     return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
                 # 安装要下载并核验两个二进制，awgctl 超时 420 秒。
@@ -12141,8 +12181,13 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8', errors='replace')
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = (form.get('action', [''])[0] or '').strip()
 
@@ -12987,6 +13032,7 @@ if __name__ == '__main__':
             """GET /vmess-status —— 状态以**实际入站**为准，不看 data 里的残留配置。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(30)
             installed = Path('/usr/local/bin/xray').exists()
             xray_path = Path('/etc/hysteria/xray.json')
             active = False
@@ -13095,14 +13141,19 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                if not self._extend_deadline(420, heavy=True):
-                    return self.reply_json(409, {'ok': False, 'error':
-                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
                 if name not in ('xray', 'sing-box'):
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里安装该核心'})
+                if not self._extend_deadline(420, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 with core_operation_lock:
                     try:
                         core_lock_fd = acquire_core_operation_lock()
@@ -13130,7 +13181,7 @@ if __name__ == '__main__':
                         msg += '；正在运行的 %s 仍是旧核心，下次重启该服务（或在协议页关闭再开启）后才换成新版本' % '、'.join(running)
                 return self.reply_json(200 if ok else 500, {'ok': ok, ('message' if ok else 'error'): msg})
             except Exception as exc:
-                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(exc).__name__, str(exc)))[:160]})
 
         def _core_users(self, name):
             """返回仍在使用该核心的协议名列表；非空时拒绝卸载。"""
@@ -13161,16 +13212,21 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                if not self._extend_deadline(120, heavy=True):
-                    return self.reply_json(409, {'ok': False, 'error':
-                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
                 units = {'xray': (('xray',), '/usr/local/bin/xray'),
                          'sing-box': ((ANYTLS_SERVICE, TUIC_SERVICE), ANYTLS_BINARY)}
                 if name not in units:
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里卸载该核心'})
+                if not self._extend_deadline(120, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 unit_names, binary = units[name]
                 with core_operation_lock:
                     try:
@@ -13209,23 +13265,26 @@ if __name__ == '__main__':
                                 capture_output=True, timeout=30)
                             state = _systemd_state(unit)
                             if not _service_stop_confirmed(stop_result, state):
-                                # 恢复每个原本存在单元的激活与开机自启状态（含本轮已停掉的单元）
+                                # 恢复每个原本存在单元的激活与开机自启状态（逐单元隔离超时/异常）
                                 restore_failed = []
                                 for restore_unit, (was_active, was_enabled, restore_absent) in unit_states.items():
                                     if restore_absent:
                                         continue
-                                    enable_result = subprocess.run(
-                                        ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
-                                        capture_output=True, timeout=30)
-                                    if was_active:
-                                        subprocess.run(['systemctl', 'reset-failed', restore_unit],
-                                                       capture_output=True, timeout=5)
-                                    action_result = subprocess.run(
-                                        ['systemctl', 'start' if was_active else 'stop', restore_unit],
-                                        capture_output=True, timeout=30)
-                                    restored_state = _systemd_state(restore_unit)
-                                    active_ok = restored_state == ('active' if was_active else 'inactive')
-                                    if enable_result.returncode != 0 or action_result.returncode != 0 or not active_ok:
+                                    try:
+                                        enable_result = subprocess.run(
+                                            ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
+                                            capture_output=True, timeout=30)
+                                        if was_active:
+                                            subprocess.run(['systemctl', 'reset-failed', restore_unit],
+                                                           capture_output=True, timeout=5)
+                                        action_result = subprocess.run(
+                                            ['systemctl', 'start' if was_active else 'stop', restore_unit],
+                                            capture_output=True, timeout=30)
+                                        restored_state = _systemd_state(restore_unit)
+                                        active_ok = restored_state == ('active' if was_active else 'inactive')
+                                        if enable_result.returncode != 0 or action_result.returncode != 0 or not active_ok:
+                                            restore_failed.append(restore_unit)
+                                    except Exception:
                                         restore_failed.append(restore_unit)
                                 if restore_failed:
                                     return self.reply_json(500, {'ok': False, 'error':
@@ -13243,7 +13302,7 @@ if __name__ == '__main__':
                         os.close(core_lock_fd)
                 return self.reply_json(200, {'ok': True, 'message': '%s 已卸载' % name})
             except Exception as exc:
-                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(exc).__name__, str(exc)))[:160]})
 
         def _apply_anytls_enable(self):
             """启用 AnyTLS：装 sing-box → 选端口 → 写配置并重启 → 落 data。
@@ -13280,13 +13339,13 @@ if __name__ == '__main__':
                 # 用户表在协议锁内取（2026-11-04 修）：旧实现在锁外取，期间撤销流程同步完
                 # anytls.json，本次再用旧名单覆盖，刚被停用 / 到期的用户又能连上直到下次同步。
                 with data_lock:
+                    previous_cfg = copy.deepcopy(config_section(data, 'anytls_config'))
                     preview = dict(data)
                     preview['anytls_config'] = new_cfg
                     users = anytls_users(preview)
                 previous_unit = unit_path.read_bytes() if unit_path.exists() else None
                 unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                 unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
-                previous_cfg = copy.deepcopy(config_section(data, 'anytls_config'))
                 cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
                 previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
@@ -13445,6 +13504,7 @@ if __name__ == '__main__':
             """GET /anytls-status —— 以 sing-box 服务实际状态为准。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(30)
             acfg = _active_anytls_config() or {}
             running = bool(acfg) and _systemd_state(ANYTLS_SERVICE) == 'active'
             version = _singbox_version()
@@ -13534,7 +13594,10 @@ if __name__ == '__main__':
                     raise
                 except Exception:
                     with data_lock:
-                        data['tuic_config'] = old
+                        if old:
+                            data['tuic_config'] = old
+                        else:
+                            data.pop('tuic_config', None)
                     if 'cfg_path' in locals():
                         if 'previous_file' not in locals():
                             raise
@@ -13668,6 +13731,7 @@ if __name__ == '__main__':
             """GET /tuic-status —— 以 hy2-tuic 服务实际状态为准。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(30)
             tcfg = _active_tuic_config() or {}
             running = bool(tcfg) and _systemd_state(TUIC_SERVICE) == 'active'
             version = _singbox_version()
@@ -13795,6 +13859,7 @@ if __name__ == '__main__':
             """GET /vlessenc-status —— 与 VMess 一致，以实际入站为准。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(30)
             installed = Path('/usr/local/bin/xray').exists()
             xray_path = Path('/etc/hysteria/xray.json')
             active = False
@@ -13847,8 +13912,13 @@ if __name__ == '__main__':
 
         def _set_bbr_locked(self):
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '')
                 ver = form.get('version', ['v1'])[0].lower()
                 if ver not in ('v1', 'v2', 'v3'):
                     return self.reply_json(400, {'ok': False, 'error': '不支持的 BBR 版本（仅支持 v1、v2 或 v3）'})
@@ -13982,8 +14052,13 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply(401, '登录已失效，请刷新页面重新登录'.encode('utf-8'))
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8', errors='replace')
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                if length < 0 or length > 65536:
+                    return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', [''])[0]
                 user_id = form.get('user_id', [''])[0].strip()
