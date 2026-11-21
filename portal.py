@@ -1880,6 +1880,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         req = urllib.request.Request(url, headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=90) as source, open(candidate, 'wb') as dest:
             shutil.copyfileobj(source, dest)
+            dest.flush()
+            os.fsync(dest.fileno())
         if not verify_sha256(candidate, expected):
             raise RuntimeError('候选核心的 SHA256 与官方 hashes.txt 不一致，原核心未更改')
         with candidate.open('rb') as stream:
@@ -1917,17 +1919,20 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         if replaced and backup is not None:
             # 经同目录临时文件原子替换回滚：直接向运行中的可执行文件 copy2 在 Linux 上
             # 会触发 ETXTBSY（Text file busy），导致回滚失败并掩盖真正的升级异常。
-            rb_fd, rb_name = tempfile.mkstemp(prefix='.hysteria-rollback-', dir=str(binary.parent))
-            os.close(rb_fd)
-            rb_tmp = Path(rb_name)
+            rb_tmp = None
             try:
+                rb_fd, rb_name = tempfile.mkstemp(prefix='.hysteria-rollback-', dir=str(binary.parent))
+                os.close(rb_fd)
+                rb_tmp = Path(rb_name)
                 shutil.copy2(backup, rb_tmp)
                 rb_tmp.chmod(0o755)
                 os.replace(rb_tmp, binary)
+                rb_tmp = None
             except Exception as rb_exc:
                 _log_ignored('upgrade_core_rollback_replace', rb_exc)
             finally:
-                rb_tmp.unlink(missing_ok=True)
+                if rb_tmp is not None:
+                    rb_tmp.unlink(missing_ok=True)
             try:
                 _restart_hy2()
             except Exception as rb_exc:
@@ -2006,6 +2011,9 @@ def acquire_core_operation_lock(directory='/etc/hysteria'):
         except BlockingIOError:
             os.close(lock_fd)
             raise RuntimeError('another core operation is running')
+        except BaseException:
+            os.close(lock_fd)
+            raise
     return lock_fd
 
 
