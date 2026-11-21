@@ -99,7 +99,7 @@ class WarpScriptHardeningTests(unittest.TestCase):
     def test_warp_restarts_and_watchdogs_reset_failed_before_restart(self):
         portal_script = _extract_portal_warp_script()
         self.assertGreaterEqual(portal_script.count('systemctl reset-failed wireproxy'), 2)
-        m = re.search(r'cat > /usr/local/bin/hy2-warp-watchdog\.sh <<EOWD\n(.*?)\nEOWD', INSTALL_TEXT, re.S)
+        m = re.search(r'cat > (?:/usr/local/bin/hy2-warp-watchdog\.sh|"\$_wd_sh_tmp") <<EOWD\n(.*?)\nEOWD', INSTALL_TEXT, re.S)
         self.assertIsNotNone(m)
         self.assertIn('systemctl reset-failed wireproxy', m.group(1))
 
