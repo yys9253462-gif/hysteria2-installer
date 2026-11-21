@@ -362,8 +362,12 @@ validate_endpoint() {
             log_err "连接地址不是有效的域名或 IPv4: ${ep}"
             return 1
         fi
-        # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置。
+        # 只校验形状会放过 99999 或带前导零（如 08080）的端口：它们会被原样写进客户端配置。
         if [[ -n "$port" ]]; then
+            if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]]; then
+                log_err "连接地址里的端口必须是 1-65535 的十进制整数（不含前导零）: ${ep}"
+                return 1
+            fi
             port="$((10#$port))"
         fi
         if [[ -n "$port" ]] && (( port < 1 || port > 65535 )); then
@@ -1329,7 +1333,8 @@ cmd_uninstall() {
     local self
     self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     if [[ "$self" == "$AWG_CTL_INSTALLED" ]]; then
-        nohup bash -c "sleep 2; rm -f '${AWG_CTL_INSTALLED}'" >/dev/null 2>&1 &
+        # 关闭继承的锁描述符 fd 9，避免卸载退出后后台子进程仍占住 /run/hy2-awgctl.lock 阻塞后续操作。
+        nohup bash -c "sleep 2; rm -f '${AWG_CTL_INSTALLED}'" >/dev/null 2>&1 9>&- &
         log_info "控制工具 ${AWG_CTL_INSTALLED} 将在本进程退出后自动移除"
     fi
 
