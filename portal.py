@@ -12033,8 +12033,8 @@ if __name__ == '__main__':
                 if action not in known_actions:
                     return self.reply_json(400, {'ok': False, 'error': '未知操作: ' + (action or '(空)')})
 
-                # peer_add 的参数同理先于安装状态校验：输入本身非法时应直接指出
-                # 哪里错，而不是笼统地报「尚未安装」。
+                # peer_add / peer_del / set_line 的参数同理先于安装状态与重型槽校验：
+                # 输入本身非法时应直接 400 指出哪里错，而不是笼统报「尚未安装」或空占重型槽。
                 if action == 'peer_add':
                     name = (form.get('name', [''])[0] or '').strip()
                     endpoint = (form.get('endpoint', [''])[0] or '').strip()
@@ -12045,6 +12045,14 @@ if __name__ == '__main__':
                     endpoint_error = awg_endpoint_error(endpoint)
                     if endpoint_error:
                         return self.reply_json(400, {'ok': False, 'error': endpoint_error})
+                elif action == 'peer_del':
+                    name = (form.get('name', [''])[0] or '').strip()
+                    if not VALID_AWG_NAME_RE.match(name):
+                        return self.reply_json(400, {'ok': False, 'error': '客户端名称非法'})
+                elif action == 'set_line':
+                    target = (form.get('line', [''])[0] or '').strip()
+                    if target not in ('2', '3'):
+                        return self.reply_json(400, {'ok': False, 'error': '协议线只能是 2 或 3'})
 
                 if not awg_installed():
                     return self.reply_json(400, {'ok': False, 'error': 'AmneziaWG 尚未安装'})
@@ -12102,8 +12110,9 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'message': f'已切换到 AWG {target}.x。⚠️ 所有客户端必须重新导入配置。'})
 
                 if action == 'update':
-                    # 先把控制工具自身刷新到最新，否则引擎会永久停在首装版本
-                    ensure_awgctl(force=True)
+                    # 先把控制工具自身刷新到最新，刷新失败则明确中止而非静默继续跑旧版本。
+                    if not ensure_awgctl(force=True):
+                        return self.reply_json(500, {'ok': False, 'error': '刷新最新 hy2-awgctl 失败，已中止更新，请检查网络后重试'})
                     rc, out, err = awg_run(['update'], timeout=420)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False, 'error': '更新失败：' + awg_err_tail(rc, out, err)})
@@ -15366,10 +15375,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 rcfg = dict(config_section(data, 'reality_config'))
 
             qr_svg = ''
-            if rcfg.get('uri'):
+            _ruri = rcfg.get('uri')
+            if is_active and isinstance(_ruri, str) and _ruri:
                 try:
                     qr_res = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
-                                            input=rcfg['uri'].encode('utf-8'), capture_output=True, timeout=3)
+                                            input=_ruri.encode('utf-8'), capture_output=True, timeout=3)
                     if qr_res.returncode == 0:
                         qr_svg = qr_res.stdout.decode('utf-8')
                 except Exception:
