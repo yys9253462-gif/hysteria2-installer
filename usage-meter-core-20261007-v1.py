@@ -56,6 +56,8 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
                 {'source': source, 'at': sampled_at,
                  'reason': 'corrupt_state_reset'})
 
+    if 'totals' in new and not isinstance(new.get('totals'), dict):
+        raise ValueError('invalid totals')
     totals = new.setdefault('totals', {})
     # 加上增量前校验原值，负数/布尔值不能被一次采样洗成正常整数。
     for uid in clean:
