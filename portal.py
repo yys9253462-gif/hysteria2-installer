@@ -15820,6 +15820,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             missing_outbound = True
                         else:
                             data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
+                            # 删光最后一个自定义出站时同步切回按域名分流，避免持久化留下 global + 空出站。
+                            if not data['custom_outbounds'] and data.get('outbound_mode') == 'global':
+                                data['outbound_mode'] = 'rules'
                             # 🔴 必须同步清理引用它的分流规则，否则 ACL 里会留下
                             #    不存在的出站名 ⇒ Hysteria 启动失败（且用户毫无察觉）。
                             data['warp_rules'] = [r for r in normalize_route_rules(state['warp_rules'])
