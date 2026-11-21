@@ -1,5 +1,6 @@
 """回归测试：GOST 安装失败回滚时先清理失败计数并精确还原原有 active / enabled 状态。"""
 import ast
+import os
 import tempfile
 import threading
 import unittest
@@ -57,6 +58,7 @@ def _run_restore(old_has_bin, old_active, old_enabled):
             'data': {},
             'old_gost_active': old_active,
             'old_gost_enabled': old_enabled,
+            'os': os,
             'subprocess': SimpleNamespace(run=fake_run),
         }
         exec(compile(mod, str(ROOT / 'portal.py'), 'exec'), ns)

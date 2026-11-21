@@ -9074,17 +9074,33 @@ def serve(path):
             return False
 
     def write_gost_selfcheck():
-        """把启动自检脚本写到 GOST_SELFCHECK_PATH (unit 的 ExecStartPost 调用).
+        """把启动自检脚本原子写到 GOST_SELFCHECK_PATH (unit 的 ExecStartPost 调用).
 
         install.sh 的 install_gost() 会写同一份内容; 这里再写一次是为了覆盖
         "服务器上已装过旧版 gost、unit 却没有自检" 的情况。返回是否写成功。
         """
+        tmp_path = None
         try:
             GOST_SELFCHECK_PATH.parent.mkdir(parents=True, exist_ok=True)
-            GOST_SELFCHECK_PATH.write_text(GOST_SELFCHECK_SCRIPT, encoding='utf-8')
-            os.chmod(str(GOST_SELFCHECK_PATH), 0o755)
+            tmp_path = GOST_SELFCHECK_PATH.with_name(
+                GOST_SELFCHECK_PATH.name + '.tmp.' + os.urandom(4).hex())
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, 'O_NOFOLLOW'):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(str(tmp_path), flags, 0o755)
+            try:
+                with os.fdopen(fd, 'wb') as fh:
+                    fh.write(GOST_SELFCHECK_SCRIPT.encode('utf-8'))
+            except BaseException:
+                tmp_path.unlink(missing_ok=True)
+                raise
+            os.chmod(str(tmp_path), 0o755)
+            os.replace(str(tmp_path), str(GOST_SELFCHECK_PATH))
+            tmp_path = None
             return True
         except OSError as exc:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
             _log_ignored('gost_selfcheck_write', exc)
             return False
 
@@ -11647,26 +11663,31 @@ if __name__ == '__main__':
                                 with tar.extractfile(member) as source, open(src_bin, 'wb') as dest:
                                     shutil.copyfileobj(source, dest)
                             if src_bin.exists():
-                                staged = Path('/usr/local/bin/gost.new')
-                                shutil.copyfile(str(src_bin), str(staged))
-                                os.chmod(str(staged), 0o755)
-                                # 先确认新文件能跑再替换（2026-11-04 修，与 Xray 安装一致）：
-                                # 摘要对得上不代表能执行（架构判错、noexec、依赖缺失），
-                                # 旧实现直接覆盖正在用的 gost，所有代理随下次重启全部失效。
+                                staged = Path('/usr/local/bin/gost.new.%s' % secrets.token_hex(6))
+                                replaced = False
                                 try:
-                                    probe = subprocess.run([str(staged), '-V'], capture_output=True,
-                                                           text=True, timeout=10)
-                                    runs = probe.returncode == 0 and 'gost' in (probe.stdout + probe.stderr).lower()
-                                except (OSError, subprocess.SubprocessError):
-                                    runs = False
-                                if not runs:
-                                    staged.unlink(missing_ok=True)
-                                    errors.append('%s: 下载的 gost 无法在本机运行，未替换现有版本' % host)
-                                    continue
-                                os.replace(str(staged), '/usr/local/bin/gost')
-                                assets_modified = True
-                                installed = True
-                                break
+                                    shutil.copyfile(str(src_bin), str(staged))
+                                    os.chmod(str(staged), 0o755)
+                                    # 先确认新文件能跑再替换（2026-11-04 修，与 Xray 安装一致）：
+                                    # 摘要对得上不代表能执行（架构判错、noexec、依赖缺失），
+                                    # 旧实现直接覆盖正在用的 gost，所有代理随下次重启全部失效。
+                                    try:
+                                        probe = subprocess.run([str(staged), '-V'], capture_output=True,
+                                                               text=True, timeout=10)
+                                        runs = probe.returncode == 0 and 'gost' in (probe.stdout + probe.stderr).lower()
+                                    except (OSError, subprocess.SubprocessError):
+                                        runs = False
+                                    if not runs:
+                                        errors.append('%s: 下载的 gost 无法在本机运行，未替换现有版本' % host)
+                                        continue
+                                    os.replace(str(staged), '/usr/local/bin/gost')
+                                    replaced = True
+                                    assets_modified = True
+                                    installed = True
+                                    break
+                                finally:
+                                    if not replaced:
+                                        staged.unlink(missing_ok=True)
                             errors.append('%s: 包内没有 gost 可执行文件' % host)
                         except Exception as e:
                             errors.append('%s: %s: %s' % (host, type(e).__name__, e))
@@ -11676,12 +11697,29 @@ if __name__ == '__main__':
                     assets_modified = True
                     for asset_path, old_asset in old_assets.items():
                         if old_asset is None:
-                            asset_path.unlink(missing_ok=True)
+                            try:
+                                asset_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
                         else:
                             contents, mode = old_asset
                             asset_path.parent.mkdir(parents=True, exist_ok=True)
-                            asset_path.write_bytes(contents)
-                            asset_path.chmod(mode)
+                            # 同目录私有临时文件 + 原子替换：避免覆写运行中二进制报 ETXTBSY，
+                            # 同时消除敏感配置文件与私钥的默认 umask 暴露窗口。
+                            tmp_asset = asset_path.with_name(
+                                asset_path.name + '.rollback.' + os.urandom(4).hex())
+                            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                            if hasattr(os, 'O_NOFOLLOW'):
+                                flags |= os.O_NOFOLLOW
+                            try:
+                                fd = os.open(str(tmp_asset), flags, 0o600)
+                                with os.fdopen(fd, 'wb') as fh:
+                                    fh.write(contents)
+                                os.chmod(str(tmp_asset), mode)
+                                os.replace(str(tmp_asset), str(asset_path))
+                            except BaseException:
+                                tmp_asset.unlink(missing_ok=True)
+                                raise
                     if not had_cert_dir and cert_dir.exists():
                         try:
                             cert_dir.rmdir()
@@ -11692,23 +11730,44 @@ if __name__ == '__main__':
                             data['proxy_services'] = previous_proxy_services
                         else:
                             data.pop('proxy_services', None)
-                    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    try:
+                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    except Exception:
+                        pass
                     if old_assets[gost_binary] is None:
-                        subprocess.run(['systemctl', 'disable', '--now', 'gost'],
-                                       capture_output=True, timeout=30)
-                        subprocess.run(['systemctl', 'stop', 'gost'],
-                                       capture_output=True, timeout=30)
+                        try:
+                            subprocess.run(['systemctl', 'disable', '--now', 'gost'],
+                                           capture_output=True, timeout=30)
+                        except Exception:
+                            pass
+                        try:
+                            subprocess.run(['systemctl', 'stop', 'gost'],
+                                           capture_output=True, timeout=30)
+                        except Exception:
+                            pass
                     else:
                         # 独立还原原有开机自启与运行状态，重启前先清理失败计数防撞上限。
-                        if old_gost_enabled:
-                            subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
-                        else:
-                            subprocess.run(['systemctl', 'disable', 'gost'], capture_output=True, timeout=30)
+                        try:
+                            if old_gost_enabled:
+                                subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
+                            else:
+                                subprocess.run(['systemctl', 'disable', 'gost'], capture_output=True, timeout=30)
+                        except Exception:
+                            pass
                         if old_gost_active:
-                            subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=15)
-                            subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
+                            try:
+                                subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=15)
+                            except Exception:
+                                pass
+                            try:
+                                subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
+                            except Exception:
+                                pass
                         else:
-                            subprocess.run(['systemctl', 'stop', 'gost'], capture_output=True, timeout=30)
+                            try:
+                                subprocess.run(['systemctl', 'stop', 'gost'], capture_output=True, timeout=30)
+                            except Exception:
+                                pass
 
                 if not installed:
                     # 把【每个源】的错误都报出来。
