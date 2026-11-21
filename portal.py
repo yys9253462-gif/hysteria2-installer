@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.53'
+PORTAL_VERSION = '2.54'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -6006,6 +6006,8 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
 # WARP 出口 IP 探测结果缓存：前端每 10 秒轮询，而每次探测都要走一次外网。
 _warp_probe_cache = {}
 _warp_probe_lock = threading.Lock()
+_warp_install_lock = threading.Lock()
+_ver_cache_lock = threading.Lock()
 
 
 _ACCESS_APPLIED = {}
@@ -7827,6 +7829,8 @@ def sync_download_artifacts(data, uri, clash, sing, qr=_QR_UNSET):
 def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', precomputed_qr=None):
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    if not isinstance(m, dict):
+        raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先修信任模型再对齐 pin。
     # 顺序有依赖：sync_pin 依赖 is_insecure 判断 pin 去留，而 is_insecure 本身
     # 可能正漂移着（自签被换成正式证书后仍是 true）。
@@ -7835,6 +7839,8 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
 
     path = root / 'portal.json'
     data = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('portal.json 顶层必须是 JSON 对象')
     original_data = copy.deepcopy(data)
     # 凭据文件缺失/损坏时重建（保 token、API Key、用户），而不是让
     # 「刷新页面」「证书自愈」这类日常操作直接抛异常（2026-10-30 修）。
@@ -7848,17 +7854,19 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     # 空串等于「任何人都能算出任意用户的 k」（`in` 判断只看键在不在）。
     if not isinstance(data.get('session_secret'), str) or not data['session_secret']:
         data['session_secret'] = secrets.token_hex(32)
-    if 'api_key' not in data:
-        data['api_key'] = access.get('api_key') or secrets.token_hex(24)
+    if not isinstance(data.get('api_key'), str) or not data['api_key'].strip():
+        access_key = access.get('api_key')
+        data['api_key'] = (access_key.strip() if isinstance(access_key, str) and access_key.strip()
+                           else secrets.token_hex(24))
         access['api_key'] = data['api_key']
         # 与其他路径一致：portal-access.json 含用户名/密码/api_key，
         # write_text 会先按 umask 建出 0644 再补权限（2026-10-29 修）。
         atomic_write_private(root / 'portal-access.json',
                              json.dumps(access, ensure_ascii=False).encode('utf-8'))
-    if 'users' not in data:
+    if not isinstance(data.get('users'), dict):
         data['users'] = {
             MASTER_USER_ID: {
-                'password': m['auth_password'],
+                'password': m.get('auth_password', ''),
                 'expires_at': MASTER_EXPIRES_AT,
                 'ip_limit': 0,
                 'limit_bytes': 0,
@@ -7868,7 +7876,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
                 'note': 'Master Admin'
             }
         }
-    if 'proxy_services' not in data:
+    if not isinstance(data.get('proxy_services'), list):
         data['proxy_services'] = []
     # 🔴 2026-10-31：只存摘要，不存整页 HTML（见 regenerate_page 的详细说明）。
     # 页面由 users / meta / clash / qr 完全可重建，存整份纯属写放大。
@@ -8091,8 +8099,12 @@ def adopt(meta_path, port, node_api_key=None):
 def _adopt_locked(meta_path, port, node_api_key=None):
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    if not isinstance(m, dict):
+        raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     path = root / 'portal.json'
     data = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(data, dict):
+        raise ValueError('portal.json 顶层必须是 JSON 对象')
     access_path = root / 'portal-access.json'
     access, _rebuilt = ensure_portal_access(root, m, data)
     data['port'] = int(port)
@@ -9112,9 +9124,16 @@ def serve(path):
         now = time.time()
         # 失败也缓存 60 秒（2026-11-06 修）：旧实现失败不记缓存，每次打开页面都再请求两次
         # GitHub（各 8 秒超时）；限流后一直被限流，GitHub 不通时页面多等 16 秒。
-        ttl = 300 if _ver_cache['data'] is not None else 60
-        if _ver_cache['t'] and now - _ver_cache['t'] < ttl:
-            return _ver_cache['data']
+        try:
+            with _ver_cache_lock:
+                cached_t = _ver_cache['t']
+                cached_data = _ver_cache['data']
+        except NameError:
+            cached_t = _ver_cache['t']
+            cached_data = _ver_cache['data']
+        ttl = 300 if cached_data is not None else 60
+        if cached_t and now - cached_t < ttl:
+            return cached_data
         try:
             req = urllib.request.Request(
                 'https://api.github.com/repos/' + AWG_REPO + '/contents/?ref=main',
@@ -9135,13 +9154,23 @@ def serve(path):
                      if isinstance(it, dict) and it.get('name')}
                     if isinstance(items, list) else {})
             if shas:
-                _ver_cache['t'] = now
-                _ver_cache['data'] = shas
+                try:
+                    with _ver_cache_lock:
+                        _ver_cache['t'] = now
+                        _ver_cache['data'] = shas
+                except NameError:
+                    _ver_cache['t'] = now
+                    _ver_cache['data'] = shas
                 return shas
         except Exception as exc:
             _log_ignored('version_check', exc)
-        _ver_cache['t'] = now
-        _ver_cache['data'] = None
+        try:
+            with _ver_cache_lock:
+                _ver_cache['t'] = now
+                _ver_cache['data'] = None
+        except NameError:
+            _ver_cache['t'] = now
+            _ver_cache['data'] = None
         return None
 
     def _version_triple(local_path, remote_name):
@@ -10980,7 +11009,15 @@ if __name__ == '__main__':
                             global_ip_deny[user_id] = dict(entries)
                         else:
                             global_ip_deny.pop(user_id, None)
-                        recent = {ip for ip, t in ip_tracker.get(user_id, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
+                        if len(global_ip_deny) > 4096:
+                            for _stale_uid in list(global_ip_deny):
+                                active_ip_deny(global_ip_deny, _stale_uid, now_ts)
+                        _raw_tracker = ip_tracker.get(user_id)
+                        recent = ({
+                            ip for ip, t in _raw_tracker.items()
+                            if isinstance(t, (int, float)) and not isinstance(t, bool)
+                            and 0 <= now_ts - t < IP_TIMEOUT_SECONDS
+                        } if isinstance(_raw_tracker, dict) else set())
                     # 只对「新加入拦截、且此刻在线」的 IP 踢一次：控制台每轮续期不会反复踢人。
                     fresh = set(entries) - before
                     online = recent | live_online_ips(user_id)
@@ -11329,8 +11366,13 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             update_lock_fd = None
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8', errors='replace')
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 target = form.get('target', [''])[0]
                 if target not in ('core', 'portal', 'awg', 'reality-online'):
@@ -11340,8 +11382,19 @@ if __name__ == '__main__':
                     # 开启在线统计要重启 xray；流量超额停用期间重启等于替 Reality 解除停用。
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，请在控制台恢复节点后再开启'})
+                    self._extend_deadline(60)
                     cfg_path = portal_path.parent / 'usage-meter-config.json'
-                    cfg = json.loads(cfg_path.read_text(encoding='utf-8')).get('reality', {})
+                    try:
+                        raw_meter_cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+                    except (OSError, ValueError) as exc:
+                        return self.reply_json(500, {'ok': False,
+                            'error': '读取 usage-meter-config.json 失败：%s' % exc})
+                    cfg = raw_meter_cfg.get('reality') if isinstance(raw_meter_cfg, dict) else None
+                    if (not isinstance(cfg, dict)
+                            or not isinstance(cfg.get('binary'), str) or not cfg['binary'].strip()
+                            or not isinstance(cfg.get('address'), str) or not cfg['address'].strip()):
+                        return self.reply_json(500, {'ok': False,
+                            'error': 'usage-meter-config.json 缺少有效的 reality 配置（binary/address）'})
                     spec = importlib.util.spec_from_file_location('reality_online_config', Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py')
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
@@ -11471,9 +11524,12 @@ if __name__ == '__main__':
                             _prune_portal_backups(base_dir,
                                                   protected=[str(b) for _, b in backups])
                             # scope 内脚本 ready/go 握手完成才交接；失败也走整包回滚。
-                            portal_start_update(
-                                restart_prefix, portal_update_restart_script(data['port'], backups, created),
-                                update_lock_fd)
+                            try:
+                                with data_lock:
+                                    restart_script = portal_update_restart_script(data['port'], backups, created)
+                            except NameError:
+                                restart_script = portal_update_restart_script(data['port'], backups, created)
+                            portal_start_update(restart_prefix, restart_script, update_lock_fd)
                     except Exception as e:
                         # 出错就把已替换的经同目录临时文件原子恢复回去，绝不留下半新半旧或半截文件
                         for dest, bak in backups:
@@ -11520,7 +11576,9 @@ if __name__ == '__main__':
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
                     # 先刷新控制脚本自身，再更新二进制。不需要重启面板。
-                    ensure_awgctl(force=True)
+                    if not ensure_awgctl(force=True):
+                        return self.reply_json(500, {'ok': False,
+                            'error': 'AmneziaWG 管理脚本刷新失败，已中止更新，请检查网络或查看门户日志'})
                     # awgctl update 要下载并核验二进制，超时 420 秒。
                     if not self._extend_deadline(480, heavy=True):
                         return self.reply_json(409, {'ok': False, 'error':
@@ -11567,6 +11625,10 @@ if __name__ == '__main__':
                         job = {'state': 'failed', 'error': str(exc)}
                     with data_lock:
                         data['core_upgrade'] = dict(job, finished_at=int(time.time()))
+                    try:
+                        with _ver_cache_lock:
+                            _core_ver_cache['t'] = 0.0
+                    except NameError:
                         _core_ver_cache['t'] = 0.0
                     # 结果已在内存，界面能读到；落盘失败只记日志（2026-11-04 修）：旧实现让
                     # 线程带着 traceback 死掉，磁盘上的任务一直是 running，重启后被当成中断任务。
@@ -12272,7 +12334,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
@@ -12297,7 +12364,10 @@ if __name__ == '__main__':
                     warp_not_installed = (data.get('warp_enabled') and not previous_warp_state
                                           and not warp_backend_installed())
                     if warp_not_installed:
-                        data['warp_enabled'] = previous_warp_state
+                        if previous_warp_state_exists:
+                            data['warp_enabled'] = previous_warp_state
+                        else:
+                            data.pop('warp_enabled', None)
                     # 没保存过名单时与页面显示同一口径（routing_state）：WARP 开着、或这次被打开 /
                     # 关掉，才落成默认名单。旧实现无条件从默认名单起步 —— WARP 关着时页面显示
                     # 「0 个已配置」，点「+ Netflix」后却冒出整套默认域名（2026-11-12 修）。
@@ -12319,8 +12389,8 @@ if __name__ == '__main__':
                         rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
                         keep = {r['domain'] for r in rules}
                         rules.extend({'domain': d, 'outbound': 'warp_socks'} for d in DEFAULT_WARP_DOMAINS if d not in keep)
-                    # 域名不合法时直接回 400、不落盘，内存里也不能先改（否则与磁盘不一致到重启）。
-                    if not bad_domain and (rules or previous_warp_rules_exists):
+                    # 域名不合法或未安装 WARP 时直接拒绝、不落盘，锁内也不能先写脏规则。
+                    if not bad_domain and not warp_not_installed and (rules or previous_warp_rules_exists):
                         data['warp_rules'] = rules
                     new_state = bool(data.get('warp_enabled'))
                     current_rules = [r['domain'] for r in rules if r['outbound'] in ('warp', 'warp_socks')]
@@ -12329,12 +12399,6 @@ if __name__ == '__main__':
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
                 if warp_not_installed:
-                    # 规则改动（如果有）与开关一起作废，不落盘。
-                    with data_lock:
-                        if previous_warp_rules_exists:
-                            data['warp_rules'] = previous_warp_rules
-                        else:
-                            data.pop('warp_rules', None)
                     return self.reply_json(409, {'ok': False, 'error':
                         '本机尚未安装 WARP（wireproxy），请先在「出站分流」里安装 WARP 再开启'})
                 try:
@@ -12429,7 +12493,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
@@ -12827,7 +12896,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
@@ -13279,7 +13353,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
                 enabled = _active_anytls_config() is not None
@@ -13498,7 +13577,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
                 enabled = _active_tuic_config() is not None
@@ -13622,7 +13706,12 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 action = form.get('action', ['toggle'])[0]
@@ -14173,6 +14262,8 @@ if __name__ == '__main__':
             """POST /install-warp 的处理逻辑（从 do_POST 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if not _warp_install_lock.acquire(blocking=False):
+                return self.reply_json(409, {'ok': False, 'error': 'WARP 正在安装中，请等待当前任务完成'})
             try:
                 # 安装脚本 subprocess 超时 180 秒，必须同步抬连接死线。
                 if not self._extend_deadline(240, heavy=True):
@@ -14224,8 +14315,15 @@ fi
 # 会被下次网页安装直接覆盖、被卸载当成本项目的删掉。
 claim_warp_assets() {
     if [ ! -f "$WARP_OWNED_MARKER" ]; then
-        : > "$WARP_OWNED_MARKER"
-        chmod 600 "$WARP_OWNED_MARKER"
+        (umask 077; : > "$WARP_OWNED_MARKER" && chmod 600 "$WARP_OWNED_MARKER")
+    fi
+}
+atomic_write_mode() {
+    local dst="$1" mode="$2" tmp
+    tmp=$(mktemp "${dst}.XXXXXX") || return 1
+    if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dst"; then
+        rm -f "$tmp"
+        return 1
     fi
 }
 
@@ -14288,9 +14386,9 @@ if [ ! -x "$WGCF_BIN" ]; then
     if ! verify_sha "${TD}/${WG_DL}" "$WANT"; then
         rm -rf "$TD"; echo "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致" >&2; exit 1
     fi
-    install -m 755 "${TD}/${WG_DL}" "${WGCF_BIN}.new" || { rm -rf "$TD"; exit 1; }
+    install -m 755 "${TD}/${WG_DL}" "${WGCF_BIN}.new" || { rm -rf "$TD" "${WGCF_BIN}.new"; exit 1; }
     rm -rf "$TD"; trap - EXIT
-    mv -f "${WGCF_BIN}.new" "$WGCF_BIN"
+    mv -f "${WGCF_BIN}.new" "$WGCF_BIN" || { rm -f "${WGCF_BIN}.new"; exit 1; }
 fi
 
 if [ ! -x "$WP_BIN" ]; then
@@ -14328,25 +14426,35 @@ if [ ! -x "$WP_BIN" ]; then
     if ! tar -xzf "${TD}/${WP_DL}" -C "${TD}/x" "$MEMBER" 2>/dev/null; then
         rm -rf "$TD"; echo "wireproxy 解压失败" >&2; exit 1
     fi
-    install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD"; exit 1; }
+    install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD" "${WP_BIN}.new"; exit 1; }
     rm -rf "$TD"; trap - EXIT
     claim_warp_assets
-    mv -f "${WP_BIN}.new" "$WP_BIN"
+    mv -f "${WP_BIN}.new" "$WP_BIN" || { rm -f "${WP_BIN}.new"; exit 1; }
 fi
 
 mkdir -p "$WG_DIR"
+chmod 700 "$WG_DIR" 2>/dev/null || true
 if [ ! -f "$WGCF_ACCT" ]; then
     log "匿名注册 Cloudflare WARP 设备..."
-    if ! "$WGCF_BIN" --config "$WGCF_ACCT" register --accept-tos >/tmp/wgcf-register.log 2>&1; then
-        echo "WARP 匿名注册失败，详见 /tmp/wgcf-register.log" >&2
+    WGCF_LOG=$(umask 077; mktemp)
+    if ! (umask 077; "$WGCF_BIN" --config "$WGCF_ACCT" register --accept-tos >"$WGCF_LOG" 2>&1); then
+        tail -n 20 "$WGCF_LOG" >&2 || true
+        rm -f "$WGCF_LOG"
+        echo "WARP 匿名注册失败" >&2
         exit 1
     fi
+    rm -f "$WGCF_LOG"
 fi
+chmod 600 "$WGCF_ACCT" 2>/dev/null || true
 if [ ! -f "$WGCF_CONF" ]; then
-    if ! ( cd "$WG_DIR" && "$WGCF_BIN" --config "$WGCF_ACCT" generate >/tmp/wgcf-generate.log 2>&1 ); then
-        echo "WARP 配置生成失败，详见 /tmp/wgcf-generate.log" >&2
+    WGCF_LOG=$(umask 077; mktemp)
+    if ! (umask 077; cd "$WG_DIR" && "$WGCF_BIN" --config "$WGCF_ACCT" generate >"$WGCF_LOG" 2>&1); then
+        tail -n 20 "$WGCF_LOG" >&2 || true
+        rm -f "$WGCF_LOG"
+        echo "WARP 配置生成失败" >&2
         exit 1
     fi
+    rm -f "$WGCF_LOG"
 fi
 [ -f "${WG_DIR}/wgcf-profile.conf" ] && [ ! -f "$WGCF_CONF" ] && mv -f "${WG_DIR}/wgcf-profile.conf" "$WGCF_CONF"
 [ -f /root/wgcf-profile.conf ] && [ ! -f "$WGCF_CONF" ] && mv -f /root/wgcf-profile.conf "$WGCF_CONF"
@@ -14354,6 +14462,7 @@ if [ ! -f "$WGCF_CONF" ]; then
     echo "未找到 wgcf 生成的 WireGuard 配置" >&2
     exit 1
 fi
+chmod 600 "$WGCF_CONF" 2>/dev/null || true
 
 WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF")
 WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF")
@@ -14393,7 +14502,7 @@ WPEOF
     trap - EXIT
 )
 
-cat > /etc/systemd/system/wireproxy.service <<'WPSVCEOF'
+atomic_write_mode /etc/systemd/system/wireproxy.service 644 <<'WPSVCEOF'
 [Unit]
 Description=WireProxy (Cloudflare WARP SOCKS5)
 After=network-online.target
@@ -14430,7 +14539,7 @@ if systemctl list-unit-files 2>/dev/null | grep -q '^warp-svc'; then
     systemctl disable --now warp-svc >/dev/null 2>&1 || true
 fi
 
-cat > /usr/local/bin/hy2-warp-watchdog.sh <<'WDE'
+atomic_write_mode /usr/local/bin/hy2-warp-watchdog.sh 755 <<'WDE'
 #!/usr/bin/env bash
 set -u
 # 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
@@ -14441,9 +14550,8 @@ if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
 WDE
-chmod 755 /usr/local/bin/hy2-warp-watchdog.sh
 
-cat > /etc/systemd/system/hy2-warp-watchdog.service <<'WDSE'
+atomic_write_mode /etc/systemd/system/hy2-warp-watchdog.service 644 <<'WDSE'
 [Unit]
 Description=Cloudflare WARP Watchdog for Hysteria 2
 After=network.target
@@ -14453,7 +14561,7 @@ Type=oneshot
 ExecStart=/usr/local/bin/hy2-warp-watchdog.sh
 WDSE
 
-cat > /etc/systemd/system/hy2-warp-watchdog.timer <<'WDTE'
+atomic_write_mode /etc/systemd/system/hy2-warp-watchdog.timer 644 <<'WDTE'
 [Unit]
 Description=Run WARP Watchdog every 3 minutes
 
@@ -14502,14 +14610,35 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # Install success is not routing success: apply the domain ACL
                 # directly, never call the legacy script with mismatched arguments.
                 with data_lock:
+                    previous_warp_enabled_exists = 'warp_enabled' in data
+                    previous_warp_rules_exists = 'warp_rules' in data
+                    previous_warp_enabled = copy.deepcopy(data.get('warp_enabled'))
+                    previous_warp_rules = copy.deepcopy(data.get('warp_rules'))
                     data['warp_enabled'] = True
-                    data.setdefault('warp_rules', list(DEFAULT_WARP_DOMAINS))
-                save_data()
+                    if not isinstance(data.get('warp_rules'), list):
+                        data['warp_rules'] = list(DEFAULT_WARP_DOMAINS)
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        if previous_warp_enabled_exists:
+                            data['warp_enabled'] = previous_warp_enabled
+                        else:
+                            data.pop('warp_enabled', None)
+                        if previous_warp_rules_exists:
+                            data['warp_rules'] = previous_warp_rules
+                        else:
+                            data.pop('warp_rules', None)
+                    raise
                 return self._reply_with_warp_apply({
                     'message': 'WARP 通道安装完成，正在应用分流配置。',
                 })
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
+            finally:
+                _warp_install_lock.release()
 
         def do_HEAD(self):
             """HEAD 与 GET 走同一套路由，只是不发正文（2026-11-04 修）。
@@ -15409,8 +15538,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
             if query.get('force', ['0'])[0] == '1':
-                _ver_cache['t'] = 0.0
-                _core_ver_cache['t'] = 0.0
+                try:
+                    with _ver_cache_lock:
+                        _ver_cache['t'] = 0.0
+                        _core_ver_cache['t'] = 0.0
+                except NameError:
+                    _ver_cache['t'] = 0.0
+                    _core_ver_cache['t'] = 0.0
             core_curr, core_latest, core_has_update = '未知', '', False
             try:
                 out = subprocess.run(['/usr/local/bin/hysteria', 'version'], capture_output=True, text=True, timeout=3).stdout
@@ -15421,20 +15555,35 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             except Exception as exc:
                 _log_ignored('core_version', exc)
             now = time.time()
-            if now - _core_ver_cache['t'] >= (300 if _core_ver_cache['tag'] else 30):
+            try:
+                with _ver_cache_lock:
+                    core_cached_t = _core_ver_cache['t']
+                    core_cached_tag = _core_ver_cache['tag']
+            except NameError:
+                core_cached_t = _core_ver_cache['t']
+                core_cached_tag = _core_ver_cache['tag']
+            if now - core_cached_t >= (300 if core_cached_tag else 30):
                 try:
                     req = urllib.request.Request('https://api.github.com/repos/apernet/hysteria/releases/latest',
                                                  headers={'User-Agent': 'hysteria2-installer'})
                     with urllib.request.urlopen(req, timeout=3) as response:
                         release = json.loads(_read_bounded_bytes(response).decode('utf-8', errors='replace'))
-                    _core_ver_cache['tag'] = (
+                    new_tag = (
                         str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
                         if isinstance(release, dict) else ''
                     )
                 except Exception:
-                    _core_ver_cache['tag'] = ''
-                _core_ver_cache['t'] = now
-            core_latest = _core_ver_cache['tag']
+                    new_tag = ''
+                try:
+                    with _ver_cache_lock:
+                        _core_ver_cache['tag'] = new_tag
+                        _core_ver_cache['t'] = now
+                except NameError:
+                    _core_ver_cache['tag'] = new_tag
+                    _core_ver_cache['t'] = now
+                core_latest = new_tag
+            else:
+                core_latest = core_cached_tag
             if core_version_key(core_curr) and core_version_key(core_latest):
                 core_has_update = core_version_key(core_latest) > core_version_key(core_curr)
 
@@ -15811,7 +15960,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
             except Exception:

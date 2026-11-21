@@ -7,7 +7,16 @@ import shutil
 import subprocess
 import time
 
+def _validate_loopback_address(address):
+    if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
+        raise ValueError('stats endpoint must be loopback')
+    port_text = address[len('127.0.0.1:'):]
+    if not port_text.isdigit() or not (1 <= int(port_text) <= 65535):
+        raise ValueError('stats endpoint must be loopback')
+
+
 def add_stats(config, port):
+    if not isinstance(config, dict):raise ValueError('invalid xray config')
     if type(port) is not int or not 1024<=port<=65535:raise ValueError('invalid port')
     cfg=copy.deepcopy(config)
     original_clients=[copy.deepcopy(i.get('settings',{}).get('clients')) for i in cfg.get('inbounds',[])]
@@ -139,11 +148,12 @@ def _rollback_restart_xray():
 
 def enable_iplimit_routing(config_path, binary, address):
     """幂等开启设备上限所需的路由接口；预检后替换，重启失败恢复原配置。不触碰 clients。"""
-    if not address.startswith('127.0.0.1:'):raise ValueError('stats endpoint must be loopback')
+    _validate_loopback_address(address)
     path=pathlib.Path(config_path)
     original=path.read_bytes()
     orig_mode=(path.stat().st_mode & 0o777) or 0o600
     config=json.loads(original)
+    if not isinstance(config, dict):raise ValueError('invalid xray config')
     if iplimit_routing_ready(config):
         return {'enabled':True,'changed':False,'backup':None}
     clients=[copy.deepcopy(i.get('settings',{}).get('clients')) for i in config.get('inbounds',[])]
@@ -175,8 +185,11 @@ def enable_iplimit_routing(config_path, binary, address):
         else:raise RuntimeError('routing api unavailable after restart')
     except Exception:
         if replaced:
-            _write_private_bytes(candidate, original, orig_mode)
-            os.replace(candidate,path)
+            try:
+                _write_private_bytes(candidate, original, orig_mode)
+                os.replace(candidate,path)
+            except OSError:
+                pass
             _rollback_restart_xray()
         raise
     finally:
@@ -187,10 +200,12 @@ def enable_iplimit_routing(config_path, binary, address):
 
 def enable_reality_online(config_path, binary, address):
     """只开启在线统计；校验后替换，失败恢复原配置，不触碰用户或 Reality 参数。"""
+    _validate_loopback_address(address)
     path=pathlib.Path(config_path)
     original=path.read_bytes()
     orig_mode=(path.stat().st_mode & 0o777) or 0o600
     config=json.loads(original)
+    if not isinstance(config, dict):raise ValueError('invalid xray config')
     levels=config.setdefault('policy',{}).setdefault('levels',{})
     used={'0'}
     for inbound in config.get('inbounds',[]):
@@ -203,7 +218,6 @@ def enable_reality_online(config_path, binary, address):
     # 新建一份，/etc/hysteria 下无界累积。
     backup=path.with_name(path.name+'.before-reality-online')
     backup_tmp=path.with_name(path.name+'.before-reality-online.tmp')
-    if not address.startswith('127.0.0.1:'):raise ValueError('stats endpoint must be loopback')
     if changed:
         replaced=False
         try:
@@ -221,14 +235,17 @@ def enable_reality_online(config_path, binary, address):
                 try:
                     subprocess.run([binary,'api','statsgetallonlineusers','--server='+address],capture_output=True,timeout=5,check=True)
                     break
-                except subprocess.CalledProcessError:
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                     if attempt == 9:
                         raise
                     time.sleep(0.5)
         except Exception:
             if replaced:
-                _write_private_bytes(candidate, original, orig_mode)
-                os.replace(candidate,path)
+                try:
+                    _write_private_bytes(candidate, original, orig_mode)
+                    os.replace(candidate,path)
+                except OSError:
+                    pass
                 # 回滚后的重启不带 check 且隔离超时异常，避免顶掉真正的失败原因。
                 _rollback_restart_xray()
             raise

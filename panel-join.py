@@ -193,7 +193,13 @@ def main():
 
     raw_api_key = meta.get("api_key")
     api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
-    portal_port = meta.get("port")
+    raw_portal_port = meta.get("port")
+    if isinstance(raw_portal_port, int) and not isinstance(raw_portal_port, bool) and 1 <= raw_portal_port <= 65535:
+        portal_port = raw_portal_port
+    elif isinstance(raw_portal_port, str) and raw_portal_port.strip().isdigit() and 1 <= int(raw_portal_port.strip()) <= 65535:
+        portal_port = int(raw_portal_port.strip())
+    else:
+        portal_port = None
     if not api_key:
         print("portal.json 里没有 api_key —— 这台节点的 portal 版本太旧，"
               "请先升级 hysteria2-installer。", file=sys.stderr)
@@ -265,12 +271,24 @@ def main():
         if not args.panel:
             print("--format curl / --register 需要 --panel", file=sys.stderr)
             return 2
+        raw_panel = args.panel.strip()
+        if any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in raw_panel):
+            print("--panel 不能包含空白或控制字符", file=sys.stderr)
+            return 2
         # 只接受 https 且不含查询串或锚点：避免把 /api/nodes 拼进 query/fragment。
-        _p = urllib.parse.urlsplit(args.panel.strip())
+        _p = urllib.parse.urlsplit(raw_panel)
+        try:
+            _panel_port = _p.port
+        except ValueError:
+            print("--panel 端口不合法（必须在 1-65535 之间）", file=sys.stderr)
+            return 2
+        if _panel_port is not None and not (1 <= _panel_port <= 65535):
+            print("--panel 端口不合法（必须在 1-65535 之间）", file=sys.stderr)
+            return 2
         if _p.scheme != "https" or not _p.hostname or _p.query or _p.fragment:
             print("--panel 必须是 https:// 开头的面板地址（不能包含 ? 或 #）", file=sys.stderr)
             return 2
-        panel = args.panel.strip().rstrip("/")
+        panel = raw_panel.rstrip("/")
 
     if args.format == "curl":
         body = json.dumps({
@@ -292,6 +310,9 @@ def main():
             return 2
         if not args.admin_token:
             print("--register 需要 --admin-token", file=sys.stderr)
+            return 2
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in args.admin_token):
+            print("--admin-token 不能包含换行或控制字符", file=sys.stderr)
             return 2
         body = json.dumps({
             "name": args.name or result["suggested_name"],

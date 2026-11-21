@@ -4554,8 +4554,7 @@ install_warp_local_proxy() {
                 && grep -qF 'ExecStart=/usr/local/bin/wireproxy -c /etc/wireguard/wp.conf' \
                     /etc/systemd/system/wireproxy.service; then
             # Adopt only an unmistakably older installer-managed WARP deployment.
-            : > "$HY2_WARP_OWNED_MARKER"
-            chmod 600 "$HY2_WARP_OWNED_MARKER"
+            (umask 077; : > "$HY2_WARP_OWNED_MARKER" && chmod 600 "$HY2_WARP_OWNED_MARKER")
         elif [[ -e "$WP_BIN" || -e /etc/systemd/system/wireproxy.service || -e /etc/wireguard/wp.conf ]]; then
             log_err "wireproxy 资产已存在但归属无法确认；为避免覆盖宿主服务，已停止 WARP 安装。"
             return 1
@@ -4599,12 +4598,16 @@ install_warp_local_proxy() {
             return 1
         fi
         if ! install -m 755 "${TMP_DIR}/${WGCF_DL}" "${WGCF_BIN}.new"; then
-            rm -rf "$TMP_DIR"
+            rm -rf "$TMP_DIR" "${WGCF_BIN}.new"
             log_err "安装 wgcf 失败，现有文件未改动。"
             return 1
         fi
         rm -rf "$TMP_DIR"
-        mv -f "${WGCF_BIN}.new" "$WGCF_BIN"
+        if ! mv -f "${WGCF_BIN}.new" "$WGCF_BIN"; then
+            rm -f "${WGCF_BIN}.new"
+            log_err "替换 wgcf 失败，现有文件未改动。"
+            return 1
+        fi
     fi
 
     # 2. 下载 wireproxy (把 WireGuard 配置转成 socks5 代理)
@@ -4666,36 +4669,50 @@ install_warp_local_proxy() {
             return 1
         fi
         if ! install -m 755 "${TMP_EXTRACT}/${WP_MEMBER}" "${WP_BIN}.new"; then
-            rm -rf "$TMP_DIR" "$TMP_EXTRACT"
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT" "${WP_BIN}.new"
             log_err "安装 wireproxy 失败，现有文件未改动。"
             return 1
         fi
         rm -rf "$TMP_DIR" "$TMP_EXTRACT"
-        mv -f "${WP_BIN}.new" "$WP_BIN"
+        if ! mv -f "${WP_BIN}.new" "$WP_BIN"; then
+            rm -f "${WP_BIN}.new"
+            log_err "替换 wireproxy 失败，现有文件未改动。"
+            return 1
+        fi
     fi
     # 只有可信 wireproxy 二进制已成功安装，才登记本项目所有权。
     if [[ ! -e "$HY2_WARP_OWNED_MARKER" ]]; then
-        : > "$HY2_WARP_OWNED_MARKER"
-        chmod 600 "$HY2_WARP_OWNED_MARKER"
+        (umask 077; : > "$HY2_WARP_OWNED_MARKER" && chmod 600 "$HY2_WARP_OWNED_MARKER")
     fi
 
     # 3. 匿名注册 WARP 设备 (一次性)
     mkdir -p "$WGCF_DIR"
+    chmod 700 "$WGCF_DIR" 2>/dev/null || true
     # BUGFIX: wgcf generate 输出的 wgcf-profile.conf 总是写到 $HOME 不受 --config 控制,
     # 必须先 cd 到目标目录再用相对路径生成
+    local _wgcf_log=""
     if [[ ! -f "$WGCF_ACCT" ]]; then
         log_step "匿名注册 Cloudflare WARP 设备 (无邮件/验证码)..."
-        if ! "$WGCF_BIN" --config "$WGCF_ACCT" register --accept-tos >/tmp/wgcf-register.log 2>&1; then
-            log_err "WARP 匿名注册失败，请查看 /tmp/wgcf-register.log"
+        _wgcf_log=$(umask 077; mktemp)
+        if ! (umask 077; "$WGCF_BIN" --config "$WGCF_ACCT" register --accept-tos >"$_wgcf_log" 2>&1); then
+            tail -n 20 "$_wgcf_log" >&2 || true
+            rm -f "$_wgcf_log"
+            log_err "WARP 匿名注册失败"
             return 1
         fi
+        rm -f "$_wgcf_log"
     fi
+    chmod 600 "$WGCF_ACCT" 2>/dev/null || true
     if [[ ! -f "$WGCF_CONF" ]]; then
         # cd 到 /etc/wireguard/ 后, generate 输出的 wgcf-profile.conf 也会在这里
-        if ! (cd "$WGCF_DIR" && "$WGCF_BIN" --config "$WGCF_ACCT" generate >/tmp/wgcf-generate.log 2>&1); then
-            log_err "WARP 配置生成失败，请查看 /tmp/wgcf-generate.log"
+        _wgcf_log=$(umask 077; mktemp)
+        if ! (umask 077; cd "$WGCF_DIR" && "$WGCF_BIN" --config "$WGCF_ACCT" generate >"$_wgcf_log" 2>&1); then
+            tail -n 20 "$_wgcf_log" >&2 || true
+            rm -f "$_wgcf_log"
+            log_err "WARP 配置生成失败"
             return 1
         fi
+        rm -f "$_wgcf_log"
     fi
     # 把 $HOME 残留的 wgcf-profile.conf 移过来 (兼容老版本 wgcf 行为)
     if [[ ! -f "$WGCF_CONF" && -f "/root/wgcf-profile.conf" ]]; then
@@ -4705,6 +4722,7 @@ install_warp_local_proxy() {
     if [[ -f "${WGCF_DIR}/wgcf-profile.conf" && ! -f "$WGCF_CONF" ]]; then
         mv "${WGCF_DIR}/wgcf-profile.conf" "$WGCF_CONF"
     fi
+    chmod 600 "$WGCF_CONF" 2>/dev/null || true
 
     # 4. 生成 wireproxy 配置 (只暴露 socks5 在 127.0.0.1)
     WP_CFG="/etc/wireguard/wp.conf"
@@ -4742,8 +4760,13 @@ EOF
         trap - EXIT
     )
 
-    # 5. wireproxy systemd 守护
-    cat > /etc/systemd/system/wireproxy.service <<EOF
+    # 5. wireproxy systemd 守护（同目录临时文件原子替换）
+    local _wp_unit_tmp=""
+    _wp_unit_tmp="$(mktemp "/etc/systemd/system/wireproxy.service.XXXXXX")" || {
+        log_err "无法创建 wireproxy.service 临时文件。"
+        return 1
+    }
+    if ! cat > "$_wp_unit_tmp" <<EOF
 [Unit]
 Description=WireProxy (Cloudflare WARP SOCKS5)
 After=network-online.target
@@ -4759,6 +4782,13 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        rm -f "$_wp_unit_tmp"
+        log_err "写入 wireproxy.service 失败。"
+        return 1
+    fi
+    chmod 644 "$_wp_unit_tmp"
+    mv -f "$_wp_unit_tmp" /etc/systemd/system/wireproxy.service
     systemctl daemon-reload
     systemctl reset-failed wireproxy >/dev/null 2>&1 || true
     systemctl enable --now wireproxy >/dev/null 2>&1 || true
@@ -4788,7 +4818,12 @@ fi
 EOWD
     chmod 755 /usr/local/bin/hy2-warp-watchdog.sh
 
-    cat > /etc/systemd/system/hy2-warp-watchdog.service <<EOF
+    local _wd_svc_tmp="" _wd_tmr_tmp=""
+    _wd_svc_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.service.XXXXXX")" || {
+        log_err "无法创建 hy2-warp-watchdog.service 临时文件。"
+        return 1
+    }
+    if ! cat > "$_wd_svc_tmp" <<EOF
 [Unit]
 Description=Cloudflare WARP Watchdog for Hysteria 2
 After=network.target
@@ -4797,8 +4832,19 @@ After=network.target
 Type=oneshot
 ExecStart=/usr/local/bin/hy2-warp-watchdog.sh
 EOF
+    then
+        rm -f "$_wd_svc_tmp"
+        log_err "写入 hy2-warp-watchdog.service 失败。"
+        return 1
+    fi
+    chmod 644 "$_wd_svc_tmp"
+    mv -f "$_wd_svc_tmp" /etc/systemd/system/hy2-warp-watchdog.service
 
-    cat > /etc/systemd/system/hy2-warp-watchdog.timer <<EOF
+    _wd_tmr_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.timer.XXXXXX")" || {
+        log_err "无法创建 hy2-warp-watchdog.timer 临时文件。"
+        return 1
+    }
+    if ! cat > "$_wd_tmr_tmp" <<EOF
 [Unit]
 Description=Run WARP Watchdog every 3 minutes
 
@@ -4810,6 +4856,13 @@ Unit=hy2-warp-watchdog.service
 [Install]
 WantedBy=timers.target
 EOF
+    then
+        rm -f "$_wd_tmr_tmp"
+        log_err "写入 hy2-warp-watchdog.timer 失败。"
+        return 1
+    fi
+    chmod 644 "$_wd_tmr_tmp"
+    mv -f "$_wd_tmr_tmp" /etc/systemd/system/hy2-warp-watchdog.timer
     systemctl daemon-reload
     systemctl enable --now hy2-warp-watchdog.timer >/dev/null 2>&1 || true
 

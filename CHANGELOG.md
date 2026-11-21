@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十四批十项修复，门户 2.54
+
+- 在线更新处理器四重加固（`portal.py` 的 `_h_post_do_upgrade_impl`）：校验 `Content-Length` 处于 `0..65536` 拦截负值或超大正文防止读取阻塞；`reality-online` 分支前置 `self._extend_deadline(60)` 并校验 `usage-meter-config.json` 顶层与 `reality` 字段（`binary`/`address`）有效后再执行；`awg` 分支检查 `ensure_awgctl(force=True)` 返回值，刷新失败立即报错中止；门户更新生成重启脚本时加锁读取门户端口。
+- 七处协议与出站表单长度校验与 WARP 锁窗口消除（`portal.py`）：`manage-warp`、`manage-reality`、`manage-vmess`、`manage-anytls`、`manage-tuic`、`manage-vlessenc` 与 `_ob_manage` 全部校验 `0 <= Content-Length <= 65536`，杜绝负长度静默回落成 `action='toggle'` 意外翻转协议开关；`_h_post_manage_warp` 将未装 WARP 判定并入首次锁内写入条件，消除先写脏规则再二次加锁回滚的竞态窗口。
+- 网页端安装 WARP 原子落盘、私钥保护与并发互斥（`portal.py` 的 `_h_post_install_warp`）：新增模块级 `_warp_install_lock` 串行保护安装避免并发覆写；内嵌脚本中 `wgcf-account.toml` 与 `wgcf.conf` 在 `umask 077` 下生成并设 `chmod 600`、改用私有临时日志取代固定 `/tmp/wgcf-*.log`；`wireproxy.service` 与看门狗脚本及单元全部改为同目录 `mktemp` 原子落盘；`save_data()` 失败时完整回滚内存 `warp_enabled` 与 `warp_rules`。
+- 门户刷新与沿用流程非对象容错与损坏字段自愈（`portal.py` 的 `_refresh_portal_state` 与 `_adopt_locked`）：显式拦截非 JSON 对象的 `client_meta.json` 与 `portal.json` 并抛出清晰 `ValueError`；`_refresh_portal_state` 对空串或非字符串 `api_key`、非字典 `users` 与非列表 `proxy_services` 执行自愈修复。
+- 版本检查缓存与升级线程并发加锁（`portal.py`）：新增模块级 `_ver_cache_lock` 保护 `_remote_root_shas`、`_h_get_check_version` 与 `upgrade_worker` 对 `_ver_cache`、`_core_ver_cache` 的原子读写与失效重置，同时保持网络请求在锁外执行不阻塞。
+- 跨节点设备黑名单损坏追踪容错与过期清理（`portal.py` 的 `users/ip-deny`）：校验 `ip_tracker` 条目必为字典且时间戳为合法非布尔数字（过滤时钟回拨），防止损坏条目引发 500；`global_ip_deny` 超过 4096 条时自动回收全部已过期条目防内存无限增长。
+- Xray 计量配置助手校验前置、超时重试与回滚隔离（`usage-meter-xray-config-20261007-v1.py`）：`add_stats`、`enable_iplimit_routing` 与 `enable_reality_online` 统一校验配置为对象且回环地址端口合法（`127.0.0.1:1..65535`）；`enable_reality_online` 重启后 gRPC 探活循环兼容 `TimeoutExpired` 重试；回滚写回原配置隔离 `OSError` 不掩盖原始异常。
+- 面板接入脚本参数安全校验（`panel-join.py`）：校验 `--panel` 禁止空白与控制字符且显式端口处于 `1..65535`，拦截无效端口输出坏命令；`--admin-token` 拒绝换行与控制字符防止请求头注入；对 `portal.json` 异常 `port` 字段做安全类型校验。
+- 安装脚本本地 WARP 部署私钥保护与原子落盘（`install.sh` 的 `install_warp_local_proxy`）：`wgcf` 账号与配置纳入 `umask 077` 并执行 `chmod 600` 保护私钥，日志改用私有 `mktemp` 并在退出前清理；归属标记在 `umask 077` 下创建；`wireproxy.service`、`hy2-warp-watchdog.service` 与 `hy2-warp-watchdog.timer` 改用同目录临时文件原子替换，二进制替换失败立即清理 `.new` 残片。
+- 门户前端后台轮询节能、防连点与异常提示补齐（`portal_assets.py`）：网速 2 秒轮询补充 `!document.hidden && !portalSessionExpired` 护栏，切后台或会话过期立即停止；WARP 重置规则按钮增加请求中禁用防连点；AmneziaWG 安装、新增客户端、切协议线与升级四处操作全部补齐网络异常捕获弹窗提示，消除未处理 Promise 拒绝。
+
 ## 2026-11-22 — 第四十三批十项修复，门户 2.53
 
 - 节点启动时间解析消除夏令时偏移（`portal.py` 的 `_hy2_config_loaded`）：解析 systemd 服务启动时间中的 `UTC`/`GMT` 时间戳时，改为纯整数格里高利历转纪元秒公式，彻底消除欧美夏令时下因 `time.mktime` 与 `time.timezone` 差 3600 秒导致的配置重载误判。
