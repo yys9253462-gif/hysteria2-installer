@@ -182,19 +182,28 @@ hy2_git_blob_sha() {
     { printf 'blob %s\0' "$size"; cat -- "$f"; } | sha1sum | awk '{print $1}'
 }
 
-# 拒绝含绝对路径或 `..` 的 tar 包（防路径穿越以 root 写出临时目录）。
+# 拒绝含绝对路径、`..`、反斜杠、空清单或链接/特殊文件成员的 tar 包（防路径穿越与符号链接逃逸）。
 hy2_tar_listing_safe() {
-    local member listing
+    local member listing vlisting vline
     [[ -f "${1:-}" ]] || return 1
     # 从 stdin 读包：GNU tar 会把带冒号的路径（如 Windows 盘符）当成远程主机。
-    # 读不出清单必须判为不安全（fail-closed），否则损坏或异常的包会被放行。
+    # 读不出清单或清单为空必须判为不安全（fail-closed），否则损坏或异常的包会被放行。
     listing="$(tar -tzf - <"$1" 2>/dev/null)" || return 1
+    [[ -n "$listing" ]] || return 1
     while IFS= read -r member; do
         member="${member%$'\r'}"
         case "$member" in
-            /*|..|../*|*/../*|*/..) return 1 ;;
+            /*|..|../*|*/../*|*/..|*\\*) return 1 ;;
         esac
     done <<<"$listing"
+    vlisting="$(tar -tvzf - <"$1" 2>/dev/null)" || return 1
+    [[ -n "$vlisting" ]] || return 1
+    while IFS= read -r vline; do
+        case "$vline" in
+            -*|d*) ;;
+            *) return 1 ;;
+        esac
+    done <<<"$vlisting"
     return 0
 }
 
@@ -1481,6 +1490,10 @@ setup_cert_via_existing_caddy() {
     local domain="$1"
     local certdir="/var/lib/caddy/.local/share/caddy/certificates"
     command -v caddy >/dev/null 2>&1 || { log_err "未找到 caddy 命令。"; return 1; }
+    if [[ -z "$domain" || "$domain" == *..* || ! "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        log_err "域名格式不合法，已拒绝写入 Caddyfile: ${domain}"
+        return 1
+    fi
 
     log_step "检测到本机 Caddy，正尝试让它为 ${domain} 签发证书..."
     # 先看它手里有没有现成的（含自动续期签过的）
@@ -1489,8 +1502,8 @@ setup_cert_via_existing_caddy() {
         return 0
     fi
 
-    # 备份后追加站点块
-    local cf="/etc/caddy/Caddyfile" bak
+    # 备份后在同目录候选文件上构造并校验，校验通过才原子替换生产 Caddyfile
+    local cf="/etc/caddy/Caddyfile" bak cand rb_tmp
     [[ -f "$cf" ]] || { log_err "找不到 /etc/caddy/Caddyfile。"; return 1; }
     bak="${cf}.bak-hy2-$(date +%Y%m%d-%H%M%S)"
     cp -a "$cf" "$bak" || { log_err "备份 Caddyfile 失败。"; return 1; }
@@ -1499,7 +1512,8 @@ setup_cert_via_existing_caddy() {
     # 幂等：已存在该域名块就不重复追加
     local appended=0
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
-        cat >> "$cf" <<CEOF
+        cand="$(mktemp "${cf}.hy2-tmp.XXXXXX")" || { log_err "创建 Caddyfile 候选临时文件失败。"; return 1; }
+        if ! cp -p "$cf" "$cand" || ! cat >> "$cand" <<CEOF
 
 # 证书签发站点（由 install.sh 自动追加）
 # 用途：本机 80/443 已被 Caddy 占用，内置 ACME 无法自行签发，
@@ -1508,11 +1522,24 @@ ${domain} {
 $(caddy_decoy_directives "$domain")
 }
 CEOF
+        then
+            rm -f "$cand"
+            log_err "写入 Caddyfile 候选配置失败，生产配置未改动。"
+            return 1
+        fi
+        if ! caddy validate --config "$cand" --adapter caddyfile >/dev/null 2>&1; then
+            rm -f "$cand"
+            log_err "追加后的 Caddyfile 校验不通过，生产配置未改动。"
+            return 1
+        fi
+        if ! mv -f "$cand" "$cf"; then
+            rm -f "$cand"
+            log_err "原子替换 Caddyfile 失败，生产配置未改动。"
+            return 1
+        fi
         appended=1
-    fi
-    if ! caddy validate --config "$cf" >/dev/null 2>&1; then
-        log_err "追加后的 Caddyfile 校验不通过，已回滚。"
-        cp -a "$bak" "$cf"
+    elif ! caddy validate --config "$cf" --adapter caddyfile >/dev/null 2>&1; then
+        log_err "现有 Caddyfile 校验不通过，已中止。"
         return 1
     fi
     # reload 而非 restart：保住现有线上连接（Caddy 2 在跑生产站点）
@@ -1533,7 +1560,13 @@ CEOF
         sleep 5
     done
     if [[ "$appended" == 1 ]]; then
-        cp -a "$bak" "$cf" 2>/dev/null || true
+        rb_tmp="$(mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
+        if [[ -n "$rb_tmp" ]] && cp -p "$bak" "$rb_tmp" 2>/dev/null && mv -f "$rb_tmp" "$cf" 2>/dev/null; then
+            :
+        else
+            rm -f "$rb_tmp" 2>/dev/null || true
+            cp -a "$bak" "$cf" 2>/dev/null || true
+        fi
         systemctl reload caddy 2>/dev/null || true
         log_warn "签发超时，已从备份回滚本次自动追加到 Caddyfile 的占位站点块。"
     fi
@@ -4625,7 +4658,9 @@ install_warp_local_proxy() {
             WGCF_TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
         fi
         WGCF_VER="${WGCF_TAG#v}"
-        [[ -z "$WGCF_VER" || "$WGCF_VER" == "null" ]] && WGCF_VER="2.3.0"
+        if [[ -z "$WGCF_VER" || "$WGCF_VER" == "null" || "$WGCF_VER" == *..* || ! "$WGCF_VER" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+            WGCF_VER="2.3.0"
+        fi
         WGCF_DL="wgcf_${WGCF_VER}_linux_${WGCF_ARCH}"
         WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/${WGCF_DL}"
         log_info "目标 wgcf 版本: v${WGCF_VER}"
@@ -4647,14 +4682,20 @@ install_warp_local_proxy() {
             log_err "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致，已放弃安装。"
             return 1
         fi
-        if ! install -m 755 "${TMP_DIR}/${WGCF_DL}" "${WGCF_BIN}.new"; then
-            rm -rf "$TMP_DIR" "${WGCF_BIN}.new"
+        local _wgcf_stage=""
+        _wgcf_stage="$(umask 022; mktemp "${WGCF_BIN}.new.XXXXXX")" || {
+            rm -rf "$TMP_DIR"
+            log_err "创建 wgcf 暂存文件失败，现有文件未改动。"
+            return 1
+        }
+        if ! install -m 755 "${TMP_DIR}/${WGCF_DL}" "$_wgcf_stage"; then
+            rm -rf "$TMP_DIR" "$_wgcf_stage"
             log_err "安装 wgcf 失败，现有文件未改动。"
             return 1
         fi
         rm -rf "$TMP_DIR"
-        if ! mv -f "${WGCF_BIN}.new" "$WGCF_BIN"; then
-            rm -f "${WGCF_BIN}.new"
+        if ! mv -f "$_wgcf_stage" "$WGCF_BIN"; then
+            rm -f "$_wgcf_stage"
             log_err "替换 wgcf 失败，现有文件未改动。"
             return 1
         fi
@@ -4677,6 +4718,9 @@ install_warp_local_proxy() {
         # ⚠️ 旧实现回退只改了 WP_VER，拼 URL 却仍用空的 WP_TAG，于是回退分支拼出
         #    `.../download//wireproxy_...`（404），回退形同虚设。现在统一用 WP_TAG。
         if [[ -z "$WP_TAG" || "$WP_TAG" == "null" ]]; then
+            WP_TAG="v1.1.3"
+        fi
+        if [[ "$WP_TAG" == *..* || ! "$WP_TAG" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
             WP_TAG="v1.1.3"
         fi
         WP_ASSET="wireproxy_linux_${WP_ARCH}.tar.gz"
@@ -4718,14 +4762,20 @@ install_warp_local_proxy() {
             log_err "wireproxy 解压失败"
             return 1
         fi
-        if ! install -m 755 "${TMP_EXTRACT}/${WP_MEMBER}" "${WP_BIN}.new"; then
-            rm -rf "$TMP_DIR" "$TMP_EXTRACT" "${WP_BIN}.new"
+        local _wp_stage=""
+        _wp_stage="$(umask 022; mktemp "${WP_BIN}.new.XXXXXX")" || {
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT"
+            log_err "创建 wireproxy 暂存文件失败，现有文件未改动。"
+            return 1
+        }
+        if ! install -m 755 "${TMP_EXTRACT}/${WP_MEMBER}" "$_wp_stage"; then
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT" "$_wp_stage"
             log_err "安装 wireproxy 失败，现有文件未改动。"
             return 1
         fi
         rm -rf "$TMP_DIR" "$TMP_EXTRACT"
-        if ! mv -f "${WP_BIN}.new" "$WP_BIN"; then
-            rm -f "${WP_BIN}.new"
+        if ! mv -f "$_wp_stage" "$WP_BIN"; then
+            rm -f "$_wp_stage"
             log_err "替换 wireproxy 失败，现有文件未改动。"
             return 1
         fi
@@ -4779,6 +4829,10 @@ install_warp_local_proxy() {
     WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF" | tr -d '\r')
     WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
     WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+    if [[ -z "$WG_PRIV" || -z "$WG_PUB" || -z "$WG_EP" ]]; then
+        log_err "WireGuard 配置解析失败（PrivateKey / PublicKey / Endpoint 缺失），已中止。"
+        return 1
+    fi
     # 用 wgcf 下发的地址（含 IPv6），AllowedIPs 同时放行 ::/0（2026-11-03 修）：
     # 旧配置只写 IPv4，走 WARP 的域名一旦解析到 IPv6 就连不上（SE 上实测）。
     WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
@@ -4854,8 +4908,13 @@ EOF
     # 7. 把 hysteria config.yaml 的 outbound warp_socks 端口同步到 19898
     warp_migrate_legacy_outbound "$WARP_SOCKS_ADDR"
 
-    # 8. Watchdog (走 WARP socks5 探活, 失败则重启 wireproxy)
-    cat > /usr/local/bin/hy2-warp-watchdog.sh <<EOWD
+    # 8. Watchdog (走 WARP socks5 探活, 失败则重启 wireproxy，原子落盘)
+    local _wd_sh_tmp=""
+    _wd_sh_tmp="$(umask 022; mktemp "/usr/local/bin/hy2-warp-watchdog.sh.XXXXXX")" || {
+        log_err "无法创建 hy2-warp-watchdog.sh 临时文件。"
+        return 1
+    }
+    if ! cat > "$_wd_sh_tmp" <<EOWD
 #!/usr/bin/env bash
 set -u
 # 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
@@ -4866,7 +4925,16 @@ if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
 EOWD
-    chmod 755 /usr/local/bin/hy2-warp-watchdog.sh
+    then
+        rm -f "$_wd_sh_tmp"
+        log_err "写入 hy2-warp-watchdog.sh 失败。"
+        return 1
+    fi
+    if ! chmod 755 "$_wd_sh_tmp" || ! mv -f "$_wd_sh_tmp" /usr/local/bin/hy2-warp-watchdog.sh; then
+        rm -f "$_wd_sh_tmp"
+        log_err "落盘 hy2-warp-watchdog.sh 失败。"
+        return 1
+    fi
 
     local _wd_svc_tmp="" _wd_tmr_tmp=""
     _wd_svc_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.service.XXXXXX")" || {

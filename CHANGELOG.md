@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十九批十项修复，门户 2.59
+
+- 协议启停死线续期与 AnyTLS/TUIC 停用核心锁序及停服超时回滚（`portal.py`）：五大协议启停接口（Reality / VMess / VLESS Encryption / AnyTLS / TUIC）在持锁前补齐 `self._extend_deadline(120)` 防触发 30 秒连接死线；AnyTLS 与 TUIC 停用及回滚统一纳入 `core_operation_lock` 与跨进程文件锁 `core_operation_file_lock()`；`systemctl disable --now` 捕获超时与 `OSError` 并经 `_restore_systemd_service_state` 完整回滚。
+- 沿用配置校验、页面重建凭据编码与 WARP 锁外探测（`portal.py`）：`_adopt_locked` 拦截布尔/越界端口及含空白、控制字符或非 ASCII 的 `node_api_key`；`regenerate_page` 安全读取 `token`、对订阅凭据做 `quote(..., safe='')` 编码并补充 `math.isfinite(t)` 过滤非有限时间；`restore_egress_into_config` 依据清洗后有效配置决定是否写回；`_h_post_manage_warp` 将 `warp_backend_installed()` 移出 `data_lock` 避免子进程阻塞鉴权。
+- 门户与安装脚本双端 WARP 安装加固（`portal.py` 与 `install.sh`）：`atomic_write_mode` 叠加 `umask 077`；`tar_member` 增 `tar -tvzf` 校验拦截符号/硬链接、设备节点与反斜杠；`wgcf`/`wireproxy` 增加版本格式正则校验与随机 `mktemp` 暂存；`install.sh` 校验提取出的 `WG_PRIV`/`WG_PUB`/`WG_EP` 非空并将 `hy2-warp-watchdog.sh` 改为原子落盘。
+- 归档安全扫描加固与借 Caddy 签发证书先验后原子替换（`portal.py` 与 `install.sh`）：`hy2_tar_listing_safe` 全面拦截符号/硬链接、设备节点、反斜杠与空归档；`setup_cert_via_existing_caddy` 增加合法域名格式校验，先在同目录候选文件上运行 `caddy validate --config "$cand" --adapter caddyfile` 校验通过再原子 `mv -f` 替换正式 `Caddyfile`，回滚同步改为原子替换。
+- Xray 配置事务初始探针与 `reset-failed` 异常隔离及 `O_NOFOLLOW` 私有写盘（`portal.py`）：`apply_xray_config_transaction` 隔离初始 `is-active`/`is-enabled` 探测超时及启用/回滚阶段 `systemctl reset-failed` 超时异常，避免辅助清理失败触发误回滚或打断恢复；`_write_priv` 叠加 `O_NOFOLLOW` 防止临时路径符号链接覆写。
+- 会话签验锁保护、Cookie 放大边界防护与重启接口命令探针（`portal.py`）：`sign_session` 在 `data_lock` 内原子读取 `session_epoch()`；`verify_session` 限制 `Cookie` 头总长不超过 `16384` 字节、最多验签前 `16` 个同名 `hy2_session` 候选防 HMAC CPU 放大，并对时间戳补充 `.isascii()` 拒绝全角数字；`_h_post_reboot_server` 先探测 `systemctl`/`reboot`/`/sbin/reboot` 可用性，缺失直接回 `500` 而不谎报 `200`，执行时通过 `exec "$@"` 安全传参。
+- Xray 准入快照损坏容错、回滚异常保留与计量/保留端口防护（`portal.py`）：`_apply_xray_access_snapshot_locked` 容忍托管入站 `settings: null` 与非字符串 `binary`（回退 `/usr/local/bin/xray`），回滚写盘包裹独立 `OSError` 捕获避免磁盘满掩盖原始重启异常；`apply_xray_config_with_meter` 兼容非对象计量配置并严格校验回环纯 ASCII 端口 `1..65535`；`managed_reserved_ports` 拦截布尔端口及损坏 `config`/`inbounds` 元素防崩溃。
+- 网页用户管理删除回滚并发保护与密码控制字符拦截（`portal.py`）：`_h_post_manage_user` 将回滚快照推迟至实际写锁内拍摄；删除落盘失败回滚时仅移除当前用户的待撤销标记并按单用户恢复 `usage_meter.totals`/`adjustments`，避免覆盖并发新增的其它待撤销用户与最新计量；新建用户拦截含换行/空字节等控制字符的密码并返回 `400`。
+- 计量读取器纯 ASCII 端口与计数、方括号地址尾缀及在线时间戳边界加固（`usage-meter-readers-20261007-v1.py`）：`_validate_loopback_xray_addr` 与 `parse_xray` 补充 `.isascii()` 拦截全角数字绕过；`read_xray` 校验 `binary` 非空无空字节并限制标准输出上限 `8 MiB`；`_addr_ip` 校验方括号 IPv6 后尾缀必为空或合法 `:port`；`cmd` 使用 `errors='replace'` 防非 UTF-8 中断采集；Reality 在线 `seen` 时间戳拒绝负数、`NaN`/`Inf`、浮点与全角数字串。
+- 前端五大协议开关失败恢复文案、空配置渲染防护与非 JSON 错误页提示（`portal_assets.py`）：Reality / VMess / VLESS Encryption / AnyTLS / TUIC 开关记录切换前文案，网络异常或状态刷新失败时自动还原不再永久卡在「切换中…」；`btnToggleReality` 补齐双击防护，与 `btnResetRealityKeys`、`obTestForm` 统一兼容反代 502 等非 JSON HTML 响应并输出含 HTTP 状态码的清晰错误；`checkVmessStatus` 与 `checkVlessencStatus` 提前判空 `json.config` 消除 `config: null` 引发的渲染异常。
+
 ## 2026-11-22 — 第四十八批十项修复，门户 2.58
 
 - 出站探测协议与超时校验、WARP 旧端口回退及出站模式清洗口径统一（`portal.py`）：`detect_outbound_ip` 先于空白裁剪拦截控制字符、去重 `socks5://`/`socks5h://` 前缀并按白名单拦截非 HTTP(S)/SOCKS5 协议方案，拒绝布尔与非有限 `timeout`；`_ob_probe` 探测 WARP 19898 不可达时自动回退探测旧官方 `127.0.0.1:40000`；`routing_state`、`_ob_list`、`_ob_manage`、`_h_get_warp_status` 与 `apply_egress_config` 统一按 `clean_outbounds` 与合法 `rules`/`global` 模式判定，消除坏出站条目导致的模式与覆盖状态漂移。

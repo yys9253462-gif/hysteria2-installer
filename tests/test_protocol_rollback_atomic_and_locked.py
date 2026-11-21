@@ -1,9 +1,11 @@
 """回归测试：AnyTLS / TUIC 启停失败回滚使用原子私有写入并在停用回滚时持有协议锁。"""
 import ast
+import contextlib
 import importlib.util
 import io
 import os
 import stat
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -95,6 +97,8 @@ class ProtocolRollbackSafetyTests(unittest.TestCase):
                     portal.__dict__,
                     data=data,
                     data_lock=threading.RLock(),
+                    core_operation_lock=threading.RLock(),
+                    core_operation_file_lock=lambda: contextlib.nullcontext(),
                     portal_path=root / 'portal.json',
                     save_data=Mock(side_effect=OSError('disk full')),
                     regenerate_page=Mock(),
@@ -104,7 +108,10 @@ class ProtocolRollbackSafetyTests(unittest.TestCase):
                     _systemd_service_snapshot=Mock(return_value={'active': 'active', 'enabled': 'enabled'}),
                     _systemd_state=Mock(return_value='inactive'),
                     _service_stop_confirmed=Mock(return_value=True),
-                    subprocess=SimpleNamespace(run=Mock(return_value=SimpleNamespace(returncode=0, stdout='', stderr=''))),
+                    subprocess=SimpleNamespace(
+                        run=Mock(return_value=SimpleNamespace(returncode=0, stdout='', stderr='')),
+                        SubprocessError=subprocess.SubprocessError,
+                    ),
                 )
                 ns[lock_name] = lock
                 ns[active_fn] = lambda: data[cfg_key]

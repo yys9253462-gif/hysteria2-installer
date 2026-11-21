@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.58'
+PORTAL_VERSION = '2.59'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -2145,14 +2145,25 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
     original = path.read_bytes() if path.exists() else None
     mode = (path.stat().st_mode & 0o777) or 0o600 if path.exists() else 0o600
     candidate = path.with_name(path.name + '.portal-candidate.json')
-    was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
-                                text=True, timeout=5).stdout.strip() == 'active'
-    was_enabled = subprocess.run(['systemctl', 'is-enabled', 'xray'], capture_output=True,
-                                 text=True, timeout=5).stdout.strip() == 'enabled'
+    try:
+        was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
+                                    text=True, timeout=5).stdout.strip() == 'active'
+    except (OSError, subprocess.SubprocessError) as probe_exc:
+        _log_ignored('xray_transaction_probe_active', probe_exc)
+        was_active = False
+    try:
+        was_enabled = subprocess.run(['systemctl', 'is-enabled', 'xray'], capture_output=True,
+                                     text=True, timeout=5).stdout.strip() == 'enabled'
+    except (OSError, subprocess.SubprocessError) as probe_exc:
+        _log_ignored('xray_transaction_probe_enabled', probe_exc)
+        was_enabled = False
 
     def _write_priv(target, payload, file_mode):
         file_mode = (file_mode & 0o777) or 0o600
-        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, file_mode)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(target), flags, file_mode)
         try:
             with os.fdopen(fd, 'wb') as handle:
                 fd = None
@@ -2185,7 +2196,10 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
         os.replace(candidate, path)
         replaced = True
         if restart:
-            subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+            try:
+                subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+            except (OSError, subprocess.SubprocessError) as rf_exc:
+                _log_ignored('xray_transaction_reset_failed', rf_exc)
             started = subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
             active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
                                     text=True, timeout=5).stdout.strip()
@@ -2218,14 +2232,20 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                     subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
             except (OSError, subprocess.SubprocessError) as rb_exc:
                 _log_ignored('xray_transaction_rollback_enable', rb_exc)
-            try:
-                if original is not None and was_active:
+            if original is not None and was_active:
+                try:
                     subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError) as rb_exc:
+                    _log_ignored('xray_transaction_rollback_reset_failed', rb_exc)
+                try:
                     subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
-                elif not was_active:
+                except (OSError, subprocess.SubprocessError) as rb_exc:
+                    _log_ignored('xray_transaction_rollback', rb_exc)
+            elif not was_active:
+                try:
                     subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
-            except (OSError, subprocess.SubprocessError) as rb_exc:
-                _log_ignored('xray_transaction_rollback', rb_exc)
+                except (OSError, subprocess.SubprocessError) as rb_exc:
+                    _log_ignored('xray_transaction_rollback', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -7036,8 +7056,10 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
     epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
-    current={tag:xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings',{}).get('clients')
-             for tag in wanted_by_tag}
+    current={}
+    for tag in wanted_by_tag:
+        inbound_settings=xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings')
+        current[tag]=inbound_settings.get('clients') if isinstance(inbound_settings, dict) else None
     if current==wanted_by_tag and _ACCESS_APPLIED.get(str(root))==(signature,epoch):
         return True
     # 首次升级/删除请求也核验实际重载，不能仅比较磁盘配置。
@@ -7045,13 +7067,17 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     for tag,wanted in wanted_by_tag.items():
         idx,_inbound=managed_inbound_index(xcfg,tag)
-        xcfg['inbounds'][idx].setdefault('settings',{})['clients']=wanted
+        inbound_obj=xcfg['inbounds'][idx]
+        if not isinstance(inbound_obj.get('settings'), dict):
+            inbound_obj['settings']={}
+        inbound_obj['settings']['clients']=wanted
     candidate=xj.with_name('xray.expiry-candidate.json')
     last_good=xj.with_name('xray.expiry-last-good.json')
     last_good_tmp=xj.with_name('xray.expiry-last-good.json.tmp')
     reality_cfg=meter_config.get('reality') if isinstance(meter_config, dict) else None
     reality_cfg=reality_cfg if isinstance(reality_cfg, dict) else {}
-    binary=reality_cfg.get('binary','/usr/local/bin/xray')
+    raw_binary=reality_cfg.get('binary')
+    binary=raw_binary.strip() if isinstance(raw_binary, str) and raw_binary.strip() else '/usr/local/bin/xray'
     replaced=False
     try:
         _write_private_bytes(candidate, json.dumps(xcfg,indent=2).encode('utf-8'), orig_mode, call_path_chmod=True)
@@ -7074,13 +7100,19 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     except Exception:
         if replaced:
-            _write_private_bytes(candidate, original, orig_mode, call_path_chmod=True)
-            candidate.replace(xj)
+            restored=False
             try:
-                subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
-                subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
-            except (OSError, subprocess.SubprocessError) as rb_exc:
-                _log_ignored('xray_access_rollback', rb_exc)
+                _write_private_bytes(candidate, original, orig_mode, call_path_chmod=True)
+                candidate.replace(xj)
+                restored=True
+            except OSError as rb_io_exc:
+                _log_ignored('xray_access_rollback_write', rb_io_exc)
+            if restored:
+                try:
+                    subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
+                    subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
+                except (OSError, subprocess.SubprocessError) as rb_exc:
+                    _log_ignored('xray_access_rollback', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -7100,11 +7132,19 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None, keep_disab
     meta = meta if isinstance(meta, dict) else {}
     data = data if isinstance(data, dict) else {}
     ports = set()
-    for value in (meta.get('listen_port'), meta.get('subscription_port')):
+
+    def _add_port(value):
+        if isinstance(value, bool):
+            return
         try:
-            ports.add(int(value))
+            port = int(value)
         except (TypeError, ValueError):
-            pass
+            return
+        if 1 <= port <= 65535:
+            ports.add(port)
+
+    for value in (meta.get('listen_port'), meta.get('subscription_port')):
+        _add_port(value)
     for key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
         # AnyTLS / Reality / VMess / VLESS Encryption 停用后都会保留端口、再启用要沿用：
         # 选新端口的调用方传 keep_disabled=True 时全部都要避开；只问「此刻谁占着」时停用段不算。
@@ -7119,28 +7159,25 @@ def managed_reserved_ports(meta, data, config=None, exclude_key=None, keep_disab
             # 于是一次无关的启停就把 Reality 从 443 换到 2053
             # （2026-10-25 实测踩到）。
             continue
-        try:
-            ports.add(int((data or {}).get(key, {}).get('port')))
-        except (TypeError, ValueError, AttributeError):
-            pass
+        if isinstance(section, dict):
+            _add_port(section.get('port'))
     # gost 代理服务的端口（2026-11-04 补）：gost 停着时这些端口不在监听表里，新启用的
     # TCP 协议可能选中它，gost 一恢复就和那条代理抢端口。
     for item in proxy_services(data):
-        try:
-            ports.add(int(item.get('port')))
-        except (TypeError, ValueError):
-            pass
+        if isinstance(item, dict):
+            _add_port(item.get('port'))
     own_tags = {REALITY_INBOUND_TAG: 'reality_config',
                 VMESS_INBOUND_TAG: 'vmess_config',
                 VLESSENC_INBOUND_TAG: 'vlessenc_config'}
-    for inbound in ((config or {}).get('inbounds') or []):
-        # 同理：自己那一条入站的端口不算冲突。
-        if exclude_key and own_tags.get((inbound or {}).get('tag')) == exclude_key:
-            continue
-        try:
-            ports.add(int(inbound.get('port')))
-        except (TypeError, ValueError, AttributeError):
-            pass
+    inbounds = config.get('inbounds') if isinstance(config, dict) else None
+    if isinstance(inbounds, list):
+        for inbound in inbounds:
+            if not isinstance(inbound, dict):
+                continue
+            # 同理：自己那一条入站的端口不算冲突。
+            if exclude_key and own_tags.get(inbound.get('tag')) == exclude_key:
+                continue
+            _add_port(inbound.get('port'))
     ports.discard(0)
     return ports
 
@@ -7154,16 +7191,26 @@ def apply_xray_config_with_meter(config, config_path, meter_cfg_path, portal_dir
     """
     config_path = Path(config_path)
     if meter_cfg_path.exists():
-        meter = json.loads(meter_cfg_path.read_text(encoding='utf-8')).get('reality') or {}
+        raw_meter = json.loads(meter_cfg_path.read_text(encoding='utf-8'))
+        meter = raw_meter.get('reality') if isinstance(raw_meter, dict) else None
+        meter = meter if isinstance(meter, dict) else {}
         address = meter.get('address', '')
-        if address:
-            if not address.startswith('127.0.0.1:'):
+        if address not in ('', None):
+            if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
                 raise ValueError('统计接口必须为回环地址')
+            port_text = address.rsplit(':', 1)[1]
+            if not (port_text.isascii() and port_text.isdigit()):
+                raise ValueError('统计接口端口非法')
+            stats_port = int(port_text)
+            if not 1 <= stats_port <= 65535:
+                raise ValueError('统计接口端口越界')
             stats_path = Path(portal_dir) / 'usage-meter-xray-config-20261007-v1.py'
             spec = importlib.util.spec_from_file_location('portal_stats_cfg', stats_path)
+            if spec is None or spec.loader is None:
+                raise RuntimeError('无法加载计量配置模块')
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            config = mod.add_stats(config, int(address.rsplit(':', 1)[1]))
+            config = mod.add_stats(config, stats_port)
     config = add_private_network_guard(config)
     # ⚠️ 必须用模块级 `_unit_suspended`，不能直接调 `unit_suspended`。
     #
@@ -8225,9 +8272,11 @@ def restore_egress_into_config(root, config_path=None):
     if not isinstance(data, dict):
         return False
     state = routing_state(data)
-    # 没保存过任何出口设置就不动：渲染总会顺带重排 ACL 头部，不该无故改写刚生成的配置。
-    if not (state['warp_enabled'] or state['custom_outbounds'] or state['warp_rules']
-            or state['outbound_mode'] == 'global'):
+    # 没保存过任何有效出口设置就不动：渲染总会顺带重排 ACL 头部，不该无故改写刚生成的配置。
+    has_outbounds = bool(clean_outbounds(state['custom_outbounds']))
+    has_rules = bool(normalize_route_rules(state['warp_rules']))
+    if not (state['warp_enabled'] or has_outbounds or has_rules
+            or (state['outbound_mode'] == 'global' and has_outbounds)):
         return False
     rendered = render_egress_config(original, state)
     if rendered == original:
@@ -8261,6 +8310,18 @@ def adopt(meta_path, port, node_api_key=None):
 
 
 def _adopt_locked(meta_path, port, node_api_key=None):
+    if isinstance(port, bool):
+        raise ValueError('门户端口不能是布尔值')
+    try:
+        port_int = int(port)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError('门户端口必须是整数') from exc
+    if not (1 <= port_int <= 65535):
+        raise ValueError('门户端口必须在 1-65535 之间')
+    if node_api_key is not None and node_api_key != '':
+        if (not isinstance(node_api_key, str) or not node_api_key.isascii()
+                or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in node_api_key)):
+            raise ValueError('node_api_key 必须是不含空白和控制字符的纯 ASCII 字符串')
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     if not isinstance(m, dict):
@@ -8271,7 +8332,7 @@ def _adopt_locked(meta_path, port, node_api_key=None):
         raise ValueError('portal.json 顶层必须是 JSON 对象')
     access_path = root / 'portal-access.json'
     access, _rebuilt = ensure_portal_access(root, m, data)
-    data['port'] = int(port)
+    data['port'] = port_int
     # users 为 null / 列表、机主条目不是 dict 时按空处理，与 user_table 一致；
     # 旧实现直接 AttributeError / TypeError，保留门户的重装中途失败（2026-11-04 修）。
     if not isinstance(data.get('users'), dict):
@@ -9905,7 +9966,7 @@ if __name__ == '__main__':
                 u for u, tr in ip_tracker.items()
                 if not isinstance(tr, dict)
                 or not any(isinstance(t, (int, float)) and not isinstance(t, bool)
-                           and 0 <= now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())
+                           and math.isfinite(t) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())
             ]
             for du in dead_uids:
                 ip_tracker.pop(du, None)
@@ -9920,14 +9981,17 @@ if __name__ == '__main__':
                 u_copy['online_ips'] = (
                     {ip: t for ip, t in tracked.items()
                      if isinstance(t, (int, float)) and not isinstance(t, bool)
-                     and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                     and math.isfinite(t) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                     if isinstance(tracked, dict) else {}
                 )
                 display_users[uid] = u_copy
             _api_key = data.get('api_key')
-            _token = data['token']
+            raw_token = data.get('token')
+            _token = raw_token if isinstance(raw_token, str) else ''
 
-        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{_token}/clash.yaml"
+        _sub_user = quote(str(access.get('username', '')), safe='')
+        _sub_pass = quote(str(access.get('password', '')), safe='')
+        subscription = f"https://{_sub_user}:{_sub_pass}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{_token}/clash.yaml"
 
         # 渲染与二维码都在锁外做（2026-10-29 修，注释此前与实现不符）：
         # page_html 在上千用户时约 27 ms，qrencode 最坏 20 秒，而 /auth
@@ -9986,20 +10050,28 @@ if __name__ == '__main__':
 
     def sign_session(token, issued_at=None):
         issued_at = int(time.time()) if issued_at is None else int(issued_at)
-        return f'{token}.{issued_at}.{_session_sig(token, issued_at, session_epoch())}'
+        with data_lock:
+            ep = session_epoch()
+        return f'{token}.{issued_at}.{_session_sig(token, issued_at, ep)}'
 
     def verify_session(cookie_header):
         if not cookie_header:
             return False
+        raw_cookie = str(cookie_header)
+        if len(raw_cookie) > 16384:
+            return False
         # 不用 SimpleCookie（2026-11-04 修）：同一 Cookie 头里只要有一个不合 RFC 的值
         # （同域其它应用 / 统计脚本写的带空格或裸 JSON 的 cookie），load() 会把**全部**
         # cookie 丢掉且不抛异常，管理员登录后刷新就回到登录页，日志里什么也没有。
-        # 收集所有同名 hy2_session 候选值逐个验签，防止排在后面的旧路径失效 Cookie 覆盖有效会话。
+        # 收集前 16 个同名 hy2_session 候选值逐个验签，防止排在后面的旧路径失效 Cookie 覆盖有效会话，
+        # 同时避免超长 Cookie 头引发 HMAC 哈希放大。
         candidates = []
-        for part in str(cookie_header).split(';'):
+        for part in raw_cookie.split(';'):
             name, sep, val = part.strip().partition('=')
             if sep and name == 'hy2_session':
                 candidates.append(val.strip().strip('"'))
+                if len(candidates) >= 16:
+                    break
         if not candidates:
             return False
         with data_lock:
@@ -10010,7 +10082,8 @@ if __name__ == '__main__':
         now = time.time()
         for value in candidates:
             parts = value.split('.')
-            if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
+            if (len(parts) != 3 or not (parts[1].isascii() and parts[1].isdigit())
+                    or not parts[0].isascii() or not parts[2].isascii()):
                 continue
             t, issued_at, sig = parts
             if not 0 <= now - int(issued_at) <= SESSION_MAX_AGE:
@@ -12639,6 +12712,8 @@ if __name__ == '__main__':
 
                 bad_domain = False
                 warp_not_installed = False
+                # 文件系统探测放在 data_lock 外执行，避免磁盘抖动时阻塞 /auth 鉴权。
+                warp_installed = warp_backend_installed() if action in ('toggle', 'enable') else True
                 with data_lock:
                     previous_warp_state_exists = 'warp_enabled' in data
                     previous_warp_rules_exists = 'warp_rules' in data
@@ -12652,7 +12727,7 @@ if __name__ == '__main__':
                     # 127.0.0.1:19898 的 warp_socks 出站，AI 等默认分流域名全部发往一个没人
                     # 监听的端口，用户只看到这些网站打不开。关闭始终允许。
                     warp_not_installed = (data.get('warp_enabled') and not previous_warp_state
-                                          and not warp_backend_installed())
+                                          and not warp_installed)
                     if warp_not_installed:
                         if previous_warp_state_exists:
                             data['warp_enabled'] = previous_warp_state
@@ -13227,6 +13302,8 @@ if __name__ == '__main__':
                 action = form.get('action', ['toggle'])[0]
                 if action not in ('toggle', 'enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 VMess 操作类型，请刷新页面后重试'})
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(120)
                 xray_path = Path('/etc/hysteria/xray.json')
                 try:
                     config = (json.loads(xray_path.read_text(encoding='utf-8'))
@@ -13700,6 +13777,8 @@ if __name__ == '__main__':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 AnyTLS 操作类型，请刷新页面后重试'})
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(120)
                 if action == 'disable' and not enabled:
                     # anytls.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
                     # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉，
@@ -13721,16 +13800,19 @@ if __name__ == '__main__':
                 if not enabled:
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'AnyTLS 本来就没有启用'})
-                with anytls_apply_lock:
+                with core_operation_lock, core_operation_file_lock(), anytls_apply_lock:
                     cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
-                    stop_result = subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
-                                                  capture_output=True, timeout=30)
-                    # 命令失败或状态查询无结果时无法证明旧进程退出；保留配置，
+                    try:
+                        stop_result = subprocess.run(['systemctl', 'disable', '--now', ANYTLS_SERVICE],
+                                                      capture_output=True, timeout=30)
+                    except (OSError, subprocess.SubprocessError):
+                        stop_result = None
+                    # 命令失败、超时或状态查询无结果时无法证明旧进程退出；保留配置并恢复原服务状态，
                     # 不能误报已关闭，否则撤销用户仍可能用内存中的旧名单连接。
                     state = _systemd_state(ANYTLS_SERVICE)
-                    if not _service_stop_confirmed(stop_result, state):
+                    if stop_result is None or not _service_stop_confirmed(stop_result, state):
                         if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
                             return self.reply_json(500, {'ok': False, 'error':
                                 'AnyTLS 停止失败且原服务状态未能恢复；配置已保留，请检查 systemctl status %s'
@@ -13751,7 +13833,7 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    with anytls_apply_lock:
+                    with core_operation_lock, core_operation_file_lock(), anytls_apply_lock:
                         with data_lock:
                             data['anytls_config'] = old_acfg
                         rollback_failed = False
@@ -13928,6 +14010,8 @@ if __name__ == '__main__':
                     action = 'disable' if enabled else 'enable'
                 if action not in ('enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 TUIC 操作类型，请刷新页面后重试'})
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(120)
                 if action == 'disable' and not enabled:
                     # tuic.json 丢了但 data 里仍是 enabled、或服务还在跑（2026-11-03 修）：
                     # 旧实现回「本来就没有启用」，服务停不掉、enabled 也清不掉。
@@ -13948,16 +14032,19 @@ if __name__ == '__main__':
                 if not enabled:
                     return self.reply_json(200, {'ok': True, 'active': False,
                                                  'message': 'TUIC 本来就没有启用'})
-                with tuic_apply_lock:
+                with core_operation_lock, core_operation_file_lock(), tuic_apply_lock:
                     cfg_path = portal_path.parent / TUIC_CONFIG_NAME
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
-                    stop_result = subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
-                                                  capture_output=True, timeout=30)
-                    # 只有明确确认服务停止后才能删配置与汇报成功；命令失败或
-                    # systemd 状态无法确认时保留配置，避免旧进程继续接受用户连接。
+                    try:
+                        stop_result = subprocess.run(['systemctl', 'disable', '--now', TUIC_SERVICE],
+                                                      capture_output=True, timeout=30)
+                    except (OSError, subprocess.SubprocessError):
+                        stop_result = None
+                    # 只有明确确认服务停止后才能删配置与汇报成功；命令失败、超时或
+                    # systemd 状态无法确认时保留配置并恢复原服务状态，避免旧进程继续接受用户连接。
                     state = _systemd_state(TUIC_SERVICE)
-                    if not _service_stop_confirmed(stop_result, state):
+                    if stop_result is None or not _service_stop_confirmed(stop_result, state):
                         if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
                             return self.reply_json(500, {'ok': False, 'error':
                                 'TUIC 停止失败且原服务状态未能恢复；配置已保留，请检查 systemctl status %s'
@@ -13978,7 +14065,7 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    with tuic_apply_lock:
+                    with core_operation_lock, core_operation_file_lock(), tuic_apply_lock:
                         with data_lock:
                             data['tuic_config'] = old_tcfg
                         cfg_path = portal_path.parent / TUIC_CONFIG_NAME
@@ -14056,6 +14143,8 @@ if __name__ == '__main__':
                 action = form.get('action', ['toggle'])[0]
                 if action not in ('toggle', 'enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 VLESS Encryption 操作类型，请刷新页面后重试'})
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(120)
                 xray_path = Path('/etc/hysteria/xray.json')
                 try:
                     config = (json.loads(xray_path.read_text(encoding='utf-8'))
@@ -14318,7 +14407,16 @@ if __name__ == '__main__':
                 if not self._extend_deadline(30, heavy=True):
                     return self.reply_json(409, {'ok': False, 'error':
                         '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                subprocess.Popen(['bash', '-c', 'sleep 1 && reboot'],
+                systemctl_bin = shutil.which('systemctl')
+                reboot_bin = shutil.which('reboot') or (
+                    '/sbin/reboot' if Path('/sbin/reboot').exists() else '')
+                if systemctl_bin:
+                    reboot_cmd = [systemctl_bin, 'reboot']
+                elif reboot_bin:
+                    reboot_cmd = [reboot_bin]
+                else:
+                    return self.reply_json(500, {'ok': False, 'error': '未找到可用的重启命令（systemctl / reboot）'})
+                subprocess.Popen(['bash', '-c', 'sleep 1 && exec "$@"', '_', *reboot_cmd],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                  start_new_session=True)
                 return self.reply_json(200, {'ok': True, 'message': '服务器正在重启中'})
@@ -14347,16 +14445,6 @@ if __name__ == '__main__':
                 now_ts = int(time.time())
                 if action not in ('create', 'delete'):
                     return self.reply(400, '请求无效，请刷新页面后重试'.encode('utf-8'))
-                with data_lock:
-                    users_map = user_table(data)
-                    previous_had_user = user_id in users_map
-                    previous_user = copy.deepcopy(users_map.get(user_id))
-                    previous_pending = copy.deepcopy(data.get('_pending_revocations')) if '_pending_revocations' in data else None
-                    previous_meter = copy.deepcopy(data.get('usage_meter')) if 'usage_meter' in data else None
-                    previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
-                    previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
-                    previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
-
 
                 if not VALID_USER_ID_RE.match(user_id):
                     return self.reply(400, '用户标识只能用字母、数字、点、下划线和连字符，长度 1-64'.encode('utf-8'))
@@ -14367,6 +14455,18 @@ if __name__ == '__main__':
                 if action == 'create' and not user_id_shareable(user_id):
                     return self.reply(400, '用户标识不能只由点组成'.encode('utf-8'))
 
+                previous_had_user = False
+                previous_user = None
+                previous_had_pending_key = False
+                previous_user_was_pending = False
+                previous_meter_total = None
+                previous_had_meter_total = False
+                previous_meter_adj = None
+                previous_had_meter_adj = False
+                previous_ip = None
+                previous_speed = None
+                previous_deny = None
+
                 if action == 'create' and user_id:
                     # 不再静默去掉首尾空白（2026-11-04 修）：「abc 」被存成「abc」，客户端按输入的
                     # 原样填就鉴权失败。与 API 同一规则：首尾带空白直接拒，全空则随机生成。
@@ -14374,6 +14474,8 @@ if __name__ == '__main__':
                     if pwd != pwd.strip() and pwd.strip():
                         return self.reply(400, '密码首尾不能有空白字符'.encode('utf-8'))
                     pwd = pwd.strip() or secrets.token_hex(16)
+                    if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
+                        return self.reply(400, '密码不能包含换行或控制字符'.encode('utf-8'))
                     # 同 REST 通道：非数字输入必须回 400，而不是让异常掐断连接。
                     try:
                         days = int(form.get('duration_days', ['30'])[0] or 30)
@@ -14397,6 +14499,8 @@ if __name__ == '__main__':
                     with data_lock:
                         if not isinstance(data.get('users'), dict):
                             data['users'] = {}
+                        previous_had_user = user_id in data['users']
+                        previous_user = copy.deepcopy(data['users'].get(user_id))
                         existing = data['users'].get(user_id)
                         if not isinstance(existing, dict):   # 条目改坏＝不存在（2026-11-06 修）
                             existing = None
@@ -14453,8 +14557,25 @@ if __name__ == '__main__':
                         if user_id not in users_map:
                             delete_missing = True
                         else:
+                            previous_had_user = True
+                            previous_user = copy.deepcopy(users_map.get(user_id))
+                            previous_had_pending_key = '_pending_revocations' in data
+                            previous_user_was_pending = user_id in pending_revocations(data)
+                            meter_obj = data.get('usage_meter')
+                            if isinstance(meter_obj, dict):
+                                totals_obj = meter_obj.get('totals')
+                                if isinstance(totals_obj, dict) and user_id in totals_obj:
+                                    previous_had_meter_total = True
+                                    previous_meter_total = copy.deepcopy(totals_obj[user_id])
+                                adj_obj = meter_obj.get('adjustments')
+                                if isinstance(adj_obj, dict) and user_id in adj_obj:
+                                    previous_had_meter_adj = True
+                                    previous_meter_adj = copy.deepcopy(adj_obj[user_id])
+                            previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
+                            previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
+                            previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
                             data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
-                            del data['users'][user_id]
+                            data['users'].pop(user_id, None)
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
@@ -14477,19 +14598,25 @@ if __name__ == '__main__':
                 except OSError:
                     with data_lock:
                         if previous_had_user:
-                            data.setdefault('users', {})[user_id] = previous_user
+                            if not isinstance(data.get('users'), dict):
+                                data['users'] = {}
+                            data['users'][user_id] = previous_user
                         else:
                             if isinstance(data.get('users'), dict):
                                 data['users'].pop(user_id, None)
                         if action == 'delete':
-                            if previous_pending is None:
-                                data.pop('_pending_revocations', None)
-                            else:
-                                data['_pending_revocations'] = previous_pending
-                            if previous_meter is None:
-                                data.pop('usage_meter', None)
-                            else:
-                                data['usage_meter'] = previous_meter
+                            if not previous_user_was_pending:
+                                remaining_pending = sorted(pending_revocations(data) - {user_id})
+                                if remaining_pending or previous_had_pending_key:
+                                    data['_pending_revocations'] = remaining_pending
+                                else:
+                                    data.pop('_pending_revocations', None)
+                            meter_obj = data.get('usage_meter')
+                            if isinstance(meter_obj, dict):
+                                if previous_had_meter_total and isinstance(meter_obj.get('totals'), dict):
+                                    meter_obj['totals'][user_id] = previous_meter_total
+                                if previous_had_meter_adj and isinstance(meter_obj.get('adjustments'), dict):
+                                    meter_obj['adjustments'][user_id] = previous_meter_adj
                             if previous_ip is None:
                                 ip_tracker.pop(user_id, None)
                             else:
@@ -14677,7 +14804,7 @@ claim_warp_assets() {
 }
 atomic_write_mode() {
     local dst="$1" mode="$2" tmp
-    tmp=$(mktemp "${dst}.XXXXXX") || return 1
+    tmp=$(umask 077; mktemp "${dst}.XXXXXX") || return 1
     if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dst"; then
         rm -f "$tmp"
         return 1
@@ -14704,13 +14831,17 @@ verify_sha() {
     [[ "$(sha256sum "$1" | awk '{print $1}')" == "$2" ]]
 }
 tar_member() {
-    local listing m n=0 hit=""
+    local listing vlisting m vline n=0 hit=""
     listing=$(tar -tzf - <"$2" 2>/dev/null) || return 1
     while IFS= read -r m; do
         m="${m%$'\r'}"
-        case "$m" in /*|..|../*|*/../*|*/..) return 2 ;; esac
+        case "$m" in /*|..|../*|*/../*|*/..|*\\*) return 2 ;; esac
         if [[ "${m#./}" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
     done <<<"$listing"
+    vlisting=$(tar -tvzf - <"$2" 2>/dev/null) || return 1
+    while IFS= read -r vline; do
+        case "$vline" in -*|d*) ;; *) return 2 ;; esac
+    done <<<"$vlisting"
     [[ $n -eq 1 ]] || return 3
     echo "$hit"
 }
@@ -14724,7 +14855,9 @@ if [ ! -x "$WGCF_BIN" ]; then
         TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
     VER="${TAG#v}"
-    case "$VER" in ""|null) VER="2.3.0" ;; esac
+    if [[ -z "$VER" || "$VER" == "null" || "$VER" == *..* || ! "$VER" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+        VER="2.3.0"
+    fi
     WG_DL="wgcf_${VER}_linux_${WG_A}"
     TD=$(mktemp -d)
     trap 'rm -rf "$TD"' EXIT
@@ -14743,9 +14876,10 @@ if [ ! -x "$WGCF_BIN" ]; then
     if ! verify_sha "${TD}/${WG_DL}" "$WANT"; then
         rm -rf "$TD"; echo "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致" >&2; exit 1
     fi
-    install -m 755 "${TD}/${WG_DL}" "${WGCF_BIN}.new" || { rm -rf "$TD" "${WGCF_BIN}.new"; exit 1; }
+    WGCF_STAGE=$(umask 022; mktemp "${WGCF_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
+    install -m 755 "${TD}/${WG_DL}" "$WGCF_STAGE" || { rm -rf "$TD" "$WGCF_STAGE"; exit 1; }
     rm -rf "$TD"; trap - EXIT
-    mv -f "${WGCF_BIN}.new" "$WGCF_BIN" || { rm -f "${WGCF_BIN}.new"; exit 1; }
+    mv -f "$WGCF_STAGE" "$WGCF_BIN" || { rm -f "$WGCF_STAGE"; exit 1; }
 fi
 
 if [ ! -x "$WP_BIN" ]; then
@@ -14757,6 +14891,9 @@ if [ ! -x "$WP_BIN" ]; then
         TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
     case "$TAG" in ""|null) TAG="v1.1.3" ;; esac
+    if [[ "$TAG" == *..* || ! "$TAG" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+        TAG="v1.1.3"
+    fi
     WP_DL="wireproxy_linux_${WP_A}.tar.gz"
     # 先清掉上一个临时目录：旧 trap 只认当前的 $TD，直接重新赋值会让
     # wgcf 那次 mktemp 的目录永远留在 /tmp（2026-10-30 修）。
@@ -14783,10 +14920,14 @@ if [ ! -x "$WP_BIN" ]; then
     if ! tar -xzf "${TD}/${WP_DL}" -C "${TD}/x" "$MEMBER" 2>/dev/null; then
         rm -rf "$TD"; echo "wireproxy 解压失败" >&2; exit 1
     fi
-    install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD" "${WP_BIN}.new"; exit 1; }
+    if [ ! -f "${TD}/x/${MEMBER}" ] || [ -L "${TD}/x/${MEMBER}" ]; then
+        rm -rf "$TD"; echo "wireproxy 解压成员非法，已放弃安装" >&2; exit 1
+    fi
+    WP_STAGE=$(umask 022; mktemp "${WP_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
+    install -m 755 "${TD}/x/${MEMBER}" "$WP_STAGE" || { rm -rf "$TD" "$WP_STAGE"; exit 1; }
     rm -rf "$TD"; trap - EXIT
     claim_warp_assets
-    mv -f "${WP_BIN}.new" "$WP_BIN" || { rm -f "${WP_BIN}.new"; exit 1; }
+    mv -f "$WP_STAGE" "$WP_BIN" || { rm -f "$WP_STAGE"; exit 1; }
 fi
 
 mkdir -p "$WG_DIR"
