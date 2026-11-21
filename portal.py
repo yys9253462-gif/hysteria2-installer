@@ -2033,7 +2033,10 @@ def gost_tls_paths(root):
             if not raw.startswith((' ', '\t')):
                 in_tls = raw.split(':', 1)[0] == 'tls'
             elif in_tls and raw.strip().startswith('key:'):
-                values = shlex.split(raw.strip().split(':', 1)[1], comments=True)
+                try:
+                    values = shlex.split(raw.strip().split(':', 1)[1], comments=True)
+                except ValueError:
+                    values = []
                 key = values[0] if values else ''
     if cert:
         cert = Path(os.path.expandvars(str(cert)))
@@ -2045,8 +2048,10 @@ def gost_tls_paths(root):
         if cert.is_file() and key.is_file() and cert.stat().st_size and key.stat().st_size:
             return str(cert), str(key)
     legacy = root / 'gost-cert'
-    if (legacy / 'cert.pem').is_file() and (legacy / 'key.pem').is_file():
-        return str(legacy / 'cert.pem'), str(legacy / 'key.pem')
+    legacy_cert, legacy_key = legacy / 'cert.pem', legacy / 'key.pem'
+    if (legacy_cert.is_file() and legacy_key.is_file()
+            and legacy_cert.stat().st_size and legacy_key.stat().st_size):
+        return str(legacy_cert), str(legacy_key)
     raise RuntimeError('HTTPS 代理缺少可用证书和私钥，请先配置节点证书')
 
 
@@ -8910,20 +8915,22 @@ def serve(path):
                         tr = ip_tracker.get(uid)
                         hy2[uid] = (
                             {ip for ip, t in tr.items()
-                             if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                             if isinstance(t, (int, float)) and not isinstance(t, bool)
+                             and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                             if isinstance(tr, dict) else set()
                         )
                 for uid in limits:
                     hy2[uid] |= live_online_ips(uid)
                 reality = read_reality_online_ips(binary, address, limits)
                 with data_lock:
-                    blocked = plan_reality_iplimit(limits, reality, hy2, reality_iplimit_state, time.time())
+                    now_plan = time.time()
+                    blocked = plan_reality_iplimit(limits, reality, hy2, reality_iplimit_state, now_plan)
                     # 控制台下发的跨节点超额 IP 一并拦截（与本机名额判断取并集）。
                     for _uid in list(global_ip_deny):
-                        _ips = active_ip_deny(global_ip_deny, _uid, time.time())
+                        _ips = active_ip_deny(global_ip_deny, _uid, now_plan)
                         if _ips:
                             blocked.setdefault(_uid, set()).update(_ips)
-                    reality_ip_snapshot.update(ips=reality, at=time.time())
+                    reality_ip_snapshot.update(ips=reality, at=now_plan)
                 added, removed = apply_reality_iplimit(binary, address, reality_iplimit_rules(blocked))
                 if added or removed:
                     print('[iplimit] Reality 拦截规则更新: +%d -%d，当前拦截 %d 个用户'
