@@ -12407,6 +12407,8 @@ if __name__ == '__main__':
 
                 if action in ('start', 'stop', 'restart'):
                     label = {'start': '启动', 'stop': '停止', 'restart': '重启'}.get(action, action)
+                    # 等 awg_operation_lock 与 30 秒 systemctl 合计可能超过默认 30 秒连接死线，先续期。
+                    self._extend_deadline(120)
                     # 与 peer 增删 / 更新串行（2026-11-04 修）：在它们中途停掉接口，热添加会
                     # 落在正在关闭的接口上，更新自己的重启也会和这里打架。
                     with awg_operation_lock:
@@ -12414,8 +12416,11 @@ if __name__ == '__main__':
                             # 先清失败计数（2026-11-13 修，同终端菜单与 awgctl）：单元是 StartLimitBurst=5 /
                             # 300 秒，连续加客户端（热加入失败会兜底重启）再点几次重启就撞上限，之后 5 分钟内
                             # 点「启动」只会拿到 start of the service was attempted too often。
-                            subprocess.run(['systemctl', 'reset-failed', AWG_SVC_NAME],
-                                           capture_output=True, timeout=5)
+                            try:
+                                subprocess.run(['systemctl', 'reset-failed', AWG_SVC_NAME],
+                                               capture_output=True, timeout=5)
+                            except (OSError, subprocess.SubprocessError):
+                                pass
                         proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
                                               capture_output=True, text=True, timeout=30)
                     if proc.returncode != 0:
@@ -14072,7 +14077,10 @@ if __name__ == '__main__':
                 if ver not in ('v1', 'v2', 'v3'):
                     return self.reply_json(400, {'ok': False, 'error': '不支持的 BBR 版本（仅支持 v1、v2 或 v3）'})
                 target = {'v1': 'bbr', 'v2': 'bbr2', 'v3': 'bbr3'}[ver]
-                subprocess.run(['modprobe', 'tcp_' + target], capture_output=True, timeout=5)
+                try:
+                    subprocess.run(['modprobe', 'tcp_' + target], capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
                 available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
                                            capture_output=True, text=True, timeout=3)
                 if available.returncode != 0:
@@ -14101,9 +14109,13 @@ if __name__ == '__main__':
                 originals = {path: path.read_bytes() if path.exists() else None for path in paths}
 
                 def _write_bbr_file(target_path, raw_bytes):
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp_path = target_path.with_name(target_path.name + '.tmp.' + secrets.token_hex(4))
                     try:
-                        tmp_path.write_bytes(raw_bytes)
+                        with open(tmp_path, 'wb') as fh:
+                            fh.write(raw_bytes)
+                            fh.flush()
+                            os.fsync(fh.fileno())
                         os.chmod(str(tmp_path), 0o644)
                         os.replace(str(tmp_path), str(target_path))
                     except BaseException:
