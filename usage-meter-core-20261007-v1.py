@@ -3,17 +3,27 @@
 历史 used_bytes 不用作真实计量初值；首次接入默认只建立基线。
 """
 import copy
+import math
 
 ACCOUNTING_REVISION = "2026-10-12-real-usage-v2"
 
 
 def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
+    if not isinstance(state, dict):
+        raise ValueError('invalid usage meter state')
     if source not in ('hysteria', 'reality'):
         raise ValueError('unknown source')
     if not isinstance(epoch, str) or not epoch:
         raise ValueError('missing service epoch')
     if not isinstance(counters, dict):
         raise ValueError('counters must be a dict')
+    valid_ts = (
+        (isinstance(sampled_at, str) and bool(sampled_at.strip()))
+        or (isinstance(sampled_at, (int, float)) and not isinstance(sampled_at, bool)
+            and math.isfinite(sampled_at))
+    )
+    if not valid_ts:
+        raise ValueError('invalid sampled_at')
     clean = {}
     for uid, pair in counters.items():
         if not isinstance(uid, str) or not isinstance(pair, dict):
@@ -186,6 +196,8 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
 
 
 def total_bytes(state, uid):
+    if not isinstance(state, dict):
+        raise ValueError('invalid usage meter state')
     totals = state.get('totals', {})
     if not isinstance(totals, dict):
         raise ValueError('invalid totals')
@@ -198,6 +210,8 @@ def total_bytes(state, uid):
 
 def adjusted_bytes(state, uid):
     """返回实测累计加账户有符号偏移；损坏状态和负结果均失败。"""
+    if not isinstance(state, dict):
+        raise ValueError('invalid usage meter state')
     total = total_bytes(state, uid)
     adjustments = state.get('adjustments', {})
     if not isinstance(adjustments, dict):
