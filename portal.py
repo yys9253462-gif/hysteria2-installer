@@ -2145,14 +2145,25 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
     original = path.read_bytes() if path.exists() else None
     mode = (path.stat().st_mode & 0o777) or 0o600 if path.exists() else 0o600
     candidate = path.with_name(path.name + '.portal-candidate.json')
-    was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
-                                text=True, timeout=5).stdout.strip() == 'active'
-    was_enabled = subprocess.run(['systemctl', 'is-enabled', 'xray'], capture_output=True,
-                                 text=True, timeout=5).stdout.strip() == 'enabled'
+    try:
+        was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
+                                    text=True, timeout=5).stdout.strip() == 'active'
+    except (OSError, subprocess.SubprocessError) as probe_exc:
+        _log_ignored('xray_transaction_probe_active', probe_exc)
+        was_active = False
+    try:
+        was_enabled = subprocess.run(['systemctl', 'is-enabled', 'xray'], capture_output=True,
+                                     text=True, timeout=5).stdout.strip() == 'enabled'
+    except (OSError, subprocess.SubprocessError) as probe_exc:
+        _log_ignored('xray_transaction_probe_enabled', probe_exc)
+        was_enabled = False
 
     def _write_priv(target, payload, file_mode):
         file_mode = (file_mode & 0o777) or 0o600
-        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, file_mode)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        if hasattr(os, 'O_NOFOLLOW'):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(str(target), flags, file_mode)
         try:
             with os.fdopen(fd, 'wb') as handle:
                 fd = None
@@ -2185,7 +2196,10 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
         os.replace(candidate, path)
         replaced = True
         if restart:
-            subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+            try:
+                subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+            except (OSError, subprocess.SubprocessError) as rf_exc:
+                _log_ignored('xray_transaction_reset_failed', rf_exc)
             started = subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
             active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
                                     text=True, timeout=5).stdout.strip()
@@ -2218,14 +2232,20 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                     subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
             except (OSError, subprocess.SubprocessError) as rb_exc:
                 _log_ignored('xray_transaction_rollback_enable', rb_exc)
-            try:
-                if original is not None and was_active:
+            if original is not None and was_active:
+                try:
                     subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError) as rb_exc:
+                    _log_ignored('xray_transaction_rollback_reset_failed', rb_exc)
+                try:
                     subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
-                elif not was_active:
+                except (OSError, subprocess.SubprocessError) as rb_exc:
+                    _log_ignored('xray_transaction_rollback', rb_exc)
+            elif not was_active:
+                try:
                     subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
-            except (OSError, subprocess.SubprocessError) as rb_exc:
-                _log_ignored('xray_transaction_rollback', rb_exc)
+                except (OSError, subprocess.SubprocessError) as rb_exc:
+                    _log_ignored('xray_transaction_rollback', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
