@@ -14801,13 +14801,6 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                       'text/html; charset=utf-8')
 
                 m = read_meta_file(meta_path)
-                # 🔴 2026-10-31：这个分享页要跑 qrencode：Hy2 一张（10 秒超时），2026-11-13 起每个
-                # 备用协议再各一张（5 秒超时，最多 5 张），最坏约 35 秒；
-                # 而默认连接死线 30 秒、且并发受 BoundedSemaphore(8) 限制。
-                # 低配机 + 多人同时打开分享页时会在 30 秒整被 watch_deadlines
-                # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
-                # 与其它带子进程的端点一致：先续期再干活。
-                self._extend_deadline(60)
                 # meta 损坏（含非字符串或纯空白 server_name/public_ip）时 artifacts 会退回 localhost，
                 # 生成一条永远连不上的链接却返回 200，这里只接受清洗后的非空字符串身份。
                 _raw_sn = m.get('server_name').strip() if isinstance(m.get('server_name'), str) else ''
@@ -14816,6 +14809,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply(503, share_unavailable_html(
                         '节点元信息缺失或损坏，请联系管理员检查 client_meta.json').encode('utf-8'),
                         'text/html; charset=utf-8')
+                # 🔴 2026-10-31：这个分享页要跑 qrencode：Hy2 一张（10 秒超时），2026-11-13 起每个
+                # 备用协议再各一张（5 秒超时，最多 5 张），最坏约 35 秒；
+                # 而默认连接死线 30 秒、且并发受 BoundedSemaphore(8) 限制。
+                # 低配机 + 多人同时打开分享页时会在 30 秒整被 watch_deadlines
+                # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
+                # 与其它带子进程的端点一致：先续期再干活。
+                self._extend_deadline(60)
                 # 密码缺失/被改坏时不能生成链接：空密码会拼出
                 # `hysteria2://@host`，客户端导入即失败，页面却显示成功。
                 pwd = u_copy.get('password')
