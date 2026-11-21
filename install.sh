@@ -2240,7 +2240,6 @@ setup_system_firewall() {
         ufw allow "${port}/udp" >/dev/null 2>&1 || true
         if [[ "$CERT_TYPE" == "acme" ]]; then
             ufw allow 80/tcp >/dev/null 2>&1 || true
-            ufw allow "${HY2_SUB_PORT}/tcp" >/dev/null 2>&1 || true
         fi
         if [[ -n "$s_port" && -n "$e_port" ]]; then
             ufw allow "${s_port}:${e_port}/udp" >/dev/null 2>&1 || true
@@ -2254,7 +2253,6 @@ setup_system_firewall() {
         firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
         if [[ "$CERT_TYPE" == "acme" ]]; then
             firewall-cmd --add-port="80/tcp" --permanent >/dev/null 2>&1 || true
-            firewall-cmd --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
         fi
         if [[ -n "$s_port" && -n "$e_port" ]]; then
             firewall-cmd --add-port="${s_port}-${e_port}/udp" --permanent >/dev/null 2>&1 || true
@@ -2327,31 +2325,38 @@ setup_system_firewall() {
             unset -f _nft_has _nft_ensure
         done <<<"$nft_inputs"
     fi
-    # 裸 iptables 兜底（既无 ufw/firewalld，也无 nft 的情况）。
-    # 注意：这里处理的是 filter/INPUT 的放行，与端口跳跃的 nat/REDIRECT 无关。
-    if command -v iptables >/dev/null 2>&1 \
+    # 裸 iptables / ip6tables 兜底（既无 ufw/firewalld，也无 nft 的情况）。
+    # 同时覆盖 IPv4 与 IPv6，并识别「policy DROP/REJECT」以及「policy ACCEPT + 链内 DROP/REJECT 规则」。
+    if { command -v iptables >/dev/null 2>&1 || command -v ip6tables >/dev/null 2>&1; } \
        && ! { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; } \
        && ! { command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; } \
        && ! command -v nft >/dev/null 2>&1; then
-        local chain_policy
-        chain_policy=$(iptables -L INPUT -n 2>/dev/null | head -n1 | grep -o 'policy [A-Z]*' | awk '{print $2}')
-        if [[ "$chain_policy" == "DROP" ]]; then
-            iptables -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 \
-                || iptables -I INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
-            iptables -C INPUT -p tcp --dport "${HY2_SUB_PORT}" -j ACCEPT >/dev/null 2>&1 \
-                || iptables -I INPUT -p tcp --dport "${HY2_SUB_PORT}" -j ACCEPT >/dev/null 2>&1 || true
-            if [[ -n "$s_port" && -n "$e_port" ]]; then
-                iptables -C INPUT -p udp --dport "${s_port}:${e_port}" -j ACCEPT >/dev/null 2>&1 \
-                    || iptables -I INPUT -p udp --dport "${s_port}:${e_port}" -j ACCEPT >/dev/null 2>&1 || true
+        local _ipt _ipt_list _ipt_policy _ipt_saved=0
+        for _ipt in iptables ip6tables; do
+            command -v "$_ipt" >/dev/null 2>&1 || continue
+            _ipt_list="$("$_ipt" -L INPUT -n 2>/dev/null || true)"
+            [[ -n "$_ipt_list" ]] || continue
+            _ipt_policy="$(printf '%s\n' "$_ipt_list" | head -n1 | grep -o 'policy [A-Z]*' | awk '{print $2}' || true)"
+            if [[ "$_ipt_policy" == "DROP" || "$_ipt_policy" == "REJECT" ]] \
+               || printf '%s\n' "$_ipt_list" | grep -qE '^[[:space:]]*(DROP|REJECT)[[:space:]]'; then
+                "$_ipt" -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 \
+                    || "$_ipt" -I INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
+                "$_ipt" -C INPUT -p tcp --dport "${HY2_SUB_PORT}" -j ACCEPT >/dev/null 2>&1 \
+                    || "$_ipt" -I INPUT -p tcp --dport "${HY2_SUB_PORT}" -j ACCEPT >/dev/null 2>&1 || true
+                if [[ -n "$s_port" && -n "$e_port" ]]; then
+                    "$_ipt" -C INPUT -p udp --dport "${s_port}:${e_port}" -j ACCEPT >/dev/null 2>&1 \
+                        || "$_ipt" -I INPUT -p udp --dport "${s_port}:${e_port}" -j ACCEPT >/dev/null 2>&1 || true
+                fi
+                if [[ "$CERT_TYPE" == "acme" ]]; then
+                    "$_ipt" -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 \
+                        || "$_ipt" -I INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
+                fi
+                log_info "已放行 ${_ipt} INPUT (udp ${port} + tcp ${HY2_SUB_PORT})。"
+                _ipt_saved=1
             fi
-            if [[ "$CERT_TYPE" == "acme" ]]; then
-                iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 \
-                    || iptables -I INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
-            fi
-            log_info "已放行 iptables INPUT (udp ${port} + tcp ${HY2_SUB_PORT})。"
-            if command -v netfilter-persistent >/dev/null 2>&1; then
-                netfilter-persistent save >/dev/null 2>&1 || true
-            fi
+        done
+        if [[ "$_ipt_saved" == "1" ]] && command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1 || true
         fi
     fi
 }
