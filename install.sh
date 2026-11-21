@@ -198,15 +198,21 @@ hy2_tar_listing_safe() {
     return 0
 }
 
-# 在包内查找与 $2 同名的成员，输出**包内实际成员名**（可能是 ./name）。
+# 在包内查找与 $2 唯一同名的成员，输出**包内实际成员名**（可能是 ./name）。
+# 先捕获 tar 清单并校验退出码，拒绝截断损坏包与同名重复成员。
 hy2_tar_find_member() {
-    local member
+    local listing member hit="" count=0
     [[ -f "${1:-}" ]] || return 1
+    listing="$(tar -tzf - <"$1" 2>/dev/null)" || return 1
     while IFS= read -r member; do
         member="${member%$'\r'}"
-        [[ "${member#./}" == "$2" ]] && { printf '%s\n' "$member"; return 0; }
-    done < <(tar -tzf - <"$1" 2>/dev/null)
-    return 1
+        if [[ "${member#./}" == "$2" ]]; then
+            count=$((count + 1))
+            hit="$member"
+        fi
+    done <<<"$listing"
+    [[ "$count" -eq 1 ]] || return 1
+    printf '%s\n' "$hit"
 }
 
 # 把 HY2_ARCH 映射成 Hysteria 官方资产后缀。
@@ -1481,6 +1487,7 @@ setup_cert_via_existing_caddy() {
     log_info "已备份 Caddyfile -> ${bak}"
 
     # 幂等：已存在该域名块就不重复追加
+    local appended=0
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
         cat >> "$cf" <<CEOF
 
@@ -1491,6 +1498,7 @@ ${domain} {
 $(caddy_decoy_directives "$domain")
 }
 CEOF
+        appended=1
     fi
     if ! caddy validate --config "$cf" >/dev/null 2>&1; then
         log_err "追加后的 Caddyfile 校验不通过，已回滚。"
@@ -1514,6 +1522,11 @@ CEOF
         fi
         sleep 5
     done
+    if [[ "$appended" == 1 ]]; then
+        cp -a "$bak" "$cf" 2>/dev/null || true
+        systemctl reload caddy 2>/dev/null || true
+        log_warn "签发超时，已从备份回滚本次自动追加到 Caddyfile 的占位站点块。"
+    fi
     log_err "等待 60 秒仍未拿到证书。请查看: journalctl -u caddy -n 50"
     return 1
 }
@@ -3194,7 +3207,7 @@ METEREOF2
                     _cs="$(jq -r '.server_name // empty' "$HY2_DIR/client_meta.json" 2>/dev/null || true)"
                     _cp="$(jq -r '.pin_sha256 // empty' "$HY2_DIR/client_meta.json" 2>/dev/null || true)"
                     if [[ "$_ct" != "$_nt" || "$_ci" != "$_ni" || "$_cs" != "$_nsn" || "$_cp" != "$_np" ]]; then
-                        _tmp_meta="$HY2_DIR/client_meta.json.tmp.$$"
+                        _tmp_meta="$(umask 077 && mktemp "$HY2_DIR/.client_meta.json.XXXXXX")"
                         if jq --arg t "$_nt" --argjson i "$_ni" --arg s "$_nsn" --arg p "$_np" \
                               '.cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p' \
                               "$HY2_DIR/client_meta.json" > "$_tmp_meta" 2>/dev/null && [[ -s "$_tmp_meta" ]]; then
@@ -4004,19 +4017,35 @@ portal_write_meter_config() {
         # 不追加到文件末尾：其他段的位置不影响 hysteria 解析，但保持可读性插入到
         # masquerade 之前；若找不到锚点则追加到末尾（hysteria 对顶层键顺序不敏感）。
         python3 - "$HY2_CONFIG" "$METER_SECRET" <<'PYEOF'
-import io, re, sys
+import io, os, re, secrets, stat, sys
 path, secret = sys.argv[1], sys.argv[2]
+st_mode = stat.S_IMODE(os.stat(path).st_mode)
 s = io.open(path, encoding='utf-8').read()
 block = ("\n# 真实计量：/traffic 只读端点，供 usage-meter 采集。必须回环监听，\n"
          "# 且 secret 与 usage-meter-config.json 的 hysteria.secret 逐字符一致。\n"
          "trafficStats:\n  listen: 127.0.0.1:19996\n  secret: %s\n" % secret)
-if not re.search(r'^trafficStats:', s, re.M):
-    anchor = 'masquerade:'
-    if anchor in s:
-        s = s.replace(anchor, block.lstrip('\n') + '\n' + anchor, 1)
+if not re.search(r'^trafficStats:\s*(?:#.*)?$', s, re.M):
+    m = re.search(r'^masquerade:\s*(?:#.*)?$', s, re.M)
+    if m:
+        s = s[:m.start()] + block.lstrip('\n') + '\n' + s[m.start():]
     else:
         s = s.rstrip('\n') + '\n' + block
-io.open(path, 'w', encoding='utf-8', newline='\n').write(s)
+tmp = path + '.tmp.' + secrets.token_hex(4)
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, 'O_NOFOLLOW'):
+    flags |= os.O_NOFOLLOW
+fd = os.open(tmp, flags, 0o600)
+try:
+    with os.fdopen(fd, 'wb') as fh:
+        fh.write(s.encode('utf-8'))
+    os.chmod(tmp, st_mode)
+    os.replace(tmp, path)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    raise
 PYEOF
         _meter_secret="$(traffic_stats_secret "$HY2_CONFIG")"
     fi
@@ -4025,10 +4054,22 @@ PYEOF
         log_err "拒绝以静默降级的方式继续安装（界面会永远显示「未开始计量」）。"
         return 1
     fi
-    cat > "${dest_dir}/usage-meter-config.json" <<METEREOF
+    local _meter_tmp
+    _meter_tmp="$(umask 077; mktemp "${dest_dir}/usage-meter-config.json.tmp.XXXXXX")" || return 1
+    if ! cat > "$_meter_tmp" <<METEREOF
 {"hysteria": {"url": "http://127.0.0.1:19996", "secret": "${_meter_secret}"}, "reality": {"binary": "/usr/local/bin/xray", "address": "127.0.0.1:19997"}}
 METEREOF
-    chmod 600 "${dest_dir}/usage-meter-config.json"
+    then
+        rm -f "$_meter_tmp"
+        unset _meter_secret
+        return 1
+    fi
+    chmod 600 "$_meter_tmp"
+    if ! mv -f "$_meter_tmp" "${dest_dir}/usage-meter-config.json"; then
+        rm -f "$_meter_tmp"
+        unset _meter_secret
+        return 1
+    fi
     unset _meter_secret
     log_info "门户程序已就位: ${dest_dir}/portal.py + portal_assets.py + 计量模块"
 }
@@ -4158,10 +4199,15 @@ sync_cert_meta() {
     if [[ "$new_pin" != "$cur_pin" ]]; then
         log_warn "  pin_sha256: ${cur_pin:-<空>} -> ${new_pin:-<清空>}"
     fi
-    local tmp_meta="${HY2_META_FILE}.tmp.$$"
+    local tmp_meta
+    tmp_meta="$(umask 077 && mktemp "${HY2_META_FILE}.XXXXXX")" || {
+        log_err "无法创建临时元数据文件，client_meta.json 保持不变。"
+        return 1
+    }
     if jq --arg t "$new_type" --argjson i "$new_insecure" --arg s "$new_sn" --arg p "$new_pin" \
           '.cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p' \
           "$HY2_META_FILE" > "$tmp_meta" 2>/dev/null && [[ -s "$tmp_meta" ]]; then
+        chmod 600 "$tmp_meta"
         mv -f "$tmp_meta" "$HY2_META_FILE"
         log_info "证书信任模型已自愈。"
     else
@@ -5896,6 +5942,9 @@ uninstall_all() {
         fi
 
         log_info "Hysteria 2 已彻底卸载完成！"
+        if declare -F release_installer_core_lock >/dev/null 2>&1; then
+            release_installer_core_lock
+        fi
     else
         log_info "已取消卸载。"
     fi
@@ -5939,15 +5988,29 @@ ask_preserve_portal() {
     fi
 }
 
+_INSTALLER_CORE_LOCK_FD=""
+
+release_installer_core_lock() {
+    if [[ -n "${_INSTALLER_CORE_LOCK_FD:-}" ]]; then
+        exec {_INSTALLER_CORE_LOCK_FD}>&- 2>/dev/null || true
+        _INSTALLER_CORE_LOCK_FD=""
+    fi
+}
+
 acquire_installer_core_lock() {
     mkdir -p "$HY2_DIR" || return 1
+    if [[ -n "${_INSTALLER_CORE_LOCK_FD:-}" ]]; then
+        release_installer_core_lock
+    fi
     local lock_fd
     exec {lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
         log_err "无法创建核心操作锁。"; return 1; }
     if ! flock -n "$lock_fd"; then
+        exec {lock_fd}>&- 2>/dev/null || true
         log_err "门户正在修改节点核心，等待完成后重试。"
         return 1
     fi
+    _INSTALLER_CORE_LOCK_FD="$lock_fd"
 }
 
 flow_install() {
@@ -5971,6 +6034,7 @@ flow_install() {
         ask_preserve_portal
     fi
     acquire_installer_core_lock || return 1
+    trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi' RETURN
     if [[ -f "$HY2_CONFIG" ]]; then
         backup_state_before_reconfigure || return 1
     fi
@@ -5983,6 +6047,7 @@ flow_install() {
     generate_server_config
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     setup_systemd
+    if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi
     show_client_configs
 }
 
@@ -5995,6 +6060,7 @@ flow_update_core() {
     exec {update_lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
         log_err "无法创建核心升级锁。"; return 1; }
     if ! flock -n "$update_lock_fd"; then
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "另一个核心升级正在运行，请稍后重试。"
         return 1
     fi
@@ -6004,29 +6070,35 @@ flow_update_core() {
     local _current_version
     _current_version="$("$HY2_BIN" version 2>/dev/null | awk -F': *' '/^Version:/{print $2; exit}')" || _current_version=""
     if [[ "$_current_version" == *+* && "${HY2_ALLOW_CUSTOM_CORE_REPLACE:-0}" != "1" ]]; then
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "当前核心是定制版本（${_current_version}），官方核心会覆盖它的补丁，已放弃更新。"
         log_err "确需换成官方核心，请先 export HY2_ALLOW_CUSTOM_CORE_REPLACE=1 再执行。"
         return 1
     fi
     local rollback_file
     rollback_file="$(mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "创建核心备份失败，现有二进制未改动。"; return 1; }
     if ! cp -p "$HY2_BIN" "$rollback_file"; then
         rm -f "$rollback_file"
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "备份核心失败，已放弃更新，现有二进制未改动。"
         return 1
     fi
     if ! install_binary; then
         rm -f "$rollback_file"
+        exec {update_lock_fd}>&- 2>/dev/null || true
         return 1
     fi
     if traffic_suspended; then
         rm -f "$rollback_file"
+        exec {update_lock_fd}>&- 2>/dev/null || true
         log_warn "核心已更新；节点正因流量超额被 Teyir 停用，暂不重启，恢复时会自动用上新核心。"
         return 0
     fi
     if ! restart_service; then
         if ! mv -f "$rollback_file" "$HY2_BIN"; then
+            exec {update_lock_fd}>&- 2>/dev/null || true
             log_err "新版本启动失败，回滚失败；本次旧核心保留在 ${rollback_file}。"
             return 1
         fi
@@ -6038,9 +6110,11 @@ flow_update_core() {
         else
             log_err "新版本启动失败，已回滚到本次旧版本。"
         fi
+        exec {update_lock_fd}>&- 2>/dev/null || true
         return 1
     fi
     rm -f "$rollback_file"
+    exec {update_lock_fd}>&- 2>/dev/null || true
 }
 
 flow_reconfigure() {
@@ -6062,6 +6136,7 @@ flow_reconfigure() {
     fi
     ask_preserve_portal
     acquire_installer_core_lock || return 1
+    trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi' RETURN
     backup_state_before_reconfigure || return 1
     # 先记下旧端口：setup_ports_and_obfs 会重写 meta，之后就拿不到了。
     local _old_listen _old_sub
@@ -6076,6 +6151,7 @@ flow_reconfigure() {
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     close_replaced_ports "$_old_listen" "$_old_sub"
     setup_systemd
+    if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi
     show_client_configs
 }
 
@@ -6341,6 +6417,7 @@ if [[ $# -gt 0 ]]; then
             generate_server_config
             setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
             setup_systemd
+            release_installer_core_lock
             show_client_configs
             ;;
         update)

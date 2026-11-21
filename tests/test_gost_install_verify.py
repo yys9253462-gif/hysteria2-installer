@@ -18,8 +18,9 @@ SRC = (ROOT / 'portal.py').read_text(encoding='utf-8')
 
 
 def staging_block():
-    m = re.search(r"\n( +)if src_bin\.exists\(\):\n.*?\n\1    os\.replace\(str\(staged\), '/usr/local/bin/gost'\)\n",
-                  SRC, re.S)
+    m = re.search(
+        r"\n( +)if src_bin\.exists\(\):\n.*?\n\1 +staged\.unlink\(missing_ok=True\)\n",
+        SRC, re.S)
     return textwrap.dedent(m.group(0).lstrip('\n'))
 
 

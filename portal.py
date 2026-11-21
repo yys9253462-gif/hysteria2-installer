@@ -212,7 +212,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.49'
+PORTAL_VERSION = '2.50'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -235,6 +235,8 @@ def _unlock_read(resp, limit):
         raw = resp.read(limit)
     except http.client.IncompleteRead as e:
         raw = e.partial
+    if not raw:
+        return ''
     return raw.decode('utf-8', 'replace')
 
 
@@ -246,10 +248,16 @@ def _unlock_fetch(url, timeout=8, limit=400000):
             return resp.status, resp.geturl(), _unlock_read(resp, limit)
     except urllib.error.HTTPError as e:
         try:
-            body = _unlock_read(e, 200000)
-        except Exception:
-            body = ''
-        return e.code, e.geturl() or url, body
+            try:
+                body = _unlock_read(e, 200000)
+            except Exception:
+                body = ''
+            return e.code, e.geturl() or url, body
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
 
 
 def _unlock_netflix():
@@ -343,8 +351,11 @@ def run_unlock_checks():
                for i, (k, n, f) in enumerate(UNLOCK_CHECKS)]
     for t in threads:
         t.start()
+    # 所有探测线程共享同一轮 30 秒总截止时间，避免逐线程串联等待把总阻塞放大到 180 秒。
+    deadline = time.monotonic() + 30.0
     for t in threads:
-        t.join(30)
+        remaining = max(0.0, deadline - time.monotonic())
+        t.join(remaining)
     return [r or {'key': k, 'name': n, 'status': 'unknown', 'region': '', 'note': '检测超时'}
             for r, (k, n, _) in zip(results, UNLOCK_CHECKS)]
 
@@ -1047,22 +1058,38 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
     """
     proxy_url = ''
     if kind == 'socks5' and addr:
-        proxy_url = 'socks5h://' + addr
+        proxy_url = 'socks5h://' + str(addr)
     elif kind == 'http' and addr:
-        proxy_url = addr
+        proxy_url = str(addr)
     elif kind == 'warp':
         proxy_url = 'socks5h://127.0.0.1:19898'
+    if proxy_url and any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in proxy_url):
+        return ''
     try:
         seconds = max(1, float(timeout))
         # urllib's ProxyHandler speaks HTTP CONNECT, not the SOCKS5 protocol.
         # Explicitly override no_proxy: '*' would silently bypass this proxy.
         args = ['curl', '--disable', '--silent', '--show-error', '--fail',
-                '--connect-timeout', str(min(3, seconds)), '--max-time', str(seconds),
-                '--proxy', proxy_url, '--noproxy', '' if proxy_url else '*']
+                '--connect-timeout', str(min(3, seconds)), '--max-time', str(seconds)]
+        stdin_cfg = None
+        if proxy_url:
+            if '@' in proxy_url:
+                # 含认证凭据时经 stdin 传入 curl 配置，避免明文密码暴露在进程列表。
+                escaped = proxy_url.replace('\\', '\\\\').replace('"', '\\"')
+                args.extend(['--config', '-'])
+                stdin_cfg = 'proxy = "%s"\n' % escaped
+            else:
+                args.extend(['--proxy', proxy_url])
+            args.extend(['--noproxy', ''])
+        else:
+            args.extend(['--noproxy', '*'])
         if proxy_insecure:
             args.append('--proxy-insecure')
         args.append('https://api4.ipify.org?format=json')
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=seconds + 2)
+        run_kwargs = {'capture_output': True, 'text': True, 'timeout': seconds + 2}
+        if stdin_cfg is not None:
+            run_kwargs['input'] = stdin_cfg
+        proc = subprocess.run(args, **run_kwargs)
         if proc.returncode != 0:
             return ''
         payload = proc.stdout.strip()
@@ -4493,10 +4520,11 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
     if selfheal_state_path and Path(selfheal_state_path).exists():
         try:
             st = json.loads(Path(selfheal_state_path).read_text(encoding='utf-8'))
-            info['healed_at'] = int(st.get('healed_at') or 0)
-            info['heal_count'] = int(st.get('heal_count') or 0)
-            if st.get('last_pin'):
-                info['pin_sha256'] = st['last_pin']
+            if isinstance(st, dict):
+                info['healed_at'] = int(st.get('healed_at') or 0)
+                info['heal_count'] = int(st.get('heal_count') or 0)
+                if isinstance(st.get('last_pin'), str) and st.get('last_pin'):
+                    info['pin_sha256'] = st['last_pin']
         except Exception as exc:
             _log_ignored('cert_info.heal_state', exc)
 
@@ -9074,17 +9102,33 @@ def serve(path):
             return False
 
     def write_gost_selfcheck():
-        """把启动自检脚本写到 GOST_SELFCHECK_PATH (unit 的 ExecStartPost 调用).
+        """把启动自检脚本原子写到 GOST_SELFCHECK_PATH (unit 的 ExecStartPost 调用).
 
         install.sh 的 install_gost() 会写同一份内容; 这里再写一次是为了覆盖
         "服务器上已装过旧版 gost、unit 却没有自检" 的情况。返回是否写成功。
         """
+        tmp_path = None
         try:
             GOST_SELFCHECK_PATH.parent.mkdir(parents=True, exist_ok=True)
-            GOST_SELFCHECK_PATH.write_text(GOST_SELFCHECK_SCRIPT, encoding='utf-8')
-            os.chmod(str(GOST_SELFCHECK_PATH), 0o755)
+            tmp_path = GOST_SELFCHECK_PATH.with_name(
+                GOST_SELFCHECK_PATH.name + '.tmp.' + os.urandom(4).hex())
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, 'O_NOFOLLOW'):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(str(tmp_path), flags, 0o755)
+            try:
+                with os.fdopen(fd, 'wb') as fh:
+                    fh.write(GOST_SELFCHECK_SCRIPT.encode('utf-8'))
+            except BaseException:
+                tmp_path.unlink(missing_ok=True)
+                raise
+            os.chmod(str(tmp_path), 0o755)
+            os.replace(str(tmp_path), str(GOST_SELFCHECK_PATH))
+            tmp_path = None
             return True
         except OSError as exc:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
             _log_ignored('gost_selfcheck_write', exc)
             return False
 
@@ -10094,8 +10138,14 @@ if __name__ == '__main__':
                 # token 的人刷 10 次错误密码就把管理员锁在门外。全局保留 200 次作
                 # 兜底，换来源爆破的总尝试次数仍然有界。
                 source = self._web_source_key()
-                per_source = self.server.login_source_failures.get(source, [])
-                per_source[:] = [t for t in per_source if now - t < 600]
+                per_source = self.server.login_source_failures.get(source)
+                if per_source is not None:
+                    per_source[:] = [t for t in per_source if now - t < 600]
+                    if not per_source:
+                        self.server.login_source_failures.pop(source, None)
+                        per_source = []
+                else:
+                    per_source = []
                 global_locked = len(self.server.login_failures) >= 200
                 if len(per_source) >= 10 or global_locked:
                     # 🔴 2026-10-31：锁定必须留痕。旧实现静默返回 True，
@@ -10110,6 +10160,10 @@ if __name__ == '__main__':
                     if now - logged.get(key, now - 600) >= 600:
                         for old_key in [k for k, t in logged.items() if now - t >= 600]:
                             del logged[old_key]
+                        # 同步限制锁定日志去重表容量，防止海量来源在同一窗口撑爆内存。
+                        while len(logged) >= 4096:
+                            oldest_key = min(logged, key=logged.get)
+                            del logged[oldest_key]
                         logged[key] = now
                         print('[portal] 登录失败达上限，%s已锁定 600 秒（该来源 %d 次、全局 %d 次失败）'
                               % ('所有来源' if global_locked else '来源 %s ' % source,
@@ -10120,10 +10174,14 @@ if __name__ == '__main__':
         def record_login_failure(self):
             now = time.monotonic()
             with data_lock:
+                self.server.login_failures[:] = [
+                    t for t in self.server.login_failures if now - t < 600]
                 self.server.login_failures.append(now)
                 table = self.server.login_source_failures
                 key = self._web_source_key()
-                table.setdefault(key, []).append(now)
+                bucket = [t for t in table.get(key, []) if now - t < 600]
+                bucket.append(now)
+                table[key] = bucket
                 table.move_to_end(key)
                 while len(table) > 4096:
                     table.popitem(last=False)
@@ -11647,26 +11705,31 @@ if __name__ == '__main__':
                                 with tar.extractfile(member) as source, open(src_bin, 'wb') as dest:
                                     shutil.copyfileobj(source, dest)
                             if src_bin.exists():
-                                staged = Path('/usr/local/bin/gost.new')
-                                shutil.copyfile(str(src_bin), str(staged))
-                                os.chmod(str(staged), 0o755)
-                                # 先确认新文件能跑再替换（2026-11-04 修，与 Xray 安装一致）：
-                                # 摘要对得上不代表能执行（架构判错、noexec、依赖缺失），
-                                # 旧实现直接覆盖正在用的 gost，所有代理随下次重启全部失效。
+                                staged = Path('/usr/local/bin/gost.new.%s' % os.urandom(6).hex())
+                                replaced = False
                                 try:
-                                    probe = subprocess.run([str(staged), '-V'], capture_output=True,
-                                                           text=True, timeout=10)
-                                    runs = probe.returncode == 0 and 'gost' in (probe.stdout + probe.stderr).lower()
-                                except (OSError, subprocess.SubprocessError):
-                                    runs = False
-                                if not runs:
-                                    staged.unlink(missing_ok=True)
-                                    errors.append('%s: 下载的 gost 无法在本机运行，未替换现有版本' % host)
-                                    continue
-                                os.replace(str(staged), '/usr/local/bin/gost')
-                                assets_modified = True
-                                installed = True
-                                break
+                                    shutil.copyfile(str(src_bin), str(staged))
+                                    os.chmod(str(staged), 0o755)
+                                    # 先确认新文件能跑再替换（2026-11-04 修，与 Xray 安装一致）：
+                                    # 摘要对得上不代表能执行（架构判错、noexec、依赖缺失），
+                                    # 旧实现直接覆盖正在用的 gost，所有代理随下次重启全部失效。
+                                    try:
+                                        probe = subprocess.run([str(staged), '-V'], capture_output=True,
+                                                               text=True, timeout=10)
+                                        runs = probe.returncode == 0 and 'gost' in (probe.stdout + probe.stderr).lower()
+                                    except (OSError, subprocess.SubprocessError):
+                                        runs = False
+                                    if not runs:
+                                        errors.append('%s: 下载的 gost 无法在本机运行，未替换现有版本' % host)
+                                        continue
+                                    os.replace(str(staged), '/usr/local/bin/gost')
+                                    replaced = True
+                                    assets_modified = True
+                                    installed = True
+                                    break
+                                finally:
+                                    if not replaced:
+                                        staged.unlink(missing_ok=True)
                             errors.append('%s: 包内没有 gost 可执行文件' % host)
                         except Exception as e:
                             errors.append('%s: %s: %s' % (host, type(e).__name__, e))
@@ -11676,12 +11739,29 @@ if __name__ == '__main__':
                     assets_modified = True
                     for asset_path, old_asset in old_assets.items():
                         if old_asset is None:
-                            asset_path.unlink(missing_ok=True)
+                            try:
+                                asset_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
                         else:
                             contents, mode = old_asset
                             asset_path.parent.mkdir(parents=True, exist_ok=True)
-                            asset_path.write_bytes(contents)
-                            asset_path.chmod(mode)
+                            # 同目录私有临时文件 + 原子替换：避免覆写运行中二进制报 ETXTBSY，
+                            # 同时消除敏感配置文件与私钥的默认 umask 暴露窗口。
+                            tmp_asset = asset_path.with_name(
+                                asset_path.name + '.rollback.' + os.urandom(4).hex())
+                            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                            if hasattr(os, 'O_NOFOLLOW'):
+                                flags |= os.O_NOFOLLOW
+                            try:
+                                fd = os.open(str(tmp_asset), flags, 0o600)
+                                with os.fdopen(fd, 'wb') as fh:
+                                    fh.write(contents)
+                                os.chmod(str(tmp_asset), mode)
+                                os.replace(str(tmp_asset), str(asset_path))
+                            except BaseException:
+                                tmp_asset.unlink(missing_ok=True)
+                                raise
                     if not had_cert_dir and cert_dir.exists():
                         try:
                             cert_dir.rmdir()
@@ -11692,23 +11772,44 @@ if __name__ == '__main__':
                             data['proxy_services'] = previous_proxy_services
                         else:
                             data.pop('proxy_services', None)
-                    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    try:
+                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                    except Exception:
+                        pass
                     if old_assets[gost_binary] is None:
-                        subprocess.run(['systemctl', 'disable', '--now', 'gost'],
-                                       capture_output=True, timeout=30)
-                        subprocess.run(['systemctl', 'stop', 'gost'],
-                                       capture_output=True, timeout=30)
+                        try:
+                            subprocess.run(['systemctl', 'disable', '--now', 'gost'],
+                                           capture_output=True, timeout=30)
+                        except Exception:
+                            pass
+                        try:
+                            subprocess.run(['systemctl', 'stop', 'gost'],
+                                           capture_output=True, timeout=30)
+                        except Exception:
+                            pass
                     else:
                         # 独立还原原有开机自启与运行状态，重启前先清理失败计数防撞上限。
-                        if old_gost_enabled:
-                            subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
-                        else:
-                            subprocess.run(['systemctl', 'disable', 'gost'], capture_output=True, timeout=30)
+                        try:
+                            if old_gost_enabled:
+                                subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
+                            else:
+                                subprocess.run(['systemctl', 'disable', 'gost'], capture_output=True, timeout=30)
+                        except Exception:
+                            pass
                         if old_gost_active:
-                            subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=15)
-                            subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
+                            try:
+                                subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=15)
+                            except Exception:
+                                pass
+                            try:
+                                subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
+                            except Exception:
+                                pass
                         else:
-                            subprocess.run(['systemctl', 'stop', 'gost'], capture_output=True, timeout=30)
+                            try:
+                                subprocess.run(['systemctl', 'stop', 'gost'], capture_output=True, timeout=30)
+                            except Exception:
+                                pass
 
                 if not installed:
                     # 把【每个源】的错误都报出来。
@@ -15283,8 +15384,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if conf_path.exists():
                     c_text = conf_path.read_text(encoding='utf-8')
                     for line in c_text.splitlines():
-                        if 'tcp_congestion_control' in line and '=' in line:
-                            configured_bbr = line.split('=')[1].strip()
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith('#') or stripped.startswith(';'):
+                            continue
+                        if '=' not in stripped:
+                            continue
+                        k_part, v_part = stripped.split('=', 1)
+                        if k_part.strip() == 'net.ipv4.tcp_congestion_control':
+                            configured_bbr = v_part.split('#', 1)[0].split(';', 1)[0].strip()
 
                 need_reboot = False
                 if configured_bbr and configured_bbr != cc_out:

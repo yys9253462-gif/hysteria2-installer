@@ -170,6 +170,32 @@ if [ -z "$SECURITY_MIRROR" ]; then
     esac
 fi
 
+# 前置参数校验：在清空磁盘与生成 chroot 脚本前拦下非法值与注入字符，
+# 防止清盘后才在第 7/8 步因参数异常中止而导致机器无引导失联。
+case "$SWAP_MB" in
+    ''|*[!0-9]*) die "SWAP_MB 必须为非负整数（当前：$SWAP_MB）" ;;
+esac
+case "$DEBIAN_SUITE" in
+    ''|*[!A-Za-z0-9._-]*|-*|.*) die "DEBIAN_SUITE 含非法字符（当前：$DEBIAN_SUITE）" ;;
+esac
+case "$HOSTNAME" in
+    ''|*[!A-Za-z0-9.-]*|-*|.*) die "HOSTNAME 含非法字符（当前：$HOSTNAME）" ;;
+esac
+case "$TIMEZONE" in
+    ''|/*|*..*|*[!A-Za-z0-9_/+.-]*) die "TIMEZONE 含非法字符或路径穿越（当前：$TIMEZONE）" ;;
+esac
+for _url_val in "$MIRROR" "$SECURITY_MIRROR"; do
+    case "$_url_val" in
+        http://*|https://*) ;;
+        *) die "镜像地址必须以 http:// 或 https:// 开头（当前：$_url_val）" ;;
+    esac
+    case "$_url_val" in
+        *[!A-Za-z0-9._~:/?#%+-]*)
+            die "镜像地址含非法字符（当前：$_url_val）" ;;
+    esac
+done
+unset _url_val
+
 # 提示里的版本跟着 --suite 走（2026-11-13 修）：旧实现写死 Debian 12，换成 trixie 时清盘确认
 # 说「安装 Debian 12（trixie）」，装完的核验说明还让人去对 bookworm，像是装错了。
 case "$DEBIAN_SUITE" in
@@ -704,15 +730,19 @@ printf '127.0.0.1\\tlocalhost\\n127.0.1.1\\t%s\\n' "${HOSTNAME}" > /etc/hosts
 # 由外层用 printf 原样写进单独文件，这里只读文件。
 chpasswd < /tmp/_rootpw
 rm -f /tmp/_rootpw
-sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-[ -f /etc/ssh/sshd_config ] || echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+if [ -f /etc/ssh/sshd_config ]; then
+    sed -i 's/^#\\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+    sed -i 's/^#\\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+fi
+grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+yes([[:space:]]|\$)' /etc/ssh/sshd_config 2>/dev/null || printf '\\nPermitRootLogin yes\\n' >> /etc/ssh/sshd_config
+grep -qE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes([[:space:]]|\$)' /etc/ssh/sshd_config 2>/dev/null || printf 'PasswordAuthentication yes\\n' >> /etc/ssh/sshd_config
 
 # 启用 ssh 开机自启（Debian 用 systemd）
 systemctl enable ssh >/dev/null 2>&1 || true
 
-# 生成 fstab
+# 生成 fstab（判空防写出无效 UUID= 导致重启失联）
 ROOT_UUID=\$(blkid -s UUID -o value "${ROOT_PART}")
+[ -n "\${ROOT_UUID}" ] || { echo "无法读取根分区 ${ROOT_PART} 的 UUID" >&2; exit 1; }
 cat > /etc/fstab <<FSTAB_EOF
 UUID=\${ROOT_UUID} / ext4 defaults,errors=remount-ro 0 1
 FSTAB_EOF
@@ -728,8 +758,10 @@ if [ "$DRY_RUN" = "1" ]; then
 else
     printf '%s\n' "$BODY" > "$MOUNT_DIR/tmp/_setup.sh"
     ( umask 077; printf 'root:%s\n' "$ROOT_PWD" > "$MOUNT_DIR/tmp/_rootpw" )
-    chroot "$MOUNT_DIR" /bin/sh /tmp/_setup.sh
+    _chroot_rc=0
+    chroot "$MOUNT_DIR" /bin/sh /tmp/_setup.sh || _chroot_rc=$?
     rm -f "$MOUNT_DIR/tmp/_setup.sh" "$MOUNT_DIR/tmp/_rootpw"
+    [ "$_chroot_rc" -eq 0 ] || die "chroot 配置失败（退出码 ${_chroot_rc}），已清理临时密码文件"
     ok "chroot 配置完成"
 fi
 

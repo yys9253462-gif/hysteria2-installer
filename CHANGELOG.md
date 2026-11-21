@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十批十项修复，门户 2.50
+
+- 混淆隧道控制脚本（`awgctl.sh`）三项稳定性与权限修复：`cmd_uninstall` 卸载前检查服务单元是否存在，跳过从未安装过的服务单元避免半装残留卡死卸载；`cmd_install` 与 `cmd_update` 在比较 `S4 < 12` 前先校验纯数字格式，防止畸形参数触发算术表达式报错；`cmd_peer_add` 与 `cmd_peer_del` 生成空备份占位文件时纳入 `umask 077` 私有掩码。
+- 安装脚本归档查找与元数据自愈加固（`install.sh`）：`hy2_tar_find_member` 改为先捕获 `tar -tzf -` 成员清单并严格校验退出码与目标成员唯一性，拒绝截断压缩包及重复同名成员；`sync_cert_meta` 与内嵌 `do_upgrade.sh` 重写 `client_meta.json` 统一改为 `umask 077` 加同目录 `mktemp` 及 `chmod 600` 原子替换，消除可预测临时文件名与权限暴露窗口。
+- 安装脚本核心操作锁与升级锁释放修复（`install.sh`）：新增 `release_installer_core_lock` 并在 `acquire_installer_core_lock` 中记录锁描述符 `_INSTALLER_CORE_LOCK_FD`、拿锁失败立即关闭描述符；`flow_update_core` 在所有退出与错误路径自包含关闭 `update_lock_fd`；`flow_install`、`flow_reconfigure`、`uninstall_all` 及直通安装分支在退出或完成核心变更后主动释放 `.core-operation.lock`，消除描述符泄漏与持续占锁阻塞门户问题。
+- 入站代理面板安装与回滚加固（`portal.py` 的 `_h_post_install_gost` 与 `write_gost_selfcheck`）：安装暂存二进制改用随机后缀 `gost.new.<随机串>` 并在 `finally` 中保证未替换即清理；`write_gost_selfcheck` 改用同目录私有临时文件加 `os.replace` 原子落地；`restore_gost_assets` 改用同目录私有临时文件原子替换避免覆写运行中二进制触发 `ETXTBSY`（文本文件忙）及敏感配置权限窗口，并逐条隔离 `systemctl` 超时异常防回滚中途断裂。
+- 救援环境重装脚本前置护栏与清理加固（`alpine2debian.sh`）：在清空磁盘前校验 `SWAP_MB`、`DEBIAN_SUITE`、`HOSTNAME`、`TIMEZONE`、`MIRROR` 与 `SECURITY_MIRROR`，拦截非法数值、路径穿越与命令注入字符；`chroot` 内部校验根分区 `ROOT_UUID` 非空并补齐 `PermitRootLogin yes` / `PasswordAuthentication yes` 追加兜底；无论 `chroot` 成功或失败均立即清除临时脚本与明文密码文件 `/tmp/_rootpw`。
+- 流媒体解锁并发超时上限与证书自愈状态容错（`portal.py` 的 `run_unlock_checks`、`_unlock_fetch`、`_unlock_read` 与 `cert_status`）：`run_unlock_checks` 改为共享单轮 30 秒总截止时间，修复六线程串行等待最坏阻塞 180 秒拖死接口死线；`_unlock_fetch` 在捕获 `HTTPError` 后 `finally` 关闭连接句柄防止描述符泄漏；`_unlock_read` 兼容 `IncompleteRead.partial` 为空值；`cert_status` 校验自愈状态文件顶层为对象再读取字段。
+- 拥塞控制状态解析与登录限流器内存边界修复（`portal.py` 的 `_h_get_bbr_status`、`login_rate_limited` 与 `record_login_failure`）：读取 `/etc/sysctl.d/99-bbr.conf` 时跳过 `#` / `;` 注释行并剥离行尾注释、精确匹配键名，修复注释旧值覆盖有效配置导致虚假「需要重启」提示；登录限流器及时淘汰 600 秒以外过期失败记录、清理空来源桶，并为 `_login_lock_logged_at` 去重表增加 4096 上限封顶防内存持续增长。
+- 出口探测代理凭据脱敏与输入校验（`portal.py` 的 `detect_outbound_ip`）：含账号密码（`@`）的代理地址改由标准输入传入 `curl --config -`，彻底避免明文代理凭据暴露在系统进程表（`ps` / `/proc/<pid>/cmdline`）；拦截含空白或控制字符的畸形代理地址；直连模式省略空的 `--proxy` 参数仅传 `--noproxy '*'`。
+- 重装脚本参数校验、下载超时与最小权限加固（`reinstall-debian13.sh`）：前置校验 `MIRROR` 仅允许安全 `http://` / `https://` 地址，拒绝前导零端口与 0 号版本；`download_installnet` 为 `wget` 增加 `-T 120` 超时防远端卡死无限挂起；`init_log` 使用 `umask 077` 与 `chmod 600` 保护重装日志，下载后的 `InstallNET.sh` 收紧为 `chmod 700`。
+- 安装脚本计量配置锚点与证书借签回滚修复（`install.sh` 的 `portal_write_meter_config` 与 `setup_cert_via_existing_caddy`）：补写 `trafficStats:` 时改为按行首正则匹配真实顶层 `masquerade:` 段，避免命中注释行内的 `masquerade:` 写坏 `config.yaml`，并将 `config.yaml` 与 `usage-meter-config.json` 均改为同目录私有临时文件原子替换；借本机 Caddy 签发证书等待 60 秒超时失败时，若本次自动追加了占位域名块则自动从备份回滚并重载 Caddy，避免生产 `Caddyfile` 残留无效站点。
+
 ## 2026-11-21 — 第三十九批十项修复，门户 2.49
 
 - 计量配置更新助手（`usage-meter-xray-config-20261007-v1.py`）新增 `_write_private_bytes` 直接以目标权限创建并落盘候选与备份配置，消除 `enable_iplimit_routing` 与 `enable_reality_online` 默认掩码暴露私钥窗口及非原子 `shutil.copy2` 备份问题；将候选文件写入移入 `try` 块确保失败必清理，并隔离回滚重启超时异常避免覆盖原始失败原因。
