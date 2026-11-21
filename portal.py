@@ -1493,6 +1493,21 @@ def portal_bundle_version(local_shas, remote_shas):
             'latest': fingerprint(remote_shas)}
 
 
+_MAX_REMOTE_META_BYTES = 2 * 1024 * 1024
+_MAX_PORTAL_FILE_BYTES = 4 * 1024 * 1024
+
+
+def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
+    """带体积上限读取外部响应，防止异常超大响应耗尽门户内存。"""
+    try:
+        raw = resp.read(limit + 1)
+    except TypeError:
+        raw = resp.read()
+    if len(raw) > limit:
+        raise ValueError('响应体积过大（超过 %d 字节）' % limit)
+    return raw
+
+
 def resolve_update_ref(ref):
     if re.fullmatch(r'[0-9a-f]{40}', ref):
         return ref
@@ -1503,7 +1518,8 @@ def resolve_update_ref(ref):
         req = urllib.request.Request('https://api.github.com/repos/' + AWG_REPO + '/commits/main',
                                      headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=8) as response:
-            value = json.loads(response.read().decode('utf-8')).get('sha', '')
+            payload = json.loads(_read_bounded_bytes(response).decode('utf-8', 'replace'))
+            value = payload.get('sha', '') if isinstance(payload, dict) else ''
     except Exception as exc:
         _log_ignored('resolve_update_ref.github', exc)
     if not re.fullmatch(r'[0-9a-f]{40}', value):
@@ -1516,7 +1532,7 @@ def resolve_update_ref(ref):
                 'https://github.com/' + AWG_REPO + '/commits/main.atom',
                 headers={'User-Agent': 'hysteria2-installer'})
             with urllib.request.urlopen(req, timeout=8) as response:
-                feed = response.read().decode('utf-8', 'replace')
+                feed = _read_bounded_bytes(response).decode('utf-8', 'replace')
             m = re.search(r'/commit/([0-9a-f]{40})', feed)
             value = m.group(1) if m else ''
         except Exception as exc:
@@ -1607,10 +1623,10 @@ def parse_xray_dgst(text):
     return found if count == 1 else None
 
 
-def fetch_text(url, timeout=30, headers=None):
+def fetch_text(url, timeout=30, headers=None, max_bytes=_MAX_REMOTE_META_BYTES):
     req = urllib.request.Request(url, headers=headers or {'User-Agent': 'hysteria2-installer'})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode('utf-8', errors='replace')
+        return _read_bounded_bytes(resp, max_bytes).decode('utf-8', errors='replace')
 
 
 def fetch_expected_sha256(manifest_url, asset, parser=None):
@@ -5629,20 +5645,6 @@ def _xray_version(binary='/usr/local/bin/xray', run=subprocess.run):
     m = re.search(r'Xray\s+v?(\d+(?:\.\d+)+)', (out.stdout or '') + (out.stderr or ''))
     return m.group(1) if m else ''
 
-_MAX_REMOTE_META_BYTES = 2 * 1024 * 1024
-
-
-def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
-    """带体积上限读取外部响应，防止异常超大响应耗尽门户内存。"""
-    try:
-        raw = resp.read(limit + 1)
-    except TypeError:
-        raw = resp.read()
-    if len(raw) > limit:
-        raise ValueError('响应体积过大（超过 %d 字节）' % limit)
-    return raw
-
-
 def install_xray_binary():
     """下载官方 Xray-core 并校验 SHA2-256 后装到 /usr/local/bin/xray，返回 (ok, message)。
 
@@ -8951,7 +8953,7 @@ def serve(path):
                 headers={'User-Agent': 'Mozilla/5.0',
                          'Accept': 'application/vnd.github+json'})
             with urllib.request.urlopen(req, timeout=8) as resp:
-                items = json.loads(resp.read().decode('utf-8'))
+                items = json.loads(_read_bounded_bytes(resp).decode('utf-8', errors='replace'))
             # GitHub 在限流/出错时返回的是对象（{"message": ...}），不是列表；
             # 旧写法 `for it in items` 直接抛 TypeError，虽然被下面 except 兜住，
             # 但每次都白跑一遍请求且永远拿不到缓存。
@@ -9231,7 +9233,7 @@ if __name__ == '__main__':
             try:
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    content = resp.read()
+                    content = _read_bounded_bytes(resp, _MAX_PORTAL_FILE_BYTES)
                 # 体积 + 关键字双重校验，挡住错误页
                 if len(content) > min_size and (marker is None or marker in content):
                     if expect_blob is not None and _git_blob_sha(content) != expect_blob:
@@ -9271,7 +9273,7 @@ if __name__ == '__main__':
                 'Accept': 'application/vnd.github+json',
             })
             with urllib.request.urlopen(req, timeout=8) as resp:
-                info = json.loads(resp.read().decode('utf-8'))
+                info = json.loads(_read_bounded_bytes(resp).decode('utf-8', errors='replace'))
             sha = info.get('sha', '') if isinstance(info, dict) else ''
             if isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha):
                 return sha
@@ -11477,9 +11479,9 @@ if __name__ == '__main__':
                 try:
                     req = urllib.request.Request('https://api.github.com/repos/go-gost/gost/releases/latest', headers={'User-Agent': 'Mozilla/5.0'})
                     with urllib.request.urlopen(req, timeout=8) as r:
-                        rel_data = json.loads(r.read().decode())
-                        if rel_data.get('tag_name'):
-                            tag = rel_data['tag_name']
+                        rel_data = json.loads(_read_bounded_bytes(r).decode('utf-8', errors='replace'))
+                        if isinstance(rel_data, dict) and isinstance(rel_data.get('tag_name'), str) and rel_data['tag_name'].strip():
+                            tag = rel_data['tag_name'].strip()
                 except Exception:
                     tag = 'v3.3.0'
 
@@ -14893,8 +14895,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     req = urllib.request.Request('https://api.github.com/repos/apernet/hysteria/releases/latest',
                                                  headers={'User-Agent': 'hysteria2-installer'})
                     with urllib.request.urlopen(req, timeout=3) as response:
-                        release = json.loads(response.read().decode('utf-8'))
-                    _core_ver_cache['tag'] = str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
+                        release = json.loads(_read_bounded_bytes(response).decode('utf-8', errors='replace'))
+                    _core_ver_cache['tag'] = (
+                        str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
+                        if isinstance(release, dict) else ''
+                    )
                 except Exception:
                     _core_ver_cache['tag'] = ''
                 _core_ver_cache['t'] = now
