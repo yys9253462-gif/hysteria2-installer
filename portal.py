@@ -13095,14 +13095,19 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                if not self._extend_deadline(420, heavy=True):
-                    return self.reply_json(409, {'ok': False, 'error':
-                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
                 if name not in ('xray', 'sing-box'):
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里安装该核心'})
+                if not self._extend_deadline(420, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 with core_operation_lock:
                     try:
                         core_lock_fd = acquire_core_operation_lock()
@@ -13130,7 +13135,7 @@ if __name__ == '__main__':
                         msg += '；正在运行的 %s 仍是旧核心，下次重启该服务（或在协议页关闭再开启）后才换成新版本' % '、'.join(running)
                 return self.reply_json(200 if ok else 500, {'ok': ok, ('message' if ok else 'error'): msg})
             except Exception as exc:
-                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(exc).__name__, str(exc)))[:160]})
 
         def _core_users(self, name):
             """返回仍在使用该核心的协议名列表；非空时拒绝卸载。"""
@@ -13161,16 +13166,21 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                if not self._extend_deadline(120, heavy=True):
-                    return self.reply_json(409, {'ok': False, 'error':
-                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                length = int(self.headers.get('Content-Length', 0))
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
                 units = {'xray': (('xray',), '/usr/local/bin/xray'),
                          'sing-box': ((ANYTLS_SERVICE, TUIC_SERVICE), ANYTLS_BINARY)}
                 if name not in units:
                     return self.reply_json(400, {'ok': False, 'error': '不支持在这里卸载该核心'})
+                if not self._extend_deadline(120, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 unit_names, binary = units[name]
                 with core_operation_lock:
                     try:
@@ -13209,23 +13219,26 @@ if __name__ == '__main__':
                                 capture_output=True, timeout=30)
                             state = _systemd_state(unit)
                             if not _service_stop_confirmed(stop_result, state):
-                                # 恢复每个原本存在单元的激活与开机自启状态（含本轮已停掉的单元）
+                                # 恢复每个原本存在单元的激活与开机自启状态（逐单元隔离超时/异常）
                                 restore_failed = []
                                 for restore_unit, (was_active, was_enabled, restore_absent) in unit_states.items():
                                     if restore_absent:
                                         continue
-                                    enable_result = subprocess.run(
-                                        ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
-                                        capture_output=True, timeout=30)
-                                    if was_active:
-                                        subprocess.run(['systemctl', 'reset-failed', restore_unit],
-                                                       capture_output=True, timeout=5)
-                                    action_result = subprocess.run(
-                                        ['systemctl', 'start' if was_active else 'stop', restore_unit],
-                                        capture_output=True, timeout=30)
-                                    restored_state = _systemd_state(restore_unit)
-                                    active_ok = restored_state == ('active' if was_active else 'inactive')
-                                    if enable_result.returncode != 0 or action_result.returncode != 0 or not active_ok:
+                                    try:
+                                        enable_result = subprocess.run(
+                                            ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
+                                            capture_output=True, timeout=30)
+                                        if was_active:
+                                            subprocess.run(['systemctl', 'reset-failed', restore_unit],
+                                                           capture_output=True, timeout=5)
+                                        action_result = subprocess.run(
+                                            ['systemctl', 'start' if was_active else 'stop', restore_unit],
+                                            capture_output=True, timeout=30)
+                                        restored_state = _systemd_state(restore_unit)
+                                        active_ok = restored_state == ('active' if was_active else 'inactive')
+                                        if enable_result.returncode != 0 or action_result.returncode != 0 or not active_ok:
+                                            restore_failed.append(restore_unit)
+                                    except Exception:
                                         restore_failed.append(restore_unit)
                                 if restore_failed:
                                     return self.reply_json(500, {'ok': False, 'error':
@@ -13243,7 +13256,7 @@ if __name__ == '__main__':
                         os.close(core_lock_fd)
                 return self.reply_json(200, {'ok': True, 'message': '%s 已卸载' % name})
             except Exception as exc:
-                return self.reply_json(500, {'ok': False, 'error': str(exc)})
+                return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(exc).__name__, str(exc)))[:160]})
 
         def _apply_anytls_enable(self):
             """启用 AnyTLS：装 sing-box → 选端口 → 写配置并重启 → 落 data。
