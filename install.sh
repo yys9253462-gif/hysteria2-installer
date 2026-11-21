@@ -310,7 +310,7 @@ hy2_acme_path_safe() {
 hy2_acme_pin_commit() {
     local json sha
     command -v jq >/dev/null 2>&1 || return 1
-    json="$(curl -fsSL --connect-timeout 15 --max-time 30 --retry 2 \
+    json="$(curl -fsSL --connect-timeout 15 --max-time 30 --max-filesize 4194304 --retry 2 \
         -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/${HY2_ACME_REPO}/commits/master" 2>/dev/null)" || return 1
     sha="$(printf '%s' "$json" | jq -r '.sha // empty' 2>/dev/null)" || return 1
@@ -323,7 +323,7 @@ hy2_acme_tree_json() {
     local commit="${1:-}" json
     [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || return 1
     command -v jq >/dev/null 2>&1 || return 1
-    json="$(curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+    json="$(curl -fsSL --connect-timeout 15 --max-time 60 --max-filesize 4194304 --retry 2 \
         -H 'Accept: application/vnd.github+json' \
         "https://api.github.com/repos/${HY2_ACME_REPO}/git/trees/${commit}?recursive=1" 2>/dev/null)" || return 1
     [[ "$(printf '%s' "$json" | jq -r '.truncated // false' 2>/dev/null)" == "false" ]] || return 1
@@ -358,7 +358,7 @@ hy2_acme_fetch_verified() {
     hy2_acme_path_safe "$path" || return 1
     [[ -n "$dest" ]] || return 1
     mkdir -p "$(dirname "$dest")" || return 1
-    curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+    curl -fsSL --connect-timeout 15 --max-time 60 --max-filesize 4194304 --retry 2 \
         -o "$dest" "https://raw.githubusercontent.com/${repo}/${commit}/${path}" 2>/dev/null || {
         rm -f "$dest"; return 1; }
     got="$(hy2_git_blob_sha "$dest")" || { rm -f "$dest"; return 1; }
@@ -373,26 +373,28 @@ hy2_acme_fetch_verified() {
 # 那等于后台定期执行未校验的新代码）。只改这一个配置项，先备份 account.conf。
 # ⚠️ 不关闭 cron 本身：证书续期仍由 `--cron` 完成。
 hy2_acme_disable_auto_upgrade() {
-    local conf="${1:-}" tmp
+    local conf="${1:-}" conf_dir tmp=""
     [[ -n "$conf" ]] || return 1
-    mkdir -p "$(dirname "$conf")" || return 1
+    conf_dir="$(dirname "$conf")"
+    mkdir -p "$conf_dir" || return 1
+    tmp="$(umask 077 && mktemp "${conf_dir}/.account.conf.XXXXXX")" || return 1
     if [[ ! -f "$conf" ]]; then
-        printf "AUTO_UPGRADE='0'\n" > "$conf" || return 1
-        chmod 600 "$conf" 2>/dev/null || true
+        printf "AUTO_UPGRADE='0'\n" > "$tmp" || { rm -f "$tmp"; return 1; }
+        chmod 600 "$tmp" 2>/dev/null || true
+        mv -f "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
         return 0
     fi
-    cp -a "$conf" "${conf}.hy2-bak" || return 1
-    tmp="$(mktemp)" || return 1
+    cp -a "$conf" "${conf}.hy2-bak" || { rm -f "$tmp"; return 1; }
     if grep -qE '^AUTO_UPGRADE=' "$conf"; then
         sed "s|^AUTO_UPGRADE=.*|AUTO_UPGRADE='0'|" "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
     elif grep -qE '^#AUTO_UPGRADE=' "$conf"; then
         sed "s|^#AUTO_UPGRADE=.*|AUTO_UPGRADE='0'|" "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
     else
-        cp -a "$conf" "$tmp" || { rm -f "$tmp"; return 1; }
+        cat "$conf" > "$tmp" || { rm -f "$tmp"; return 1; }
         printf "\nAUTO_UPGRADE='0'\n" >> "$tmp" || { rm -f "$tmp"; return 1; }
     fi
-    cat "$tmp" > "$conf" || { rm -f "$tmp"; return 1; }
-    rm -f "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$conf" || { rm -f "$tmp"; return 1; }
     grep -qE "^AUTO_UPGRADE='0'$" "$conf" || return 1
     return 0
 }
@@ -425,7 +427,8 @@ hy2_acme_install_verified() {
         return 1
     fi
 
-    work="$(mktemp -d)" || { log_err "无法创建临时目录，已放弃安装 acme.sh。"; return 1; }
+    work="$(umask 077 && mktemp -d)" || { log_err "无法创建临时目录，已放弃安装 acme.sh。"; return 1; }
+    trap 'rm -rf "${work:-}" 2>/dev/null || true' RETURN
 
     for path in $HY2_ACME_FILES; do
         if ! blob="$(hy2_acme_blob_for_path "$tree_json" "$path")"; then
@@ -511,7 +514,7 @@ hy2_acme_shebang_safe() {
 # 允许 shebang 差异是因为上游 install() 会把所有 .sh 的首行改成 `#!<bash 路径>`。
 hy2_acme_same_except_shebang() {
     local src="${1:-}" dst="${2:-}"
-    [[ -f "$src" && -f "$dst" ]] || return 1
+    [[ -f "$src" && -f "$dst" && ! -L "$dst" ]] || return 1
     cmp -s "$src" "$dst" && return 0
     hy2_acme_shebang_safe "$(head -n1 "$src" 2>/dev/null)" || return 1
     hy2_acme_shebang_safe "$(head -n1 "$dst" 2>/dev/null)" || return 1
@@ -530,7 +533,8 @@ hy2_acme_verify_existing() {
         log_err "缺少 jq，无法校验已有 acme.sh 的官方身份。"
         return 1
     fi
-    work="$(mktemp -d)" || { log_err "无法创建临时目录，无法校验已有 acme.sh。"; return 1; }
+    work="$(umask 077 && mktemp -d)" || { log_err "无法创建临时目录，无法校验已有 acme.sh。"; return 1; }
+    trap 'rm -rf "${work:-}" 2>/dev/null || true' RETURN
     # 优先对比本机记录的固定 commit（本项目装的 / 已核验过的安装）。
     # 记录存在时**绝不**回退到上游 master：对不上就是被改过，必须阻断。
     # 没有记录的旧安装（get.acme.sh 装的）只能对比当前 master，核验通过后再补记录。
@@ -6551,9 +6555,10 @@ close_replaced_ports() {
     local old_udp="$1" old_tcp="$2" in_use
     # gost 代理服务的端口也算在用（2026-11-06 补）：它们同样由门户放行，被换掉的订阅端口
     # 恰好与某条代理同号时不能把那条代理的放行一起收回。
-    in_use="$(jq -r '([.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
-        | map(select(type == "object") | .port | numbers))
-        + ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | numbers) else [] end)
+    in_use="$(jq -r 'def pnum: if type=="number" then . elif type=="string" and test("^[0-9]+$") then tonumber else empty end;
+        ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
+        | map(select(type == "object") | .port | pnum))
+        + ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | pnum) else [] end)
         | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
     _close_one() {   # $1=port $2=proto
         is_valid_port "$1" || return 0
@@ -6591,19 +6596,20 @@ close_installer_ports() {
     # 先存下捕获组：is_valid_port 自己也用 =~，会覆盖 BASH_REMATCH。
     if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
         lo="${BASH_REMATCH[1]}"; hi="${BASH_REMATCH[2]}"
-        if is_valid_port "$lo" && is_valid_port "$hi"; then _fw_close "$range" udp; fi
+        if is_valid_port "$lo" && is_valid_port "$hi" && (( 10#$lo <= 10#$hi )); then _fw_close "$range" udp; fi
     fi
     tcp_ports="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
-    tcp_ports+=$'\n'"$(jq -r --argjson px "$with_proxies" '
-        ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config] | map(select(type == "object") | .port | numbers))
-        + (if $px == 1 then ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | numbers) else [] end) else [] end)
+    tcp_ports+=$'\n'"$(jq -r --argjson px "$with_proxies" 'def pnum: if type=="number" then . elif type=="string" and test("^[0-9]+$") then tonumber else empty end;
+        ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config] | map(select(type == "object") | .port | pnum))
+        + (if $px == 1 then ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | pnum) else [] end) else [] end)
         | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
     while IFS= read -r p; do
         is_valid_port "$p" || continue
         [[ "$p" == 80 || "$p" == 443 ]] && continue
         _fw_close "$p" tcp
-    done <<<"$tcp_ports"
-    p="$(jq -r '.tuic_config | if type == "object" then (.port | numbers) else empty end' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    done < <(printf '%s\n' "$tcp_ports" | sort -u)
+    p="$(jq -r 'def pnum: if type=="number" then . elif type=="string" and test("^[0-9]+$") then tonumber else empty end;
+        .tuic_config | if type == "object" then (.port | pnum) else empty end' "$HY2_DIR/portal.json" 2>/dev/null || true)"
     if is_valid_port "$p"; then _fw_close "$p" udp; fi
     if [[ "$fwd_on" == 1 ]]; then firewall-cmd --reload >/dev/null 2>&1 || true; fi
     unset -f _fw_close
