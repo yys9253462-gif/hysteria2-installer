@@ -6655,6 +6655,8 @@ def _nft_port_rule(proto, port):
 
 def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
     """Whether another configured protocol still needs an open firewall port."""
+    if isinstance(port, bool):
+        return False
     try:
         port = int(port)
     except (TypeError, ValueError):
@@ -6670,17 +6672,20 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
             continue
         if isinstance(section, dict) and (key not in ('anytls_config', 'tuic_config') or section.get('enabled')):
             try:
-                if int(section.get('port') or 0) == port:
+                raw_p = section.get('port')
+                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
                     return True
             except (TypeError, ValueError):
                 pass
     tags = {REALITY_INBOUND_TAG, VMESS_INBOUND_TAG, VLESSENC_INBOUND_TAG}
     if isinstance(xray_config, dict):
-        for inbound in xray_config.get('inbounds', []):
+        inbounds = xray_config.get('inbounds')
+        for inbound in (inbounds if isinstance(inbounds, list) else []):
             if not isinstance(inbound, dict) or inbound.get('tag') not in tags:
                 continue
             try:
-                if int(inbound.get('port') or 0) == port:
+                raw_p = inbound.get('port')
+                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
                     section_key = {REALITY_INBOUND_TAG: 'reality_config',
                                    VMESS_INBOUND_TAG: 'vmess_config',
                                    VLESSENC_INBOUND_TAG: 'vlessenc_config'}[inbound['tag']]
@@ -6688,23 +6693,27 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
                         return True
             except (TypeError, ValueError):
                 continue
-    for service in (ANYTLS_SERVICE, TUIC_SERVICE):
+    for service, cfg_key in ((ANYTLS_SERVICE, 'anytls_config'), (TUIC_SERVICE, 'tuic_config')):
+        if exclude_key == cfg_key:
+            continue
         config_path = Path('/etc/hysteria') / (ANYTLS_CONFIG_NAME if service == ANYTLS_SERVICE else TUIC_CONFIG_NAME)
         if _systemd_state(service) == 'active' and config_path.exists():
             try:
                 config = json.loads(config_path.read_text(encoding='utf-8'))
                 listeners = config.get('inbounds', []) if isinstance(config, dict) else []
-                if any(int(item.get('listen_port') or 0) == port for item in listeners
-                       if isinstance(item, dict)):
+                if isinstance(listeners, list) and any(
+                        not isinstance(item.get('listen_port'), bool) and int(item.get('listen_port') or 0) == port
+                        for item in listeners if isinstance(item, dict)):
                     return True
             except (OSError, ValueError, TypeError):
                 return True
-    if proto == 'tcp':
+    if proto == 'tcp' and exclude_key != 'proxy_services':
         for item in data.get('proxy_services', []) if isinstance(data.get('proxy_services'), list) else []:
             if not isinstance(item, dict):
                 continue
             try:
-                if int(item.get('port') or 0) == port:
+                raw_p = item.get('port')
+                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
                     return True
             except (TypeError, ValueError):
                 pass
@@ -6718,6 +6727,8 @@ def firewall_port(port, proto='tcp', open_=True):
     Hy2 与 AWG 的端口由安装脚本放行；门户自己装的 Reality 和 GOST 代理端口要在这里处理，
     否则开着防火墙的系统上本机探测一切正常，外网却连不上。
     """
+    if isinstance(port, bool):
+        return False
     try:
         port = int(port)
     except (TypeError, ValueError):
@@ -16023,7 +16034,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 conf_path = Path('/etc/sysctl.d/99-bbr.conf')
                 configured_bbr = ''
                 if conf_path.exists():
-                    c_text = conf_path.read_text(encoding='utf-8')
+                    try:
+                        c_text = conf_path.read_text(encoding='utf-8')
+                    except (OSError, UnicodeDecodeError):
+                        c_text = ''
                     for line in c_text.splitlines():
                         stripped = line.strip()
                         if not stripped or stripped.startswith('#') or stripped.startswith(';'):
@@ -16050,13 +16064,18 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 # tcp_available_congestion_control 只列出**已加载**的模块：新机器上
                 # tcp_bbr 还没 modprobe，只会看到 "reno cubic"，前端据此把按钮全禁用。
-                # 所以把「内核里装了、可被 modprobe 的模块」也算作可用。
+                # 所以把「内核里装了、可被 modprobe 的模块」也算作可用；未装 modinfo 时平稳跳过。
                 available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
                                            capture_output=True, text=True, timeout=2).stdout.split()
                 for algo in ('bbr', 'bbr2', 'bbr3'):
-                    if algo not in available and subprocess.run(
-                            ['modinfo', '-n', 'tcp_' + algo], capture_output=True, timeout=2).returncode == 0:
-                        available.append(algo)
+                    if algo in available:
+                        continue
+                    try:
+                        if subprocess.run(
+                                ['modinfo', '-n', 'tcp_' + algo], capture_output=True, timeout=2).returncode == 0:
+                            available.append(algo)
+                    except (OSError, subprocess.SubprocessError):
+                        continue
 
                 return self.reply_json(200, {
                     'ok': True,
