@@ -938,11 +938,10 @@ cmd_peer_add() {
         (umask 077; cp -p "$AWG_CONFIG" "$config_backup") || { rm -f "$peers_backup" "$config_backup"; die "无法备份服务端配置"; }
         had_config=1
     else
-        : > "$config_backup"
-        chmod 600 "$config_backup"
+        (umask 077; : > "$config_backup")
     fi
 
-    tmp="$(mktemp "${AWG_DIR}/.peers.XXXXXX")"
+    tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers.XXXXXX")"
     # 同 peer-del：jq 失败时空输出不能盖掉原有客户端（2026-11-04 修）。
     if ! jq --arg n "$name" --arg ip "$addr" --arg priv "$priv" \
        --arg pub "$pub" --arg psk "$psk" --arg ep "$endpoint" \
@@ -992,11 +991,10 @@ cmd_peer_del() {
         (umask 077; cp -p "$AWG_CONFIG" "$config_backup") || { rm -f "$peers_backup" "$config_backup"; die "无法备份服务端配置"; }
         had_config=1
     else
-        : > "$config_backup"
-        chmod 600 "$config_backup"
+        (umask 077; : > "$config_backup")
     fi
 
-    tmp="$(mktemp "${AWG_DIR}/.peers.XXXXXX")"
+    tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers.XXXXXX")"
     # jq 失败（peers.json 结构被改坏）时不能拿空输出覆盖原文件（2026-11-04 修）：
     # 那会一次删光全部客户端。
     if ! jq --arg n "$name" '.peers |= map(select(.name != $n))' "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
@@ -1197,7 +1195,7 @@ cmd_install() {
     # 保护，沿用会让服务起不来、事务回滚，换协议线永远装不上（2026-11-04 修）。
     local _s4
     _s4="$(meta_get S4)"
-    if [[ -n "$(meta_get S1)" && "$line" == "3" && "${_s4:-0}" -lt 12 ]]; then
+    if [[ -n "$(meta_get S1)" && "$line" == "3" ]] && { [[ ! "$_s4" =~ ^[0-9]+$ ]] || (( 10#$_s4 < 12 )); }; then
         log_warn "旧 S4=${_s4} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
         meta_set S1 ""
     fi
@@ -1304,21 +1302,26 @@ cmd_uninstall() {
     require_root
 
     log_step "停止并移除 AmneziaWG 服务..."
-    local was_active=0 was_enabled=0 state enabled_state
+    local was_active=0 was_enabled=0 state enabled_state unit_absent=0
     systemctl is-active --quiet "$AWG_SERVICE_NAME" 2>/dev/null && was_active=1 || true
     enabled_state="$(systemctl is-enabled "$AWG_SERVICE_NAME" 2>/dev/null || true)"
     [[ "$enabled_state" == enabled ]] && was_enabled=1
-    if ! systemctl stop "$AWG_SERVICE_NAME" 2>/dev/null; then
-        die "无法停止 ${AWG_SERVICE_NAME}，保留服务单元、二进制和客户端配置。"
+    if [[ "$was_active" == 0 && ! -e "$AWG_SERVICE" && ( "$enabled_state" == "not-found" || -z "$enabled_state" ) ]]; then
+        unit_absent=1
     fi
-    state="$(systemctl is-active "$AWG_SERVICE_NAME" 2>/dev/null || true)"
-    if [[ "$state" != inactive && "$state" != failed ]]; then
-        die "无法确认 ${AWG_SERVICE_NAME} 已停止（state=${state:-unknown}），保留全部资产。"
-    fi
-    if ! systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null; then
-        if [[ "$was_enabled" == 1 ]]; then systemctl enable "$AWG_SERVICE_NAME" >/dev/null 2>&1 || true; fi
-        if [[ "$was_active" == 1 ]]; then awg_restart_service >/dev/null 2>&1 || true; fi
-        die "无法禁用 ${AWG_SERVICE_NAME}，服务已按原状态恢复且未删除资产。"
+    if [[ "$unit_absent" == 0 ]]; then
+        if ! systemctl stop "$AWG_SERVICE_NAME" 2>/dev/null; then
+            die "无法停止 ${AWG_SERVICE_NAME}，保留服务单元、二进制和客户端配置。"
+        fi
+        state="$(systemctl is-active "$AWG_SERVICE_NAME" 2>/dev/null || true)"
+        if [[ "$state" != inactive && "$state" != failed ]]; then
+            die "无法确认 ${AWG_SERVICE_NAME} 已停止（state=${state:-unknown}），保留全部资产。"
+        fi
+        if ! systemctl disable "$AWG_SERVICE_NAME" 2>/dev/null; then
+            if [[ "$was_enabled" == 1 ]]; then systemctl enable "$AWG_SERVICE_NAME" >/dev/null 2>&1 || true; fi
+            if [[ "$was_active" == 1 ]]; then awg_restart_service >/dev/null 2>&1 || true; fi
+            die "无法禁用 ${AWG_SERVICE_NAME}，服务已按原状态恢复且未删除资产。"
+        fi
     fi
 
     # awg-quick down 会执行 PostDown，顺带清掉 FORWARD 与 MASQUERADE 规则
@@ -1463,7 +1466,7 @@ cmd_update() {
             # 3.x 要求 S1~S4 >= 12，2.x 的 S4 可能是 0~11，必须重生成
             local s4
             s4="$(meta_get S4)"
-            if [[ "${s4:-0}" -lt 12 ]]; then
+            if [[ ! "$s4" =~ ^[0-9]+$ ]] || (( 10#$s4 < 12 )); then
                 log_warn "旧 S4=${s4} 不满足 3.x 头部保护的 >=12 要求，正在重新生成全部混淆参数"
                 gen_obfs_params "$line"
                 meta_set Jc "$AWG_JC"; meta_set Jmin "$AWG_JMIN"; meta_set Jmax "$AWG_JMAX"
