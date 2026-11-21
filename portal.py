@@ -8426,13 +8426,19 @@ def serve(path):
                 enforce_node_access(portal_path.parent,snapshot,pending,reality_apply_lock,
                                     skip_anytls=False, skip_tuic=False)
             except Exception as exc:
+                need_save_pending = False
                 with data_lock:
                     queued = sorted(pending_revocations(data) | pending)
                     # 队列没变就不重写：旧实现每次失败都整份重写 portal.json 并 fsync，
                     # 只有到期用户、队列为空时也写一个空列表，等于每 5 秒落盘一次（2026-11-12 修）。
                     if queued and data.get('_pending_revocations') != queued:
                         data['_pending_revocations'] = queued
+                        need_save_pending = True
+                if need_save_pending:
+                    try:
                         save_data()
+                    except Exception as save_exc:
+                        _log_ignored('apply_access.save_pending', save_exc)
                 reason = type(exc).__name__ + ': ' + ' '.join(str(exc).split())[:300]
                 now = time.monotonic()
                 if reason != last_enforce_error[0] or now - last_enforce_error[1] >= 3600:
@@ -10578,7 +10584,10 @@ if __name__ == '__main__':
                                 # （2026-10-29 修：旧实现无条件保留旧 status/用量，
                                 # 控制台对账时传 active=false 或 limit_bytes 会被静默忽略）。
                                 if 'used_bytes' not in params:
-                                    record['used_bytes'] = int(existing.get('used_bytes', 0))
+                                    try:
+                                        record['used_bytes'] = int(existing.get('used_bytes') or 0)
+                                    except (TypeError, ValueError):
+                                        record['used_bytes'] = 0
                                 record['created_at'] = existing.get('created_at', now_ts)
                                 if 'legacy_auth_value' in existing:
                                     record['legacy_auth_value'] = existing['legacy_auth_value']
@@ -10839,7 +10848,7 @@ if __name__ == '__main__':
                                     new_expiry = int(base_time) + days * 86400
                                 # limit_bytes=0 表示不限量：加流量不能把它变成「只有本次加的量」，
                                 # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
-                                old_limit = int(u.get('limit_bytes', 0))
+                                old_limit = int(u.get('limit_bytes') or 0)
                                 new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
                                 if ((new_expiry is not None and not 0 <= new_expiry <= 253402300799)
                                         or not 0 <= new_limit <= 2**63 - 1):
@@ -11014,7 +11023,8 @@ if __name__ == '__main__':
                     if missing:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(404, {'ok': False, 'error': 'User not found'})
-                    regenerate_page()
+                    if not durability_uncertain:
+                        regenerate_page()
                     # ⚠️ 2026-10-04 补：停用/启用必须同步到 xray。
                     #
                     # 原因：status 只在 hy2 的 handle_auth 里被检查，
