@@ -585,6 +585,8 @@ function showConfirm(options = {}) {
 // 整页刷新看新列表；没有 JS 时表单照旧原生提交。
 async function submitUserForm(form) {
   const btn = form.querySelector('[type="submit"]');
+  if (form._submitting || (btn && btn.disabled)) return;
+  form._submitting = true;
   if (btn) btn.disabled = true;
   try {
     const res = await fetch(form.getAttribute('action'), {
@@ -604,6 +606,7 @@ async function submitUserForm(form) {
   } catch (e) {
     alert('请求异常: ' + e.message);
   } finally {
+    form._submitting = false;
     if (btn) btn.disabled = false;
   }
 }
@@ -1270,16 +1273,25 @@ function obMsg(text, kind) {
 //    出站配置能改流量出口，属管理操作，不能仅凭 api_key 就能动。
 async function waitForEgressApply() {
   const deadline = Date.now() + 45000;
+  if (typeof portalSessionExpired !== 'undefined' && portalSessionExpired) {
+    throw new Error('登录已失效，请重新登录');
+  }
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 500));
+    if (typeof portalSessionExpired !== 'undefined' && portalSessionExpired) {
+      throw new Error('登录已失效，请重新登录');
+    }
     let json;
     try {
       const res = await fetch(location.pathname + 'outbounds/list', {credentials:'same-origin'});
-      if (res.status === 401) throw new Error('登录已失效，请重新登录');
+      if (res.status === 401 || (typeof portalSessionExpired !== 'undefined' && portalSessionExpired)) {
+        throw new Error('登录已失效，请重新登录');
+      }
       if (!res.ok) continue;
       json = await res.json();
+      if (!json || typeof json !== 'object') continue;
     } catch (err) {
-      if (String(err.message).includes('登录已失效')) throw err;
+      if (String(err && err.message).includes('登录已失效')) throw err;
       continue;
     }
     if (!json.applying) {
@@ -1340,6 +1352,7 @@ async function probeOutbound(kind, addr, insecure = false) {
     if (obEls.probeAddr && typeof obEls.probeAddr.focus === 'function') obEls.probeAddr.focus();
     return;
   }
+  const seq = (probeOutbound._seq = (probeOutbound._seq || 0) + 1);
   obEls.ip.textContent = '探测中...';
   if (obEls.ipNote) obEls.ipNote.textContent = '只检测所选出站端点的可达性，不代表已配置分流规则的实际出口';
   try {
@@ -1350,8 +1363,12 @@ async function probeOutbound(kind, addr, insecure = false) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
     });
-    const json = await res.json();
-    if (!json.ok) throw new Error(json.error || '探测失败');
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (seq !== probeOutbound._seq) return;
+    if (res.ok === false || !json || !json.ok) {
+      throw new Error((json && json.error) || ('探测失败（HTTP ' + res.status + '）'));
+    }
     if (json.ip) {
       obEls.ip.textContent = json.ip;
       if (obEls.ipNote) obEls.ipNote.textContent = '探测地址：' + json.ip + '；客户端实际出口仍取决于当前模式与分流规则';
@@ -1364,8 +1381,9 @@ async function probeOutbound(kind, addr, insecure = false) {
       }
     }
   } catch (e) {
+    if (seq !== probeOutbound._seq) return;
     obEls.ip.textContent = '探测失败';
-    if (obEls.ipNote) obEls.ipNote.textContent = String(e.message || e);
+    if (obEls.ipNote) obEls.ipNote.textContent = String((e && e.message) || e);
   }
 }
 
@@ -1415,20 +1433,36 @@ function obDecode(s) {
   try { return decodeURIComponent(s || ''); } catch (e) { return s || ''; }
 }
 
-// 识别常见代理写法；认不出返回 null。只解析、不发请求。
+// 识别常见代理写法（兼容 IPv6 字面量与严格端口范围 1-65535）；认不出返回 null。只解析、不发请求。
 function obParseLink(raw) {
   const s = String(raw || '').trim();
   if (!s) return null;
-  let m = s.match(/^(?:socks5h?|socks):\/\/(?:([^:@\/\s]*)(?::([^@\/\s]*))?@)?([^\/:@\s]+):(\d{1,5})\/?(?:[?#].*)?$/i);
-  if (m) return { type: 'socks5', host: m[3], addr: m[3] + ':' + m[4], user: obDecode(m[1]), pass: obDecode(m[2]) };
-  m = s.match(/^https?:\/\/(?:[^@\/\s]*@)?([^\/:@\s]+)(?::\d{1,5})?\/?$/i);
-  if (m) return { type: 'http', host: m[1], url: s.replace(/\/$/, '') };
-  m = s.match(/^([^\s:@\/]+):(\d{1,5}):([^\s:]+):(\S+)$/);           // host:port:user:pass
-  if (m) return { type: 'socks5', host: m[1], addr: m[1] + ':' + m[2], user: m[3], pass: m[4] };
-  m = s.match(/^([^\s:@\/]+):([^\s:@]+)@([^\s:@\/]+):(\d{1,5})$/);   // user:pass@host:port
-  if (m) return { type: 'socks5', host: m[3], addr: m[3] + ':' + m[4], user: m[1], pass: m[2] };
-  m = s.match(/^([^\s:@\/]+):(\d{1,5})$/);                           // host:port
-  if (m) return { type: 'socks5', host: m[1], addr: s, user: '', pass: '' };
+  const okPort = (p) => {
+    const n = Number(p);
+    return /^\d{1,5}$/.test(p) && n >= 1 && n <= 65535;
+  };
+  let m = s.match(/^(?:socks5h?|socks):\/\/(?:([^:@\/\s]*)(?::([^@\/\s]*))?@)?(\[[0-9a-fA-F:]+\]|[^\/:@\s[\]]+):(\d{1,5})\/?(?:[?#].*)?$/i);
+  if (m && okPort(m[4])) {
+    const host = m[3].replace(/^\[|\]$/g, '');
+    return { type: 'socks5', host: host, addr: m[3] + ':' + m[4], user: obDecode(m[1]), pass: obDecode(m[2]) };
+  }
+  m = s.match(/^https?:\/\/(?:[^@\/\s]*@)?(\[[0-9a-fA-F:]+\]|[^\/:@\s[\]]+)(?::(\d{1,5}))?\/?$/i);
+  if (m && (!m[2] || okPort(m[2]))) {
+    const host = m[1].replace(/^\[|\]$/g, '');
+    return { type: 'http', host: host, url: s.replace(/\/$/, '') };
+  }
+  m = s.match(/^([^\s:@\/[\]]+):(\d{1,5}):([^\s:]+):(\S+)$/);         // host:port:user:pass
+  if (m && okPort(m[2])) return { type: 'socks5', host: m[1], addr: m[1] + ':' + m[2], user: m[3], pass: m[4] };
+  m = s.match(/^([^\s:@\/]+):([^\s:@]+)@(\[[0-9a-fA-F:]+\]|[^\s:@\/[\]]+):(\d{1,5})$/);   // user:pass@host:port
+  if (m && okPort(m[4])) {
+    const host = m[3].replace(/^\[|\]$/g, '');
+    return { type: 'socks5', host: host, addr: m[3] + ':' + m[4], user: m[1], pass: m[2] };
+  }
+  m = s.match(/^(\[[0-9a-fA-F:]+\]|[^\s:@\/[\]]+):(\d{1,5})$/);       // host:port 或 [ipv6]:port
+  if (m && okPort(m[2])) {
+    const host = m[1].replace(/^\[|\]$/g, '');
+    return { type: 'socks5', host: host, addr: s, user: '', pass: '' };
+  }
   return null;
 }
 
@@ -1495,11 +1529,14 @@ function obApplyQuick() {
 
 // 用表单当前填写的参数探测出口 IP —— 不保存、不改配置。
 async function obTestForm() {
+  if (obEls.btnTest && obEls.btnTest.disabled) return;
   const t = obEls.type ? obEls.type.value : 'socks5';
   let kind = t, addr = '';
   if (t === 'socks5') {
     const a = obEls.socksAddr.value.trim();
-    if (!/^[^\s:]+:\d{1,5}$/.test(a)) { obMsg('SOCKS5 地址格式应为 host:port', 'err'); return; }
+    const am = a.match(/^(?:\[[0-9a-fA-F:]+\]|[^\s:[\]]+):(\d{1,5})$/);
+    const port = am ? Number(am[1]) : 0;
+    if (!am || port < 1 || port > 65535) { obMsg('SOCKS5 地址格式应为 host:port（端口 1-65535）', 'err'); return; }
     const u = obEls.socksUser.value.trim(), pw = obEls.socksPass.value.trim();
     addr = (u || pw) ? encodeURIComponent(u) + ':' + encodeURIComponent(pw) + '@' + a : a;
   } else if (t === 'http') {
@@ -1508,7 +1545,7 @@ async function obTestForm() {
   } else {
     kind = 'direct';
   }
-  obEls.btnTest.disabled = true;
+  if (obEls.btnTest) obEls.btnTest.disabled = true;
   obMsg('测试中...', '');
   try {
     const body = new URLSearchParams({ kind: kind, addr: addr,
@@ -1528,7 +1565,7 @@ async function obTestForm() {
   } catch (e) {
     obMsg('测试失败：' + (e.message || e), 'err');
   } finally {
-    obEls.btnTest.disabled = false;
+    if (obEls.btnTest) obEls.btnTest.disabled = false;
   }
 }
 
@@ -1667,6 +1704,7 @@ if (obEls.list) {
     const test = e.target.closest('[data-ob-test]');
     if (del) {
       e.preventDefault();
+      if (del.disabled) return;
       const name = del.getAttribute('data-ob-del');
       const confirmed = await showConfirm({
         title: '删除出站',
@@ -1676,12 +1714,15 @@ if (obEls.list) {
         isDanger: true
       });
       if (!confirmed) return;
+      del.disabled = true;
       try {
         await obApi('delete', { name: name });
         await loadOutbounds();
         obMsg('已删除「' + name + '」', 'ok');
       } catch (err) {
         obMsg('删除失败：' + (err.message || err), 'err');
+      } finally {
+        del.disabled = false;
       }
     } else if (edit) {
       e.preventDefault();
@@ -1708,23 +1749,28 @@ if (obEls.list) {
 if (obEls.rulesList) {
   obEls.rulesList.addEventListener('click', async (e) => {
     const del = e.target.closest('[data-rule-del]');
-    if (!del) return;
+    if (!del || del.disabled) return;
     e.preventDefault();
     const dom = del.getAttribute('data-rule-del');
+    del.disabled = true;
     try {
       await obApi('rule-del', { domain: dom });
       await loadOutbounds();
     } catch (err) {
       obMsg('删除规则失败：' + (err.message || err), 'err');
+    } finally {
+      del.disabled = false;
     }
   });
 }
 
 if (obEls.btnRuleAdd) {
   obEls.btnRuleAdd.addEventListener('click', async () => {
+    if (obEls.btnRuleAdd.disabled) return;
     const dom = obEls.ruleDomain ? obEls.ruleDomain.value.trim() : '';
     const tgt = obEls.ruleOutbound ? obEls.ruleOutbound.value : 'warp_socks';
     if (!dom) { obMsg('请填写域名', 'err'); return; }
+    obEls.btnRuleAdd.disabled = true;
     try {
       await obApi('rule-add', { domain: dom, outbound: tgt });
       if (obEls.ruleDomain) obEls.ruleDomain.value = '';
@@ -1732,6 +1778,8 @@ if (obEls.btnRuleAdd) {
       obMsg('规则已添加 ✓', 'ok');
     } catch (e) {
       obMsg('添加规则失败：' + (e.message || e), 'err');
+    } finally {
+      obEls.btnRuleAdd.disabled = false;
     }
   });
 }
@@ -1821,8 +1869,11 @@ async function checkRealityStatus() {
       const cfg = json.config;
       if (realityUriVal) realityUriVal.value = cfg.uri || '';
       // 没有新二维码时清空旧的（2026-11-04 修，与 VMess 一致）：重置密钥后 qrencode 超时
-      // 返回空，旧二维码留在页面上，里面还是旧 pbk，扫了连不上。
-      if (realityQrBox) realityQrBox.innerHTML = cfg.qr_svg || '';
+      // 返回空，旧二维码留在页面上，里面还是旧 pbk，扫了连不上。同时校验只渲染合法 SVG。
+      if (realityQrBox) {
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        realityQrBox.innerHTML = _qr;
+      }
       if (realitySniVal) realitySniVal.textContent = (cfg.sni || 'www.apple.com') + ':' + (cfg.port || 443);
       if (realityUuidVal) realityUuidVal.textContent = cfg.uuid || '-';
       if (realityPubkeyVal) realityPubkeyVal.textContent = cfg.pub_key || '-';
@@ -1998,7 +2049,10 @@ async function checkVmessStatus() {
       btnToggleVmess.className = 'toggle-btn on';
       if (vmessContentBox) vmessContentBox.style.display = 'block';
       if (vmessUriVal) vmessUriVal.value = cfg.uri || '';
-      if (vmessQrBox) vmessQrBox.innerHTML = cfg.qr_svg || '';
+      if (vmessQrBox) {
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        vmessQrBox.innerHTML = _qr;
+      }
       if (vmessDomainVal) vmessDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
       if (vmessUuidVal) vmessUuidVal.textContent = cfg.uuid || '-';
       if (vmessPathVal) vmessPathVal.textContent = cfg.ws_path || '-';
@@ -2104,7 +2158,10 @@ async function checkVlessencStatus() {
       btnToggleVlessenc.className = 'toggle-btn on';
       if (vlessencContentBox) vlessencContentBox.style.display = 'block';
       if (vlessencUriVal) vlessencUriVal.value = cfg.uri || '';
-      if (vlessencQrBox) vlessencQrBox.innerHTML = cfg.qr_svg || '';
+      if (vlessencQrBox) {
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        vlessencQrBox.innerHTML = _qr;
+      }
       if (vlessencDomainVal) vlessencDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
       if (vlessencUuidVal) vlessencUuidVal.textContent = cfg.uuid || '-';
       if (vlessencTcpVal) vlessencTcpVal.textContent = 'TCP ' + (cfg.port || '--');
@@ -2204,7 +2261,10 @@ async function checkAnytlsStatus() {
       if (anytlsContentBox) anytlsContentBox.style.display = 'block';
       if (anytlsUriVal) anytlsUriVal.value = cfg.uri || '';
       const qrBox = document.getElementById('anytls-qr-box');
-      if (qrBox) qrBox.innerHTML = cfg.qr_svg || '';
+      if (qrBox) {
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        qrBox.innerHTML = _qr;
+      }
       const domainEl = document.getElementById('anytls-domain-val');
       if (domainEl) domainEl.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
       const tcpEl = document.getElementById('anytls-tcp-val');
@@ -2304,7 +2364,10 @@ async function checkTuicStatus() {
       if (tuicContentBox) tuicContentBox.style.display = 'block';
       if (tuicUriVal) tuicUriVal.value = cfg.uri || '';
       const qrBox = document.getElementById('tuic-qr-box');
-      if (qrBox) qrBox.innerHTML = cfg.qr_svg || '';
+      if (qrBox) {
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        qrBox.innerHTML = _qr;
+      }
       const domainEl = document.getElementById('tuic-domain-val');
       if (domainEl) domainEl.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
       const tcpEl = document.getElementById('tuic-tcp-val');
@@ -3023,7 +3086,9 @@ async function waitForCoreUpgrade() {
       // 会话过期不再空等 5 分钟（2026-11-06 修）
       if (res.status === 401 || portalSessionExpired) throw new Error('登录已失效，请刷新页面重新登录后查看更新结果');
       if (!res.ok) continue;
-      state = (await res.json()).job || {};
+      const payload = await res.json();
+      if (!payload || typeof payload !== 'object') continue;
+      state = (payload.job && typeof payload.job === 'object') ? payload.job : {};
     } catch (e) {
       if (e && String(e.message || '').startsWith('登录已失效')) throw e;
       continue;

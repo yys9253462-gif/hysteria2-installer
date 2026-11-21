@@ -218,7 +218,7 @@ fi
 
 # 探测目标磁盘
 if [ -z "$DISK" ]; then
-    for cand in /dev/vda /dev/sda /dev/xvda /dev/hda; do
+    for cand in /dev/vda /dev/sda /dev/xvda /dev/hda /dev/nvme0n1; do
         if [ -b "$cand" ]; then DISK="$cand"; break; fi
     done
 fi
@@ -229,7 +229,11 @@ is_whole_disk "$DISK" || die "$DISK 不是整块磁盘（像是分区），请�
 DISK="$(readlink -f "$DISK" 2>/dev/null || printf '%s' "$DISK")"
 ok "目标磁盘：$DISK"
 
-DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null || echo 0) / 2048))
+_raw_sectors="$(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null | tr -d '[:space:]')"
+case "$_raw_sectors" in
+    ''|*[!0-9]*) _raw_sectors=0 ;;
+esac
+DISK_SIZE_MB=$((_raw_sectors / 2048))
 if [ "$DISK_SIZE_MB" -gt 0 ]; then
     ok "磁盘容量：约 ${DISK_SIZE_MB} MB"
     if [ "$DISK_SIZE_MB" -lt 1500 ]; then
@@ -260,7 +264,7 @@ if ! ip route show default >/dev/null 2>&1 || [ -z "$(ip route show default 2>/d
     warn "尚未获取到默认路由，先启用网卡再尝试 DHCP..."
     for ifc in /sys/class/net/*; do
         ifc=${ifc##*/}
-        [ "$ifc" = "lo" ] && continue
+        { [ "$ifc" = "lo" ] || [ "$ifc" = "*" ]; } && continue
         # 先启用网卡（DOWN 状态下 DHCP 一定失败）
         if [ "$DRY_RUN" = "1" ]; then
             printf '    %s[dry-run]%s ip link set %s up\n' "$c_ylw" "$c_rst" "$ifc"
@@ -300,9 +304,9 @@ fi
 # ── 第 3 步：抽取网络配置（★ 防失联的关键）─────────────────────────────
 info "第 3/9 步：抽取当前网络配置（重装后用于恢复，防止失联）"
 
-MAIN_IFACE=$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1 | tr -d '[:space:]')
+MAIN_IFACE=$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' | tr -d '[:space:]')
 MAIN_IP=$(ip -4 addr show "$MAIN_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 | tr -d '[:space:]')
-MAIN_GATE=$(ip route show default 2>/dev/null | awk '/default/{print $3}' | head -n1 | tr -d '[:space:]')
+MAIN_GATE=$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}' | tr -d '[:space:]')
 MAIN_CIDR=$(ip -4 addr show "$MAIN_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f2 | head -n1 | tr -d '[:space:]')
 
 if [ -z "$MAIN_IP" ] || [ -z "$MAIN_GATE" ] || [ -z "$MAIN_CIDR" ]; then
@@ -479,7 +483,7 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s sfdisk %s  <<< ",,83,*"\n' "$c_ylw" "$c_rst" "$DISK"
 else
     # 先清干净旧分区表（防止旧表残留导致 sfdisk 判断成"已存在"而跳过）
-    run sh -c "dd if=/dev/zero of='$DISK' bs=512 count=1 conv=notrunc 2>/dev/null || true"
+    run sh -c 'dd if=/dev/zero of="$1" bs=512 count=1 conv=notrunc 2>/dev/null || true' _ "$DISK"
 
     _parted_ok=0
     if printf ',,83,*\n' | sfdisk --label dos --no-reread "$DISK"; then

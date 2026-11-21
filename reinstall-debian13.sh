@@ -364,9 +364,9 @@ fi
 # ── 第 3 步：提取网络配置（★ 防失联关键）─────────────────────────────────
 info "第 3/6 步：提取网络配置（用于重装后恢复，防止失联）"
 
-MAIN_IFACE="$(ip route show default 2>/dev/null | awk '{print $5}' | head -n1 | tr -d '[:space:]')"
+MAIN_IFACE="$(ip route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}' | tr -d '[:space:]')"
 MAIN_IP="$(ip -4 addr show "$MAIN_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -n1 | tr -d '[:space:]')"
-MAIN_GATE="$(ip route show default 2>/dev/null | awk '/default/{print $3}' | head -n1 | tr -d '[:space:]')"
+MAIN_GATE="$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}' | tr -d '[:space:]')"
 CIDR_NUM="$(ip -4 addr show "$MAIN_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f2 | head -n1 | tr -d '[:space:]')"
 
 if [ -z "$MAIN_IFACE" ] || [ -z "$MAIN_IP" ] || [ -z "$MAIN_GATE" ] || [ -z "$CIDR_NUM" ]; then
@@ -397,7 +397,11 @@ is_whole_disk "$DISK" || die "$DISK 不是整块磁盘（像是分区），请�
 # 「正被挂载」这条救援盘特征会漏掉；传给 InstallNET 的也必须是 /dev/vdX 这种写法。
 DISK="$(readlink -f "$DISK" 2>/dev/null || printf '%s' "$DISK")"
 
-DISK_SIZE_MB=$(($(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null || echo 0) / 2048))
+_raw_sectors="$(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null | tr -d '[:space:]')"
+case "$_raw_sectors" in
+    ''|*[!0-9]*) _raw_sectors=0 ;;
+esac
+DISK_SIZE_MB=$((_raw_sectors / 2048))
 ok "目标磁盘：$DISK（约 ${DISK_SIZE_MB} MB）"
 
 # ── 救援盘识别：三条特征同时命中时【硬拦截】───────────────────────────
@@ -626,11 +630,11 @@ download_installnet() {
         if command -v wget >/dev/null 2>&1; then
             # 不能 --no-check-certificate：下载的脚本随后以 root 执行并重装整个系统，
             # 跳过证书校验等于把机器交给任何能做中间人的人。
-            wget -qO "$IN_FILE" -T 120 "$_u" && installnet_looks_valid && return 0
+            ( umask 077; wget -qO "$IN_FILE" -T 120 "$_u" ) && installnet_looks_valid && return 0
         fi
         rm -f "$IN_FILE"
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSL --max-time 120 -o "$IN_FILE" "$_u" && installnet_looks_valid && return 0
+            ( umask 077; curl -fsSL --max-time 120 --max-filesize 2097152 -o "$IN_FILE" "$_u" ) && installnet_looks_valid && return 0
         fi
     done
     rm -f "$IN_FILE"

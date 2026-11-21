@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.61'
+PORTAL_VERSION = '2.62'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -251,6 +251,8 @@ def _unlock_read(resp, limit):
 
 def _unlock_fetch(url, timeout=8, limit=400000):
     """返回 (status_code, final_url, body_text)。HTTP 错误码也正常返回，网络错误抛异常。"""
+    if not isinstance(url, str) or urlsplit(url).scheme not in ('http', 'https'):
+        raise ValueError('unsupported unlock url scheme')
     req = urllib.request.Request(url, headers={'User-Agent': _UNLOCK_UA, 'Accept-Language': 'en-US,en;q=0.9'})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -491,9 +493,9 @@ def validate_outbound(entry):
         addr = raw_addr.strip() if isinstance(raw_addr, str) else ''
         if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in addr):
             return False, None, "SOCKS5 地址不能包含控制字符"
-        # 支持 host:port 与 [IPv6]:port 两种形式，且必须带合法端口
+        # 支持 host:port 与 [IPv6]:port 两种形式，且必须带无前导零的纯 ASCII 合法端口
         if addr.startswith('['):
-            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:([0-9]{1,5})', addr)
+            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:([1-9][0-9]{0,4})', addr, re.ASCII)
             if not m_v6:
                 return False, None, "SOCKS5 IPv6 地址格式应为 [IPv6]:port，例如 [::1]:1080"
             try:
@@ -504,7 +506,7 @@ def validate_outbound(entry):
                 return False, None, "SOCKS5 方括号内必须是 IPv6 地址"
             port_str = m_v6.group(2)
         else:
-            if not re.fullmatch(r'[^\s:\[\]]+:[0-9]{1,5}', addr):
+            if not re.fullmatch(r'[^\s:\[\]/@?#]+:[1-9][0-9]{0,4}', addr, re.ASCII):
                 return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
             _, port_str = addr.rsplit(':', 1)
         if not (0 < int(port_str) < 65536):
@@ -569,9 +571,10 @@ def _yaml_scalar(value):
     校验层只要求「可见 ASCII」，但 `*`（别名）、`{`/`[`（流式集合）、
     `&`（锚点）、`%`（指令）开头的值直接拼进 YAML 会让整份配置解析失败 ——
     Hysteria 起不来，用户只看到「应用失败」却不知道是密码写法的问题。
-    单引号标量里只需把 `'` 写成 `''`。
+    同时剔除回车/换行等控制字符，避免破坏单引号标量导致多行注入。
     """
-    return "'" + str(value).replace("'", "''") + "'"
+    cleaned = re.sub(r'[\x00-\x1f\x7f]', '', str(value))
+    return "'" + cleaned.replace("'", "''") + "'"
 
 
 
@@ -602,6 +605,15 @@ def outbound_names_in(text):
     return [_yaml_name_value(m)
             for m in re.findall(_OUTBOUND_NAME_LINE_RE.pattern, text or '', re.M)]
 
+_DIRECT_OUTBOUND_MODES = ('auto', '64', '46', '6', '4')
+
+
+def _is_safe_outbound_str(value):
+    return isinstance(value, str) and bool(value.strip()) and not any(
+        ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value
+    )
+
+
 def clean_outbounds(outbounds):
     """只保留结构完整的出站条目；容器被改坏时返回空表。
 
@@ -621,6 +633,19 @@ def clean_outbounds(outbounds):
             and OUTBOUND_NAME_RE.match(ob['name'])]
 
 
+def _renderable_outbounds(outbounds):
+    """在 clean_outbounds 基础上进一步筛选可安全渲染进 YAML 的出站条目。"""
+    result = []
+    for ob in clean_outbounds(outbounds):
+        otype = ob['type']
+        if otype == 'socks5' and not _is_safe_outbound_str(ob.get('addr')):
+            continue
+        if otype == 'http' and not _is_safe_outbound_str(ob.get('url')):
+            continue
+        result.append(ob)
+    return result
+
+
 def render_outbound_yaml(entry):
     """把一条出站配置渲染成 YAML 片段（缩进与 config.yaml 风格一致）。"""
     otype = entry['type']
@@ -629,17 +654,19 @@ def render_outbound_yaml(entry):
     if otype == 'socks5':
         lines.append('    socks5:')
         lines.append('      addr: %s' % _yaml_scalar(entry['addr']))
-        if entry.get('username'):
+        if isinstance(entry.get('username'), str) and entry['username']:
             lines.append('      username: %s' % _yaml_scalar(entry['username']))
-        if entry.get('password'):
+        if isinstance(entry.get('password'), str) and entry['password']:
             lines.append('      password: %s' % _yaml_scalar(entry['password']))
     elif otype == 'http':
         lines.append('    http:')
         lines.append('      url: %s' % _yaml_scalar(entry['url']))
         lines.append('      insecure: %s' % ('true' if entry.get('insecure') else 'false'))
     elif otype == 'direct':
+        raw_mode = entry.get('mode')
+        mode = raw_mode if isinstance(raw_mode, str) and raw_mode in _DIRECT_OUTBOUND_MODES else 'auto'
         lines.append('    direct:')
-        lines.append('      mode: %s' % (entry.get('mode') or 'auto'))
+        lines.append('      mode: %s' % mode)
     return '\n'.join(lines)
 
 
@@ -652,10 +679,11 @@ def upsert_outbound_block(cfg_text, outbounds):
     再追加新的。
     """
     text = strip_managed_outbounds(cfg_text)
-    if not outbounds:
+    cleaned = _renderable_outbounds(outbounds)
+    if not cleaned:
         return text
 
-    block = '\n'.join(render_outbound_yaml(ob) for ob in clean_outbounds(outbounds))
+    block = '\n'.join(render_outbound_yaml(ob) for ob in cleaned)
     if 'outbounds:' in text:
         # 插到 outbounds 段的末尾（顶格行的下一行起）
         lines = text.split('\n')
@@ -1914,7 +1942,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
     if '+' in current_line and not allow_custom:
         raise RuntimeError('当前核心含定制补丁，升级官方核心需要明确确认覆盖补丁')
     machine = platform.machine().lower()
-    arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64', 'armv7l': 'armv7'}.get(machine)
+    arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64',
+            'armv7l': 'armv7', 'armv7': 'armv7', 'armhf': 'armv7'}.get(machine)
     if not arch:
         raise RuntimeError('Unsupported core architecture')
     asset_arch = HYSTERIA_ARCH_ASSET.get(arch)
@@ -1933,11 +1962,20 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
     replaced = False
     try:
         # 先解析确定版本，再取该版本的官方 hashes.txt。绝不用浮动 latest 的字节。
+        def _clean_hy2_tag(raw_tag):
+            if not isinstance(raw_tag, str):
+                return ''
+            val = raw_tag.strip()
+            if not val or '..' in val or not re.fullmatch(r'(?:app/)?v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}', val):
+                return ''
+            return val
+
         tag = ''
         try:
-            tag = str(json.loads(fetch_text(
+            rel_obj = json.loads(fetch_text(
                 'https://api.github.com/repos/apernet/hysteria/releases/latest',
-                timeout=10)).get('tag_name') or '')
+                timeout=10))
+            tag = _clean_hy2_tag(rel_obj.get('tag_name') if isinstance(rel_obj, dict) else '')
         except Exception:
             tag = ''
         if not tag:
@@ -1954,6 +1992,7 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 # 下载站只给裸版本号，而 GitHub 的 release tag 是 `app/vX.Y.Z`；
                 # 不补前缀拼出的 hashes.txt / 资产 URL 实测 404，回退路径会永远失败。
                 tag = ('app/' + m.group(1)) if m else ''
+                tag = _clean_hy2_tag(tag)
             except Exception:
                 tag = ''
         if not tag:
@@ -1968,7 +2007,7 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                + tag + '/' + asset)
         req = urllib.request.Request(url, headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=90) as source, open(candidate, 'wb') as dest:
-            shutil.copyfileobj(source, dest)
+            _copy_stream_bounded(source, dest, _MAX_BINARY_ARCHIVE_BYTES)
             dest.flush()
             os.fsync(dest.fileno())
         if not verify_sha256(candidate, expected):
@@ -2123,27 +2162,37 @@ def gost_tls_paths(root):
     cert = _config_tls_cert_path(str(config)) or _config_acme_cert_path(str(config))
     key = ''
     in_tls = False
-    if config.exists():
-        for raw in config.read_text(encoding='utf-8').splitlines():
+    if config.is_file():
+        try:
+            cfg_lines = config.read_text(encoding='utf-8').splitlines()
+        except (OSError, UnicodeDecodeError):
+            cfg_lines = []
+        for raw in cfg_lines:
             if not raw.strip() or raw.lstrip().startswith('#'):
                 continue
             if not raw.startswith((' ', '\t')):
-                in_tls = raw.split(':', 1)[0] == 'tls'
+                in_tls = raw.split(':', 1)[0].strip() == 'tls'
             elif in_tls and raw.strip().startswith('key:'):
                 try:
                     values = shlex.split(raw.strip().split(':', 1)[1], comments=True)
                 except ValueError:
                     values = []
-                key = values[0] if values else ''
+                key = ' '.join(values) if values else ''
     if cert:
         cert = Path(os.path.expandvars(str(cert)))
         if not cert.is_absolute():
             cert = root / cert
-        key = Path(os.path.expandvars(key)) if key else cert.with_suffix('.key')
-        if not key.is_absolute():
-            key = root / key
-        if cert.is_file() and key.is_file() and cert.stat().st_size and key.stat().st_size:
-            return str(cert), str(key)
+        key_candidates = []
+        if key:
+            kpath = Path(os.path.expandvars(key))
+            key_candidates.append(kpath if kpath.is_absolute() else root / kpath)
+        else:
+            key_candidates.append(cert.with_suffix('.key'))
+            key_candidates.append(cert.with_name('privkey.pem'))
+        if cert.is_file() and cert.stat().st_size:
+            for kcand in key_candidates:
+                if kcand.is_file() and kcand.stat().st_size:
+                    return str(cert), str(kcand)
     legacy = root / 'gost-cert'
     legacy_cert, legacy_key = legacy / 'cert.pem', legacy / 'key.pem'
     if (legacy_cert.is_file() and legacy_key.is_file()
@@ -2172,7 +2221,10 @@ def _write_private_bytes(target, payload, mode=0o600, call_path_chmod=False):
     """以指定权限直接创建并落盘敏感配置，避免默认 umask 先落明文再改权。"""
     target = Path(target)
     mode = (mode & 0o777) or 0o600
-    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, 'O_NOFOLLOW'):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(target), flags, mode)
     try:
         with os.fdopen(fd, 'wb') as handle:
             fd = None
@@ -5531,17 +5583,26 @@ def build_anytls_config(acfg, users, cert_file, key_file):
     出站同样要拒绝内网 / 云元数据，与 Hy2 ACL、Xray 的 add_private_network_guard
     对齐。先 resolve 再按 IP 拒：客户端用域名访问内网地址时也能挡住。
     """
+    if not isinstance(acfg, dict):
+        raise ValueError('invalid anytls config')
+    port = _valid_port(acfg.get('port'))
+    if not port:
+        raise ValueError('invalid anytls port')
+    raw_sni = acfg.get('sni')
+    raw_domain = acfg.get('domain')
+    server_name = (raw_sni.strip() if isinstance(raw_sni, str) and raw_sni.strip()
+                   else (raw_domain.strip() if isinstance(raw_domain, str) and raw_domain.strip() else ''))
     return {
         'log': {'level': 'warn', 'timestamp': True},
         'inbounds': [{
             'type': 'anytls',
             'tag': ANYTLS_INBOUND_TAG,
             'listen': '::',
-            'listen_port': int(acfg['port']),
+            'listen_port': port,
             'users': users,
             'tls': {
                 'enabled': True,
-                'server_name': acfg.get('sni') or acfg.get('domain'),
+                'server_name': server_name,
                 'certificate_path': cert_file,
                 'key_path': key_file,
             },
@@ -5748,18 +5809,27 @@ def tuic_users(data):
 
 def build_tuic_config(tcfg, users, cert_file, key_file):
     """sing-box 完整配置（只有一个 tuic 入站）；出站先 resolve 再拒内网。"""
+    if not isinstance(tcfg, dict):
+        raise ValueError('invalid tuic config')
+    port = _valid_port(tcfg.get('port'))
+    if not port:
+        raise ValueError('invalid tuic port')
+    raw_sni = tcfg.get('sni')
+    raw_domain = tcfg.get('domain')
+    server_name = (raw_sni.strip() if isinstance(raw_sni, str) and raw_sni.strip()
+                   else (raw_domain.strip() if isinstance(raw_domain, str) and raw_domain.strip() else ''))
     return {
         'log': {'level': 'warn', 'timestamp': True},
         'inbounds': [{
             'type': 'tuic',
             'tag': TUIC_INBOUND_TAG,
             'listen': '::',
-            'listen_port': int(tcfg['port']),
+            'listen_port': port,
             'users': users,
             'congestion_control': 'bbr',
             'tls': {
                 'enabled': True,
-                'server_name': tcfg.get('sni') or tcfg.get('domain'),
+                'server_name': server_name,
                 'alpn': ['h3'],
                 'certificate_path': cert_file,
                 'key_path': key_file,
@@ -8674,12 +8744,33 @@ def serve(path):
     # 必需字段缺失时给出明确中文错误再退出。旧行为是在后面的 data['port']
     # 处抛 KeyError，日志里只有一段 traceback —— 而门户是 Hysteria 的鉴权后端，
     # 它起不来等于全部用户连不上（2026-10-29 加）。
+    if not isinstance(data, dict):
+        raise SystemExit('[portal] portal.json 顶层必须是 JSON 对象（当前是 %s）。'
+                         '请从备份恢复 portal.json 或重新执行安装。' % type(data).__name__)
     _required = ('port', 'token', 'auth_hash', 'users')
     _missing = [k for k in _required if k not in data]
     if _missing:
         raise SystemExit('[portal] portal.json 缺少必需字段: %s。'
                          '请从备份恢复 portal.json 或重新执行安装。'
                          % ', '.join(_missing))
+    _raw_port = data.get('port')
+    _bind_port = 0
+    if not isinstance(_raw_port, bool):
+        if isinstance(_raw_port, int):
+            _bind_port = _raw_port if 1 <= _raw_port <= 65535 else 0
+        elif isinstance(_raw_port, float):
+            if _raw_port == _raw_port and _raw_port != float('inf') and _raw_port != float('-inf') and _raw_port.is_integer():
+                _cand_p = int(_raw_port)
+                _bind_port = _cand_p if 1 <= _cand_p <= 65535 else 0
+        elif isinstance(_raw_port, str):
+            _ps = _raw_port.strip()
+            if _ps.isascii() and _ps.isdigit():
+                _cand_p = int(_ps)
+                _bind_port = _cand_p if 1 <= _cand_p <= 65535 else 0
+    if not _bind_port:
+        raise SystemExit('[portal] portal.json 的 port 无效: %r。'
+                         '请从备份恢复 portal.json 或重新执行安装。' % (_raw_port,))
+    data['port'] = _bind_port
     # users 必须是对象（2026-11-06 修）：被写成列表 / 字符串时旧实现照常启动，随后十几处
     # data.get('users', {}).get(...) 全部抛 AttributeError，开户、改密、续费、分享页一律 500。
     # 与缺字段同样处理：给出明确错误并退出，不拿空表顶替（那会让所有用户静默失效）。
@@ -8963,26 +9054,29 @@ def serve(path):
         wanted = set(node_default_ifaces())
         rx = tx = 0
         seen = []
-        with open('/proc/net/dev', encoding='utf-8', errors='replace') as fh:
-            for line in fh:
-                if ':' not in line:
-                    continue
-                name, rest = line.split(':', 1)
-                name = name.strip()
-                if name not in wanted:
-                    continue
-                cols = rest.split()
-                if len(cols) < 9:
-                    continue
-                try:
-                    rx_val, tx_val = int(cols[0]), int(cols[8])
-                except ValueError:
-                    continue
-                if rx_val < 0 or tx_val < 0:
-                    continue
-                rx += rx_val
-                tx += tx_val
-                seen.append(name)
+        try:
+            with open('/proc/net/dev', encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    if ':' not in line:
+                        continue
+                    name, rest = line.split(':', 1)
+                    name = name.strip()
+                    if name not in wanted:
+                        continue
+                    cols = rest.split()
+                    if len(cols) < 9:
+                        continue
+                    try:
+                        rx_val, tx_val = int(cols[0]), int(cols[8])
+                    except ValueError:
+                        continue
+                    if rx_val < 0 or tx_val < 0:
+                        continue
+                    rx += rx_val
+                    tx += tx_val
+                    seen.append(name)
+        except OSError:
+            pass
         try:
             boot_id = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8', errors='replace').strip()
         except OSError:
@@ -9133,11 +9227,19 @@ def serve(path):
     SPEED_WINDOW_SECONDS = 15
 
     def _meter_speed_sample(uid, tx, rx, elapsed, source):
+        # 使用内置数值边界判断有限性（不依赖 math），兼容隔离单测命名空间。
+        for val in (tx, rx, elapsed):
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not (0 <= val < float('inf')):
+                return
         if elapsed <= 0:
+            return
+        tx_rate = tx / elapsed
+        rx_rate = rx / elapsed
+        if not (0 <= tx_rate < float('inf') and 0 <= rx_rate < float('inf')):
             return
         with data_lock:
             speed_tracker.setdefault(uid, {})[source] = (
-                time.monotonic(), tx / elapsed, rx / elapsed)
+                time.monotonic(), tx_rate, rx_rate)
 
     # 计量模块不改变 UUID/密码/状态；旧记账值另存，used_bytes 同步真实累计。
     usage_meter = None
@@ -9173,12 +9275,23 @@ def serve(path):
             return set()
         snapshot = getattr(usage_meter, 'live_snapshot', None)
         sampled_at = getattr(usage_meter, 'live_sampled_at', 0)
-        if not snapshot or time.time() - sampled_at >= 45:
+        if (not isinstance(snapshot, dict)
+                or isinstance(sampled_at, bool)
+                or not isinstance(sampled_at, (int, float))
+                or not math.isfinite(sampled_at)
+                or time.time() - sampled_at >= 45):
             return set()
-        row = (snapshot.get('users') or {}).get(uid) or {}
-        if not row.get('hysteria_ok'):
+        users_map = snapshot.get('users')
+        row = users_map.get(uid) if isinstance(users_map, dict) else None
+        if not isinstance(row, dict) or not row.get('hysteria_ok'):
             return set()
-        return {str(item.get('ip')) for item in row.get('ips') or [] if item.get('ip')}
+        raw_ips = row.get('ips')
+        if not isinstance(raw_ips, (list, tuple, set)):
+            return set()
+        return {
+            item['ip'] for item in raw_ips
+            if isinstance(item, dict) and isinstance(item.get('ip'), str) and item['ip']
+        }
 
     # ---- Reality 设备上限（2026-10-23）----
     # Hy2 的上限在 /auth 里拦；Reality 不经过 /auth，由这个循环每轮读 Xray 在线 IP、
@@ -9204,7 +9317,10 @@ def serve(path):
         binary = address = ''
         while True:
             try:
-                _raw_cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+                try:
+                    _raw_cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.is_file() else {}
+                except (OSError, ValueError):
+                    _raw_cfg = {}
                 rcfg = _raw_cfg.get('reality') if isinstance(_raw_cfg, dict) else {}
                 rcfg = rcfg if isinstance(rcfg, dict) else {}
                 binary = rcfg.get('binary', '') if isinstance(rcfg.get('binary'), str) else ''
@@ -9231,6 +9347,8 @@ def serve(path):
                         try:
                             enable_retry_at = time.monotonic() + 600
                             spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
+                            if spec is None or spec.loader is None:
+                                raise RuntimeError('missing_iplimit_module')
                             mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
                             # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
                             # 否则两边同时改 xray.json，会有一方以「并发修改」失败一轮（jp 上线时踩过）。
@@ -9240,7 +9358,7 @@ def serve(path):
                             os.close(_core_fd)
                     finally:
                         core_operation_lock.release()
-                    if outcome.get('changed'):
+                    if isinstance(outcome, dict) and outcome.get('changed'):
                         print('[iplimit] 已为 Reality 开启设备上限路由接口，备份: %s' % outcome.get('backup'),
                               file=sys.stderr)
                     ready = True
@@ -9362,14 +9480,23 @@ def serve(path):
                     continue
                 ptype = svc.get('type') if isinstance(svc.get('type'), str) else 'socks5'
                 raw_port = svc.get('port')
-                if isinstance(raw_port, bool):
+                port = 0
+                if not isinstance(raw_port, bool):
+                    if isinstance(raw_port, int):
+                        port = raw_port if 1 <= raw_port <= 65535 else 0
+                    elif isinstance(raw_port, float):
+                        if raw_port == raw_port and raw_port != float('inf') and raw_port != float('-inf') and raw_port.is_integer():
+                            cand_p = int(raw_port)
+                            port = cand_p if 1 <= cand_p <= 65535 else 0
+                    elif isinstance(raw_port, str):
+                        ps = raw_port.strip()
+                        if ps.isascii() and ps.isdigit():
+                            cand_p = int(ps)
+                            port = cand_p if 1 <= cand_p <= 65535 else 0
+                if not port:
                     continue
-                try:
-                    port = int(raw_port or 0)
-                except (TypeError, ValueError, OverflowError):
-                    continue
-                if port <= 0 or port > 65535:
-                    continue
+                raw_user = svc.get('username', '')
+                raw_pass = svc.get('password', '')
                 handler_type = 'socks5' if ptype == 'socks5' else 'http'
                 entry = {
                     'name': f'proxy-{idx}',
@@ -9377,8 +9504,8 @@ def serve(path):
                     'handler': {
                         'type': handler_type,
                         'auth': {
-                            'username': svc.get('username', ''),
-                            'password': svc.get('password', ''),
+                            'username': raw_user if isinstance(raw_user, str) else '',
+                            'password': raw_pass if isinstance(raw_pass, str) else '',
                         },
                     },
                     'listener': {'type': 'tcp'},
@@ -12052,14 +12179,14 @@ if __name__ == '__main__':
                     if unit_suspended(AWG_SVC_NAME):
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
+                    # awgctl update 要联网刷新脚本并下载核验二进制（超时 420 秒），先申请重型死线槽。
+                    if not self._extend_deadline(480, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     # 先刷新控制脚本自身，再更新二进制。不需要重启面板。
                     if not ensure_awgctl(force=True):
                         return self.reply_json(500, {'ok': False,
                             'error': 'AmneziaWG 管理脚本刷新失败，已中止更新，请检查网络或查看门户日志'})
-                    # awgctl update 要下载并核验二进制，超时 420 秒。
-                    if not self._extend_deadline(480, heavy=True):
-                        return self.reply_json(409, {'ok': False, 'error':
-                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                     rc, out, err = awg_run(['update'], timeout=420)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False,
@@ -12118,7 +12245,20 @@ if __name__ == '__main__':
                     self.reply_json(200, {'ok': True, 'target': 'core', 'applying': True,
                         'message': '核心更新任务已接受，下载、应用和回滚结果将单独核验'})
                 finally:
-                    threading.Thread(target=upgrade_worker, daemon=True).start()
+                    try:
+                        threading.Thread(target=upgrade_worker, daemon=True).start()
+                    except Exception as thr_exc:
+                        with data_lock:
+                            data['core_upgrade'] = {
+                                'state': 'failed',
+                                'error': '启动核心更新工作线程失败: %s' % str(thr_exc)[:160],
+                                'finished_at': int(time.time()),
+                            }
+                        try:
+                            save_data()
+                        except Exception as save_exc:
+                            print('[portal] core upgrade thread start failure not saved: %s'
+                                  % type(save_exc).__name__, file=sys.stderr, flush=True)
                 return
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
@@ -13276,7 +13416,8 @@ if __name__ == '__main__':
             """
             m = read_meta_file(meta_path)
             public_ip = m.get('public_ip', '127.0.0.1')
-            domain = (m.get('server_name') or '').strip()
+            raw_sn = m.get('server_name')
+            domain = raw_sn.strip() if isinstance(raw_sn, str) else ''
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('VMess 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain)
@@ -13387,7 +13528,8 @@ if __name__ == '__main__':
             """
             m = read_meta_file(meta_path)
             public_ip = m.get('public_ip', '127.0.0.1')
-            domain = (m.get('server_name') or '').strip()
+            raw_sn = m.get('server_name')
+            domain = raw_sn.strip() if isinstance(raw_sn, str) else ''
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('VLESS Encryption 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain, 'VLESS Encryption')
@@ -13642,6 +13784,7 @@ if __name__ == '__main__':
             """GET /cores-status —— 核心管理页：各核心装没装、版本、服务状态、被谁依赖。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            self._extend_deadline(45)
 
             def version_of(binary, args, pattern):
                 if not Path(binary).exists():
@@ -13813,25 +13956,33 @@ if __name__ == '__main__':
                         unit_states = {}
                         for unit in unit_names:
                             active = _systemd_state(unit) == 'active'
-                            is_en = subprocess.run(
-                                ['systemctl', 'is-enabled', unit], capture_output=True,
-                                text=True, timeout=5)
-                            enabled_state = is_en.stdout.strip()
+                            try:
+                                is_en = subprocess.run(
+                                    ['systemctl', 'is-enabled', unit], capture_output=True,
+                                    text=True, timeout=5)
+                                enabled_state = is_en.stdout.strip()
+                                is_en_rc = is_en.returncode
+                            except (OSError, subprocess.SubprocessError):
+                                enabled_state = ''
+                                is_en_rc = 1
                             unit_absent = (
                                 not active
                                 and not Path('/etc/systemd/system/%s.service' % unit).exists()
-                                and (enabled_state == 'not-found' or (is_en.returncode != 0 and not enabled_state))
+                                and (enabled_state == 'not-found' or (is_en_rc != 0 and not enabled_state))
                             )
                             unit_states[unit] = (active, enabled_state == 'enabled', unit_absent)
                         for unit in unit_names:
                             _, _, unit_absent = unit_states[unit]
                             if unit_absent:
                                 continue
-                            stop_result = subprocess.run(
-                                ['systemctl', 'disable', '--now', unit],
-                                capture_output=True, timeout=30)
+                            try:
+                                stop_result = subprocess.run(
+                                    ['systemctl', 'disable', '--now', unit],
+                                    capture_output=True, timeout=30)
+                            except (OSError, subprocess.SubprocessError):
+                                stop_result = None
                             state = _systemd_state(unit)
-                            if not _service_stop_confirmed(stop_result, state):
+                            if not (stop_result is not None and _service_stop_confirmed(stop_result, state)):
                                 # 恢复每个原本存在单元的激活与开机自启状态（逐单元隔离超时/异常）
                                 restore_failed = []
                                 for restore_unit, (was_active, was_enabled, restore_absent) in unit_states.items():
@@ -13842,8 +13993,11 @@ if __name__ == '__main__':
                                             ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
                                             capture_output=True, timeout=30)
                                         if was_active:
-                                            subprocess.run(['systemctl', 'reset-failed', restore_unit],
-                                                           capture_output=True, timeout=5)
+                                            try:
+                                                subprocess.run(['systemctl', 'reset-failed', restore_unit],
+                                                               capture_output=True, timeout=5)
+                                            except (OSError, subprocess.SubprocessError):
+                                                pass
                                         action_result = subprocess.run(
                                             ['systemctl', 'start' if was_active else 'stop', restore_unit],
                                             capture_output=True, timeout=30)
@@ -13861,9 +14015,15 @@ if __name__ == '__main__':
                                     '核心服务 %s 未能确认停止；已恢复原服务状态并保留所有文件' % unit})
                         for unit in unit_names:
                             Path('/etc/systemd/system/%s.service' % unit).unlink(missing_ok=True)
-                        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                        try:
+                            subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
+                        except (OSError, subprocess.SubprocessError):
+                            pass
                         for unit in unit_names:
-                            subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
+                            try:
+                                subprocess.run(['systemctl', 'reset-failed', unit], capture_output=True, timeout=5)
+                            except (OSError, subprocess.SubprocessError):
+                                pass
                         Path(binary).unlink(missing_ok=True)
                     finally:
                         os.close(core_lock_fd)
@@ -13878,7 +14038,8 @@ if __name__ == '__main__':
             不会留下「显示已启用、实际没有」的状态。secret 只在首次生成。
             """
             m = read_meta_file(meta_path)
-            domain = (m.get('server_name') or '').strip()
+            raw_sn = m.get('server_name')
+            domain = raw_sn.strip() if isinstance(raw_sn, str) else ''
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('AnyTLS 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain, 'AnyTLS')
@@ -14114,7 +14275,8 @@ if __name__ == '__main__':
             规则同 _apply_anytls_enable：配置先落地、数据后写入；secret 只在首次生成。
             """
             m = read_meta_file(meta_path)
-            domain = (m.get('server_name') or '').strip()
+            raw_sn = m.get('server_name')
+            domain = raw_sn.strip() if isinstance(raw_sn, str) else ''
             if not domain or not _is_dns_name(domain):
                 raise RuntimeError('TUIC 需要先绑定域名（当前无可用 server_name）')
             cert_file, key_file, sni = self._vmess_certificate(domain, 'TUIC')
@@ -14917,7 +15079,7 @@ if __name__ == '__main__':
                 length = int(self.headers.get('Content-Length', 0))
                 if length < 0 or length > 4096:
                     return self.reply(400, b'Bad request')
-                body = self.rfile.read(length).decode('utf-8', errors='ignore')
+                body = self.rfile.read(length).decode('utf-8', errors='ignore') if length > 0 else ''
                 params = parse_qs(body)
                 user = params.get('username', [''])[0]
                 pwd = params.get('password', [''])[0]
@@ -14926,8 +15088,11 @@ if __name__ == '__main__':
                 return self.reply(400, b'Bad request')
 
             with data_lock:
-                portal_token = str(data.get('token') or '')
+                raw_tok = data.get('token')
+                portal_token = raw_tok if isinstance(raw_tok, str) else ''
                 expected_hash = data.get('auth_hash')
+            if not portal_token or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in portal_token):
+                return self.reply(503, b'Portal token unavailable')
 
             if self.login_rate_limited():
                 # 与密码错误用同一页面形态，不给爆破者「已被限流」的区分信号。
@@ -16338,9 +16503,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                                  headers={'User-Agent': 'hysteria2-installer'})
                     with urllib.request.urlopen(req, timeout=3) as response:
                         release = json.loads(_read_bounded_bytes(response).decode('utf-8', errors='replace'))
+                    raw_tag = release.get('tag_name') if isinstance(release, dict) else None
                     new_tag = (
-                        str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
-                        if isinstance(release, dict) else ''
+                        raw_tag.strip().removeprefix('app/').removeprefix('v')
+                        if isinstance(raw_tag, str) else ''
                     )
                 except Exception:
                     new_tag = ''
@@ -16432,6 +16598,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                             input=_ruri.encode('utf-8'), capture_output=True, timeout=3)
                     if qr_res.returncode == 0:
                         qr_svg = qr_res.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception:
                     qr_svg = ''
 
@@ -16448,7 +16616,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'short_id': rcfg.get('short_id', ''),
                     'flow': 'xtls-rprx-vision',
                     'sni': rcfg.get('dest_sni', 'www.apple.com'),
-                    'port': rcfg.get('port', 443) if is_active else 0,
+                    'port': (_valid_port(rcfg.get('port')) or 443) if is_active else 0,
                     'qr_svg': qr_svg if is_active else ''
                 }
             })
@@ -16612,10 +16780,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
                 kernel_ver = platform.release()
-                cc_out = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_congestion_control'],
-                                        capture_output=True, text=True, timeout=2).stdout.strip()
-                qdisc_out = subprocess.run(['sysctl', '-n', 'net.core.default_qdisc'],
-                                          capture_output=True, text=True, timeout=2).stdout.strip()
+                def _sysctl_read(param):
+                    try:
+                        return subprocess.run(['sysctl', '-n', param],
+                                              capture_output=True, text=True, timeout=2).stdout.strip()
+                    except (OSError, subprocess.SubprocessError):
+                        return ''
+                cc_out = _sysctl_read('net.ipv4.tcp_congestion_control')
+                qdisc_out = _sysctl_read('net.core.default_qdisc')
 
                 conf_path = Path('/etc/sysctl.d/99-bbr.conf')
                 configured_bbr = ''
@@ -16651,8 +16823,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # tcp_available_congestion_control 只列出**已加载**的模块：新机器上
                 # tcp_bbr 还没 modprobe，只会看到 "reno cubic"，前端据此把按钮全禁用。
                 # 所以把「内核里装了、可被 modprobe 的模块」也算作可用；未装 modinfo 时平稳跳过。
-                available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
-                                           capture_output=True, text=True, timeout=2).stdout.split()
+                available = _sysctl_read('net.ipv4.tcp_available_congestion_control').split()
                 for algo in ('bbr', 'bbr2', 'bbr3'):
                     if algo in available:
                         continue
@@ -16730,6 +16901,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if kind in ('socks5', 'http') and not addr:
                 return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
+            self._extend_deadline(45)
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
             if kind == 'warp' and not ip:
                 # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
@@ -16756,9 +16928,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(400, {'ok': False, 'error': '缺少 action 参数'})
 
             msg = ''
-            with data_lock:
-                previous_egress = {key: (key in data, copy.deepcopy(data.get(key))) for key in
-                    ('custom_outbounds', 'warp_rules', 'outbound_mode')}
+            previous_egress = {}
             # ---------- 出站增删改 ----------
             if action in ('save', 'delete'):
                 if action == 'save':
@@ -16782,6 +16952,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if not ok:
                         return self.reply_json(400, {'ok': False, 'error': err})
                     with data_lock:
+                        previous_egress = {'custom_outbounds': ('custom_outbounds' in data,
+                                                                copy.deepcopy(data.get('custom_outbounds')))}
                         # 容器被改坏成 null / 数字时按空表处理（2026-11-04 修，与删除一致）：
                         # 旧写法 list(None) 在 data_lock 内抛 TypeError，新增出站一律失败。
                         outs = [o for o in routing_state(data)['custom_outbounds'] if isinstance(o, dict)]
@@ -16809,6 +16981,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         if not any(o.get('name') == name for o in outs):
                             missing_outbound = True
                         else:
+                            previous_egress = {key: (key in data, copy.deepcopy(data.get(key))) for key in
+                                               ('custom_outbounds', 'warp_rules', 'outbound_mode')}
                             data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
                             # 删光最后一个自定义出站时同步切回按域名分流，避免持久化留下 global + 空出站。
                             if not data['custom_outbounds'] and data.get('outbound_mode') == 'global':
@@ -16835,6 +17009,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if mode == 'global' and not valid_outs:
                         no_valid_outbounds = True
                     else:
+                        previous_egress = {'outbound_mode': ('outbound_mode' in data,
+                                                             copy.deepcopy(data.get('outbound_mode')))}
                         data['outbound_mode'] = mode
                 if no_valid_outbounds:
                     return self.reply_json(400, {'ok': False, 'error': '请先新增一个出站，再切换全局出口'})
@@ -16867,6 +17043,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         rules = [r for r in rules if r['domain'] not in (cleaned, dom)]
                         msg = '规则「%s」已删除' % cleaned
                     if rule_error is None:
+                        previous_egress = {'warp_rules': ('warp_rules' in data,
+                                                          copy.deepcopy(data.get('warp_rules')))}
                         data['warp_rules'] = rules
                 if rule_error is not None:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
@@ -16967,19 +17145,23 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             # （自愈单元没装 / 装的是旧版 / 证书刚换还没跑到）。
             live_sn = ''
             meta_sn = str(info.get('server_name') or '')
-            if certificate_covers_domain(meta_sn, info.get('sans') or [],
-                                         info.get('common_name') or ''):
+            _raw_sans = info.get('sans')
+            _clean_sans = [s for s in (_raw_sans if isinstance(_raw_sans, (list, tuple)) else [])
+                           if isinstance(s, str)]
+            _raw_cn = info.get('common_name')
+            _clean_cn = _raw_cn if isinstance(_raw_cn, str) else ''
+            if certificate_covers_domain(meta_sn, _clean_sans, _clean_cn):
                 live_sn = meta_sn
             else:
-                for san in info.get('sans') or []:
+                for san in _clean_sans:
                     if not san.startswith('*.') and _is_dns_name(san):
                         live_sn = san
                         break
-                if not live_sn and _is_dns_name(info.get('common_name') or ''):
-                    live_sn = info['common_name']
+                if not live_sn and _is_dns_name(_clean_cn):
+                    live_sn = _clean_cn
             info['live_server_name'] = live_sn
             info['meta_matches_cert'] = bool(meta_sn) and certificate_covers_domain(
-                meta_sn, info.get('sans') or [], info.get('common_name') or '')
+                meta_sn, _clean_sans, _clean_cn)
             info['warn_days'] = CERT_EXPIRY_WARN_DAYS
             info['critical_days'] = CERT_EXPIRY_CRITICAL_DAYS
             return self.reply_json(200, info)
@@ -17085,6 +17267,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             覆盖自己的最长操作时长。死线防的是「连接挂着不动」的
             slow-loris 行为，不是防「服务端正在干活」。
             """
+            # 拦截布尔、非数值、非有限（nan/inf）与非正数，避免 nan 写坏死线导致连接逃逸看门狗。
+            # 不依赖 math 模块，兼容隔离单测命名空间。
+            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+                return
+            seconds = float(seconds)
+            if not (seconds > 0 and seconds < float('inf')):
+                return
             with self.deadline_lock:
                 if request in self.deadlines:
                     self.deadlines[request] = max(self.deadlines[request],
@@ -17144,7 +17333,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
 
 
-    server = ThreadingHTTPServer(('127.0.0.1', data['port']), Handler)
+    server = ThreadingHTTPServer(('127.0.0.1', _bind_port), Handler)
     server.requests, server.failures, server.api_requests = [], [], []
     server.api_anon_requests = []
     # 每来源 60 秒 60 次失败；全局速率由 requests 桶管，这里不再设兜底。
@@ -17224,10 +17413,28 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         with data_lock:
             _susp = suspend_state(data)
         if _susp.get('suspended'):
-            for _u in _susp.get('units') or []:
-                subprocess.run(['systemctl', 'stop', _u], capture_output=True, timeout=20)
-            print('[portal] 流量超额停用中，已重新停止: %s' % ','.join(_susp.get('units') or []),
-                  file=sys.stderr)
+            _raw_units = _susp.get('units')
+            _units = [
+                _u.strip() for _u in (_raw_units if isinstance(_raw_units, (list, tuple)) else [])
+                if isinstance(_u, str)
+                and _u.strip()
+                and not _u.strip().startswith('-')
+                and not any(_c.isspace() or ord(_c) < 32 for _c in _u.strip())
+            ]
+            _stopped_units = []
+            _failed_units = []
+            for _u in _units:
+                try:
+                    subprocess.run(['systemctl', 'stop', _u], capture_output=True, timeout=20)
+                    _stopped_units.append(_u)
+                except Exception as _u_err:
+                    _failed_units.append('%s(%s)' % (_u, type(_u_err).__name__))
+            if _stopped_units:
+                print('[portal] 流量超额停用中，已重新停止: %s' % ','.join(_stopped_units),
+                      file=sys.stderr)
+            if _failed_units:
+                print('[portal] 流量超额停用中，部分服务停止失败: %s' % ','.join(_failed_units),
+                      file=sys.stderr)
     except Exception as e:
         print('[portal] 重新应用超额停用失败: %s' % str(e)[:120], file=sys.stderr)
 
@@ -17239,7 +17446,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # systemd 停止 / 重启 / 关机时先把内存里的计量落盘（2026-11-04 修）：计量每 60 秒
     # 才写一次，旧实现收到 SIGTERM 直接退出，最多丢一分钟流量；关机时 Hy2 / Xray
     # 也一起重启换了 epoch，这段流量再也补算不回来，used_bytes 永久偏低。
+    _exiting = {'flag': False}
+
     def _flush_and_exit(signum, frame):
+        if _exiting['flag']:
+            return
+        _exiting['flag'] = True
         try:
             save_data()
         except Exception as exc:
@@ -17248,6 +17460,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
     # 只有主线程能装信号处理器；测试里在线程中跑 serve() 时跳过，不能让门户因此起不来。
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, _flush_and_exit)
+        signal.signal(signal.SIGINT, _flush_and_exit)
     server.serve_forever()
 
 
