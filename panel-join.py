@@ -69,9 +69,14 @@ def meta_host(meta_text):
         return ""
     if not isinstance(meta, dict):
         return ""
-    key = "public_ip" if meta.get("is_insecure") else "server_name"
-    host = meta.get(key)
-    return host.strip() if isinstance(host, str) else ""
+    flag = meta.get("is_insecure", False)
+    is_insecure = flag is True or (isinstance(flag, str) and flag.strip().lower() == "true")
+    primary, fallback = ("public_ip", "server_name") if is_insecure else ("server_name", "public_ip")
+    for key in (primary, fallback):
+        host = meta.get(key)
+        if isinstance(host, str) and host.strip():
+            return host.strip()
+    return ""
 
 
 def read(path):
@@ -186,7 +191,8 @@ def main():
         print("portal.json 格式损坏：顶层必须是 JSON 对象。", file=sys.stderr)
         return 2
 
-    api_key = meta.get("api_key") or ""
+    raw_api_key = meta.get("api_key")
+    api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
     portal_port = meta.get("port")
     if not api_key:
         print("portal.json 里没有 api_key —— 这台节点的 portal 版本太旧，"
@@ -208,8 +214,11 @@ def main():
         # 锚定行首：被注释掉的 `# listenHTTPS: :1111` 不能当成对外端口（2026-11-12 修）。
         m2 = re.search(r"^\s*listenHTTPS:\s*\S*?:?(\d+)[\"']?\s*(?:#.*)?$", cfg_text, re.M)
         https_port = m2.group(1) if m2 else ""
-    # 端口 0 / 越界拼出的地址永远连不上，旧实现照样输出并返回 0（2026-11-12 修）。
-    if not (https_port.isdigit() and 1 <= int(https_port) <= 65535):
+    # 端口 0 / 越界拼出的地址永远连不上，旧实现照样输出并返回 0（2026-11-12 修）；
+    # 同时去掉十进制前导零（如 08443 -> 8443），避免严格 URL 解析器拒绝。
+    if https_port.isdigit() and 1 <= int(https_port) <= 65535:
+        https_port = str(int(https_port))
+    else:
         https_port = ""
 
     if not https_port:
@@ -226,6 +235,10 @@ def main():
     # `listen` 也可能带主机（`0.0.0.0:443` / `[::]:443`）：旧实现只去掉开头的冒号，
     # listen_port 变成 null、建议节点名成了 `a.com-0.0.0.0:443`（2026-11-12 修）。
     listen = (cfg.get("listen", {}).get("__value__") or "").rpartition(":")[2].strip()
+    if listen.isdigit() and 1 <= int(listen) <= 65535:
+        listen = str(int(listen))
+    else:
+        listen = ""
     if not domain:
         # 没有主机名就拼不出能用的地址；旧实现输出 `https://<端口>` 并返回 0。
         print("取不到节点的对外地址：client_meta.json 没有 server_name / public_ip，"
@@ -252,11 +265,10 @@ def main():
         if not args.panel:
             print("--format curl / --register 需要 --panel", file=sys.stderr)
             return 2
-        # 只接受 https（2026-11-04 修）：http 会把管理员 JWT 与节点 api_key 明文发出去；
-        # 去掉结尾的 /，免得拼成 //api/nodes。
+        # 只接受 https 且不含查询串或锚点：避免把 /api/nodes 拼进 query/fragment。
         _p = urllib.parse.urlsplit(args.panel.strip())
-        if _p.scheme != "https" or not _p.hostname:
-            print("--panel 必须是 https:// 开头的面板地址", file=sys.stderr)
+        if _p.scheme != "https" or not _p.hostname or _p.query or _p.fragment:
+            print("--panel 必须是 https:// 开头的面板地址（不能包含 ? 或 #）", file=sys.stderr)
             return 2
         panel = args.panel.strip().rstrip("/")
 
@@ -290,12 +302,15 @@ def main():
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + args.admin_token)
         try:
-            r = urllib.request.urlopen(req, timeout=30)
-            print(f"登记成功 HTTP {r.status}")
-            print(r.read().decode())
+            with urllib.request.urlopen(req, timeout=30) as r:
+                print(f"登记成功 HTTP {r.status}")
+                print(r.read(65536).decode("utf-8", errors="replace"))
             return 0
         except urllib.error.HTTPError as e:
-            detail = e.read().decode()[:300]
+            try:
+                detail = e.read(4096).decode("utf-8", errors="replace")[:300]
+            finally:
+                e.close()
             print(f"登记失败 HTTP {e.code}: {detail}", file=sys.stderr)
             return 1
         except Exception as e:

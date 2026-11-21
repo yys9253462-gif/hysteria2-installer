@@ -212,7 +212,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.47'
+PORTAL_VERSION = '2.48'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -807,6 +807,19 @@ def outbound_target_exists(target, outbounds=None, existing_names=None):
     custom = {str(o.get('name') or '') for o in rows if isinstance(o, dict)}
     configured = set(_existing_outbound_names() if existing_names is None else existing_names)
     return bool(target) and target in custom | configured
+
+
+def _clean_route_domain(raw):
+    """把分流规则输入的域名或完整地址规范成纯小写主机名。"""
+    text = str(raw or '').strip().lower()
+    text = re.sub(r'^[a-z][a-z0-9+.\-]*://', '', text)
+    text = re.split(r'[/?#]', text, maxsplit=1)[0]
+    return text.split('@')[-1].split(':')[0].strip('.')
+
+
+def _valid_route_domain(domain):
+    """判断规范化后的分流域名是否合法（禁止连续点与非法字符）。"""
+    return bool(domain) and '..' not in domain and bool(re.fullmatch(r'[a-z0-9.-]+', domain))
 
 
 def build_warp_acl_config(original, enabled, rules):
@@ -1493,6 +1506,21 @@ def portal_bundle_version(local_shas, remote_shas):
             'latest': fingerprint(remote_shas)}
 
 
+_MAX_REMOTE_META_BYTES = 2 * 1024 * 1024
+_MAX_PORTAL_FILE_BYTES = 4 * 1024 * 1024
+
+
+def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
+    """带体积上限读取外部响应，防止异常超大响应耗尽门户内存。"""
+    try:
+        raw = resp.read(limit + 1)
+    except TypeError:
+        raw = resp.read()
+    if len(raw) > limit:
+        raise ValueError('响应体积过大（超过 %d 字节）' % limit)
+    return raw
+
+
 def resolve_update_ref(ref):
     if re.fullmatch(r'[0-9a-f]{40}', ref):
         return ref
@@ -1503,7 +1531,8 @@ def resolve_update_ref(ref):
         req = urllib.request.Request('https://api.github.com/repos/' + AWG_REPO + '/commits/main',
                                      headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=8) as response:
-            value = json.loads(response.read().decode('utf-8')).get('sha', '')
+            payload = json.loads(_read_bounded_bytes(response).decode('utf-8', 'replace'))
+            value = payload.get('sha', '') if isinstance(payload, dict) else ''
     except Exception as exc:
         _log_ignored('resolve_update_ref.github', exc)
     if not re.fullmatch(r'[0-9a-f]{40}', value):
@@ -1516,7 +1545,7 @@ def resolve_update_ref(ref):
                 'https://github.com/' + AWG_REPO + '/commits/main.atom',
                 headers={'User-Agent': 'hysteria2-installer'})
             with urllib.request.urlopen(req, timeout=8) as response:
-                feed = response.read().decode('utf-8', 'replace')
+                feed = _read_bounded_bytes(response).decode('utf-8', 'replace')
             m = re.search(r'/commit/([0-9a-f]{40})', feed)
             value = m.group(1) if m else ''
         except Exception as exc:
@@ -1607,10 +1636,10 @@ def parse_xray_dgst(text):
     return found if count == 1 else None
 
 
-def fetch_text(url, timeout=30, headers=None):
+def fetch_text(url, timeout=30, headers=None, max_bytes=_MAX_REMOTE_META_BYTES):
     req = urllib.request.Request(url, headers=headers or {'User-Agent': 'hysteria2-installer'})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read().decode('utf-8', errors='replace')
+        return _read_bounded_bytes(resp, max_bytes).decode('utf-8', errors='replace')
 
 
 def fetch_expected_sha256(manifest_url, asset, parser=None):
@@ -1813,8 +1842,23 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         return {'changed': True, 'version': newer, 'backup': str(backup)}
     except Exception:
         if replaced and backup is not None:
-            shutil.copy2(backup, binary)
-            _restart_hy2()
+            # 经同目录临时文件原子替换回滚：直接向运行中的可执行文件 copy2 在 Linux 上
+            # 会触发 ETXTBSY（Text file busy），导致回滚失败并掩盖真正的升级异常。
+            rb_fd, rb_name = tempfile.mkstemp(prefix='.hysteria-rollback-', dir=str(binary.parent))
+            os.close(rb_fd)
+            rb_tmp = Path(rb_name)
+            try:
+                shutil.copy2(backup, rb_tmp)
+                rb_tmp.chmod(0o755)
+                os.replace(rb_tmp, binary)
+            except Exception as rb_exc:
+                _log_ignored('upgrade_core_rollback_replace', rb_exc)
+            finally:
+                rb_tmp.unlink(missing_ok=True)
+            try:
+                _restart_hy2()
+            except Exception as rb_exc:
+                _log_ignored('upgrade_core_rollback_restart', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -4336,6 +4380,7 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
     meta = meta if isinstance(meta, dict) else {}
     cert_file, cn, sans, self_signed = _resolve_live_cert(root, config_path)
 
+    meta_insecure = clean_node_identity(meta)[0]
     info = {
         'ok': False,
         'cert_exists': cert_file.exists(),
@@ -4352,8 +4397,8 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
         'warn_level': 'unknown',      # unknown | ok | warn | critical | expired
         'server_name': meta.get('server_name', ''),
         'cert_type': meta.get('cert_type', ''),
-        'is_insecure': bool(meta.get('is_insecure')),
-        'renewal_managed': meta.get('cert_type') == 'acme' and not bool(meta.get('is_insecure')),
+        'is_insecure': meta_insecure,
+        'renewal_managed': meta.get('cert_type') == 'acme' and not meta_insecure,
         'pin_sha256': meta.get('pin_sha256', ''),
         'healed_at': 0,
         'heal_count': 0,
@@ -4639,7 +4684,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     if m.get('cert_type') != new_type:
         m['cert_type'] = new_type
         changed = True
-    if bool(m.get('is_insecure')) != bool(new_insecure):
+    if m.get('is_insecure') is not bool(new_insecure):
         m['is_insecure'] = new_insecure
         changed = True
     if m.get('server_name') != new_sn:
@@ -5670,21 +5715,26 @@ def install_xray_binary():
                 with zipfile.ZipFile(zpath, 'r') as zf:
                     member = safe_zip_members(zf.namelist(), 'xray')
                     zf.extract(member, path=tmpdir)
-                bin_path = Path(tmpdir) / 'xray'
+                bin_path = Path(tmpdir) / member
                 if bin_path.exists():
-                    staged = Path('/usr/local/bin/xray.new')
-                    shutil.copyfile(str(bin_path), str(staged))
-                    os.chmod(str(staged), 0o755)
-                    # 换上之前先确认新二进制能跑（2026-11-03 修）：旧实现直接 os.replace，
-                    # 新文件起不来时旧核心已被覆盖，正在跑的 Reality / VMess / VLESS-Enc
-                    # 下一次重启就全挂，而且没有可回滚的旧文件。
-                    if not _xray_version(str(staged)):
-                        staged.unlink(missing_ok=True)
-                        errors.append('%s: 新 xray 无法运行（version 检查失败），未替换' % host)
-                        continue
-                    os.replace(str(staged), '/usr/local/bin/xray')
-                    installed = True
-                    break
+                    staged = Path('/usr/local/bin/xray.new.%s' % secrets.token_hex(6))
+                    replaced = False
+                    try:
+                        shutil.copyfile(str(bin_path), str(staged))
+                        os.chmod(str(staged), 0o755)
+                        # 换上之前先确认新二进制能跑（2026-11-03 修）：旧实现直接 os.replace，
+                        # 新文件起不来时旧核心已被覆盖，正在跑的 Reality / VMess / VLESS-Enc
+                        # 下一次重启就全挂，而且没有可回滚的旧文件。
+                        if not _xray_version(str(staged)):
+                            errors.append('%s: 新 xray 无法运行（version 检查失败），未替换' % host)
+                            continue
+                        os.replace(str(staged), '/usr/local/bin/xray')
+                        replaced = True
+                        installed = True
+                        break
+                    finally:
+                        if not replaced:
+                            staged.unlink(missing_ok=True)
                 errors.append('%s: 包内没有 xray' % host)
             except Exception as exc:
                 errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
@@ -5712,14 +5762,18 @@ def install_singbox():
         req = urllib.request.Request('https://api.github.com/repos/SagerNet/sing-box/releases/latest',
                                      headers={'User-Agent': 'hy2-portal'})
         with urllib.request.urlopen(req, timeout=15) as r:
-            release = json.loads(r.read().decode('utf-8'))
+            release = json.loads(_read_bounded_bytes(r, _MAX_REMOTE_META_BYTES).decode('utf-8', errors='replace'))
     except Exception as exc:
         return False, '取不到 sing-box 最新版本信息: %s' % exc
+    if not isinstance(release, dict):
+        return False, '取不到 sing-box 最新版本信息: 响应结构不是 JSON 对象'
     tag = str(release.get('tag_name') or '')
     ver = tag.lstrip('v')
     asset_name = f'sing-box-{ver}-linux-{arch}.tar.gz'
-    asset = next((a for a in release.get('assets') or [] if a.get('name') == asset_name), None)
-    digest = str((asset or {}).get('digest') or '')
+    raw_assets = release.get('assets')
+    assets = raw_assets if isinstance(raw_assets, list) else []
+    asset = next((a for a in assets if isinstance(a, dict) and a.get('name') == asset_name), None)
+    digest = str((asset or {}).get('digest') or '').strip().lower()
     expected = digest[len('sha256:'):] if digest.startswith('sha256:') else ''
     if not re.fullmatch(r'[0-9a-f]{64}', expected):
         return False, '取不到 %s 的官方 SHA256，无法校验下载内容，已放弃安装' % asset_name
@@ -5736,20 +5790,25 @@ def install_singbox():
                 if not verify_sha256(archive, expected):
                     errors.append('%s: SHA256 与官方不一致' % host)
                     continue
-                with tarfile.open(str(archive), 'r:gz') as tar:
-                    member_name = safe_tar_members([m.name for m in tar.getmembers() if m.isfile()],
-                                                   'sing-box')
-                    member = tar.getmember(member_name)
-                    staged = Path(ANYTLS_BINARY + '.new')
-                    with tar.extractfile(member) as src, open(staged, 'wb') as dst:
-                        shutil.copyfileobj(src, dst)
-                os.chmod(str(staged), 0o755)
-                version = _singbox_version(str(staged))
-                if not version or version < ANYTLS_MIN_SINGBOX:
-                    staged.unlink(missing_ok=True)
-                    return False, 'sing-box 版本 %s 不支持 AnyTLS（需要 1.12.0+）' % ver
-                os.replace(str(staged), ANYTLS_BINARY)
-                return True, 'sing-box %s 安装完成' % ver
+                staged = Path('%s.new.%s' % (ANYTLS_BINARY, secrets.token_hex(6)))
+                replaced = False
+                try:
+                    with tarfile.open(str(archive), 'r:gz') as tar:
+                        member_name = safe_tar_members([m.name for m in tar.getmembers() if m.isfile()],
+                                                       'sing-box')
+                        member = tar.getmember(member_name)
+                        with tar.extractfile(member) as src, open(staged, 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
+                    os.chmod(str(staged), 0o755)
+                    version = _singbox_version(str(staged))
+                    if not version or version < ANYTLS_MIN_SINGBOX:
+                        return False, 'sing-box 版本 %s 不支持 AnyTLS（需要 1.12.0+）' % ver
+                    os.replace(str(staged), ANYTLS_BINARY)
+                    replaced = True
+                    return True, 'sing-box %s 安装完成' % ver
+                finally:
+                    if not replaced:
+                        staged.unlink(missing_ok=True)
             except Exception as exc:
                 errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
     return False, '下载 sing-box 失败 —— ' + ' ｜ '.join(errors)
@@ -7842,7 +7901,7 @@ def ensure_portal_access(root, meta, data):
     password = secrets.token_urlsafe(32)
     auth = base64.b64encode(f'{username}:{password}'.encode())
     data['auth_hash'] = hashlib.sha256(auth).hexdigest()
-    host = meta['public_ip'] if meta.get('is_insecure') else meta.get('server_name', 'localhost')
+    host = meta_display_host(meta)
     sub_port, _src = resolve_subscription_port(meta)
     url = f"https://{_host_for_url(host)}:{sub_port}/{data.get('token', '')}/"
     access = portal_access_payload(url, username, password, data.get('api_key', ''))
@@ -8907,7 +8966,13 @@ def serve(path):
                 headers={'User-Agent': 'Mozilla/5.0',
                          'Accept': 'application/vnd.github+json'})
             with urllib.request.urlopen(req, timeout=8) as resp:
-                items = json.loads(resp.read().decode('utf-8'))
+                try:
+                    raw = resp.read(2 * 1024 * 1024 + 1)
+                except TypeError:
+                    raw = resp.read()
+                if len(raw) > 2 * 1024 * 1024:
+                    raise ValueError('远端目录清单响应过大')
+                items = json.loads(raw.decode('utf-8', errors='replace'))
             # GitHub 在限流/出错时返回的是对象（{"message": ...}），不是列表；
             # 旧写法 `for it in items` 直接抛 TypeError，虽然被下面 except 兜住，
             # 但每次都白跑一遍请求且永远拿不到缓存。
@@ -9187,7 +9252,12 @@ if __name__ == '__main__':
             try:
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    content = resp.read()
+                    try:
+                        content = resp.read(4 * 1024 * 1024 + 1)
+                    except TypeError:
+                        content = resp.read()
+                    if len(content) > 4 * 1024 * 1024:
+                        raise ValueError('远端源码文件响应过大')
                 # 体积 + 关键字双重校验，挡住错误页
                 if len(content) > min_size and (marker is None or marker in content):
                     if expect_blob is not None and _git_blob_sha(content) != expect_blob:
@@ -9227,7 +9297,13 @@ if __name__ == '__main__':
                 'Accept': 'application/vnd.github+json',
             })
             with urllib.request.urlopen(req, timeout=8) as resp:
-                info = json.loads(resp.read().decode('utf-8'))
+                try:
+                    raw = resp.read(2 * 1024 * 1024 + 1)
+                except TypeError:
+                    raw = resp.read()
+                if len(raw) > 2 * 1024 * 1024:
+                    raise ValueError('远端摘要响应过大')
+                info = json.loads(raw.decode('utf-8', errors='replace'))
             sha = info.get('sha', '') if isinstance(info, dict) else ''
             if isinstance(sha, str) and re.fullmatch(r'[0-9a-f]{40}', sha):
                 return sha
@@ -9410,7 +9486,7 @@ if __name__ == '__main__':
         root = portal_path.parent
         access_file = root / 'portal-access.json'
         access = read_access_file(access_file)
-        host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+        host = meta_display_host(m)
         subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
         
         now_ts = int(time.time())
@@ -10852,7 +10928,7 @@ if __name__ == '__main__':
                     with data_lock:
                         items = proxy_services(data)
                     m = read_meta_file(meta_path)
-                    host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+                    host = meta_display_host(m)
                     # 不脱敏 password, 调用方是受信 API key
                     return self.reply_json(200, {
                         'ok': True,
@@ -11363,7 +11439,7 @@ if __name__ == '__main__':
                     return 500, {'ok': False, 'applied': False,
                         'error': '防火墙放行失败，代理记录已恢复；请检查本机防火墙状态'}
                 m = read_meta_file(meta_path)
-                host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+                host = meta_display_host(m)
                 host_part = '[' + host + ']' if ':' in host and not host.startswith('[') else host
                 uri = '%s://%s:%s@%s:%s' % (ptype, quote(username, safe=''), quote(password, safe=''), host_part, port)
                 qr_svg = ''
@@ -11433,9 +11509,9 @@ if __name__ == '__main__':
                 try:
                     req = urllib.request.Request('https://api.github.com/repos/go-gost/gost/releases/latest', headers={'User-Agent': 'Mozilla/5.0'})
                     with urllib.request.urlopen(req, timeout=8) as r:
-                        rel_data = json.loads(r.read().decode())
-                        if rel_data.get('tag_name'):
-                            tag = rel_data['tag_name']
+                        rel_data = json.loads(_read_bounded_bytes(r).decode('utf-8', errors='replace'))
+                        if isinstance(rel_data, dict) and isinstance(rel_data.get('tag_name'), str) and rel_data['tag_name'].strip():
+                            tag = rel_data['tag_name'].strip()
                 except Exception:
                     tag = 'v3.3.0'
 
@@ -11887,16 +11963,16 @@ if __name__ == '__main__':
                     rules = normalize_route_rules(
                         routing_state(dict(data, warp_enabled=defaults_apply))['warp_rules'])
                     if action == 'add_rule':
-                        raw = form.get('domain', [''])[0].strip().lower()
-                        domain = re.sub(r'^[a-zA-Z]+://', '', raw).split('/')[0].split(':')[0].strip('.')
-                        if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
+                        domain = _clean_route_domain(form.get('domain', [''])[0])
+                        if not _valid_route_domain(domain):
                             bad_domain = True
                         else:
                             rules = [r for r in rules if r['domain'] != domain]
                             rules.append({'domain': domain, 'outbound': 'warp_socks'})
                     elif action == 'del_rule':
-                        domain = form.get('domain', [''])[0].strip().lower()
-                        rules = [r for r in rules if not (r['domain'] == domain and r['outbound'] in ('warp', 'warp_socks'))]
+                        raw = form.get('domain', [''])[0].strip().lower()
+                        domain = _clean_route_domain(raw) or raw
+                        rules = [r for r in rules if not (r['domain'] in (domain, raw) and r['outbound'] in ('warp', 'warp_socks'))]
                     elif action == 'reset_rules':
                         rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
                         keep = {r['domain'] for r in rules}
@@ -11957,7 +12033,7 @@ if __name__ == '__main__':
                         core_lock_fd = acquire_core_operation_lock()
                     except RuntimeError as exc:
                         if str(exc) == 'another core operation is running':
-                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                            return self.reply_json(409, {'ok': False, 'error': '另一个核心操作正在进行，请稍后再试'})
                         raise
                     try:
                         if xray_unit_foreign():
@@ -12598,7 +12674,7 @@ if __name__ == '__main__':
                         core_lock_fd = acquire_core_operation_lock()
                     except RuntimeError as exc:
                         if str(exc) == 'another core operation is running':
-                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                            return self.reply_json(409, {'ok': False, 'error': '另一个核心操作正在进行，请稍后再试'})
                         raise
                     try:
                         if name == 'xray' and xray_unit_foreign():
@@ -12651,6 +12727,9 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
+                if not self._extend_deadline(120, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
@@ -12664,12 +12743,12 @@ if __name__ == '__main__':
                         core_lock_fd = acquire_core_operation_lock()
                     except RuntimeError as exc:
                         if str(exc) == 'another core operation is running':
-                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                            return self.reply_json(409, {'ok': False, 'error': '另一个核心操作正在进行，请稍后再试'})
                         raise
                     try:
-                        # Keep the usage check inside the same process-wide lock as
-                        # protocol installation, so a concurrent enable cannot race
-                        # between this check and binary removal.
+                        if name == 'xray' and xray_unit_foreign():
+                            return self.reply_json(409, {'ok': False, 'error': XRAY_FOREIGN_ERROR})
+                        # 在跨进程核心锁内检查在用协议，防止并发启用与删除二进制竞态
                         in_use = self._core_users(name)
                         if in_use:
                             return self.reply_json(409, {'ok': False, 'error':
@@ -12677,23 +12756,36 @@ if __name__ == '__main__':
                         unit_states = {}
                         for unit in unit_names:
                             active = _systemd_state(unit) == 'active'
-                            enabled_state = subprocess.run(
+                            is_en = subprocess.run(
                                 ['systemctl', 'is-enabled', unit], capture_output=True,
-                                text=True, timeout=5).stdout.strip()
-                            unit_states[unit] = (active, enabled_state == 'enabled')
+                                text=True, timeout=5)
+                            enabled_state = is_en.stdout.strip()
+                            unit_absent = (
+                                not active
+                                and not Path('/etc/systemd/system/%s.service' % unit).exists()
+                                and (enabled_state == 'not-found' or (is_en.returncode != 0 and not enabled_state))
+                            )
+                            unit_states[unit] = (active, enabled_state == 'enabled', unit_absent)
                         for unit in unit_names:
+                            _, _, unit_absent = unit_states[unit]
+                            if unit_absent:
+                                continue
                             stop_result = subprocess.run(
                                 ['systemctl', 'disable', '--now', unit],
                                 capture_output=True, timeout=30)
                             state = _systemd_state(unit)
                             if not _service_stop_confirmed(stop_result, state):
-                                # Restore every unit's original active and enabled
-                                # state, including units already stopped in this pass.
+                                # 恢复每个原本存在单元的激活与开机自启状态（含本轮已停掉的单元）
                                 restore_failed = []
-                                for restore_unit, (was_active, was_enabled) in unit_states.items():
+                                for restore_unit, (was_active, was_enabled, restore_absent) in unit_states.items():
+                                    if restore_absent:
+                                        continue
                                     enable_result = subprocess.run(
                                         ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
                                         capture_output=True, timeout=30)
+                                    if was_active:
+                                        subprocess.run(['systemctl', 'reset-failed', restore_unit],
+                                                       capture_output=True, timeout=5)
                                     action_result = subprocess.run(
                                         ['systemctl', 'start' if was_active else 'stop', restore_unit],
                                         capture_output=True, timeout=30)
@@ -13671,11 +13763,13 @@ verify_sha() {
     [[ "$(sha256sum "$1" | awk '{print $1}')" == "$2" ]]
 }
 tar_member() {
-    local m n=0 hit=""
+    local listing m n=0 hit=""
+    listing=$(tar -tzf - <"$2" 2>/dev/null) || return 1
     while IFS= read -r m; do
+        m="${m%$'\r'}"
         case "$m" in /*|..|../*|*/../*|*/..) return 2 ;; esac
         if [[ "${m#./}" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
-    done < <(tar -tzf "$2" 2>/dev/null)
+    done <<<"$listing"
     [[ $n -eq 1 ]] || return 3
     echo "$hit"
 }
@@ -13788,7 +13882,11 @@ if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ]; then
 fi
 
 claim_warp_assets
-cat > "$WP_CFG" <<WPEOF
+(
+    umask 077
+    WP_TMP=$(mktemp "${WP_CFG}.XXXXXX")
+    trap 'rm -f "${WP_TMP:-}"' EXIT
+    cat > "$WP_TMP" <<WPEOF
 # wireproxy config (managed by hysteria2-installer, do not edit)
 [Interface]
 Address = ${WG_ADDR}
@@ -13804,7 +13902,10 @@ PersistentKeepalive = 25
 [Socks5]
 BindAddress = ${WARP_SOCKS_ADDR}
 WPEOF
-chmod 600 "$WP_CFG"
+    chmod 600 "$WP_TMP"
+    mv -f "$WP_TMP" "$WP_CFG"
+    trap - EXIT
+)
 
 cat > /etc/systemd/system/wireproxy.service <<'WPSVCEOF'
 [Unit]
@@ -13824,6 +13925,7 @@ WantedBy=multi-user.target
 WPSVCEOF
 systemctl daemon-reload
 systemctl enable wireproxy >/dev/null 2>&1 || true
+systemctl reset-failed wireproxy >/dev/null 2>&1 || true
 systemctl restart wireproxy >/dev/null 2>&1 || true
 sleep 3
 
@@ -13849,6 +13951,7 @@ set -u
 probe() { curl --proxy socks5h://127.0.0.1:19898 --silent --fail --max-time 6 "$1" >/dev/null 2>&1; }
 if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
+    systemctl reset-failed wireproxy >/dev/null 2>&1 || true
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
 WDE
@@ -13942,6 +14045,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 def flush(self):
                     return real.flush()
 
+            self._head_body_started = False
             self.wfile = _HeadersOnly(self)
             original_end_headers = self.end_headers
 
@@ -13953,6 +14057,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             try:
                 return self.do_GET()
             finally:
+                self._head_body_started = False
                 self.wfile = real
                 self.end_headers = original_end_headers
 
@@ -14190,7 +14295,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         'node': {
                             'public_ip': m.get('public_ip', ''),
                             'server_name': m.get('server_name', ''),
-                            'is_insecure': bool(m.get('is_insecure')),
+                            'is_insecure': clean_node_identity(m)[0],
                             'hop_port_range': m.get('hop_port_range', ''),
                             'users_count': d_snap['users_count'],
                         },
@@ -14263,7 +14368,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 面板只看这条 API: 补齐 host 与 gost 运行状态,
                     # 否则列表显示不出主机名, 也无法区分"服务真的可用"和"条目存在".
                     m = read_meta_file(meta_path)
-                    host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+                    host = meta_display_host(m)
                     return self.reply_json(200, {
                         'ok': True,
                         'count': len(items),
@@ -14683,8 +14788,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 root = portal_path.parent
                 access_file = root / 'portal-access.json'
                 access = read_access_file(access_file)
-                host = (m.get('public_ip', '127.0.0.1') if m.get('is_insecure')
-                        else m.get('server_name', 'localhost'))
+                host = meta_display_host(m)
                 with data_lock:
                     users = {uid: dict(u) for uid, u in users_list_rows(user_table(data))
                              if isinstance(u, dict)}
@@ -14787,7 +14891,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             with data_lock:
                 services = proxy_services(data)
             m = read_meta_file(meta_path)
-            host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+            host = meta_display_host(m)
             return self.reply_json(200, {
                 'ok': True,
                 'gost_installed': Path('/usr/local/bin/gost').exists(),
@@ -14821,8 +14925,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     req = urllib.request.Request('https://api.github.com/repos/apernet/hysteria/releases/latest',
                                                  headers={'User-Agent': 'hysteria2-installer'})
                     with urllib.request.urlopen(req, timeout=3) as response:
-                        release = json.loads(response.read().decode('utf-8'))
-                    _core_ver_cache['tag'] = str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
+                        release = json.loads(_read_bounded_bytes(response).decode('utf-8', errors='replace'))
+                    _core_ver_cache['tag'] = (
+                        str(release.get('tag_name') or '').removeprefix('app/').removeprefix('v')
+                        if isinstance(release, dict) else ''
+                    )
                 except Exception:
                     _core_ver_cache['tag'] = ''
                 _core_ver_cache['t'] = now
@@ -15300,9 +15407,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     state = routing_state(data)
                     rules = normalize_route_rules(state['warp_rules'])
                     if action == 'rule-add':
-                        cleaned = re.sub(r'^[a-zA-Z]+://', '', dom).split('/')[0].split(':')[0].strip('.')
+                        cleaned = _clean_route_domain(dom)
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()
-                        if not cleaned or not re.match(r'^[a-zA-Z0-9.\-]+$', cleaned):
+                        if not _valid_route_domain(cleaned):
                             rule_error = '域名格式不正确'
                         elif not outbound_target_exists(target, state['custom_outbounds']):
                             rule_error = '所选出站不存在，请刷新页面后重新选择已配置的出站'
@@ -15311,8 +15418,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             rules.append({'domain': cleaned, 'outbound': target})
                             msg = '规则「%s」→ %s 已添加' % (cleaned, target)
                     else:
-                        rules = [r for r in rules if r['domain'] != dom]
-                        msg = '规则「%s」已删除' % dom
+                        cleaned = _clean_route_domain(dom) or dom
+                        rules = [r for r in rules if r['domain'] not in (cleaned, dom)]
+                        msg = '规则「%s」已删除' % cleaned
                     if rule_error is None:
                         data['warp_rules'] = rules
                 if rule_error is not None:
