@@ -809,6 +809,19 @@ def outbound_target_exists(target, outbounds=None, existing_names=None):
     return bool(target) and target in custom | configured
 
 
+def _clean_route_domain(raw):
+    """把分流规则输入的域名或完整地址规范成纯小写主机名。"""
+    text = str(raw or '').strip().lower()
+    text = re.sub(r'^[a-z][a-z0-9+.\-]*://', '', text)
+    text = re.split(r'[/?#]', text, maxsplit=1)[0]
+    return text.split('@')[-1].split(':')[0].strip('.')
+
+
+def _valid_route_domain(domain):
+    """判断规范化后的分流域名是否合法（禁止连续点与非法字符）。"""
+    return bool(domain) and '..' not in domain and bool(re.fullmatch(r'[a-z0-9.-]+', domain))
+
+
 def build_warp_acl_config(original, enabled, rules):
     """Render WARP domain ACL over the existing Hysteria config."""
     text = strip_acl_block(original)
@@ -11933,16 +11946,16 @@ if __name__ == '__main__':
                     rules = normalize_route_rules(
                         routing_state(dict(data, warp_enabled=defaults_apply))['warp_rules'])
                     if action == 'add_rule':
-                        raw = form.get('domain', [''])[0].strip().lower()
-                        domain = re.sub(r'^[a-zA-Z]+://', '', raw).split('/')[0].split(':')[0].strip('.')
-                        if not domain or not re.fullmatch(r'[a-z0-9.-]+', domain):
+                        domain = _clean_route_domain(form.get('domain', [''])[0])
+                        if not _valid_route_domain(domain):
                             bad_domain = True
                         else:
                             rules = [r for r in rules if r['domain'] != domain]
                             rules.append({'domain': domain, 'outbound': 'warp_socks'})
                     elif action == 'del_rule':
-                        domain = form.get('domain', [''])[0].strip().lower()
-                        rules = [r for r in rules if not (r['domain'] == domain and r['outbound'] in ('warp', 'warp_socks'))]
+                        raw = form.get('domain', [''])[0].strip().lower()
+                        domain = _clean_route_domain(raw) or raw
+                        rules = [r for r in rules if not (r['domain'] in (domain, raw) and r['outbound'] in ('warp', 'warp_socks'))]
                     elif action == 'reset_rules':
                         rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
                         keep = {r['domain'] for r in rules}
@@ -15377,9 +15390,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     state = routing_state(data)
                     rules = normalize_route_rules(state['warp_rules'])
                     if action == 'rule-add':
-                        cleaned = re.sub(r'^[a-zA-Z]+://', '', dom).split('/')[0].split(':')[0].strip('.')
+                        cleaned = _clean_route_domain(dom)
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()
-                        if not cleaned or not re.match(r'^[a-zA-Z0-9.\-]+$', cleaned):
+                        if not _valid_route_domain(cleaned):
                             rule_error = '域名格式不正确'
                         elif not outbound_target_exists(target, state['custom_outbounds']):
                             rule_error = '所选出站不存在，请刷新页面后重新选择已配置的出站'
@@ -15388,8 +15401,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             rules.append({'domain': cleaned, 'outbound': target})
                             msg = '规则「%s」→ %s 已添加' % (cleaned, target)
                     else:
-                        rules = [r for r in rules if r['domain'] != dom]
-                        msg = '规则「%s」已删除' % dom
+                        cleaned = _clean_route_domain(dom) or dom
+                        rules = [r for r in rules if r['domain'] not in (cleaned, dom)]
+                        msg = '规则「%s」已删除' % cleaned
                     if rule_error is None:
                         data['warp_rules'] = rules
                 if rule_error is not None:
