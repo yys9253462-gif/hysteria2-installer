@@ -3064,6 +3064,10 @@ for it in items if isinstance(items, list) else []:
     if [[ "$_file_ok" == "1" ]]; then
         # 配置自愈在持有跨进程锁的事务内执行，与发布/验证/回滚串行。
         cat > "$_bundle_dir/repair-config.sh" <<'PORTALREPAIR'
+        # 本脚本是独立执行文件，不能依赖 install.sh 里的函数定义，需内联同一套 tls.cert 解析规则。
+        config_tls_cert() {
+            awk '/^tls:/{f=1;next} f&&/^[ \t]+cert:/{sub(/^[ \t]*cert:[ \t]*/,"");sub(/[ \t]+#.*$/,"");gsub(/["\x27]/,"");print;exit} f&&/^[^ \t#]/{f=0}' "$1" 2>/dev/null || true
+        }
         # 计量配置自愈（2026-10-08）：老装机 / 手工改过的 config.yaml 可能没有
         # trafficStats 段，于是 usage-meter-config.json 从未生成，portal 启动即
         # `真实计量未初始化: FileNotFoundError` —— 换模块也治不好。
