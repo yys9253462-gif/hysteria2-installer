@@ -10890,6 +10890,9 @@ if __name__ == '__main__':
                     if pwd != pwd.strip():
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: password must not start or end with whitespace'})
+                    if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: password must not contain control characters'})
                     # 🔴 2026-10-25 修：这些值直接来自请求体，`int('abc')` 会抛
                     # ValueError。该分支不在任何 try 里，异常会穿透 do_POST →
                     # 连接被掐断，客户端只看到 "Remote end closed connection"，
@@ -11020,6 +11023,10 @@ if __name__ == '__main__':
                                     data['users'][user_id] = record
                                     save_data()
                                 except ValueError:
+                                    if previous_meter is missing:
+                                        data.pop('usage_meter', None)
+                                    else:
+                                        data['usage_meter'] = previous_meter
                                     conflict = (409, 'Invalid meter ledger; reconciliation not applied')
                                 except AtomicWriteDurabilityError:
                                     # 文件已替换：保留新值并继续同步协议，随后返回不确定状态。
@@ -11029,6 +11036,8 @@ if __name__ == '__main__':
                                         if isinstance(data.get('users'), dict):
                                             data['users'].pop(user_id, None)
                                     else:
+                                        if not isinstance(data.get('users'), dict):
+                                            data['users'] = {}
                                         data['users'][user_id] = existing
                                     if previous_meter is missing:
                                         data.pop('usage_meter', None)
@@ -11037,6 +11046,9 @@ if __name__ == '__main__':
                                     conflict = (503, 'Reconciliation save failed; disk state may require verification')
                             elif conflict is None:
                                 previous_record = copy.deepcopy(existing)
+                                missing = object()
+                                previous_meter = (copy.deepcopy(data['usage_meter'])
+                                                  if 'usage_meter' in data else missing)
                                 restore_meter_user(data, user_id)
                                 if not isinstance(data.get('users'), dict):
                                     data['users'] = {}
@@ -11050,7 +11062,13 @@ if __name__ == '__main__':
                                         if isinstance(data.get('users'), dict):
                                             data['users'].pop(user_id, None)
                                     else:
+                                        if not isinstance(data.get('users'), dict):
+                                            data['users'] = {}
                                         data['users'][user_id] = previous_record
+                                    if previous_meter is missing:
+                                        data.pop('usage_meter', None)
+                                    else:
+                                        data['usage_meter'] = previous_meter
                                     reality_registry(data)
                                     conflict = (503, 'User save failed; disk state may require verification')
                             if conflict is None:
@@ -11150,9 +11168,10 @@ if __name__ == '__main__':
                     try:
                         changes = {}
                         if 'password' in params:
-                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修）。
+                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修），且拒绝控制字符。
                             if (not isinstance(params['password'], str) or not params['password'].strip()
-                                    or params['password'] != params['password'].strip()):
+                                    or params['password'] != params['password'].strip()
+                                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in params['password'])):
                                 raise ValueError()
                             changes['password'] = params['password']
                         if 'expires_at' in params:
@@ -11329,7 +11348,7 @@ if __name__ == '__main__':
                         _raw_tracker = ip_tracker.get(user_id)
                         recent = ({
                             ip for ip, t in _raw_tracker.items()
-                            if isinstance(t, (int, float)) and not isinstance(t, bool)
+                            if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t)
                             and 0 <= now_ts - t < IP_TIMEOUT_SECONDS
                         } if isinstance(_raw_tracker, dict) else set())
                     # 只对「新加入拦截、且此刻在线」的 IP 踢一次：控制台每轮续期不会反复踢人。
@@ -11355,11 +11374,31 @@ if __name__ == '__main__':
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
                         previous_global_deny = copy.deepcopy(global_ip_deny.get(user_id))
+                        previous_had_pending_key = '_pending_revocations' in data
+                        previous_user_was_pending = user_id in pending_revocations(data)
+                        meter_obj = data.get('usage_meter')
+                        previous_had_meter_total = False
+                        previous_meter_total = None
+                        previous_had_meter_adj = False
+                        previous_meter_adj = None
+                        previous_had_retired_key = False
+                        previous_retired_val = None
+                        previous_user_was_retired = False
+                        if isinstance(meter_obj, dict):
+                            totals_obj = meter_obj.get('totals')
+                            if isinstance(totals_obj, dict) and user_id in totals_obj:
+                                previous_had_meter_total = True
+                                previous_meter_total = copy.deepcopy(totals_obj[user_id])
+                            adj_obj = meter_obj.get('adjustments')
+                            if isinstance(adj_obj, dict) and user_id in adj_obj:
+                                previous_had_meter_adj = True
+                                previous_meter_adj = copy.deepcopy(adj_obj[user_id])
+                            previous_had_retired_key = 'retired_users' in meter_obj
+                            previous_retired_val = copy.deepcopy(meter_obj.get('retired_users'))
+                            if isinstance(previous_retired_val, list):
+                                previous_user_was_retired = user_id in previous_retired_val
                         previous = {
                             'user': copy.deepcopy(users_map.get(user_id)),
-
-                            'pending': copy.deepcopy(data.get('_pending_revocations')),
-                            'meter': copy.deepcopy(data.get('usage_meter')),
                             'ip': copy.deepcopy(ip_tracker.get(user_id)),
                             'speed': copy.deepcopy(speed_tracker.get(user_id)),
                         }
@@ -11369,7 +11408,7 @@ if __name__ == '__main__':
                         # successful idempotent deletion must clear that stale scope.
                         global_ip_deny.pop(user_id, None)
                         if previous_had_user:
-                            del data['users'][user_id]
+                            data['users'].pop(user_id, None)
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
@@ -11384,15 +11423,31 @@ if __name__ == '__main__':
                     except OSError:
                         with data_lock:
                             if previous_had_user:
-                                data.setdefault('users', {})[user_id] = previous['user']
-                            if previous['pending'] is None:
-                                data.pop('_pending_revocations', None)
-                            else:
-                                data['_pending_revocations'] = previous['pending']
-                            if previous['meter'] is None:
-                                data.pop('usage_meter', None)
-                            else:
-                                data['usage_meter'] = previous['meter']
+                                if not isinstance(data.get('users'), dict):
+                                    data['users'] = {}
+                                data['users'][user_id] = previous['user']
+                            if not previous_user_was_pending:
+                                remaining_pending = sorted(pending_revocations(data) - {user_id})
+                                if remaining_pending or previous_had_pending_key:
+                                    data['_pending_revocations'] = remaining_pending
+                                else:
+                                    data.pop('_pending_revocations', None)
+                            meter_obj = data.get('usage_meter')
+                            if isinstance(meter_obj, dict):
+                                if previous_had_meter_total and isinstance(meter_obj.get('totals'), dict):
+                                    meter_obj['totals'][user_id] = previous_meter_total
+                                if previous_had_meter_adj and isinstance(meter_obj.get('adjustments'), dict):
+                                    meter_obj['adjustments'][user_id] = previous_meter_adj
+                                if not previous_user_was_retired and isinstance(meter_obj.get('retired_users'), list):
+                                    rem_retired = [uid for uid in meter_obj['retired_users'] if uid != user_id]
+                                    if rem_retired:
+                                        meter_obj['retired_users'] = rem_retired
+                                    elif not previous_had_retired_key:
+                                        meter_obj.pop('retired_users', None)
+                                    elif isinstance(previous_retired_val, list):
+                                        meter_obj['retired_users'] = []
+                                    else:
+                                        meter_obj['retired_users'] = previous_retired_val
                             if previous['ip'] is None:
                                 ip_tracker.pop(user_id, None)
                             else:
@@ -14491,6 +14546,9 @@ if __name__ == '__main__':
                 previous_had_meter_total = False
                 previous_meter_adj = None
                 previous_had_meter_adj = False
+                previous_had_retired_key = False
+                previous_retired_val = None
+                previous_user_was_retired = False
                 previous_ip = None
                 previous_speed = None
                 previous_deny = None
@@ -14599,6 +14657,10 @@ if __name__ == '__main__':
                                 if isinstance(adj_obj, dict) and user_id in adj_obj:
                                     previous_had_meter_adj = True
                                     previous_meter_adj = copy.deepcopy(adj_obj[user_id])
+                                previous_had_retired_key = 'retired_users' in meter_obj
+                                previous_retired_val = copy.deepcopy(meter_obj.get('retired_users'))
+                                if isinstance(previous_retired_val, list):
+                                    previous_user_was_retired = user_id in previous_retired_val
                             previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
                             previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
                             previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
@@ -14645,6 +14707,16 @@ if __name__ == '__main__':
                                     meter_obj['totals'][user_id] = previous_meter_total
                                 if previous_had_meter_adj and isinstance(meter_obj.get('adjustments'), dict):
                                     meter_obj['adjustments'][user_id] = previous_meter_adj
+                                if not previous_user_was_retired and isinstance(meter_obj.get('retired_users'), list):
+                                    rem_retired = [uid for uid in meter_obj['retired_users'] if uid != user_id]
+                                    if rem_retired:
+                                        meter_obj['retired_users'] = rem_retired
+                                    elif not previous_had_retired_key:
+                                        meter_obj.pop('retired_users', None)
+                                    elif isinstance(previous_retired_val, list):
+                                        meter_obj['retired_users'] = []
+                                    else:
+                                        meter_obj['retired_users'] = previous_retired_val
                             if previous_ip is None:
                                 ip_tracker.pop(user_id, None)
                             else:
