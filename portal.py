@@ -8652,6 +8652,7 @@ def serve(path):
             # 一台服务都没停。这里统一走 suspend_state 的清洗规则。
             state = suspend_state(data)
         results = {}
+        _retired = set()
         if suspend:
             units = state.get('units') if state.get('suspended') else None
             if units is None:
@@ -8715,13 +8716,16 @@ def serve(path):
                 else:
                     data.pop('traffic_suspend', None)
             for unit, succeeded in results.items():
-                if not succeeded:
+                if not succeeded or (not suspend and unit in _retired):
                     continue
                 compensate = 'start' if suspend else 'stop'
                 try:
+                    if compensate == 'start':
+                        subprocess.run(['systemctl', 'reset-failed', unit],
+                                       capture_output=True, timeout=5)
                     subprocess.run(['systemctl', compensate, unit],
                                    capture_output=True, timeout=20)
-                except OSError:
+                except Exception:
                     pass
             raise
         return new_state, results
