@@ -13849,11 +13849,10 @@ if __name__ == '__main__':
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply(404, '该用户已不存在（可能已在别处删除），请刷新页面'.encode('utf-8'))
 
-                regenerate_page()
+                save_data()
                 if not self._sync_reality_clients():
                     with data_lock:
                         if action == 'delete':
-                            save_data()
                             revoked_pending = True
                         else:
                             revoked_pending = False
@@ -13861,11 +13860,12 @@ if __name__ == '__main__':
                                 data.get('users', {}).pop(user_id, None)
                             else:
                                 data.setdefault('users', {})[user_id] = previous_user
-                    save_data()
                     if revoked_pending:
-                        # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
+                        # 锁外重建页面并持久化：用户已删仅待断开连接，页面状态须与最新 users 对齐。
+                        regenerate_page()
                         return self.reply(503, '用户已删除，但节点上的旧连接还没确认断开，后台会自动重试；请稍后刷新页面确认'
                                           .encode('utf-8'))
+                    save_data()
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
                 regenerate_page()
