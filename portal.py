@@ -4777,7 +4777,12 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     state_path = Path(state_path) if state_path else root / 'cert-selfheal.json'
     try:
         cert_file = Path(cert_file)
-        digest = hashlib.sha256(cert_file.read_bytes()).hexdigest()
+        if not cert_file.is_file():
+            return False
+        raw_cert = cert_file.read_bytes()
+        if not raw_cert:
+            return False
+        digest = hashlib.sha256(raw_cert).hexdigest()
     except OSError:
         return False
     state = {}
@@ -8482,7 +8487,7 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     """
     root = Path(meta_path).parent
     meta_file = Path(meta_path)
-    if not meta_file.exists():
+    if not meta_file.is_file():
         return False
     try:
         m = json.loads(meta_file.read_text(encoding='utf-8'))
@@ -8502,7 +8507,7 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
         configured_path = Path(configured)
         if not configured_path.is_absolute():
             configured_path = Path(config_path).parent / configured_path
-        configured_missing = not configured_path.exists()
+        configured_missing = not configured_path.is_file()
     live_cert, _, _, _ = _resolve_live_cert(root, config_path)
     changed = sync_cert_trust(m, root, meta_path, config_path=config_path)
     # sync_cert_trust 只在漂移时写盘；pin 的修正也一并在此处理（保持与 refresh 一致）。
@@ -12658,9 +12663,10 @@ if __name__ == '__main__':
                 endpoint_error = awg_endpoint_error(endpoint)
                 if endpoint_error:
                     return self.reply_json(400, {'ok': False, 'error': endpoint_error})
-                # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃或主监听端口冲突的取值
+                # 端口若由用户指定，提前拦掉非 ASCII 数字及会与 Hysteria2/TUIC 冲突的取值
+                port_num = None
                 if port:
-                    if not port.isdigit() or not (1 <= int(port) <= 65535):
+                    if not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535):
                         return self.reply_json(400, {'ok': False, 'error': '端口必须是 1-65535 的数字'})
                     port_num = int(port)
                     if 20000 <= port_num <= 40000:
@@ -12674,23 +12680,31 @@ if __name__ == '__main__':
                         if hy2_listen and port_num == hy2_listen:
                             return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 已被 Hysteria2 主监听端口占用，请更换其它 UDP 端口'})
                         hop_range = str(m_now.get('hop_port_range') or '').strip()
-                        hop_match = re.fullmatch(r'(\d{1,5})-(\d{1,5})', hop_range)
+                        hop_match = re.fullmatch(r'([0-9]{1,5})-([0-9]{1,5})', hop_range)
                         if hop_match:
                             hs, he = int(hop_match.group(1)), int(hop_match.group(2))
                             if 1 <= hs <= he <= 65535 and hs <= port_num <= he:
                                 return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 落在当前 Hysteria2 端口跳跃区间 {hs}-{he} 内，请更换其它 UDP 端口'})
+                    try:
+                        with data_lock:
+                            tuic_cfg = config_section(data, 'tuic_config')
+                            tuic_port = _valid_port(tuic_cfg.get('port')) if tuic_cfg.get('enabled') else 0
+                    except NameError:
+                        tuic_port = 0
+                    if tuic_port and port_num == tuic_port:
+                        return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 已被 TUIC 协议占用，请更换其它 UDP 端口'})
                 if unit_suspended(AWG_SVC_NAME):
                     return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，请在控制台恢复节点后再安装 AmneziaWG'})
-                if not ensure_awgctl():
-                    return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
-                # 安装要下载并核验两个二进制，awgctl 超时 420 秒。
+                # 安装要下载控制脚本与校验两个二进制（总超时 420 秒），先申请重型死线槽再联网。
                 if not self._extend_deadline(480, heavy=True):
                     return self.reply_json(409, {'ok': False, 'error':
                         '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
+                if not ensure_awgctl():
+                    return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
 
                 args = ['install', '--line', line, '--endpoint', endpoint]
-                if port:
-                    args += ['--port', port]
+                if port_num is not None:
+                    args += ['--port', str(port_num)]
                 rc, out, err = awg_run(args, timeout=420)
                 if rc != 0:
                     return self.reply_json(500, {'ok': False, 'error': '安装失败：' + awg_err_tail(rc, out, err)})
@@ -12754,62 +12768,8 @@ if __name__ == '__main__':
                 if action in ('set_line', 'update', 'start', 'restart') and unit_suspended(AWG_SVC_NAME):
                     return self.reply_json(409, {'ok': False, 'error':
                         '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
-                if not ensure_awgctl():
-                    return self.reply_json(500, {'ok': False, 'error': 'hy2-awgctl 不可用'})
 
-                # update / set_line 的 awgctl 超时给到 420 秒（要下载并交叉
-                # 验证二进制），必须先把连接死线抬到覆盖全程。
-                if action in ('set_line', 'update'):
-                    if not self._extend_deadline(480, heavy=True):
-                        return self.reply_json(409, {'ok': False, 'error':
-                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-
-                if action == 'peer_add':
-                    # name / endpoint 已在安装状态检查之前校验过。
-                    # peer-add 会生成密钥并渲染服务端配置，90 秒超时。
-                    if not self._extend_deadline(120, heavy=True):
-                        return self.reply_json(409, {'ok': False, 'error':
-                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                    rc, out, err = awg_run(['peer-add', name, '--endpoint', endpoint], timeout=90)
-                    if rc != 0:
-                        return self.reply_json(500, {'ok': False, 'error': '创建失败：' + awg_err_tail(rc, out, err, 400)})
-                    return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已创建'})
-
-                if action == 'peer_del':
-                    name = (form.get('name', [''])[0] or '').strip()
-                    if not VALID_AWG_NAME_RE.match(name):
-                        return self.reply_json(400, {'ok': False, 'error': '客户端名称非法'})
-                    # 与 peer_add 同样抬死线（2026-11-04 修）：awg_run 先排队等 AWG 操作锁，
-                    # update 占锁时可达 420 秒；默认 30 秒死线先关掉连接，浏览器报网络错误，
-                    # 删除却在锁空出来后照常执行，重试只拿到「客户端不存在」。
-                    if not self._extend_deadline(120, heavy=True):
-                        return self.reply_json(409, {'ok': False, 'error':
-                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                    rc, out, err = awg_run(['peer-del', name], timeout=90)
-                    if rc != 0:
-                        return self.reply_json(500, {'ok': False, 'error': '删除失败：' + awg_err_tail(rc, out, err, 400)})
-                    return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已删除'})
-
-                if action == 'set_line':
-                    target = (form.get('line', [''])[0] or '').strip()
-                    if target not in ('2', '3'):
-                        return self.reply_json(400, {'ok': False, 'error': '协议线只能是 2 或 3'})
-                    if target == awg_state()['line']:
-                        return self.reply_json(200, {'ok': True, 'message': f'已经是 AWG {target}.x，无需切换。'})
-                    rc, out, err = awg_run(['update', '--line', target], timeout=420)
-                    if rc != 0:
-                        return self.reply_json(500, {'ok': False, 'error': '切换失败：' + awg_err_tail(rc, out, err)})
-                    return self.reply_json(200, {'ok': True, 'message': f'已切换到 AWG {target}.x。⚠️ 所有客户端必须重新导入配置。'})
-
-                if action == 'update':
-                    # 先把控制工具自身刷新到最新，刷新失败则明确中止而非静默继续跑旧版本。
-                    if not ensure_awgctl(force=True):
-                        return self.reply_json(500, {'ok': False, 'error': '刷新最新 hy2-awgctl 失败，已中止更新，请检查网络后重试'})
-                    rc, out, err = awg_run(['update'], timeout=420)
-                    if rc != 0:
-                        return self.reply_json(500, {'ok': False, 'error': '更新失败：' + awg_err_tail(rc, out, err)})
-                    return self.reply_json(200, {'ok': True, 'message': '二进制已更新，协议线与参数保持不变，客户端无需重新导入。'})
-
+                # start / stop / restart 直接调 systemctl，不依赖 hy2-awgctl，断网环境也可启停。
                 if action in ('start', 'stop', 'restart'):
                     label = {'start': '启动', 'stop': '停止', 'restart': '重启'}.get(action, action)
                     # 等 awg_operation_lock 与 30 秒 systemctl 合计可能超过默认 30 秒连接死线，先续期。
@@ -12831,6 +12791,48 @@ if __name__ == '__main__':
                     if proc.returncode != 0:
                         return self.reply_json(500, {'ok': False, 'error': '服务' + label + '失败：' + (proc.stderr or '').strip()[-400:]})
                     return self.reply_json(200, {'ok': True, 'message': '服务已' + label})
+
+                # 其余动作依赖 hy2-awgctl：先申请重型死线槽，再调用 ensure_awgctl（避免联网拉脚本超 30 秒被掐断）。
+                if action in ('set_line', 'update'):
+                    if not self._extend_deadline(480, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
+                else:
+                    if not self._extend_deadline(120, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
+
+                if not ensure_awgctl():
+                    return self.reply_json(500, {'ok': False, 'error': 'hy2-awgctl 不可用'})
+
+                if action == 'peer_add':
+                    rc, out, err = awg_run(['peer-add', name, '--endpoint', endpoint], timeout=90)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '创建失败：' + awg_err_tail(rc, out, err, 400)})
+                    return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已创建'})
+
+                if action == 'peer_del':
+                    rc, out, err = awg_run(['peer-del', name], timeout=90)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '删除失败：' + awg_err_tail(rc, out, err, 400)})
+                    return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已删除'})
+
+                if action == 'set_line':
+                    if target == awg_state()['line']:
+                        return self.reply_json(200, {'ok': True, 'message': f'已经是 AWG {target}.x，无需切换。'})
+                    rc, out, err = awg_run(['update', '--line', target], timeout=420)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '切换失败：' + awg_err_tail(rc, out, err)})
+                    return self.reply_json(200, {'ok': True, 'message': f'已切换到 AWG {target}.x。⚠️ 所有客户端必须重新导入配置。'})
+
+                if action == 'update':
+                    # 先把控制工具自身刷新到最新，刷新失败则明确中止而非静默继续跑旧版本。
+                    if not ensure_awgctl(force=True):
+                        return self.reply_json(500, {'ok': False, 'error': '刷新最新 hy2-awgctl 失败，已中止更新，请检查网络后重试'})
+                    rc, out, err = awg_run(['update'], timeout=420)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '更新失败：' + awg_err_tail(rc, out, err)})
+                    return self.reply_json(200, {'ok': True, 'message': '二进制已更新，协议线与参数保持不变，客户端无需重新导入。'})
             except subprocess.TimeoutExpired:
                 return self.reply_json(500, {'ok': False, 'error': '操作超时，请查看服务器日志'})
             except Exception as e:
