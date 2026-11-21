@@ -4625,7 +4625,9 @@ install_warp_local_proxy() {
             WGCF_TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
         fi
         WGCF_VER="${WGCF_TAG#v}"
-        [[ -z "$WGCF_VER" || "$WGCF_VER" == "null" ]] && WGCF_VER="2.3.0"
+        if [[ -z "$WGCF_VER" || "$WGCF_VER" == "null" || "$WGCF_VER" == *..* || ! "$WGCF_VER" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+            WGCF_VER="2.3.0"
+        fi
         WGCF_DL="wgcf_${WGCF_VER}_linux_${WGCF_ARCH}"
         WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/${WGCF_DL}"
         log_info "目标 wgcf 版本: v${WGCF_VER}"
@@ -4647,14 +4649,20 @@ install_warp_local_proxy() {
             log_err "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致，已放弃安装。"
             return 1
         fi
-        if ! install -m 755 "${TMP_DIR}/${WGCF_DL}" "${WGCF_BIN}.new"; then
-            rm -rf "$TMP_DIR" "${WGCF_BIN}.new"
+        local _wgcf_stage=""
+        _wgcf_stage="$(umask 022; mktemp "${WGCF_BIN}.new.XXXXXX")" || {
+            rm -rf "$TMP_DIR"
+            log_err "创建 wgcf 暂存文件失败，现有文件未改动。"
+            return 1
+        }
+        if ! install -m 755 "${TMP_DIR}/${WGCF_DL}" "$_wgcf_stage"; then
+            rm -rf "$TMP_DIR" "$_wgcf_stage"
             log_err "安装 wgcf 失败，现有文件未改动。"
             return 1
         fi
         rm -rf "$TMP_DIR"
-        if ! mv -f "${WGCF_BIN}.new" "$WGCF_BIN"; then
-            rm -f "${WGCF_BIN}.new"
+        if ! mv -f "$_wgcf_stage" "$WGCF_BIN"; then
+            rm -f "$_wgcf_stage"
             log_err "替换 wgcf 失败，现有文件未改动。"
             return 1
         fi
@@ -4676,7 +4684,7 @@ install_warp_local_proxy() {
         fi
         # ⚠️ 旧实现回退只改了 WP_VER，拼 URL 却仍用空的 WP_TAG，于是回退分支拼出
         #    `.../download//wireproxy_...`（404），回退形同虚设。现在统一用 WP_TAG。
-        if [[ -z "$WP_TAG" || "$WP_TAG" == "null" ]]; then
+        if [[ -z "$WP_TAG" || "$WP_TAG" == "null" || "$WP_TAG" == *..* || ! "$WP_TAG" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
             WP_TAG="v1.1.3"
         fi
         WP_ASSET="wireproxy_linux_${WP_ARCH}.tar.gz"
@@ -4718,14 +4726,20 @@ install_warp_local_proxy() {
             log_err "wireproxy 解压失败"
             return 1
         fi
-        if ! install -m 755 "${TMP_EXTRACT}/${WP_MEMBER}" "${WP_BIN}.new"; then
-            rm -rf "$TMP_DIR" "$TMP_EXTRACT" "${WP_BIN}.new"
+        local _wp_stage=""
+        _wp_stage="$(umask 022; mktemp "${WP_BIN}.new.XXXXXX")" || {
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT"
+            log_err "创建 wireproxy 暂存文件失败，现有文件未改动。"
+            return 1
+        }
+        if ! install -m 755 "${TMP_EXTRACT}/${WP_MEMBER}" "$_wp_stage"; then
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT" "$_wp_stage"
             log_err "安装 wireproxy 失败，现有文件未改动。"
             return 1
         fi
         rm -rf "$TMP_DIR" "$TMP_EXTRACT"
-        if ! mv -f "${WP_BIN}.new" "$WP_BIN"; then
-            rm -f "${WP_BIN}.new"
+        if ! mv -f "$_wp_stage" "$WP_BIN"; then
+            rm -f "$_wp_stage"
             log_err "替换 wireproxy 失败，现有文件未改动。"
             return 1
         fi
@@ -4779,6 +4793,10 @@ install_warp_local_proxy() {
     WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF" | tr -d '\r')
     WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
     WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+    if [[ -z "$WG_PRIV" || -z "$WG_PUB" || -z "$WG_EP" ]]; then
+        log_err "WireGuard 配置解析失败（PrivateKey / PublicKey / Endpoint 缺失），已中止。"
+        return 1
+    fi
     # 用 wgcf 下发的地址（含 IPv6），AllowedIPs 同时放行 ::/0（2026-11-03 修）：
     # 旧配置只写 IPv4，走 WARP 的域名一旦解析到 IPv6 就连不上（SE 上实测）。
     WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
@@ -4854,8 +4872,13 @@ EOF
     # 7. 把 hysteria config.yaml 的 outbound warp_socks 端口同步到 19898
     warp_migrate_legacy_outbound "$WARP_SOCKS_ADDR"
 
-    # 8. Watchdog (走 WARP socks5 探活, 失败则重启 wireproxy)
-    cat > /usr/local/bin/hy2-warp-watchdog.sh <<EOWD
+    # 8. Watchdog (走 WARP socks5 探活, 失败则重启 wireproxy，原子落盘)
+    local _wd_sh_tmp=""
+    _wd_sh_tmp="$(umask 022; mktemp "/usr/local/bin/hy2-warp-watchdog.sh.XXXXXX")" || {
+        log_err "无法创建 hy2-warp-watchdog.sh 临时文件。"
+        return 1
+    }
+    if ! cat > "$_wd_sh_tmp" <<EOWD
 #!/usr/bin/env bash
 set -u
 # 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
@@ -4866,7 +4889,16 @@ if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/
     systemctl restart wireproxy >/dev/null 2>&1 || true
 fi
 EOWD
-    chmod 755 /usr/local/bin/hy2-warp-watchdog.sh
+    then
+        rm -f "$_wd_sh_tmp"
+        log_err "写入 hy2-warp-watchdog.sh 失败。"
+        return 1
+    fi
+    if ! chmod 755 "$_wd_sh_tmp" || ! mv -f "$_wd_sh_tmp" /usr/local/bin/hy2-warp-watchdog.sh; then
+        rm -f "$_wd_sh_tmp"
+        log_err "落盘 hy2-warp-watchdog.sh 失败。"
+        return 1
+    fi
 
     local _wd_svc_tmp="" _wd_tmr_tmp=""
     _wd_svc_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.service.XXXXXX")" || {

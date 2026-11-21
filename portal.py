@@ -14710,7 +14710,7 @@ claim_warp_assets() {
 }
 atomic_write_mode() {
     local dst="$1" mode="$2" tmp
-    tmp=$(mktemp "${dst}.XXXXXX") || return 1
+    tmp=$(umask 077; mktemp "${dst}.XXXXXX") || return 1
     if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dst"; then
         rm -f "$tmp"
         return 1
@@ -14737,13 +14737,17 @@ verify_sha() {
     [[ "$(sha256sum "$1" | awk '{print $1}')" == "$2" ]]
 }
 tar_member() {
-    local listing m n=0 hit=""
+    local listing vlisting m vline n=0 hit=""
     listing=$(tar -tzf - <"$2" 2>/dev/null) || return 1
     while IFS= read -r m; do
         m="${m%$'\r'}"
-        case "$m" in /*|..|../*|*/../*|*/..) return 2 ;; esac
+        case "$m" in /*|..|../*|*/../*|*/..|*\\*) return 2 ;; esac
         if [[ "${m#./}" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
     done <<<"$listing"
+    vlisting=$(tar -tvzf - <"$2" 2>/dev/null) || return 1
+    while IFS= read -r vline; do
+        case "$vline" in -*|d*) ;; *) return 2 ;; esac
+    done <<<"$vlisting"
     [[ $n -eq 1 ]] || return 3
     echo "$hit"
 }
@@ -14757,7 +14761,9 @@ if [ ! -x "$WGCF_BIN" ]; then
         TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
     VER="${TAG#v}"
-    case "$VER" in ""|null) VER="2.3.0" ;; esac
+    if [[ -z "$VER" || "$VER" == "null" || "$VER" == *..* || ! "$VER" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+        VER="2.3.0"
+    fi
     WG_DL="wgcf_${VER}_linux_${WG_A}"
     TD=$(mktemp -d)
     trap 'rm -rf "$TD"' EXIT
@@ -14776,9 +14782,10 @@ if [ ! -x "$WGCF_BIN" ]; then
     if ! verify_sha "${TD}/${WG_DL}" "$WANT"; then
         rm -rf "$TD"; echo "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致" >&2; exit 1
     fi
-    install -m 755 "${TD}/${WG_DL}" "${WGCF_BIN}.new" || { rm -rf "$TD" "${WGCF_BIN}.new"; exit 1; }
+    WGCF_STAGE=$(umask 022; mktemp "${WGCF_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
+    install -m 755 "${TD}/${WG_DL}" "$WGCF_STAGE" || { rm -rf "$TD" "$WGCF_STAGE"; exit 1; }
     rm -rf "$TD"; trap - EXIT
-    mv -f "${WGCF_BIN}.new" "$WGCF_BIN" || { rm -f "${WGCF_BIN}.new"; exit 1; }
+    mv -f "$WGCF_STAGE" "$WGCF_BIN" || { rm -f "$WGCF_STAGE"; exit 1; }
 fi
 
 if [ ! -x "$WP_BIN" ]; then
@@ -14789,7 +14796,9 @@ if [ ! -x "$WP_BIN" ]; then
     else
         TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
-    case "$TAG" in ""|null) TAG="v1.1.3" ;; esac
+    if [[ -z "$TAG" || "$TAG" == "null" || "$TAG" == *..* || ! "$TAG" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+        TAG="v1.1.3"
+    fi
     WP_DL="wireproxy_linux_${WP_A}.tar.gz"
     # 先清掉上一个临时目录：旧 trap 只认当前的 $TD，直接重新赋值会让
     # wgcf 那次 mktemp 的目录永远留在 /tmp（2026-10-30 修）。
@@ -14816,10 +14825,14 @@ if [ ! -x "$WP_BIN" ]; then
     if ! tar -xzf "${TD}/${WP_DL}" -C "${TD}/x" "$MEMBER" 2>/dev/null; then
         rm -rf "$TD"; echo "wireproxy 解压失败" >&2; exit 1
     fi
-    install -m 755 "${TD}/x/${MEMBER}" "${WP_BIN}.new" || { rm -rf "$TD" "${WP_BIN}.new"; exit 1; }
+    if [ ! -f "${TD}/x/${MEMBER}" ] || [ -L "${TD}/x/${MEMBER}" ]; then
+        rm -rf "$TD"; echo "wireproxy 解压成员非法，已放弃安装" >&2; exit 1
+    fi
+    WP_STAGE=$(umask 022; mktemp "${WP_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
+    install -m 755 "${TD}/x/${MEMBER}" "$WP_STAGE" || { rm -rf "$TD" "$WP_STAGE"; exit 1; }
     rm -rf "$TD"; trap - EXIT
     claim_warp_assets
-    mv -f "${WP_BIN}.new" "$WP_BIN" || { rm -f "${WP_BIN}.new"; exit 1; }
+    mv -f "$WP_STAGE" "$WP_BIN" || { rm -f "$WP_STAGE"; exit 1; }
 fi
 
 mkdir -p "$WG_DIR"
