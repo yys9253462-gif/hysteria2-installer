@@ -122,10 +122,11 @@ init_log() {
     if [ ! -d "$_logdir" ]; then
         mkdir -p "$_logdir" 2>/dev/null || { LOG=""; return 0; }
     fi
-    if ! : > "$LOG" 2>/dev/null; then
+    if ! ( umask 077; : > "$LOG" ) 2>/dev/null; then
         LOG=""
         return 0
     fi
+    chmod 600 "$LOG" 2>/dev/null || true
     return 0
 }
 
@@ -238,7 +239,7 @@ case "$NET_MODE" in
 esac
 
 case "$PORT" in
-    ''|*[!0-9]*) die "SSH 端口必须是数字，当前是：$PORT" ;;
+    ''|0*|*[!0-9]*) die "SSH 端口必须是无前导零的正整数，当前是：$PORT" ;;
 esac
 [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "SSH 端口超出范围（1-65535）：$PORT"
 
@@ -247,10 +248,17 @@ case "$SWAP_MB" in
 esac
 
 case "$RELEASE" in
-    ''|*[!0-9]*) die "Debian 版本号必须是数字（如 12 / 13），当前是：$RELEASE" ;;
+    ''|0*|*[!0-9]*) die "Debian 版本号必须是正整数（如 12 / 13），当前是：$RELEASE" ;;
 esac
 
 [ -n "$MIRROR" ] || die "镜像地址不能为空"
+case "$MIRROR" in
+    http://*|https://*) ;;
+    *) die "镜像地址必须以 http:// 或 https:// 开头：$MIRROR" ;;
+esac
+case "$MIRROR" in
+    *[!A-Za-z0-9._~:/?#%+-]*) die "镜像地址含非法字符：$MIRROR" ;;
+esac
 
 if [ -n "$PASSWORD" ] && ! password_ok "$PASSWORD"; then
     die "${PASSWORD_RULE}：InstallNET 不加引号地使用密码，特殊字符会让装好的系统用这个密码登不上"
@@ -616,7 +624,7 @@ download_installnet() {
         if command -v wget >/dev/null 2>&1; then
             # 不能 --no-check-certificate：下载的脚本随后以 root 执行并重装整个系统，
             # 跳过证书校验等于把机器交给任何能做中间人的人。
-            wget -qO "$IN_FILE" "$_u" && installnet_looks_valid && return 0
+            wget -qO "$IN_FILE" -T 120 "$_u" && installnet_looks_valid && return 0
         fi
         rm -f "$IN_FILE"
         if command -v curl >/dev/null 2>&1; then
@@ -663,7 +671,7 @@ fi
 
 info "下载 InstallNET.sh"
 download_installnet || die "下载 InstallNET.sh 失败。请检查网络后重试。"
-chmod a+x "$IN_FILE" 2>/dev/null || true
+chmod 700 "$IN_FILE" 2>/dev/null || true
 
 # 校验下载完整性：InstallNET.sh 正常有 270KB 左右
 _size="$(wc -c < "$IN_FILE" 2>/dev/null | tr -d ' ')"
