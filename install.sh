@@ -952,9 +952,10 @@ install_binary() {
     # 永远执行不到 —— 实测 api.github.com 不可达时 exit=6 直接死掉。
     # 而「api.github.com 被墙/限流」恰恰是本工具用户最常见的处境，
     # 为此专门写的 download.hysteria.network 直链回退形同虚设。
-    LATEST_TAG=$(curl -s --max-time 10 https://api.github.com/repos/apernet/hysteria/releases/latest | jq -r '.tag_name // empty') || LATEST_TAG=""
+    LATEST_TAG=$(curl -s --max-time 10 --max-filesize=2097152 https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || LATEST_TAG=""
 
-    local asset_arch asset tmpdir expected got
+    local asset_arch asset tmpdir="" staged="" expected got
+    trap 'rm -rf "${tmpdir:-}" "${staged:-}"' RETURN
     if ! asset_arch="$(hy2_core_asset_arch "$HY2_ARCH")"; then
         log_err "Hysteria 2 不支持当前 CPU 架构: ${HY2_ARCH}"
         return 1
@@ -987,7 +988,7 @@ install_binary() {
     log_info "目标版本: ${LATEST_TAG} (${asset})"
     log_step "下载二进制文件至 ${HY2_BIN}..."
 
-    tmpdir="$(mktemp -d)"
+    tmpdir="$(umask 077; mktemp -d)" || return 1
     # 官方同版本的 hashes.txt；hysteria 的 tag 形如 app/v2.13.0，路径要原样保留。
     if ! expected="$(hy2_expected_sha256 \
             "https://github.com/apernet/hysteria/releases/download/${LATEST_TAG}/hashes.txt" \
@@ -998,7 +999,7 @@ install_binary() {
         return 1
     fi
 
-    if ! curl -fL --progress-bar --max-time 300 \
+    if ! curl -fL --progress-bar --max-time 300 --max-filesize=209715200 \
             "https://github.com/apernet/hysteria/releases/download/${LATEST_TAG}/${asset}" \
             -o "${tmpdir}/${asset}"; then
         rm -rf "$tmpdir"
@@ -1021,8 +1022,7 @@ install_binary() {
         log_err "校验通过但二进制无法运行（架构不匹配？），已放弃安装。"
         return 1
     fi
-    local staged
-    staged="$(mktemp "$(dirname "$HY2_BIN")/.hysteria.new.XXXXXX")" || {
+    staged="$(umask 077; mktemp "$(dirname "$HY2_BIN")/.hysteria.new.XXXXXX")" || {
         rm -rf "$tmpdir"
         log_err "无法在 $(dirname "$HY2_BIN") 创建临时二进制文件，现有二进制未改动。"
         return 1
@@ -3891,13 +3891,13 @@ portal_fetch_files() {
     # 计量文件与门户文件同源同生命周期，一起拉、一起失败
     for f in $PORTAL_FILES $METER_FILES; do
         if [[ "$mode" == "api" ]]; then
-            if ! curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" \
+            if ! curl -fsSL --max-time 30 --max-filesize=16777216 -H "Accept: application/vnd.github.raw" \
                  "${base}/${f}?ref=${PORTAL_FETCH_REF}" -o "${dir}/${f}" 2>/dev/null; then
                 PORTAL_FETCH_FILES_ERR="下载 ${f} 失败"
                 return 1
             fi
         else
-            if ! curl -fsSL --max-time 30 "${base}/${f}" -o "${dir}/${f}" 2>/dev/null; then
+            if ! curl -fsSL --max-time 30 --max-filesize=16777216 "${base}/${f}" -o "${dir}/${f}" 2>/dev/null; then
                 PORTAL_FETCH_FILES_ERR="下载 ${f} 失败"
                 return 1
             fi
@@ -3910,10 +3910,11 @@ portal_fetch_files() {
 # 一次目录列表请求即可拿到全部文件（contents API 的 JSON 里就带 sha），
 # 比逐文件请求省额度。取不到返回 1 —— 调用方必须 fail-closed。
 portal_remote_blob_shas() {
-    local ref="${1:-}" json
+    local ref="${1:-}" json=""
+    trap 'rm -f "${json:-}"' RETURN
     [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
     json="$(umask 077; mktemp)" || return 1
-    if ! curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
+    if ! curl -fsSL --max-time 20 --max-filesize=4194304 -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${AWG_REPO}/contents/?ref=${ref}" -o "$json" 2>/dev/null; then
         rm -f "$json"
         return 1
@@ -3973,8 +3974,8 @@ portal_fetch_py() {
     # 先问 GitHub API；它被限流（匿名每 IP 60 次/小时，共享 IP 极常见）时
     # 退回 jsDelivr 的 resolved 接口 —— 同样给出 main 对应的**具体 commit**，
     # 于是「锁定一次提交、三源取同一份」的保证不变，又不会因为限流装不上。
-    PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/commits/main" 2>/dev/null |
-        python3 -c 'import json,re,sys
+    PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 --max-filesize=2097152 "https://api.github.com/repos/${repo}/commits/main" 2>/dev/null |
+        python3 -I -c 'import json,re,sys
 try:
     obj=json.load(sys.stdin)
     s=obj.get("sha","") if isinstance(obj, dict) else ""
@@ -3984,8 +3985,8 @@ assert isinstance(s, str) and re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/
         # 次选：仓库的 commits Atom feed。它由 github.com 直接提供、不计 API 额度，
         # 且条目里带完整 40 位 commit —— 一样能锁定到具体提交。
         # （jsDelivr 的 resolved 接口对分支名返回 null，不能用作回退。）
-        PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 "https://github.com/${repo}/commits/main.atom" 2>/dev/null |
-            python3 -c 'import re,sys
+        PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 --max-filesize=2097152 "https://github.com/${repo}/commits/main.atom" 2>/dev/null |
+            python3 -I -c 'import re,sys
 m=re.search(r"/commit/([0-9a-f]{40})", sys.stdin.read())
 assert m; print(m.group(1))' 2>/dev/null)" || PORTAL_FETCH_REF=""
     fi
@@ -4192,9 +4193,11 @@ portal_write_meter_config() {
         fi
         # 不追加到文件末尾：其他段的位置不影响 hysteria 解析，但保持可读性插入到
         # masquerade 之前；若找不到锚点则追加到末尾（hysteria 对顶层键顺序不敏感）。
-        python3 - "$HY2_CONFIG" "$METER_SECRET" <<'PYEOF'
+        python3 -I - "$HY2_CONFIG" "$METER_SECRET" <<'PYEOF'
 import io, os, re, secrets, stat, sys
 path, secret = sys.argv[1], sys.argv[2]
+if os.path.islink(path):
+    sys.exit('refusing to write symlink config.yaml')
 st_mode = stat.S_IMODE(os.stat(path).st_mode)
 s = io.open(path, encoding='utf-8').read()
 block = ("\n# 真实计量：/traffic 只读端点，供 usage-meter 采集。必须回环监听，\n"
@@ -4206,6 +4209,36 @@ if not re.search(r'^trafficStats:\s*(?:#.*)?$', s, re.M):
         s = s[:m.start()] + block.lstrip('\n') + '\n' + s[m.start():]
     else:
         s = s.rstrip('\n') + '\n' + block
+else:
+    # 已有顶层 trafficStats 段但缺失或损坏了 secret：原段内补写/修正 secret，保留既有 listen。
+    lines = s.splitlines(True)
+    out_lines = []
+    in_ts = False
+    replaced_secret = False
+    inserted = False
+    for line in lines:
+        if not in_ts and re.match(r'^trafficStats:\s*(?:#.*)?$', line):
+            in_ts = True
+            out_lines.append(line)
+            continue
+        if in_ts:
+            if line.strip() and not line[:1].isspace() and not line.lstrip().startswith('#'):
+                if not replaced_secret:
+                    out_lines.append('  secret: %s\n' % secret)
+                    inserted = True
+                in_ts = False
+                out_lines.append(line)
+                continue
+            if re.match(r'^\s+secret\s*:', line):
+                out_lines.append('  secret: %s\n' % secret)
+                replaced_secret = True
+                continue
+        out_lines.append(line)
+    if in_ts and not replaced_secret and not inserted:
+        if out_lines and not out_lines[-1].endswith('\n'):
+            out_lines[-1] += '\n'
+        out_lines.append('  secret: %s\n' % secret)
+    s = ''.join(out_lines)
 tmp = path + '.tmp.' + secrets.token_hex(4)
 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
 if hasattr(os, 'O_NOFOLLOW'):
@@ -4234,7 +4267,7 @@ PYEOF
     fi
     local _meter_tmp
     _meter_tmp="$(umask 077; mktemp "${dest_dir}/usage-meter-config.json.tmp.XXXXXX")" || return 1
-    if ! printf '%s' "$_meter_secret" | python3 -c 'import json, os, sys
+    if ! printf '%s' "$_meter_secret" | python3 -I -c 'import json, os, sys
 secret = sys.stdin.read()
 payload = {"hysteria": {"url": "http://127.0.0.1:19996", "secret": secret}, "reality": {"binary": "/usr/local/bin/xray", "address": "127.0.0.1:19997"}}
 with open(sys.argv[1], "wb") as fh:
@@ -5447,26 +5480,33 @@ EOF
 #    注意 blob sha 与「文件 sha1」不同，必须带 blob 头才算得对。
 awg_fetch_ctl() {
     local out="$1"
-    local ref expected blob tmp
+    local ref expected blob tmp="" staged=""
+    trap 'rm -f "${tmp:-}" "${staged:-}"' RETURN
 
     # 只解析一次，三个源都读同一快照；解析失败就放弃，绝不回退到浮动 main。
-    ref="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${AWG_REPO}/commits/main" 2>/dev/null |
-        python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha",""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || ref=""
+    ref="$(curl -fsSL --max-time 15 --max-filesize=2097152 "https://api.github.com/repos/${AWG_REPO}/commits/main" 2>/dev/null |
+        python3 -I -c 'import json,re,sys
+obj=json.load(sys.stdin)
+s=obj.get("sha","") if isinstance(obj, dict) else ""
+assert isinstance(s, str) and re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || ref=""
     if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
         log_err "无法把 main 固定到具体 commit，已放弃获取 awgctl.sh（不回退到浮动 main）"
         return 1
     fi
 
     # 预期 blob 身份：走 contents API 的 JSON（只回一个 sha，不用下载内容）。
-    expected="$(curl -fsSL --max-time 15 -H "Accept: application/vnd.github+json" \
+    expected="$(curl -fsSL --max-time 15 --max-filesize=2097152 -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${AWG_REPO}/contents/awgctl.sh?ref=${ref}" 2>/dev/null |
-        python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha",""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || expected=""
+        python3 -I -c 'import json,re,sys
+obj=json.load(sys.stdin)
+s=obj.get("sha","") if isinstance(obj, dict) else ""
+assert isinstance(s, str) and re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || expected=""
     if [[ ! "$expected" =~ ^[0-9a-f]{40}$ ]]; then
         log_err "无法取得 awgctl.sh@${ref} 的预期 blob 身份，已放弃获取（不做无身份比对的下载）"
         return 1
     fi
 
-    tmp="$(mktemp)"
+    tmp="$(umask 077; mktemp)" || return 1
     local -a sources=(
         "https://api.github.com/repos/${AWG_REPO}/contents/awgctl.sh?ref=${ref}"
         "https://cdn.jsdelivr.net/gh/${AWG_REPO}@${ref}/awgctl.sh"
@@ -5475,7 +5515,7 @@ awg_fetch_ctl() {
     local url got
     for url in "${sources[@]}"; do
         : > "$tmp"
-        if ! curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" "$url" -o "$tmp" 2>/dev/null; then
+        if ! curl -fsSL --max-time 30 --max-filesize=4194304 -H "Accept: application/vnd.github.raw" "$url" -o "$tmp" 2>/dev/null; then
             continue
         fi
         [[ -s "$tmp" ]] && grep -q 'hy2-awgctl' "$tmp" 2>/dev/null || continue
@@ -5484,9 +5524,13 @@ awg_fetch_ctl() {
             log_warn "awgctl.sh 来源 ${url%%\?*} 的内容与 ${ref} 的 blob 身份不一致，换下一个源"
             continue
         fi
-        if ! install -m 0755 "$tmp" "$out"; then
+        staged="$(umask 077; mktemp "$(dirname "$out")/.awgctl.new.XXXXXX")" || continue
+        if ! install -m 0755 "$tmp" "$staged" || ! mv -f "$staged" "$out"; then
+            rm -f "$staged"
+            staged=""
             continue
         fi
+        staged=""
         rm -f "$tmp"
         return 0
     done
@@ -5523,7 +5567,7 @@ awg_ensure_ctl() {
     fi
 
     if [[ -z "$src" ]]; then
-        tmp="$(mktemp)"
+        tmp="$(umask 077; mktemp)" || return 1
         if awg_fetch_ctl "$tmp"; then
             src="$tmp"
         else
