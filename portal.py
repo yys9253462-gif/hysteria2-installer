@@ -11329,8 +11329,13 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             update_lock_fd = None
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                body = self.rfile.read(length).decode('utf-8', errors='replace')
+                try:
+                    length = int(self.headers.get('Content-Length', 0))
+                except (TypeError, ValueError):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if length < 0 or length > 65536:
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
                 target = form.get('target', [''])[0]
                 if target not in ('core', 'portal', 'awg', 'reality-online'):
@@ -11340,8 +11345,19 @@ if __name__ == '__main__':
                     # 开启在线统计要重启 xray；流量超额停用期间重启等于替 Reality 解除停用。
                     if unit_suspended('xray'):
                         return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，请在控制台恢复节点后再开启'})
+                    self._extend_deadline(60)
                     cfg_path = portal_path.parent / 'usage-meter-config.json'
-                    cfg = json.loads(cfg_path.read_text(encoding='utf-8')).get('reality', {})
+                    try:
+                        raw_meter_cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+                    except (OSError, ValueError) as exc:
+                        return self.reply_json(500, {'ok': False,
+                            'error': '读取 usage-meter-config.json 失败：%s' % exc})
+                    cfg = raw_meter_cfg.get('reality') if isinstance(raw_meter_cfg, dict) else None
+                    if (not isinstance(cfg, dict)
+                            or not isinstance(cfg.get('binary'), str) or not cfg['binary'].strip()
+                            or not isinstance(cfg.get('address'), str) or not cfg['address'].strip()):
+                        return self.reply_json(500, {'ok': False,
+                            'error': 'usage-meter-config.json 缺少有效的 reality 配置（binary/address）'})
                     spec = importlib.util.spec_from_file_location('reality_online_config', Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py')
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
@@ -11471,8 +11487,13 @@ if __name__ == '__main__':
                             _prune_portal_backups(base_dir,
                                                   protected=[str(b) for _, b in backups])
                             # scope 内脚本 ready/go 握手完成才交接；失败也走整包回滚。
+                            try:
+                                with data_lock:
+                                    portal_port = data['port']
+                            except NameError:
+                                portal_port = data['port']
                             portal_start_update(
-                                restart_prefix, portal_update_restart_script(data['port'], backups, created),
+                                restart_prefix, portal_update_restart_script(portal_port, backups, created),
                                 update_lock_fd)
                     except Exception as e:
                         # 出错就把已替换的经同目录临时文件原子恢复回去，绝不留下半新半旧或半截文件
@@ -11520,7 +11541,9 @@ if __name__ == '__main__':
                         return self.reply_json(409, {'ok': False, 'error':
                             '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
                     # 先刷新控制脚本自身，再更新二进制。不需要重启面板。
-                    ensure_awgctl(force=True)
+                    if not ensure_awgctl(force=True):
+                        return self.reply_json(500, {'ok': False,
+                            'error': 'AmneziaWG 管理脚本刷新失败，已中止更新，请检查网络或查看门户日志'})
                     # awgctl update 要下载并核验二进制，超时 420 秒。
                     if not self._extend_deadline(480, heavy=True):
                         return self.reply_json(409, {'ok': False, 'error':
