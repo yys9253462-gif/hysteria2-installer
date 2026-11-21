@@ -1,3 +1,16 @@
+## 2026-11-21 — 第三十七批十项修复，门户 2.47
+
+- 实时在线地址采集（`usage-meter-readers-20261007-v1.py` 的 `read_live_connections` 与 `parse_events`）兼容空切片或空映射序列化产生的空值（`{"users": null}`、`{"ips": null}`、核心条目 `ips: null`），避免单次空在线状态把全机采集标成异常；同步补齐 `/online/ips` 与回退 `/online` 的 4 MiB 体积上限、日志非对象负载拦截与同协议双栈地址去重。
+- 自定义出站可达性预检（`portal.py` 的 `_unreachable_outbounds`）改用标准库地址拆分器解析超文本与加密超文本出站，并剥离加密隧道协议地址的方括号：修复带认证信息代理（如 `http://user:pass@host:port`）被截成用户名、加密代理默认端口误用 80 以及双栈字面量地址被误判为无法连通的问题。
+- 门户自更新重启脚本（`portal.py` 的 `portal_update_restart_script`）在升级后重启与失败自动回滚重启前均先执行 `systemctl reset-failed hysteria-portal`：避免新版本启动崩溃触发服务重启频率上限后，连自动回滚重启也被系统管理器拒绝而导致整机鉴权后端离线。
+- 系统服务回滚恢复函数（`portal.py` 的 `_restore_systemd_service_state`）在还原原运行中服务时改为先执行 `systemctl reset-failed` 再执行 `systemctl restart`（而非 `systemctl start`）：既避免回滚撞上启动频率上限被拒，又解决服务仍以新配置运行时 `start` 静默空操作而未重载旧配置的缺陷。
+- 备选传输协议（`AnyTLS` 与 `TUIC`）启停失败回滚的配置文件恢复全部改用原子私有落盘（`_restore_config_atomically`）替代裸 `cfg_path.write_bytes`，消除停用删除后再写回导致权限退化为全局可读并暴露用户密码及半写风险；两处停用回滚同时加回协议互斥锁防止与并发撤销线程竞态覆盖。
+- 出站配置回滚（`_rollback_outbounds` 写回 `config.yaml`）与门户元数据自愈（`sync_cert_trust`、`sync_pin`、`prepare` 写回 `client_meta.json`）统一改用 `atomic_write_private` 原子落盘并保持仅机主可读权限，避免写入中断或并发读取产生半截配置并泄露机主密码。
+- 入站代理安装失败回滚（`_h_post_install_gost` 的 `restore_gost_assets`）在重启旧服务前先清理失败计数，并按安装前快照独立还原开机自启与启停状态：修复原有禁用但运行中的服务被误设自启、以及原有已启用但停运的服务回滚时未被停止的问题。
+- 证书链修复脚本（`fix_cert_chain.sh`）修复 `leaf_pub` 在损坏证书上对空输出求摘要导致两张损坏证书假匹配的缺陷（先确认公钥非空再算摘要），并让 `cert_of` 与 `set_tls_cert` 兼容带行尾注释的 `tls:` 顶格配置段。
+- 系统重装脚本（`alpine2debian.sh` 与 `reinstall-debian13.sh`）统一采用精确整盘与分区枚举助手（`disk_mounts` 与 `disk_devices`），彻底清除卸载遍历、残留挂载检查与子分区签名探测中的前缀通配模糊匹配，避免多盘环境下 `/dev/sda` 误伤 `/dev/sdaa1` 或 `/dev/nvme0n1` 误伤 `/dev/nvme0n10p1`。
+- 混淆隧道控制脚本（`awgctl.sh`）的 `validate_endpoint` 拒收带前导零的显式端口（与 `validate_port` 保持同一规则，防止非法前导零端口写入客户端配置），同时 `cmd_uninstall` 延迟自删后台子进程关闭继承的锁文件描述符（`9>&-`），避免卸载退出后短时占锁阻塞后续命令。
+
 ## 2026-11-19 — 第三十六批十项修复，门户 2.46
 
 - 计量核心（`usage-meter-core-20261007-v1.py`）在清理已删除用户累计流量（`totals`）时同步清除平级流量偏移（`adjustments[uid]`），同时保留暂未删除的停用用户偏移：此前仅遍历废弃的嵌套结构，导致带负偏移的已删用户被同名重建后 `adjusted_bytes` 算得负值并触发整机计量循环持续失败。
