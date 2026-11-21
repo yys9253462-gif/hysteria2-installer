@@ -27,11 +27,36 @@ def service_running(service):
     return r.stdout.decode(errors='replace').strip() not in ('inactive', 'failed')
 
 
-def read_hysteria(url, secret):
-    p=urlparse(url)
-    if p.scheme != 'http' or p.hostname not in ('127.0.0.1','::1') or p.path not in ('','/'):
+def _validate_loopback_http_base(url, secret):
+    if not isinstance(url, str) or any(ch in url for ch in ('\r', '\n', '\x00')):
         raise ValueError('stats endpoint must be loopback HTTP base URL')
-    req=urllib.request.Request(url.rstrip('/')+'/traffic',headers={'Authorization':secret})
+    if not isinstance(secret, str) or any(ch in secret for ch in ('\r', '\n', '\x00')):
+        raise ValueError('invalid stats secret')
+    p = urlparse(url)
+    try:
+        port = p.port
+    except ValueError:
+        raise ValueError('stats endpoint must be loopback HTTP base URL') from None
+    if (p.scheme != 'http' or p.hostname not in ('127.0.0.1', '::1')
+            or p.path not in ('', '/') or p.params or p.query or p.fragment
+            or p.username is not None or p.password is not None
+            or (port is not None and not (1 <= port <= 65535))):
+        raise ValueError('stats endpoint must be loopback HTTP base URL')
+    return url.rstrip('/')
+
+
+def _validate_loopback_xray_addr(address):
+    if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
+        raise ValueError('xray endpoint must be loopback')
+    port_text = address[len('127.0.0.1:'):]
+    if not port_text.isdigit() or not (1 <= int(port_text) <= 65535):
+        raise ValueError('xray endpoint must be loopback')
+    return address
+
+
+def read_hysteria(url, secret):
+    base = _validate_loopback_http_base(url, secret)
+    req = urllib.request.Request(base + '/traffic', headers={'Authorization': secret})
     with urllib.request.urlopen(req, timeout=4) as response:
         raw=response.read(4*1024*1024+1)
     if len(raw)>4*1024*1024:
@@ -79,17 +104,15 @@ def parse_xray(raw):
 
 
 def read_xray(binary, address):
-    if not address.startswith('127.0.0.1:'): raise ValueError('xray endpoint must be loopback')
+    address = _validate_loopback_xray_addr(address)
     r=subprocess.run([binary,'api','statsquery','--server='+address,'-pattern','user>>>','-reset=false'],
                      capture_output=True,timeout=5,check=True)
     return parse_xray(r.stdout.decode())
 
 
 def read_hysteria_online(url, secret):
-    p = urlparse(url)
-    if p.scheme != 'http' or p.hostname not in ('127.0.0.1', '::1') or p.path not in ('', '/'):
-        raise ValueError('stats endpoint must be loopback HTTP base URL')
-    req = urllib.request.Request(url.rstrip('/') + '/online', headers={'Authorization': secret})
+    base = _validate_loopback_http_base(url, secret)
+    req = urllib.request.Request(base + '/online', headers={'Authorization': secret})
     with urllib.request.urlopen(req, timeout=4) as response:
         raw = response.read(4 * 1024 * 1024 + 1)
     if len(raw) > 4 * 1024 * 1024:
@@ -143,8 +166,17 @@ def parse_events(rows):
     unmatched=set()
     if any(not isinstance(row,dict) for row in rows):
         raise ValueError('invalid_connection_event')
+    def _event_sort_ts(row):
+        raw_ts = row.get('__MONOTONIC_TIMESTAMP')
+        if raw_ts is None:
+            raw_ts = row.get('__REALTIME_TIMESTAMP')
+        if raw_ts is None:
+            return 0
+        if isinstance(raw_ts, bool):
+            raise ValueError('invalid_connection_event')
+        return int(raw_ts)
     try:
-        rows=sorted(rows,key=lambda row:int(row.get('__MONOTONIC_TIMESTAMP',row.get('__REALTIME_TIMESTAMP',0))))
+        rows=sorted(rows,key=_event_sort_ts)
     except (TypeError,ValueError):
         raise ValueError('invalid_connection_event') from None
     for row in rows:
@@ -205,9 +237,8 @@ def read_live_connections():
     try:
         h=cfg.get('hysteria')
         if not isinstance(h,dict):raise ValueError('invalid_hysteria_config')
-        parsed=urlparse(h['url'])
-        if parsed.scheme!='http' or parsed.hostname not in ('127.0.0.1','::1') or parsed.path not in ('','/'):raise ValueError('stats_not_loopback')
-        live_req=urllib.request.Request(h['url'].rstrip('/')+'/online/ips',headers={'Authorization':h['secret']})
+        base=_validate_loopback_http_base(h.get('url'),h.get('secret'))
+        live_req=urllib.request.Request(base+'/online/ips',headers={'Authorization':h['secret']})
         try:
             with urllib.request.urlopen(live_req,timeout=4) as response:
                 raw=response.read(4*1024*1024+1)
@@ -229,7 +260,10 @@ def read_live_connections():
                 if not isinstance(row,dict):raise ValueError('invalid_core_live_user')
                 # Go 序列化空切片可能产出 null，按空列表处理，避免误判全机采集失败。
                 raw_ips=[] if row.get('ips') is None else row.get('ips')
-                if type(row.get('connections'))!=int or row['connections']<0 or not isinstance(raw_ips,list):raise ValueError('invalid_core_live_user')
+                if (type(row.get('connections'))!=int or row['connections']<0
+                        or not isinstance(raw_ips,list)
+                        or any(not isinstance(ip,str) for ip in raw_ips)):
+                    raise ValueError('invalid_core_live_user')
                 dedup_ips=list(dict.fromkeys(_norm_ip(ip) for ip in raw_ips))
                 ips=[{'ip':ip,'protocol':'Hy2','last_seen':output['sampled_at']} for ip in dedup_ips]
                 out.update(ok=True,hysteria_ok=True,error='',hysteria_count=row['connections'],ips=ips)
@@ -278,8 +312,7 @@ def read_live_connections():
             level0=levels.get('0') if isinstance(levels,dict) else None
             enabled=level0.get('statsUserOnline',False) if isinstance(level0,dict) else False
             if not enabled:raise ValueError('online_statistics_not_enabled')
-            address=rcfg['address']
-            if not address.startswith('127.0.0.1:'):raise ValueError('stats_not_loopback')
+            address=_validate_loopback_xray_addr(rcfg.get('address'))
             allusers=json.loads(cmd([binary,'api','statsgetallonlineusers','--server='+address]))
             # Go 序列化空切片或空映射时常返回 null，仅把 None 视为缺省空集合，其它非法类型仍拒绝。
             names=([] if allusers.get('users') is None else allusers.get('users')) if isinstance(allusers,dict) else allusers
