@@ -41,7 +41,8 @@ err(){  echo "${c_red}[✗]${c_rst} $*"; }
 cert_of () {   # 从 config.yaml 取出 tls.cert 路径
     # install.sh 写的是 `cert: "/path"`（带引号）：引号与行尾注释都要去掉，
     # 否则拿 "\"/path\"" 去找文件，必然报「证书文件不存在」（2026-11-03 修）。
-    awk '/^tls:[[:space:]]*$/{f=1;next} /^[^[:space:]]/{f=0}
+    # 顶格 `tls:` 允许带行尾注释（如 `tls: # 自定义证书`）。
+    awk '/^tls:[[:space:]]*(#.*)?$/{f=1;next} /^[^[:space:]]/{f=0}
          f && /^[[:space:]]+cert:/{
              sub(/^[[:space:]]+cert:[[:space:]]*/,"")
              if ($0 ~ /^"/) { sub(/^"/,""); sub(/".*$/,"") }
@@ -51,14 +52,19 @@ cert_of () {   # 从 config.yaml 取出 tls.cert 路径
          }' "$1"
 }
 n_certs () { local n; n="$(grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
-# 证书文件第一张证书（叶证书）的公钥指纹
-leaf_pub () { openssl x509 -in "$1" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}'; }
+# 证书文件第一张证书（叶证书）的公钥指纹；损坏或无法解析时返回空串，避免对空输入求 sha256 引发假匹配。
+leaf_pub () {
+    local pub
+    pub="$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null)" || return 1
+    [[ -n "$pub" ]] || return 1
+    printf '%s\n' "$pub" | openssl sha256 2>/dev/null | awk '{print $NF}'
+}
 # 只改 tls: 段里的 cert: 行，按字面替换（2026-11-04 修）：旧实现 sed 全文替换且把路径当
 # 正则，key: "/x/a.cer.key" 这种同前缀路径会一起被改坏，hysteria 随即起不来。
 set_tls_cert () {   # $1=config $2=new path
     local tmp; tmp="$(mktemp "${1}.XXXXXX")" || return 1
     NEW_CERT="$2" awk '
-        /^tls:[[:space:]]*$/ {f=1; print; next}
+        /^tls:[[:space:]]*(#.*)?$/ {f=1; print; next}
         /^[^[:space:]]/ {f=0}
         f && !done && /^[[:space:]]+cert:/ {
             match($0, /^[[:space:]]+cert:/); print substr($0, 1, RLENGTH) " \"" ENVIRON["NEW_CERT"] "\""
