@@ -4139,6 +4139,8 @@ fd = os.open(tmp, flags, 0o600)
 try:
     with os.fdopen(fd, 'wb') as fh:
         fh.write(s.encode('utf-8'))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.chmod(tmp, st_mode)
     os.replace(tmp, path)
 except BaseException:
@@ -4157,10 +4159,18 @@ PYEOF
     fi
     local _meter_tmp
     _meter_tmp="$(umask 077; mktemp "${dest_dir}/usage-meter-config.json.tmp.XXXXXX")" || return 1
-    if ! cat > "$_meter_tmp" <<METEREOF
-{"hysteria": {"url": "http://127.0.0.1:19996", "secret": "${_meter_secret}"}, "reality": {"binary": "/usr/local/bin/xray", "address": "127.0.0.1:19997"}}
-METEREOF
-    then
+    if ! printf '%s' "$_meter_secret" | python3 -c '
+import json, os, sys
+secret = sys.stdin.read()
+payload = {
+    "hysteria": {"url": "http://127.0.0.1:19996", "secret": secret},
+    "reality": {"binary": "/usr/local/bin/xray", "address": "127.0.0.1:19997"},
+}
+with open(sys.argv[1], "wb") as fh:
+    fh.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+    fh.flush()
+    os.fsync(fh.fileno())
+' "$_meter_tmp"; then
         rm -f "$_meter_tmp"
         unset _meter_secret
         return 1
@@ -4940,7 +4950,7 @@ install_gost() {
     # ⚠️ 同样要 `|| GOST_LATEST=""`：api.github.com 不可达时 curl 失败会让
     # set -e 直接终止，下面的兜底版本号永远用不上（与 install_binary 同一个坑）。
     GOST_LATEST=$(curl -s --max-time 15 https://api.github.com/repos/go-gost/gost/releases/latest | jq -r '.tag_name // empty') || GOST_LATEST=""
-    if [[ -z "$GOST_LATEST" || "$GOST_LATEST" == "null" ]]; then
+    if [[ -z "$GOST_LATEST" || "$GOST_LATEST" == "null" || "$GOST_LATEST" == *..* || ! "$GOST_LATEST" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
         GOST_LATEST="v3.3.0"
     fi
     GOST_VER="${GOST_LATEST#v}"
@@ -5058,15 +5068,29 @@ install_gost() {
         log_err "gost 解压失败。"
         return 1
     fi
-    if ! install -m 755 "$TMP_DIR/$GOST_MEMBER" "${GOST_BIN}.new"; then
+    local _gost_new=""
+    _gost_new="$(umask 022; mktemp "${GOST_BIN}.new.XXXXXX")" || {
         rm -rf "$TMP_DIR"
+        _finish_gost_install
+        log_err "创建 gost 暂存文件失败，现有文件未改动。"
+        return 1
+    }
+    if ! install -m 755 "$TMP_DIR/$GOST_MEMBER" "$_gost_new"; then
+        rm -rf "$TMP_DIR" "$_gost_new"
         _finish_gost_install
         log_err "安装 gost 失败，现有文件未改动。"
         return 1
     fi
     rm -rf "$TMP_DIR"
-    if ! mv -f "${GOST_BIN}.new" "$GOST_BIN"; then
-        rm -f "${GOST_BIN}.new"
+    # 替换现役二进制前先验证新文件能在当前主机执行，避免架构错配打坏现有服务。
+    if ! "$_gost_new" -V >/dev/null 2>&1; then
+        rm -f "$_gost_new"
+        _finish_gost_install
+        log_err "下载的 gost 二进制无法在本机执行，已放弃替换，现有文件未改动。"
+        return 1
+    fi
+    if ! mv -f "$_gost_new" "$GOST_BIN"; then
+        rm -f "$_gost_new"
         _restore_gost_install
         log_err "gost 二进制替换失败，已恢复原部署。"
         return 1
@@ -5215,7 +5239,13 @@ PYSELFCHECK
     #   -R 30s      —— gost 官方周期自动重载，作为兜底（实测 v3.3.0 有效）
     #   ExecStartPost —— 跑自检脚本确认端口真的监听了，把"active 但无监听"
     #                    的静默故障变成启动失败，交给 systemd 重试
-    if ! cat > /etc/systemd/system/gost.service <<EOF
+    local _gost_unit_tmp=""
+    _gost_unit_tmp="$(umask 022; mktemp "/etc/systemd/system/gost.service.XXXXXX")" || {
+        _restore_gost_install
+        log_err "GOST systemd unit 临时文件创建失败，已恢复原部署。"
+        return 1
+    }
+    if ! cat > "$_gost_unit_tmp" <<EOF
 [Unit]
 Description=GOST Proxy Service (SOCKS5/HTTP/HTTPS inbound)
 After=network-online.target
@@ -5236,8 +5266,15 @@ ExecStartPost=/usr/local/lib/hy2-gost-selfcheck
 WantedBy=multi-user.target
 EOF
     then
+        rm -f "$_gost_unit_tmp"
         _restore_gost_install
         log_err "GOST systemd unit 写入失败，已恢复原部署。"
+        return 1
+    fi
+    if ! chmod 644 "$_gost_unit_tmp" || ! mv -f "$_gost_unit_tmp" /etc/systemd/system/gost.service; then
+        rm -f "$_gost_unit_tmp"
+        _restore_gost_install
+        log_err "GOST systemd unit 落盘失败，已恢复原部署。"
         return 1
     fi
     if ! (umask 077; : > "$HY2_DIR/.hy2-gost-owned" && chmod 600 "$HY2_DIR/.hy2-gost-owned"); then
