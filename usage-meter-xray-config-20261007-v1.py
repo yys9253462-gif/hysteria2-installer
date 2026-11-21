@@ -3,6 +3,7 @@ import copy
 import pathlib
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -14,6 +15,57 @@ def _validate_loopback_address(address):
     if (not port_text.isascii() or not port_text.isdigit()
             or port_text.startswith('0') or not (1 <= int(port_text) <= 65535)):
         raise ValueError('stats endpoint must be loopback')
+
+
+def _client_level_key(raw_level):
+    """将客户端 level 规整为非负整数字符串，忽略 null/布尔/非法值，避免污染 policy.levels。"""
+    if isinstance(raw_level, bool) or raw_level is None:
+        return None
+    if isinstance(raw_level, int):
+        return str(raw_level) if raw_level >= 0 else None
+    if isinstance(raw_level, str):
+        cleaned = raw_level.strip()
+        if cleaned and cleaned.isascii() and cleaned.isdigit():
+            return str(int(cleaned))
+    return None
+
+
+def _inbound_uses_port(raw_port, target_port):
+    """判断 Xray 入站 port（支持整数、数字字符串、逗号分隔列表或 lo-hi 区间）是否覆盖 target_port。"""
+    if isinstance(raw_port, bool) or raw_port is None:
+        return False
+    if isinstance(raw_port, int):
+        return raw_port == target_port
+    if isinstance(raw_port, str):
+        for seg in raw_port.split(','):
+            seg = seg.strip()
+            if not seg:
+                continue
+            if '-' in seg:
+                lo_s, _, hi_s = seg.partition('-')
+                lo_s, hi_s = lo_s.strip(), hi_s.strip()
+                if (lo_s.isascii() and lo_s.isdigit() and hi_s.isascii() and hi_s.isdigit()):
+                    lo, hi = int(lo_s), int(hi_s)
+                    if lo <= target_port <= hi:
+                        return True
+            elif seg.isascii() and seg.isdigit() and int(seg) == target_port:
+                return True
+    return False
+
+
+def _fsync_parent_dir(target):
+    """在支持目录 fsync 的系统上刷盘父目录项，确保 os.replace 落盘持久。"""
+    parent = pathlib.Path(target).parent
+    try:
+        dir_fd = os.open(str(parent), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 def _inbound_clients(inbound):
@@ -68,7 +120,9 @@ def add_stats(config, port):
         if isinstance(clients, list):
             for client in clients:
                 if isinstance(client, dict):
-                    used.add(str(client.get('level',0)))
+                    lvl=_client_level_key(client.get('level',0))
+                    if lvl is not None:
+                        used.add(lvl)
     for level in used:
         lv=levels.get(level)
         if lv is None:
@@ -93,7 +147,7 @@ def add_stats(config, port):
     if entries:
         if len(entries)!=1 or entries[0]!=desired:raise ValueError('api inbound conflict')
     else:
-        if any(isinstance(i, dict) and type(i.get('port')) is int and i.get('port')==port for i in inbounds):
+        if any(isinstance(i, dict) and _inbound_uses_port(i.get('port'), port) for i in inbounds):
             raise ValueError('port conflict')
         inbounds.append(desired)
     routing=_ensure_dict(cfg,'routing')
@@ -205,7 +259,11 @@ def _write_private_bytes(target, payload, mode):
 def _restart_xray(check=True):
     # 先清失败计数，与门户其它重启 Xray 的地方一致：刚连续重启过、撞上 StartLimitBurst 时
     # restart 会被直接拒绝，回滚那次同样起不来，Xray 一直停着（2026-11-12 修）。
-    subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=5)
+    # reset-failed 自身超时/失败不得打断真正的 restart。
+    try:
+        subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
     return subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=15,check=check)
 
 
@@ -232,13 +290,14 @@ def enable_iplimit_routing(config_path, binary, address):
     api_rule_first(config)
     if clients!=[_inbound_clients(i) for i in inbounds]:
         raise ValueError('add_iplimit_routing must not modify inbound clients')
-    candidate=path.with_name(path.name+'.iplimit-candidate.json')
+    nonce=secrets.token_hex(6)
+    candidate=path.with_name(path.name+f'.iplimit-candidate.{nonce}.json')
     # 只保留最近一份备份（2026-10-24 修）：旧实现每次都用纳秒时间戳新建
     # `xray.json.before-iplimit-<ns>`，而这个函数在每次 Xray 重启后都会被调用，
     # /etc/hysteria 下会无界累积备份文件（实测已出现）。
     # 固定文件名既保留回滚能力，又不会随重启增长。
     backup=path.with_name(path.name+'.before-iplimit')
-    backup_tmp=path.with_name(path.name+'.before-iplimit.tmp')
+    backup_tmp=path.with_name(path.name+f'.before-iplimit.{nonce}.tmp')
     replaced=False
     try:
         _write_private_bytes(candidate, json.dumps(config,indent=2).encode('utf-8'), orig_mode)
@@ -247,11 +306,15 @@ def enable_iplimit_routing(config_path, binary, address):
         _write_private_bytes(backup_tmp, original, orig_mode)
         os.replace(backup_tmp, backup)
         os.replace(candidate,path);replaced=True
+        _fsync_parent_dir(path)
         _restart_xray()
         subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
         for _ in range(10):
-            probe=subprocess.run([binary,'api','lsrules','--server='+address],capture_output=True,timeout=5)
-            if probe.returncode==0:break
+            try:
+                probe=subprocess.run([binary,'api','lsrules','--server='+address],capture_output=True,timeout=5)
+                if probe.returncode==0:break
+            except subprocess.TimeoutExpired:
+                pass
             time.sleep(0.5)
         else:raise RuntimeError('routing api unavailable after restart')
     except Exception:
@@ -259,6 +322,7 @@ def enable_iplimit_routing(config_path, binary, address):
             try:
                 _write_private_bytes(candidate, original, orig_mode)
                 os.replace(candidate,path)
+                _fsync_parent_dir(path)
             except OSError:
                 pass
             _rollback_restart_xray()
@@ -286,7 +350,9 @@ def enable_reality_online(config_path, binary, address):
         if isinstance(clients, list):
             for client in clients:
                 if isinstance(client, dict):
-                    used.add(str(client.get('level',0)))
+                    lvl=_client_level_key(client.get('level',0))
+                    if lvl is not None:
+                        used.add(lvl)
     changed=any(not (isinstance(levels.get(level), dict) and levels[level].get('statsUserOnline',False)) for level in used)
     for level in used:
         lv=levels.get(level)
@@ -296,11 +362,12 @@ def enable_reality_online(config_path, binary, address):
         elif not isinstance(lv, dict):
             raise ValueError('invalid xray policy level')
         lv['statsUserOnline']=True
-    candidate=path.with_name(path.name+'.online-candidate.json')
+    nonce=secrets.token_hex(6)
+    candidate=path.with_name(path.name+f'.online-candidate.{nonce}.json')
     # 固定备份名，与 before-iplimit 同理（2026-11-03 修）：时间戳文件名每次改动
     # 新建一份，/etc/hysteria 下无界累积。
     backup=path.with_name(path.name+'.before-reality-online')
-    backup_tmp=path.with_name(path.name+'.before-reality-online.tmp')
+    backup_tmp=path.with_name(path.name+f'.before-reality-online.{nonce}.tmp')
     if changed:
         replaced=False
         try:
@@ -310,6 +377,7 @@ def enable_reality_online(config_path, binary, address):
             _write_private_bytes(backup_tmp, original, orig_mode)
             os.replace(backup_tmp, backup)
             os.replace(candidate,path);replaced=True
+            _fsync_parent_dir(path)
             _restart_xray()
             subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
             # 重启后等待 gRPC 统计接口就绪再判失败，与 enable_iplimit_routing 一致；
@@ -327,6 +395,7 @@ def enable_reality_online(config_path, binary, address):
                 try:
                     _write_private_bytes(candidate, original, orig_mode)
                     os.replace(candidate,path)
+                    _fsync_parent_dir(path)
                 except OSError:
                     pass
                 # 回滚后的重启不带 check 且隔离超时异常，避免顶掉真正的失败原因。

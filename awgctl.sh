@@ -413,17 +413,18 @@ validate_endpoint() {
 
 download_binaries() {
     local line="$1" arch="$2"
-    local url tmpd
+    local url tmpd="" bakd=""
 
     url="https://github.com/${AWG_REPO}/releases/download/${AWG_RELEASE_TAG}/amneziawg-linux-${arch}-awg${line}.tar.gz"
     log_step "下载 AmneziaWG 二进制 (协议线 AWG ${line}.x / 架构 ${arch})"
     log_info "来源: ${url}"
 
-    tmpd="$(mktemp -d)"
+    tmpd="$(umask 077 && mktemp -d)"
+    trap 'rm -rf "${tmpd:-}" "${bakd:-}" 2>/dev/null || true' RETURN
     # --max-time 与 `9>&-`（2026-11-03 修）：门户 420 秒超时只杀 bash，不杀 curl；
     # curl 又继承了持锁的 fd 9。下载卡住时孤儿 curl 一直占着锁，之后每个改 AWG
     # 的命令都等 300 秒再失败，EXIT 回滚也不会执行。两次下载 + 校验必须在 420 秒内完。
-    if ! curl -fL --connect-timeout 20 --max-time 240 --retry 2 --retry-delay 2 \
+    if ! curl -fL --connect-timeout 20 --max-time 240 --max-filesize 167772160 --retry 2 --retry-delay 2 \
             -o "${tmpd}/awg.tar.gz" "$url" 2>/dev/null 9>&-; then
         rm -rf "$tmpd"
         log_err "下载失败。可能原因："
@@ -440,7 +441,7 @@ download_binaries() {
     #    缺摘要就拒绝安装，不存在绕过路径。
     local sums_url want got
     sums_url="https://github.com/${AWG_REPO}/releases/download/${AWG_RELEASE_TAG}/SHA256SUMS"
-    if ! curl -fsSL --connect-timeout 20 --max-time 60 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null 9>&-; then
+    if ! curl -fsSL --connect-timeout 20 --max-time 60 --max-filesize 1048576 --retry 2 -o "${tmpd}/SHA256SUMS" "$sums_url" 2>/dev/null 9>&-; then
         # curl -o 会先建文件：失败时可能留下空/半截的 SHA256SUMS，
         # 一并清掉，避免被当成"清单存在但没有该资产"。
         rm -rf "$tmpd"
@@ -510,7 +511,7 @@ download_binaries() {
 
     mkdir -p "$AWG_DIR"
     # 覆盖现役二进制前先备份，并使用同目录临时文件原子替换，避免覆写运行中程序触发 ETXTBSY。
-    local bakd f
+    local f
     bakd="$(umask 077; mktemp -d "${AWG_DIR}/.binbak.XXXXXX")"
     for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
         [[ -e "$f" ]] && cp -a "$f" "$bakd/$(basename "$f")"
@@ -640,6 +641,9 @@ render_server_config() {
     wan="$(detect_wan_iface 2>/dev/null)" || wan="（未探测到默认路由，按隧道网段 NAT）"
 
     [[ -n "$port" ]] || die "meta 中缺少 port，无法渲染配置"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+        die "meta 中 port 非法: ${port}"
+    fi
     [[ -n "$priv" ]] || die "meta 中缺少 server_private_key，无法渲染配置"
 
     # MTU 必须扣掉 S4：S4 是每个 Data 包的随机填充，不扣掉外层会分片。
@@ -704,8 +708,11 @@ render_server_config() {
 
         if [[ -s "$AWG_PEERS_FILE" ]]; then
             jq -r '
-                .peers[]? |
-                "\n[Peer]\n# \(.name)\nPublicKey = \(.public_key)\nPresharedKey = \(.preshared_key)\nAllowedIPs = \(.address)/32"
+                (.peers // []) | if type=="array" then .[] else empty end |
+                select(type=="object" and (.public_key | type=="string" and length>0) and (.address | type=="string" and length>0)) |
+                "\n[Peer]\n# \(.name // "peer")\nPublicKey = \(.public_key)" +
+                (if (.preshared_key | type=="string" and length>0) then "\nPresharedKey = \(.preshared_key)" else "" end) +
+                "\nAllowedIPs = \(.address)/32"
             ' "$AWG_PEERS_FILE"
         fi
     } > "$tmp"; then
@@ -1068,13 +1075,13 @@ cmd_peer_list() {
     fi
 
     if [[ "${1:-}" == "--json" ]]; then
-        # 不输出私钥，避免门户页面泄露
-        jq '[.peers[]? | {name, address, endpoint, public_key, created_at, enabled}]' "$AWG_PEERS_FILE"
+        # 不输出私钥，避免门户页面泄露；过滤非对象脏项
+        jq '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | {name, address, endpoint, public_key, created_at, enabled}]' "$AWG_PEERS_FILE"
         return 0
     fi
 
     local count
-    count="$(jq '[.peers[]?] | length' "$AWG_PEERS_FILE")"
+    count="$(jq '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object")] | length' "$AWG_PEERS_FILE")"
     if [[ "$count" == "0" ]]; then
         log_warn "尚无任何客户端。"
         return 0
@@ -1089,7 +1096,7 @@ cmd_peer_list() {
     {
         printf '%-20s %-16s %-20s %s\n' "名称" "隧道地址" "创建时间" "流量(下行/上行)"
         printf -- '--------------------------------------------------------------------------------\n'
-        jq -r '.peers[]? | [.name, .address, .created_at, .public_key] | @tsv' "$AWG_PEERS_FILE"
+        jq -r '(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | [.name, .address, .created_at, .public_key] | @tsv' "$AWG_PEERS_FILE"
     } | AWG_TR="$transfer_data" awk -F'\t' '
         BEGIN {
             tr = ENVIRON["AWG_TR"]
@@ -1119,7 +1126,7 @@ cmd_client_conf() {
 
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
-            '.peers[]? | select(.name==$n) | .endpoint // empty' "$AWG_PEERS_FILE")"
+            '(.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)' "$AWG_PEERS_FILE")"
     fi
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
@@ -1437,7 +1444,7 @@ cmd_status() {
     port="$(meta_get port)"
 
     if [[ -f "$AWG_PEERS_FILE" ]]; then
-        peers_count="$(jq -r '[.peers[]?] | length' "$AWG_PEERS_FILE" 2>/dev/null || echo "")"
+        peers_count="$(jq -r '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object")] | length' "$AWG_PEERS_FILE" 2>/dev/null || echo "")"
     fi
     if [[ -f "$AWG_VERSION_FILE" ]]; then
         go_tag="$(awk -F= '/^amneziawg-go=/{print $2}' "$AWG_VERSION_FILE" 2>/dev/null || true)"
@@ -1490,6 +1497,7 @@ cmd_update() {
         esac
     done
     require_root
+    require_jq
     is_installed || die "AmneziaWG 尚未安装，请先执行 install"
 
     local arch
@@ -1607,7 +1615,7 @@ cmd_qr() {
     peer_exists "$name" || die "客户端不存在: ${name}"
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
-            '.peers[]? | select(.name==$n) | .endpoint // empty' "$AWG_PEERS_FILE")"
+            '(.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)' "$AWG_PEERS_FILE")"
     fi
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"

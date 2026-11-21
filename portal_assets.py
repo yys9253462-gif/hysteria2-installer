@@ -3036,6 +3036,7 @@ async function waitForCoreUpgrade() {
 }
 
 async function doUpgrade(target) {
+  if (doUpgrade._busy) return;
   const names = { core: 'Hysteria 2 官方核心', portal: '控制面板自身', awg: 'AmneziaWG 引擎' };
   const btns = { core: btnUpdateCore, portal: btnUpdatePortal, awg: btnUpdateAwgEngine };
   const btn = btns[target];
@@ -3049,7 +3050,8 @@ async function doUpgrade(target) {
     isDanger: custom,
     isWarn: !custom
   });
-  if (!confirmed) return;
+  if (!confirmed || doUpgrade._busy) return;
+  doUpgrade._busy = true;
   if (btn) { btn.disabled = true; btn.textContent = '升级中...'; }
   if (updateStatusMsg) updateStatusMsg.textContent = '正在下载并应用更新，请稍候...';
   try {
@@ -3059,8 +3061,8 @@ async function doUpgrade(target) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'target=' + encodeURIComponent(target) + (custom ? '&allow_custom=1' : '')
     });
-    const json = await res.json();
-    if (json.ok) {
+    const json = await res.json().catch(() => null);
+    if (res.ok !== false && json && json.ok) {
       if (target === 'core' && json.applying) {
         if (updateStatusMsg) updateStatusMsg.textContent = '更新任务运行中，正在等待验证实际结果...';
         const job = await waitForCoreUpgrade();
@@ -3082,13 +3084,18 @@ async function doUpgrade(target) {
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
       setTimeout(() => location.reload(), 5000);
     } else {
-      alert(json.error || '升级失败');
-      if (updateStatusMsg) updateStatusMsg.textContent = json.error || '升级失败';
+      const errMsg = (json && json.error) || ('升级失败 (HTTP ' + res.status + ')');
+      alert(errMsg);
+      if (updateStatusMsg) updateStatusMsg.textContent = errMsg;
       if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
     }
   } catch (e) {
-    alert('升级请求异常: ' + e.message);
+    const errMsg = '升级请求异常: ' + (e && e.message ? e.message : e);
+    alert(errMsg);
+    if (updateStatusMsg) updateStatusMsg.textContent = errMsg;
     if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
+  } finally {
+    doUpgrade._busy = false;
   }
 }
 
@@ -3225,9 +3232,10 @@ const resPQr = document.getElementById('res-pqr');
 
 function showProxyResult(data) {
   if (!proxyModal) return;
-  const host = data.host || curProxyServerHost;
+  const host = String(data.host || curProxyServerHost || '');
+  const hostPart = (host.includes(':') && !host.startsWith('[')) ? ('[' + host + ']') : host;
   const ptype = data.type || 'socks5';
-  const url = data.url || (ptype + '://' + encodeURIComponent(data.username) + ':' + encodeURIComponent(data.password) + '@' + host + ':' + data.port);
+  const url = data.url || (ptype + '://' + encodeURIComponent(data.username) + ':' + encodeURIComponent(data.password) + '@' + hostPart + ':' + data.port);
   const fmt = data.format || (host + ':' + data.port + ':' + data.username + ':' + data.password);
 
   if (resPTypeBadge) {
@@ -3242,8 +3250,10 @@ function showProxyResult(data) {
   if (resPFmt) resPFmt.value = fmt;
 
   if (resPQr) {
-    // 没生成出二维码时必须覆盖掉初始「生成中...」或上一次创建的旧二维码，避免扫码连错代理。
-    resPQr.innerHTML = data.qr || '<p style="color:var(--muted);font-size:12px;margin:0;text-align:center">二维码生成失败（服务器可能未安装 qrencode），请复制右侧代理链接导入</p>';
+    // 没生成出二维码或返回值不是 SVG 时必须覆盖掉初始「生成中...」或旧二维码，避免扫码连错代理或注入非 SVG 内容。
+    resPQr.innerHTML = (typeof data.qr === 'string' && data.qr.includes('<svg'))
+      ? data.qr
+      : '<p style="color:var(--muted);font-size:12px;margin:0;text-align:center">二维码生成失败（服务器可能未安装 qrencode），请复制右侧代理链接导入</p>';
   }
 
   // 代理详情的复制按钮都走统一兜底（2026-11-03 修）：剪贴板接口不可用时旧写法
@@ -3272,6 +3282,7 @@ function showProxyResult(data) {
 // 绑定秒级一键生成按钮
 document.querySelectorAll('.btn-quick-proxy').forEach(btn => {
   btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
     const ptype = btn.dataset.ptype;
     const cPortEl = document.getElementById('custom-proxy-port');
     const customPort = cPortEl ? cPortEl.value.trim() : '';
@@ -3288,16 +3299,16 @@ document.querySelectorAll('.btn-quick-proxy').forEach(btn => {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: body
       });
-      const json = await res.json();
-      if (json.ok) {
+      const json = await res.json().catch(() => null);
+      if (res.ok !== false && json && json.ok) {
         if (cPortEl) cPortEl.value = '';
         showProxyResult(json);
         loadProxyServices();
       } else {
-        alert(json.error || '生成失败');
+        alert((json && json.error) || ('生成失败 (HTTP ' + res.status + ')'));
       }
     } catch (e) {
-      alert('生成异常: ' + e.message);
+      alert('生成异常: ' + (e && e.message ? e.message : e));
     } finally {
       btn.disabled = false;
       btn.textContent = origText;
@@ -3307,13 +3318,14 @@ document.querySelectorAll('.btn-quick-proxy').forEach(btn => {
 
 if (btnInstallGost) {
   btnInstallGost.addEventListener('click', async () => {
+    if (btnInstallGost.disabled) return;
     const confirmed = await showConfirm({
       title: '安装 GOST 代理服务',
       text: '确定要一键安装或更新 GOST 代理服务吗？系统将自动匹配架构并配置自启。',
       icon: '🧱',
       confirmText: '开始安装'
     });
-    if (!confirmed) return;
+    if (!confirmed || btnInstallGost.disabled) return;
     btnInstallGost.disabled = true;
     const origText = btnInstallGost.textContent;
     let installedOk = false;
@@ -3324,16 +3336,16 @@ if (btnInstallGost) {
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
-      const json = await res.json();
-      if (res.ok && json.ok) {
+      const json = await res.json().catch(() => null);
+      if (res.ok !== false && json && json.ok) {
         installedOk = true;
         alert(json.message || 'GOST 安装成功！服务已就绪。');
         await loadProxyServices();
       } else {
-        alert(json.error || '安装失败，请检查服务器网络或日志');
+        alert((json && json.error) || ('安装失败 (HTTP ' + res.status + ')，请检查服务器网络或日志'));
       }
     } catch (e) {
-      alert('安装请求异常: ' + e.message);
+      alert('安装请求异常: ' + (e && e.message ? e.message : e));
     } finally {
       btnInstallGost.disabled = false;
       if (!installedOk) btnInstallGost.textContent = origText;
@@ -3432,8 +3444,8 @@ async function loadProxyServices() {
             headers: {'Content-Type':'application/x-www-form-urlencoded'},
             body: 'action=delete&id=' + encodeURIComponent(btn.dataset.proxyDel)
           });
-          const json = await res.json();
-          if (!res.ok || !json.ok) throw new Error(json.error || '删除代理失败');
+          const json = await res.json().catch(() => null);
+          if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('删除代理失败 (HTTP ' + res.status + ')'));
           await loadProxyServices();
         } catch (err) {
           alert(err.message || '删除代理请求失败');
@@ -3498,11 +3510,11 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
     
     try {
       const res = await fetch('/' + token + '/user-config?user_id=' + encodeURIComponent(uid), { credentials: 'same-origin' });
-      // 先经 Response.prototype.json 解析：401/429/404/503 都带有明确中文原因，
-      // 旧实现一见 !res.ok 就抛「网络请求异常 (HTTP N)」，把密码已损坏、用户已删除等真因全吞掉了。
-      const json = await res.json();
+      // 先经 Response.prototype.json 解析：401/429/404/503 都带有明确中文原因；
+      // 若网关返回非 JSON 502 错误页则优雅回退为含状态码提示，不暴露底层 SyntaxError。
+      const json = await res.json().catch(() => null);
       if (mySeq !== userModalSeq) return;
-      if (!res.ok || !json.ok) throw new Error((json && json.error) || ('网络请求异常 (HTTP ' + res.status + ')'));
+      if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('网络请求异常 (HTTP ' + res.status + ')'));
       
       uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
       
@@ -3556,7 +3568,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div class="user-connect-grid">
           <div style="text-align:center;background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px">
             <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:8px">专属二维码扫码导入</div>
-            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${json.qr_svg || '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
+            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg')) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
             <div style="font-size:11px;color:var(--muted);margin-top:8px">Shadowrocket / v2rayNG / Nekobox</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:12px">
@@ -3644,7 +3656,16 @@ function awgPost(endpoint, params) {
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(params).toString()
-  }).then(r => r.json()).catch(e => ({ ok: false, error: '请求异常: ' + e.message }));
+  }).then(async r => {
+    const data = await r.json().catch(() => null);
+    if (!data || typeof data !== 'object') {
+      return { ok: false, error: '服务返回非 JSON 响应 (HTTP ' + r.status + ')' };
+    }
+    if (r.ok === false && data.ok !== false) {
+      return Object.assign({}, data, { ok: false, error: data.error || ('请求失败 (HTTP ' + r.status + ')') });
+    }
+    return data;
+  }).catch(e => ({ ok: false, error: '请求异常: ' + (e && e.message ? e.message : e) }));
 }
 
 function setAwgBadge(text, bg, color) {
@@ -3708,11 +3729,12 @@ function fmtAwgCreated(value) {
 
 function renderAwgPeers(peers) {
   if (!awgPeerTbody) return;
-  if (!peers.length) {
+  const safePeers = (Array.isArray(peers) ? peers : []).filter(p => p && typeof p === 'object');
+  if (!safePeers.length) {
     awgPeerTbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">暂无客户端，用上方表单新增</td></tr>';
     return;
   }
-  awgPeerTbody.innerHTML = peers.map(p => {
+  awgPeerTbody.innerHTML = safePeers.map(p => {
     const enc = encodeURIComponent(p.name);
     const bs = 'padding:3px 10px;font-size:11px';
     return '<tr data-awg-endpoint="' + obEsc(p.endpoint || '') + '">'
@@ -3775,6 +3797,7 @@ if (btnInstallAwg) {
 
 if (btnDoInstallAwg) {
   btnDoInstallAwg.addEventListener('click', async () => {
+    if (btnDoInstallAwg.disabled) return;
     const line = awgLineSelect ? awgLineSelect.value : '3';
     const endpoint = awgEndpointInput ? awgEndpointInput.value.trim() : '';
     if (!endpoint) { alert('请填写客户端连接地址（域名或公网 IP）'); return; }
@@ -3784,7 +3807,7 @@ if (btnDoInstallAwg) {
       icon: '🧱',
       confirmText: '开始安装'
     });
-    if (!confirmed) return;
+    if (!confirmed || btnDoInstallAwg.disabled) return;
     btnDoInstallAwg.disabled = true;
     const orig = btnDoInstallAwg.textContent;
     btnDoInstallAwg.textContent = '⏳ 安装中，请稍候...';
@@ -3803,6 +3826,7 @@ if (btnDoInstallAwg) {
 
 if (btnAddAwgPeer) {
   btnAddAwgPeer.addEventListener('click', async () => {
+    if (btnAddAwgPeer.disabled) return;
     const name = awgPeerName ? awgPeerName.value.trim() : '';
     const endpoint = (awgPeerEndpoint && awgPeerEndpoint.value.trim()) || awgCurrentEndpoint;
     if (!name) { alert('请填写客户端名称'); return; }
@@ -3838,6 +3862,7 @@ if (btnAddAwgPeer) {
 
 if (btnSwitchAwgLine) {
   btnSwitchAwgLine.addEventListener('click', async () => {
+    if (btnSwitchAwgLine.disabled) return;
     // 只有两条协议线，直接切到另一条（2026-11-13 修，同终端菜单）：旧实现先弹原生输入框让人手打 2 / 3，
     // 打成当前线还要再弹一次「无需切换」。
     const target = awgCurrentLine === '3' ? '2' : '3';
@@ -3850,7 +3875,7 @@ if (btnSwitchAwgLine) {
       confirmText: '切换到 AWG ' + target + '.x',
       isDanger: true
     });
-    if (!confirmed) return;
+    if (!confirmed || btnSwitchAwgLine.disabled) return;
     // 请求期间禁用（2026-11-04 修）：第二次提交会再生成一遍混淆参数，中间导出的配置随即失效。
     btnSwitchAwgLine.disabled = true;
     try {
@@ -3865,6 +3890,7 @@ if (btnSwitchAwgLine) {
 
 if (btnUpdateAwg) {
   btnUpdateAwg.addEventListener('click', async () => {
+    if (btnUpdateAwg.disabled) return;
     const confirmed = await showConfirm({
       title: '更新 AmneziaWG',
       text: '确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。',
@@ -3872,7 +3898,7 @@ if (btnUpdateAwg) {
       confirmText: '开始更新',
       isWarn: true
     });
-    if (!confirmed) return;
+    if (!confirmed || btnUpdateAwg.disabled) return;
     btnUpdateAwg.disabled = true;
     try {
       const json = await awgPost('manage-amneziawg', { action: 'update' });

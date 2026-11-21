@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.60'
+PORTAL_VERSION = '2.61'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1641,6 +1641,8 @@ def portal_bundle_version(local_shas, remote_shas):
 
 _MAX_REMOTE_META_BYTES = 2 * 1024 * 1024
 _MAX_PORTAL_FILE_BYTES = 4 * 1024 * 1024
+_MAX_BINARY_ARCHIVE_BYTES = 160 * 1024 * 1024
+_MAX_BINARY_EXTRACT_BYTES = 256 * 1024 * 1024
 
 
 def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
@@ -1652,6 +1654,29 @@ def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
     if len(raw) > limit:
         raise ValueError('响应体积过大（超过 %d 字节）' % limit)
     return raw
+
+
+def _copy_stream_bounded(src, dst, limit, chunk_size=65536):
+    """按块受限复制流，防止异常或恶意镜像与压缩炸弹写爆磁盘。"""
+    total = 0
+    while True:
+        try:
+            chunk = src.read(chunk_size)
+        except TypeError:
+            chunk = src.read()
+            if chunk:
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError('下载或解压体积超过上限（%d 字节）' % limit)
+                dst.write(chunk)
+            break
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise ValueError('下载或解压体积超过上限（%d 字节）' % limit)
+        dst.write(chunk)
+    return total
 
 
 def resolve_update_ref(ref):
@@ -4052,6 +4077,8 @@ def subscription_userinfo(user):
     计量只记每个用户上下行的合计，按惯例全部计在 download；不限量写 total=0，
     未设到期（永久）写 expire=0。坏值（布尔 / 负数 / 无法解析）一律按 0。
     """
+    if not isinstance(user, dict):
+        user = {}
     def _num(value):
         n = 0 if isinstance(value, bool) else _safe_int(value)
         return n if n > 0 else 0
@@ -4066,8 +4093,9 @@ def subscription_profile_headers(meta, user_id, ext):
     分不清；24 小时自动更新让节点改端口 / 换协议后客户端自己跟上。文件名只留安全字符。
     """
     name = re.sub(r'[^A-Za-z0-9._-]', '_', '%s-%s' % (clean_node_identity(meta)[3], user_id)).strip('._')
+    safe_ext = re.sub(r'[^A-Za-z0-9]', '', str(ext or ''))[:16] or 'txt'
     return (('profile-update-interval', '24'),
-            ('Content-Disposition', 'attachment; filename="%s.%s"' % ((name or 'subscription')[:80], ext)))
+            ('Content-Disposition', 'attachment; filename="%s.%s"' % ((name or 'subscription')[:80], safe_ext)))
 
 
 def _extra_link_boxes(extra_links):
@@ -4319,7 +4347,7 @@ def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ''
     in_tls = False
     for raw in text.split('\n'):
@@ -4350,7 +4378,7 @@ def _parse_cert_subject(cert_file):
     right but whose SAN is empty/wrong will still fail `CRYPTO_ERROR 0x150`.
     """
     cert_file = Path(cert_file)
-    if not cert_file.exists():
+    if not cert_file.is_file():
         return '', [], False
     try:
         # fullchain.pem holds the leaf first; openssl x509 reads the first block.
@@ -4380,9 +4408,14 @@ def _parse_cert_subject(cert_file):
         sans = []
         for line in p_san.stdout.splitlines():
             line = line.strip()
-            if line.startswith('DNS:'):
-                sans = [d.strip() for d in line[len('DNS:'):].split(',') if d.strip()]
-                break
+            if 'DNS:' not in line:
+                continue
+            for item in line.split(','):
+                item = item.strip()
+                if item.startswith('DNS:'):
+                    dns_val = item[len('DNS:'):].strip()
+                    if dns_val:
+                        sans.append(dns_val)
 
         self_signed = bool(issuer_line) and issuer_line == subject_line
         return cn, sans, self_signed
@@ -4398,8 +4431,14 @@ def _config_acme_cert_path(config_path):
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
+    def _split_yaml_value(raw_val):
+        try:
+            return shlex.split(raw_val, comments=True)
+        except ValueError:
+            cleaned = raw_val.split('#', 1)[0].strip().strip('"').strip("'")
+            return [cleaned] if cleaned else []
     in_acme = False
     found_acme = False
     in_domains = False
@@ -4418,7 +4457,7 @@ def _config_acme_cert_path(config_path):
             continue
         line = raw.strip()
         if line.startswith('-') and in_domains:
-            values = shlex.split(line[1:].strip(), comments=True)
+            values = _split_yaml_value(line[1:].strip())
             if values:
                 domains.append(values[0].lower())
             continue
@@ -4426,7 +4465,7 @@ def _config_acme_cert_path(config_path):
         if not sep:
             continue
         in_domains = key == 'domains'
-        values = shlex.split(value.strip(), comments=True)
+        values = _split_yaml_value(value.strip())
         scalar = ' '.join(values)
         if key == 'dir':
             storage = scalar
@@ -4550,7 +4589,7 @@ def _find_cert_key(cert_file, cfg_dir):
     candidates = []
     try:
         text = (cfg_dir / 'config.yaml').read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         text = ''
     in_tls = False
     for raw in text.splitlines():
@@ -4560,9 +4599,14 @@ def _find_cert_key(cert_file, cfg_dir):
             in_tls = raw.split(':', 1)[0].strip() == 'tls'
             continue
         if in_tls and raw.strip().startswith('key:'):
-            value = raw.strip().split(':', 1)[1].strip().strip('"').strip("'")
-            path = Path(value)
-            candidates.append(path if path.is_absolute() else cfg_dir / path)
+            raw_val = raw.strip().split(':', 1)[1]
+            try:
+                value = ' '.join(shlex.split(raw_val, comments=True))
+            except ValueError:
+                value = raw_val.split('#', 1)[0].strip().strip('"').strip("'")
+            if value:
+                path = Path(value)
+                candidates.append(path if path.is_absolute() else cfg_dir / path)
             break
     candidates.extend(_cert_key_candidates(cert_file))
     seen = set()
@@ -4733,7 +4777,12 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     state_path = Path(state_path) if state_path else root / 'cert-selfheal.json'
     try:
         cert_file = Path(cert_file)
-        digest = hashlib.sha256(cert_file.read_bytes()).hexdigest()
+        if not cert_file.is_file():
+            return False
+        raw_cert = cert_file.read_bytes()
+        if not raw_cert:
+            return False
+        digest = hashlib.sha256(raw_cert).hexdigest()
     except OSError:
         return False
     state = {}
@@ -4822,11 +4871,11 @@ def record_cert_heal(root, state, before, after):
 
 
 def _is_dns_name(value):
-    value = (value or '').strip()
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
     if not value or len(value) > 253:
         return False
-    if value.startswith('www.bing.com'):
-        return True
     return bool(re.match(r'^[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?'
                          r'(\.[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?)+$', value))
 
@@ -4863,7 +4912,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     config_has_acme = False
     try:
         config_has_acme = bool(re.search(r'^acme:', Path(config_path).read_text(encoding='utf-8'), re.M))
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         pass
 
     # 证书解析统一走 _resolve_live_cert —— 自愈与界面显示必须是同一张证书，
@@ -4877,13 +4926,16 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         configured_path = Path(configured)
         if not configured_path.is_absolute():
             configured_path = Path(config_path).parent / configured_path
-        if not configured_path.exists():
+        if not configured_path.is_file():
             print('[portal] 证书自愈跳过：config.yaml 指向的证书 %s 不存在' % configured_path,
                   file=sys.stderr)
             return False
     cert_file, cn, sans, self_signed = _resolve_live_cert(root, config_path)
-    if not cert_file.exists():
+    if not cert_file.is_file():
         # 证书都读不到，不做任何猜测 —— 交给原来的行为。
+        return False
+    if not cn and not sans and not self_signed:
+        # 证书文件已损坏/截断或 openssl 解析失败时，绝不能按非自签覆盖现有信任配置。
         return False
 
     # server_name 取值：SAN 首选（现代客户端只看 SAN），CN 兜底。
@@ -4892,11 +4944,13 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     # 一张证书常覆盖多个域名，直接取第一个非通配 SAN 会在换证后把 SNI 悄悄
     # 换成另一个域名 —— 已发出的订阅全部连不上。install.sh 的 sync_cert_meta
     # 已经是这个优先级，两处必须一致。
-    current_sn = str(m.get('server_name') or '').strip().lower()
+    raw_sn = m.get('server_name')
+    clean_meta_sn = raw_sn.strip() if isinstance(raw_sn, str) else ''
+    current_sn = clean_meta_sn.lower()
     san_lower = [str(x).strip().lower() for x in (sans or [])]
     candidate = ''
     if current_sn and certificate_covers_domain(current_sn, san_lower, str(cn or '')):
-        candidate = str(m.get('server_name')).strip()
+        candidate = clean_meta_sn
     if not candidate:
         for san in sans or []:
             if san.startswith('*.'):
@@ -4916,7 +4970,9 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         new_insecure = False
         new_pin = ''
 
-    new_sn = candidate or m.get('server_name') or m.get('public_ip', 'localhost')
+    raw_pub_ip = m.get('public_ip')
+    clean_pub_ip = raw_pub_ip.strip() if isinstance(raw_pub_ip, str) else ''
+    new_sn = candidate or clean_meta_sn or clean_pub_ip or 'localhost'
 
     changed = False
     if m.get('cert_type') != new_type:
@@ -5951,7 +6007,7 @@ def install_xray_binary():
             try:
                 req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=45) as resp, open(zpath, 'wb') as out_f:
-                    shutil.copyfileobj(resp, out_f)
+                    _copy_stream_bounded(resp, out_f, _MAX_BINARY_ARCHIVE_BYTES)
                 if not verify_sha256(zpath, expected):
                     errors.append('%s: SHA256 与官方 .dgst 不一致' % host)
                     continue
@@ -5960,14 +6016,16 @@ def install_xray_binary():
                     continue
                 with zipfile.ZipFile(zpath, 'r') as zf:
                     member = safe_zip_members(zf.namelist(), 'xray')
-                    zf.extract(member, path=tmpdir)
-                bin_path = Path(tmpdir) / member
-                if bin_path.exists():
+                    info = zf.getinfo(member)
+                    if info.is_dir():
+                        raise ValueError('zip 内 xray 成员是目录而非可执行文件')
+                    if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                        raise ValueError('zip 内含不允许的符号链接成员: %s' % member)
                     staged = Path('/usr/local/bin/xray.new.%s' % secrets.token_hex(6))
                     replaced = False
                     try:
-                        with open(bin_path, 'rb') as src_f, open(staged, 'wb') as dst_f:
-                            shutil.copyfileobj(src_f, dst_f)
+                        with zf.open(info, 'r') as src_f, open(staged, 'wb') as dst_f:
+                            _copy_stream_bounded(src_f, dst_f, _MAX_BINARY_EXTRACT_BYTES)
                             dst_f.flush()
                             os.fsync(dst_f.fileno())
                         os.chmod(str(staged), 0o755)
@@ -5984,7 +6042,6 @@ def install_xray_binary():
                     finally:
                         if not replaced:
                             staged.unlink(missing_ok=True)
-                errors.append('%s: 包内没有 xray' % host)
             except Exception as exc:
                 errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
 
@@ -6037,7 +6094,7 @@ def install_singbox():
             try:
                 req = urllib.request.Request(url, headers={'User-Agent': 'hy2-portal'})
                 with urllib.request.urlopen(req, timeout=180) as resp, open(archive, 'wb') as out:
-                    shutil.copyfileobj(resp, out)
+                    _copy_stream_bounded(resp, out, _MAX_BINARY_ARCHIVE_BYTES)
                 if not verify_sha256(archive, expected):
                     errors.append('%s: SHA256 与官方不一致' % host)
                     continue
@@ -6059,12 +6116,12 @@ def install_singbox():
                             if m.isfile():
                                 regular_names.append(mname)
                         member_name = safe_tar_members(regular_names, 'sing-box')
-                        member = tar.getmember(member_name)
+                        member = next(m for m in all_members if m.name == member_name and m.isfile())
                         extracted = tar.extractfile(member)
                         if extracted is None:
                             raise ValueError('tar 包内无法读取 sing-box 成员')
                         with extracted as src, open(staged, 'wb') as dst:
-                            shutil.copyfileobj(src, dst)
+                            _copy_stream_bounded(src, dst, _MAX_BINARY_EXTRACT_BYTES)
                             dst.flush()
                             os.fsync(dst.fileno())
                     os.chmod(str(staged), 0o755)
@@ -8430,7 +8487,7 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     """
     root = Path(meta_path).parent
     meta_file = Path(meta_path)
-    if not meta_file.exists():
+    if not meta_file.is_file():
         return False
     try:
         m = json.loads(meta_file.read_text(encoding='utf-8'))
@@ -8450,7 +8507,7 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
         configured_path = Path(configured)
         if not configured_path.is_absolute():
             configured_path = Path(config_path).parent / configured_path
-        configured_missing = not configured_path.exists()
+        configured_missing = not configured_path.is_file()
     live_cert, _, _, _ = _resolve_live_cert(root, config_path)
     changed = sync_cert_trust(m, root, meta_path, config_path=config_path)
     # sync_cert_trust 只在漂移时写盘；pin 的修正也一并在此处理（保持与 refresh 一致）。
@@ -12088,13 +12145,18 @@ if __name__ == '__main__':
                     ptype = str(params.get('protocol') or params.get('type') or 'socks5').lower()
                     if ptype not in ('socks5', 'http', 'https'):
                         return 400, {'ok': False, 'error': '代理类型只能是 SOCKS5、HTTP 或 HTTPS'}
-                    raw_port = str(params.get('port') or '').strip()
-                    try:
-                        port = int(raw_port) if raw_port else 0
-                    except (TypeError, ValueError):
-                        port = -1
-                    if raw_port and not 1 <= port <= 65535:
+                    raw_port_in = params.get('port')
+                    if isinstance(raw_port_in, bool):
                         return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
+                    raw_port = str(raw_port_in if raw_port_in is not None else '').strip()
+                    if raw_port:
+                        if not re.fullmatch(r'[0-9]{1,5}', raw_port):
+                            return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
+                        port = int(raw_port)
+                        if not 1 <= port <= 65535:
+                            return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
+                    else:
+                        port = 0
                     if ptype == 'https':
                         # 没有可用证书时给 400 + 可读原因，而不是 500 的
                         # 「proxy add failed: ...」（2026-10-30 修）。
@@ -12145,8 +12207,15 @@ if __name__ == '__main__':
                     if not selected:
                         return 400, {'ok': False, 'error': '指定端口已占用，或无法找到空闲端口'}
                     port = selected
-                    raw_user = str(params.get('username') or '')
-                    raw_pass = str(params.get('password') or '')
+                    raw_user_in = params.get('username')
+                    raw_pass_in = params.get('password')
+                    raw_note_in = params.get('note')
+                    if (raw_user_in is not None and not isinstance(raw_user_in, str)) or (
+                            raw_pass_in is not None and not isinstance(raw_pass_in, str)) or (
+                            raw_note_in is not None and not isinstance(raw_note_in, str)):
+                        return 400, {'ok': False, 'error': '代理账号、密码与备注必须是字符串'}
+                    raw_user = raw_user_in or ''
+                    raw_pass = raw_pass_in or ''
                     if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_user + raw_pass):
                         return 400, {'ok': False, 'error': '代理账号或密码不能包含换行或控制字符'}
                     username = raw_user.strip()[:64] or ('user_' + secrets.token_hex(4))
@@ -12157,7 +12226,7 @@ if __name__ == '__main__':
                         return 400, {'ok': False, 'error': 'SOCKS5 账号或密码不能超过 255 字节'}
                     entry = {'id': 'proxy_' + secrets.token_hex(6), 'type': ptype, 'port': port,
                              'username': username, 'password': password, 'created_at': int(time.time()),
-                             'note': str(params.get('note') or '').strip()[:200]}
+                             'note': (raw_note_in or '').strip()[:200]}
                     with data_lock:
                         data['proxy_services'] = working + [entry]
                 else:
@@ -12177,7 +12246,12 @@ if __name__ == '__main__':
                     with data_lock:
                         data['proxy_services'] = previous
                     raise
-                if not reload_gost():
+                try:
+                    reloaded = reload_gost()
+                except Exception as exc:
+                    _log_ignored('proxy_reload', exc)
+                    reloaded = False
+                if not reloaded:
                     with data_lock:
                         data['proxy_services'] = previous
                     try:
@@ -12225,6 +12299,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
                 return 200, dict(entry, ok=True, applied=True, host=host, url=uri, qr=qr_svg,
@@ -12266,13 +12342,17 @@ if __name__ == '__main__':
                         managed_unit = (gost_unit.is_file() and
                             'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
                             in gost_unit.read_text(encoding='utf-8'))
-                    except OSError:
+                    except (OSError, UnicodeDecodeError):
                         pass
                     if not (gost_owner.is_file() and managed_unit):
                         return self.reply_json(409, {'ok': False, 'error':
                             '检测到已有 GOST 文件或服务但无法确认归属；为避免覆盖宿主服务，已停止安装'})
-                    version = subprocess.run(['/usr/local/bin/gost', '-V'], capture_output=True, timeout=5)
-                    if version.returncode == 0:
+                    try:
+                        version = subprocess.run(['/usr/local/bin/gost', '-V'], capture_output=True, timeout=5)
+                        old_bin_ok = version.returncode == 0
+                    except Exception:
+                        old_bin_ok = False
+                    if old_bin_ok:
                         if not reload_gost():
                             return self.reply_json(500, {'ok': False, 'error': 'GOST 修复失败或端口未就绪，请检查日志'})
                         return self.reply_json(200, {'ok': True, 'applied': True, 'message': 'GOST 已恢复运行，监听端口已核对'})
@@ -12281,10 +12361,10 @@ if __name__ == '__main__':
                     arch = 'linux_amd64'
                 elif 'aarch64' in machine or 'arm64' in machine:
                     arch = 'linux_arm64'
-                elif 'armv7' in machine:
+                elif 'armv7' in machine or 'armhf' in machine:
                     arch = 'linux_armv7'
                 else:
-                    arch = 'linux_amd64'
+                    return self.reply_json(400, {'ok': False, 'error': '不支持的 CPU 架构，无法安装 GOST: %s' % machine})
 
                 # 动态探测最新版本（严格校验版本号格式，防止异常响应注入路径段）
                 tag = 'v3.3.0'
@@ -12329,9 +12409,12 @@ if __name__ == '__main__':
                 cert_files = (cert_dir / 'cert.pem', cert_dir / 'key.pem')
                 had_cert_dir = cert_dir.exists()
                 old_gost_active = _systemd_state('gost') == 'active'
-                old_gost_enabled = subprocess.run(
-                    ['systemctl', 'is-enabled', 'gost'], capture_output=True,
-                    text=True, timeout=5).stdout.strip() == 'enabled'
+                try:
+                    old_gost_enabled = subprocess.run(
+                        ['systemctl', 'is-enabled', 'gost'], capture_output=True,
+                        text=True, timeout=5).stdout.strip() == 'enabled'
+                except Exception:
+                    old_gost_enabled = False
                 with data_lock:
                     had_proxy_services = 'proxy_services' in data
                     previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
@@ -12348,7 +12431,7 @@ if __name__ == '__main__':
                             req = urllib.request.Request(u, headers={'User-Agent': 'Mozilla/5.0'})
                             # 超时给足：包有 ~17MB，30 秒在慢线路上不够
                             with urllib.request.urlopen(req, timeout=180) as resp, open(archive_path, 'wb') as out_f:
-                                shutil.copyfileobj(resp, out_f)
+                                _copy_stream_bounded(resp, out_f, _MAX_BINARY_ARCHIVE_BYTES)
                             if not verify_sha256(archive_path, expected):
                                 errors.append('%s: SHA256 与官方 checksums.txt 不一致' % host)
                                 continue
@@ -12378,7 +12461,7 @@ if __name__ == '__main__':
                                 if extracted is None:
                                     raise ValueError('tar 包内无法读取 gost 成员')
                                 with extracted as source, open(src_bin, 'wb') as dest:
-                                    shutil.copyfileobj(source, dest)
+                                    _copy_stream_bounded(source, dest, _MAX_BINARY_EXTRACT_BYTES)
                             if src_bin.exists():
                                 staged = Path('/usr/local/bin/gost.new.%s' % os.urandom(6).hex())
                                 replaced = False
@@ -12521,7 +12604,12 @@ if __name__ == '__main__':
                 subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
 
                 # 重新生成 gost.yml 并启动服务
-                if not reload_gost():
+                try:
+                    reloaded = reload_gost()
+                except Exception as exc:
+                    _log_ignored('proxy_reload', exc)
+                    reloaded = False
+                if not reloaded:
                     restore_gost_assets()
                     if old_gost_active:
                         reload_gost()
@@ -12575,9 +12663,10 @@ if __name__ == '__main__':
                 endpoint_error = awg_endpoint_error(endpoint)
                 if endpoint_error:
                     return self.reply_json(400, {'ok': False, 'error': endpoint_error})
-                # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃或主监听端口冲突的取值
+                # 端口若由用户指定，提前拦掉非 ASCII 数字及会与 Hysteria2/TUIC 冲突的取值
+                port_num = None
                 if port:
-                    if not port.isdigit() or not (1 <= int(port) <= 65535):
+                    if not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535):
                         return self.reply_json(400, {'ok': False, 'error': '端口必须是 1-65535 的数字'})
                     port_num = int(port)
                     if 20000 <= port_num <= 40000:
@@ -12591,23 +12680,31 @@ if __name__ == '__main__':
                         if hy2_listen and port_num == hy2_listen:
                             return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 已被 Hysteria2 主监听端口占用，请更换其它 UDP 端口'})
                         hop_range = str(m_now.get('hop_port_range') or '').strip()
-                        hop_match = re.fullmatch(r'(\d{1,5})-(\d{1,5})', hop_range)
+                        hop_match = re.fullmatch(r'([0-9]{1,5})-([0-9]{1,5})', hop_range)
                         if hop_match:
                             hs, he = int(hop_match.group(1)), int(hop_match.group(2))
                             if 1 <= hs <= he <= 65535 and hs <= port_num <= he:
                                 return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 落在当前 Hysteria2 端口跳跃区间 {hs}-{he} 内，请更换其它 UDP 端口'})
+                    try:
+                        with data_lock:
+                            tuic_cfg = config_section(data, 'tuic_config')
+                            tuic_port = _valid_port(tuic_cfg.get('port')) if tuic_cfg.get('enabled') else 0
+                    except NameError:
+                        tuic_port = 0
+                    if tuic_port and port_num == tuic_port:
+                        return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 已被 TUIC 协议占用，请更换其它 UDP 端口'})
                 if unit_suspended(AWG_SVC_NAME):
                     return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，请在控制台恢复节点后再安装 AmneziaWG'})
-                if not ensure_awgctl():
-                    return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
-                # 安装要下载并核验两个二进制，awgctl 超时 420 秒。
+                # 安装要下载控制脚本与校验两个二进制（总超时 420 秒），先申请重型死线槽再联网。
                 if not self._extend_deadline(480, heavy=True):
                     return self.reply_json(409, {'ok': False, 'error':
                         '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
+                if not ensure_awgctl():
+                    return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
 
                 args = ['install', '--line', line, '--endpoint', endpoint]
-                if port:
-                    args += ['--port', port]
+                if port_num is not None:
+                    args += ['--port', str(port_num)]
                 rc, out, err = awg_run(args, timeout=420)
                 if rc != 0:
                     return self.reply_json(500, {'ok': False, 'error': '安装失败：' + awg_err_tail(rc, out, err)})
@@ -12671,62 +12768,8 @@ if __name__ == '__main__':
                 if action in ('set_line', 'update', 'start', 'restart') and unit_suspended(AWG_SVC_NAME):
                     return self.reply_json(409, {'ok': False, 'error':
                         '节点因流量超额停用中，AmneziaWG 将在控制台恢复节点时一并恢复'})
-                if not ensure_awgctl():
-                    return self.reply_json(500, {'ok': False, 'error': 'hy2-awgctl 不可用'})
 
-                # update / set_line 的 awgctl 超时给到 420 秒（要下载并交叉
-                # 验证二进制），必须先把连接死线抬到覆盖全程。
-                if action in ('set_line', 'update'):
-                    if not self._extend_deadline(480, heavy=True):
-                        return self.reply_json(409, {'ok': False, 'error':
-                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-
-                if action == 'peer_add':
-                    # name / endpoint 已在安装状态检查之前校验过。
-                    # peer-add 会生成密钥并渲染服务端配置，90 秒超时。
-                    if not self._extend_deadline(120, heavy=True):
-                        return self.reply_json(409, {'ok': False, 'error':
-                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                    rc, out, err = awg_run(['peer-add', name, '--endpoint', endpoint], timeout=90)
-                    if rc != 0:
-                        return self.reply_json(500, {'ok': False, 'error': '创建失败：' + awg_err_tail(rc, out, err, 400)})
-                    return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已创建'})
-
-                if action == 'peer_del':
-                    name = (form.get('name', [''])[0] or '').strip()
-                    if not VALID_AWG_NAME_RE.match(name):
-                        return self.reply_json(400, {'ok': False, 'error': '客户端名称非法'})
-                    # 与 peer_add 同样抬死线（2026-11-04 修）：awg_run 先排队等 AWG 操作锁，
-                    # update 占锁时可达 420 秒；默认 30 秒死线先关掉连接，浏览器报网络错误，
-                    # 删除却在锁空出来后照常执行，重试只拿到「客户端不存在」。
-                    if not self._extend_deadline(120, heavy=True):
-                        return self.reply_json(409, {'ok': False, 'error':
-                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
-                    rc, out, err = awg_run(['peer-del', name], timeout=90)
-                    if rc != 0:
-                        return self.reply_json(500, {'ok': False, 'error': '删除失败：' + awg_err_tail(rc, out, err, 400)})
-                    return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已删除'})
-
-                if action == 'set_line':
-                    target = (form.get('line', [''])[0] or '').strip()
-                    if target not in ('2', '3'):
-                        return self.reply_json(400, {'ok': False, 'error': '协议线只能是 2 或 3'})
-                    if target == awg_state()['line']:
-                        return self.reply_json(200, {'ok': True, 'message': f'已经是 AWG {target}.x，无需切换。'})
-                    rc, out, err = awg_run(['update', '--line', target], timeout=420)
-                    if rc != 0:
-                        return self.reply_json(500, {'ok': False, 'error': '切换失败：' + awg_err_tail(rc, out, err)})
-                    return self.reply_json(200, {'ok': True, 'message': f'已切换到 AWG {target}.x。⚠️ 所有客户端必须重新导入配置。'})
-
-                if action == 'update':
-                    # 先把控制工具自身刷新到最新，刷新失败则明确中止而非静默继续跑旧版本。
-                    if not ensure_awgctl(force=True):
-                        return self.reply_json(500, {'ok': False, 'error': '刷新最新 hy2-awgctl 失败，已中止更新，请检查网络后重试'})
-                    rc, out, err = awg_run(['update'], timeout=420)
-                    if rc != 0:
-                        return self.reply_json(500, {'ok': False, 'error': '更新失败：' + awg_err_tail(rc, out, err)})
-                    return self.reply_json(200, {'ok': True, 'message': '二进制已更新，协议线与参数保持不变，客户端无需重新导入。'})
-
+                # start / stop / restart 直接调 systemctl，不依赖 hy2-awgctl，断网环境也可启停。
                 if action in ('start', 'stop', 'restart'):
                     label = {'start': '启动', 'stop': '停止', 'restart': '重启'}.get(action, action)
                     # 等 awg_operation_lock 与 30 秒 systemctl 合计可能超过默认 30 秒连接死线，先续期。
@@ -12748,6 +12791,48 @@ if __name__ == '__main__':
                     if proc.returncode != 0:
                         return self.reply_json(500, {'ok': False, 'error': '服务' + label + '失败：' + (proc.stderr or '').strip()[-400:]})
                     return self.reply_json(200, {'ok': True, 'message': '服务已' + label})
+
+                # 其余动作依赖 hy2-awgctl：先申请重型死线槽，再调用 ensure_awgctl（避免联网拉脚本超 30 秒被掐断）。
+                if action in ('set_line', 'update'):
+                    if not self._extend_deadline(480, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
+                else:
+                    if not self._extend_deadline(120, heavy=True):
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
+
+                if not ensure_awgctl():
+                    return self.reply_json(500, {'ok': False, 'error': 'hy2-awgctl 不可用'})
+
+                if action == 'peer_add':
+                    rc, out, err = awg_run(['peer-add', name, '--endpoint', endpoint], timeout=90)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '创建失败：' + awg_err_tail(rc, out, err, 400)})
+                    return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已创建'})
+
+                if action == 'peer_del':
+                    rc, out, err = awg_run(['peer-del', name], timeout=90)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '删除失败：' + awg_err_tail(rc, out, err, 400)})
+                    return self.reply_json(200, {'ok': True, 'message': f'客户端 {name} 已删除'})
+
+                if action == 'set_line':
+                    if target == awg_state()['line']:
+                        return self.reply_json(200, {'ok': True, 'message': f'已经是 AWG {target}.x，无需切换。'})
+                    rc, out, err = awg_run(['update', '--line', target], timeout=420)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '切换失败：' + awg_err_tail(rc, out, err)})
+                    return self.reply_json(200, {'ok': True, 'message': f'已切换到 AWG {target}.x。⚠️ 所有客户端必须重新导入配置。'})
+
+                if action == 'update':
+                    # 先把控制工具自身刷新到最新，刷新失败则明确中止而非静默继续跑旧版本。
+                    if not ensure_awgctl(force=True):
+                        return self.reply_json(500, {'ok': False, 'error': '刷新最新 hy2-awgctl 失败，已中止更新，请检查网络后重试'})
+                    rc, out, err = awg_run(['update'], timeout=420)
+                    if rc != 0:
+                        return self.reply_json(500, {'ok': False, 'error': '更新失败：' + awg_err_tail(rc, out, err)})
+                    return self.reply_json(200, {'ok': True, 'message': '二进制已更新，协议线与参数保持不变，客户端无需重新导入。'})
             except subprocess.TimeoutExpired:
                 return self.reply_json(500, {'ok': False, 'error': '操作超时，请查看服务器日志'})
             except Exception as e:
@@ -13536,6 +13621,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vmess_qr', exc)
             return self.reply_json(200, {
@@ -14002,6 +14089,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('anytls_qr', exc)
             return self.reply_json(200, {
@@ -14234,6 +14323,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('tuic_qr', exc)
             return self.reply_json(200, {
@@ -14375,6 +14466,8 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
+                        if '<svg' not in qr_svg:
+                            qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vlessenc_qr', exc)
             return self.reply_json(200, {
@@ -15575,7 +15668,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         missing_user = not isinstance(u, dict)
                         result = None
                         if not missing_user:
-                            result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
+                            result = {k: copy.deepcopy(v) for k, v in u.items() if k not in ('password', 'view_nonce')}
                             # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
                             result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
                             result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
@@ -15754,6 +15847,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
                     except Exception:
                         qr_svg = ''
+                    if '<svg' not in qr_svg:
+                        qr_svg = ''
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
                     _insecure, server_name, _pub_clean, host = clean_node_identity(m)
@@ -15853,6 +15948,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
+                if '<svg' not in qr_svg:
+                    qr_svg = ""
 
                 denial = user_access_denial(u_copy)
                 return self.reply_json(200, {
@@ -15914,10 +16011,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not any(p.get('name') == name for p in peers_now):
                     return self.reply(404, ('客户端「%s」不存在，可能已被删除，请刷新页面' % name).encode('utf-8'))
 
-                # 连接地址优先用查询参数，其次用安装时记录的 endpoint
+                # 连接地址优先用查询参数，其次用安装时记录的 endpoint（过滤非字符串脏值）
                 endpoint = ((query.get('endpoint', [''])[0] or '').strip()
-                            or next((p.get('endpoint', '') for p in peers_now
-                                     if p.get('name') == name and p.get('endpoint')), '')
+                            or next((p.get('endpoint').strip() for p in peers_now
+                                     if p.get('name') == name and isinstance(p.get('endpoint'), str)
+                                     and p.get('endpoint').strip()), '')
                             or awg_state()['endpoint'])
                 if not endpoint:
                     return self.reply(400, '没有可用的连接地址：请在新增客户端时填写连接地址，'
@@ -16073,14 +16171,30 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 access_file = root / 'portal-access.json'
                 access = read_access_file(access_file)
                 host = meta_display_host(m)
+                now_ts = int(time.time())
+                users = {}
                 with data_lock:
-                    users = {uid: dict(u) for uid, u in users_list_rows(user_table(data))
-                             if isinstance(u, dict)}
+                    for uid, u in users_list_rows(user_table(data)):
+                        if not isinstance(u, dict):
+                            continue
+                        u_copy = dict(u)
+                        tracked = ip_tracker.get(uid)
+                        u_copy['online_ips'] = (
+                            {ip: t for ip, t in tracked.items()
+                             if isinstance(t, (int, float)) and not isinstance(t, bool)
+                             and t == t and (t - t == 0)
+                             and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                            if isinstance(tracked, dict) else {}
+                        )
+                        users[uid] = u_copy
                     _api_key = data.get('api_key')
-                    _token = data['token']
+                    raw_token = data.get('token')
+                    _token = raw_token if isinstance(raw_token, str) else ''
+                _sub_user = quote(str(access.get('username', '')), safe='')
+                _sub_pass = quote(str(access.get('password', '')), safe='')
                 subscription = (
                     "https://%s:%s@%s:%d/%s/clash.yaml"
-                    % (access.get('username', ''), access.get('password', ''),
+                    % (_sub_user, _sub_pass,
                        _host_for_url(host), resolve_subscription_port(m)[0], _token))
                 return page_html(m, uri, subscription, clash, sing, users=users,
                                  api_key=_api_key, token=_token,

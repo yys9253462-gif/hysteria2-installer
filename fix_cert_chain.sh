@@ -97,9 +97,11 @@ restart_hysteria () {
 # `0.0.0.0:8443` / `":8443"` 拿整串去连，修好的链被报成「验证未通过」。
 masq_https_port () {   # $1=config
     awk '
-        /^[[:space:]]*listenHTTPS:/ {
+        /^masquerade:[[:space:]]*(#.*)?$/ { f=1; next }
+        /^[^[:space:]]/ { f=0 }
+        f && /^[[:space:]]+listenHTTPS:/ {
             v = $0
-            sub(/^[[:space:]]*listenHTTPS:[[:space:]]*/, "", v)
+            sub(/^[[:space:]]+listenHTTPS:[[:space:]]*/, "", v)
             sub(/[[:space:]]+#.*$/, "", v)
             gsub(/["\047[:space:]]/, "", v)
             n = split(v, parts, ":"); v = parts[n]
@@ -112,10 +114,10 @@ masq_https_port () {   # $1=config
 cert_sni () {   # $1=cert
     local s
     s="$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null \
-         | grep -o 'DNS:[^,[:space:]]*' | head -n1 | cut -d: -f2)"
+         | grep -o 'DNS:[^,[:space:]]*' | head -n1 | cut -d: -f2)" || true
     if [[ -z "$s" ]]; then
         s="$(openssl x509 -in "$1" -noout -subject -nameopt RFC2253 2>/dev/null \
-             | sed 's/^subject= *//' | tr ',' '\n' | sed -n 's/^CN=//p' | head -n1)"
+             | sed 's/^subject= *//' | tr ',' '\n' | sed -n 's/^CN=//p' | head -n1)" || true
     fi
     [[ "$s" == \*.* ]] && s="www.${s#\*.}"
     printf '%s' "$s"
@@ -139,14 +141,17 @@ fi
 
 [[ "$CERT_FILE" != /* && ! "$CERT_FILE" =~ ^[A-Za-z]:[/\\] ]] && CERT_FILE="$(dirname "$CONFIG")/${CERT_FILE}"
 info "当前证书文件：$CERT_FILE"
-[[ -f "$CERT_FILE" ]] || { err "证书文件不存在：$CERT_FILE"; exit 1; }
+[[ -f "$CERT_FILE" && -r "$CERT_FILE" ]] || { err "证书文件不存在或不可读：$CERT_FILE"; exit 1; }
 
 COUNT="$(n_certs "$CERT_FILE")"
 info "该文件包含证书数量：$COUNT"
 FINAL_CERT="$CERT_FILE"
 CHANGED=0
 
-if [[ "$COUNT" -ge 2 ]]; then
+if [[ ! "$COUNT" =~ ^[0-9]+$ || "$COUNT" -lt 1 ]]; then
+    err "证书文件不含有效 PEM 证书块（COUNT=${COUNT:-0}）：$CERT_FILE"
+    exit 1
+elif [[ "$COUNT" -ge 2 ]]; then
     ok "证书文件已包含完整链（$COUNT 张），无需修改。"
 else
     warn "仅 1 张证书 = 只有叶证书，缺少中间证书。开始查找同目录的 fullchain。"
@@ -178,7 +183,7 @@ else
     fi
 
     BK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S).$$"
-    (umask 077 && cp -a "$CONFIG" "$BK") || { rm -f "$BK"; err "备份配置失败，未做任何修改。"; exit 1; }
+    (umask 077 && cp -a "$CONFIG" "$BK" && chmod 600 "$BK") || { rm -f "$BK"; err "备份配置失败，未做任何修改。"; exit 1; }
     info "已备份原配置：$BK"
 
     set_tls_cert "$CONFIG" "$FULL" || { restore_config_file "$BK" "$CONFIG" || true; err "写入配置失败，已恢复备份。"; exit 1; }
@@ -217,8 +222,13 @@ SNI="$(cert_sni "$FINAL_CERT")"
 
 if command -v openssl >/dev/null 2>&1; then
     info "验证 127.0.0.1:${SUB_PORT} 服务出的证书链 (SNI=${SNI:-localhost}) ..."
-    CHAIN="$(echo | timeout 8 openssl s_client -connect "127.0.0.1:${SUB_PORT}" -servername "${SNI:-localhost}" 2>/dev/null \
-             | grep -E 's:|i:|Verify return code')"
+    if command -v timeout >/dev/null 2>&1; then
+        CHAIN="$(echo | timeout 8 openssl s_client -connect "127.0.0.1:${SUB_PORT}" -servername "${SNI:-localhost}" 2>/dev/null \
+                 | grep -E 's:|i:|Verify return code' || true)"
+    else
+        CHAIN="$(echo | openssl s_client -connect "127.0.0.1:${SUB_PORT}" -servername "${SNI:-localhost}" 2>/dev/null \
+                 | grep -E 's:|i:|Verify return code' || true)"
+    fi
     echo "$CHAIN" | sed 's/^/    /'
     if echo "$CHAIN" | grep -q 'Verify return code: 0'; then
         ok "证书链完整，客户端可正常校验。完成。"
