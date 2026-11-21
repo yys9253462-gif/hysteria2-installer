@@ -7801,8 +7801,18 @@ def sync_pin(m, root, meta_path):
 
 
 def prepare(meta_path, port, node_api_key=None):
+    if isinstance(port, bool):
+        raise ValueError('门户端口必须是 1-65535 的整数')
+    try:
+        port_num = int(port)
+    except (TypeError, ValueError):
+        raise ValueError('门户端口必须是 1-65535 的整数') from None
+    if not (1 <= port_num <= 65535):
+        raise ValueError('门户端口必须是 1-65535 的整数')
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    if not isinstance(m, dict):
+        raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     # 先修信任模型（cert_type/server_name/is_insecure/pin），再对齐 pin。
     # 顺序不能反：sync_pin 依赖 is_insecure 判断 pin 该不该留，而 is_insecure
     # 本身可能正漂移着（自签证书被换成正式证书后仍是 true）。
@@ -7851,7 +7861,7 @@ def prepare(meta_path, port, node_api_key=None):
                      username=user, password=password)
     auth = base64.b64encode(f'{user}:{password}'.encode())
 
-    data = dict(port=int(port), token=token, auth_hash=hashlib.sha256(auth).hexdigest(),
+    data = dict(port=port_num, token=token, auth_hash=hashlib.sha256(auth).hexdigest(),
                 session_secret=session_secret, api_key=api_key, users=users,
                 proxy_services=[], page=page, qr=qr_svg.decode('utf-8', 'replace'), clash=clash, sing=sing)
     for filename, value in [('portal.json', data), ('portal-access.json', portal_access_payload(base, user, password, api_key))]:
@@ -12584,6 +12594,9 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             binary_replaced = False
             try:
+                if unit_suspended('xray'):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '节点因流量超额停用中，请在控制台恢复节点后再安装并启用 Reality'})
                 # 三个下载源 × 45 秒 + 校验/解压，全程远超 30 秒默认死线。
                 if not self._extend_deadline(300, heavy=True):
                     return self.reply_json(409, {'ok': False, 'error':
@@ -12633,7 +12646,9 @@ if __name__ == '__main__':
                             '最常见原因是 TCP 443 已被其他服务（如 Caddy / Nginx）占用。'
                             '日志尾部：%s' % (xr_state, xr_log.strip()[-400:])})
 
-                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % config_section(data, 'reality_config').get('port', '')})
+                with data_lock:
+                    reality_port = config_section(data, 'reality_config').get('port', '')
+                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % reality_port})
             except Exception as e:
                 # 二进制已经换成新版后，后续配置一步失败（例如找不到空闲端口）时要说清楚：
                 # 旧回复只有「安装执行异常」，管理员不知道正在跑的协议下次重启就会用新核心。
