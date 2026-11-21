@@ -182,19 +182,28 @@ hy2_git_blob_sha() {
     { printf 'blob %s\0' "$size"; cat -- "$f"; } | sha1sum | awk '{print $1}'
 }
 
-# 拒绝含绝对路径或 `..` 的 tar 包（防路径穿越以 root 写出临时目录）。
+# 拒绝含绝对路径、`..`、反斜杠、空清单或链接/特殊文件成员的 tar 包（防路径穿越与符号链接逃逸）。
 hy2_tar_listing_safe() {
-    local member listing
+    local member listing vlisting vline
     [[ -f "${1:-}" ]] || return 1
     # 从 stdin 读包：GNU tar 会把带冒号的路径（如 Windows 盘符）当成远程主机。
-    # 读不出清单必须判为不安全（fail-closed），否则损坏或异常的包会被放行。
+    # 读不出清单或清单为空必须判为不安全（fail-closed），否则损坏或异常的包会被放行。
     listing="$(tar -tzf - <"$1" 2>/dev/null)" || return 1
+    [[ -n "$listing" ]] || return 1
     while IFS= read -r member; do
         member="${member%$'\r'}"
         case "$member" in
-            /*|..|../*|*/../*|*/..) return 1 ;;
+            /*|..|../*|*/../*|*/..|*\\*) return 1 ;;
         esac
     done <<<"$listing"
+    vlisting="$(tar -tvzf - <"$1" 2>/dev/null)" || return 1
+    [[ -n "$vlisting" ]] || return 1
+    while IFS= read -r vline; do
+        case "$vline" in
+            -*|d*) ;;
+            *) return 1 ;;
+        esac
+    done <<<"$vlisting"
     return 0
 }
 
@@ -1481,6 +1490,10 @@ setup_cert_via_existing_caddy() {
     local domain="$1"
     local certdir="/var/lib/caddy/.local/share/caddy/certificates"
     command -v caddy >/dev/null 2>&1 || { log_err "未找到 caddy 命令。"; return 1; }
+    if [[ -z "$domain" || "$domain" == *..* || ! "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        log_err "域名格式不合法，已拒绝写入 Caddyfile: ${domain}"
+        return 1
+    fi
 
     log_step "检测到本机 Caddy，正尝试让它为 ${domain} 签发证书..."
     # 先看它手里有没有现成的（含自动续期签过的）
@@ -1489,8 +1502,8 @@ setup_cert_via_existing_caddy() {
         return 0
     fi
 
-    # 备份后追加站点块
-    local cf="/etc/caddy/Caddyfile" bak
+    # 备份后在同目录候选文件上构造并校验，校验通过才原子替换生产 Caddyfile
+    local cf="/etc/caddy/Caddyfile" bak cand rb_tmp
     [[ -f "$cf" ]] || { log_err "找不到 /etc/caddy/Caddyfile。"; return 1; }
     bak="${cf}.bak-hy2-$(date +%Y%m%d-%H%M%S)"
     cp -a "$cf" "$bak" || { log_err "备份 Caddyfile 失败。"; return 1; }
@@ -1499,7 +1512,8 @@ setup_cert_via_existing_caddy() {
     # 幂等：已存在该域名块就不重复追加
     local appended=0
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
-        cat >> "$cf" <<CEOF
+        cand="$(mktemp "${cf}.hy2-tmp.XXXXXX")" || { log_err "创建 Caddyfile 候选临时文件失败。"; return 1; }
+        if ! cp -p "$cf" "$cand" || ! cat >> "$cand" <<CEOF
 
 # 证书签发站点（由 install.sh 自动追加）
 # 用途：本机 80/443 已被 Caddy 占用，内置 ACME 无法自行签发，
@@ -1508,11 +1522,24 @@ ${domain} {
 $(caddy_decoy_directives "$domain")
 }
 CEOF
+        then
+            rm -f "$cand"
+            log_err "写入 Caddyfile 候选配置失败，生产配置未改动。"
+            return 1
+        fi
+        if ! caddy validate --config "$cand" --adapter caddyfile >/dev/null 2>&1; then
+            rm -f "$cand"
+            log_err "追加后的 Caddyfile 校验不通过，生产配置未改动。"
+            return 1
+        fi
+        if ! mv -f "$cand" "$cf"; then
+            rm -f "$cand"
+            log_err "原子替换 Caddyfile 失败，生产配置未改动。"
+            return 1
+        fi
         appended=1
-    fi
-    if ! caddy validate --config "$cf" >/dev/null 2>&1; then
-        log_err "追加后的 Caddyfile 校验不通过，已回滚。"
-        cp -a "$bak" "$cf"
+    elif ! caddy validate --config "$cf" --adapter caddyfile >/dev/null 2>&1; then
+        log_err "现有 Caddyfile 校验不通过，已中止。"
         return 1
     fi
     # reload 而非 restart：保住现有线上连接（Caddy 2 在跑生产站点）
@@ -1533,7 +1560,13 @@ CEOF
         sleep 5
     done
     if [[ "$appended" == 1 ]]; then
-        cp -a "$bak" "$cf" 2>/dev/null || true
+        rb_tmp="$(mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
+        if [[ -n "$rb_tmp" ]] && cp -p "$bak" "$rb_tmp" 2>/dev/null && mv -f "$rb_tmp" "$cf" 2>/dev/null; then
+            :
+        else
+            rm -f "$rb_tmp" 2>/dev/null || true
+            cp -a "$bak" "$cf" 2>/dev/null || true
+        fi
         systemctl reload caddy 2>/dev/null || true
         log_warn "签发超时，已从备份回滚本次自动追加到 Caddyfile 的占位站点块。"
     fi
@@ -4684,7 +4717,10 @@ install_warp_local_proxy() {
         fi
         # ⚠️ 旧实现回退只改了 WP_VER，拼 URL 却仍用空的 WP_TAG，于是回退分支拼出
         #    `.../download//wireproxy_...`（404），回退形同虚设。现在统一用 WP_TAG。
-        if [[ -z "$WP_TAG" || "$WP_TAG" == "null" || "$WP_TAG" == *..* || ! "$WP_TAG" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+        if [[ -z "$WP_TAG" || "$WP_TAG" == "null" ]]; then
+            WP_TAG="v1.1.3"
+        fi
+        if [[ "$WP_TAG" == *..* || ! "$WP_TAG" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
             WP_TAG="v1.1.3"
         fi
         WP_ASSET="wireproxy_linux_${WP_ARCH}.tar.gz"

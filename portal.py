@@ -14796,7 +14796,8 @@ if [ ! -x "$WP_BIN" ]; then
     else
         TAG=$(printf '%s' "$RAW" | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)
     fi
-    if [[ -z "$TAG" || "$TAG" == "null" || "$TAG" == *..* || ! "$TAG" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+    case "$TAG" in ""|null) TAG="v1.1.3" ;; esac
+    if [[ "$TAG" == *..* || ! "$TAG" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
         TAG="v1.1.3"
     fi
     WP_DL="wireproxy_linux_${WP_A}.tar.gz"
