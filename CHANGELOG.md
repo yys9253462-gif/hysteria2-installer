@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十五批十项修复，门户 2.55
+
+- AnyTLS 与 TUIC 启用路径加锁与回滚键清理（`portal.py` 的 `_apply_anytls_enable` 与 `_apply_tuic_enable`）：将 `_apply_anytls_enable` 对 `data['anytls_config']` 的深拷贝移入 `data_lock`（数据锁）内部消除并发迭代隐患；`_apply_tuic_enable` 启用失败回滚时，若原无 `tuic_config` 则执行 `data.pop('tuic_config', None)` 而非残留空字典。
+- 核心安装与卸载处理器参数前置校验与回滚隔离（`portal.py` 的 `_h_post_install_core` 与 `_h_post_uninstall_core`）：前置校验 `0 <= Content-Length <= 65536` 与合法核心名后再申领 `heavy=True` 重型槽，防止非法请求空占重型槽；卸载停服失败回滚循环逐单元隔离超时与子进程异常，避免首个单元恢复超时中断其余单元恢复，并统一兜底 500 错误格式。
+- 流量计量核心非对象状态与非法采样时间拦截（`usage-meter-core-20261007-v1.py`）：`apply_sample`、`total_bytes` 与 `adjusted_bytes` 统一拦截非字典 `state` 抛出 `ValueError`；`apply_sample` 前置校验 `sampled_at` 为非空字符串或非布尔有限数字，拒绝 `None`、布尔值、空串及非有限数且不污染原状态。
+- 全门户剩余五处表单长度校验清零与鉴权布尔时间戳过滤（`portal.py`）：`_h_post_manage_proxy`、`_h_post_install_amneziawg`、`_h_post_manage_amneziawg`、`_set_bbr_locked` 与 `_h_post_manage_user` 补齐 `0 <= Content-Length <= 65536` 拦截；`/auth` 两处 `ip_tracker` 过滤补齐 `not isinstance(t, bool)` 排除损坏布尔时间戳。
+- 网页端安装 AmneziaWG 停用护栏与动态端口冲突校验（`portal.py` 的 `_h_post_install_amneziawg`）：整机流量超额停用期间返回 409 拒绝绕过停用启动服务；用户指定端口时额外读取 `client_meta.json`，提前拦截与 Hysteria2 主监听端口或自定义端口跳跃区间冲突的端口。
+- 借 Nginx 签发证书原子落盘与核心操作锁/回滚备份加固（`install.sh`）：`setup_cert_via_nginx` 改为同目录 `mktemp` 原子写入 Nginx 验证站点配置，并将私钥安装与归属标记纳入 `umask 077`；`uninstall_all` 持锁后补充 `RETURN` 释放陷阱防中途退出漏锁；`flow_update_core` 在 `umask 077` 下创建核心回滚副本。
+- 入站代理安装脚本原子落盘与 HTTPS 私钥权限保护（`install.sh` 的 `install_gost`）：自签 HTTPS 代理证书与私钥生成纳入 `umask 077` 并显式 `chmod 600`（消除此前 0644 暴露私钥窗口）；初始配置 `gost.yml` 与启动自检脚本 `hy2-gost-selfcheck` 改为同目录 `mktemp` 原子替换；归属标记在 `umask 077` 下创建。
+- 四协议状态接口补齐死线续期（`portal.py` 的 `_h_get_vmess_status`、`_h_get_anytls_status`、`_h_get_tuic_status` 与 `_h_get_vlessenc_status`）：四个调用 `qrencode` 子进程的状态查询接口均补齐 `self._extend_deadline(30)`，与 Reality 状态接口对齐，避免低配机多并发下撞上默认 30 秒连接死线断连。
+- 入站代理证书路径解析容错与 Reality 设备上限线程布尔时间戳过滤（`portal.py` 的 `gost_tls_paths` 与 `reality_iplimit_worker`）：`gost_tls_paths` 捕获 `shlex.split` 的未闭合引号 `ValueError` 并校验备用自签证书/私钥非空字节；`reality_iplimit_worker` 过滤 `ip_tracker` 排除布尔时间戳并复用单次时钟扫描黑名单。
+- Xray 配置事务回滚三步独立隔离（`portal.py` 的 `apply_xray_config_transaction`）：将配置恢复、开机自启恢复与服务启停恢复拆分为三段独立异常处理，确保写盘失败不掩盖原始启动错误，且 `systemctl enable/disable` 超时不跳过后续服务恢复。
+
 ## 2026-11-22 — 第四十四批十项修复，门户 2.54
 
 - 在线更新处理器四重加固（`portal.py` 的 `_h_post_do_upgrade_impl`）：校验 `Content-Length` 处于 `0..65536` 拦截负值或超大正文防止读取阻塞；`reality-online` 分支前置 `self._extend_deadline(60)` 并校验 `usage-meter-config.json` 顶层与 `reality` 字段（`binary`/`address`）有效后再执行；`awg` 分支检查 `ensure_awgctl(force=True)` 返回值，刷新失败立即报错中止；门户更新生成重启脚本时加锁读取门户端口。
