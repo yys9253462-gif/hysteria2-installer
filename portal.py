@@ -11552,14 +11552,22 @@ if __name__ == '__main__':
                         else:
                             data.pop('proxy_services', None)
                     subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=30)
-                    if old_assets[gost_binary] is not None and old_gost_active:
-                        subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
-                        subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
-                    elif not old_gost_enabled or old_assets[gost_binary] is None:
+                    if old_assets[gost_binary] is None:
                         subprocess.run(['systemctl', 'disable', '--now', 'gost'],
                                        capture_output=True, timeout=30)
                         subprocess.run(['systemctl', 'stop', 'gost'],
                                        capture_output=True, timeout=30)
+                    else:
+                        # 独立还原原有开机自启与运行状态，重启前先清理失败计数防撞上限。
+                        if old_gost_enabled:
+                            subprocess.run(['systemctl', 'enable', 'gost'], capture_output=True, timeout=30)
+                        else:
+                            subprocess.run(['systemctl', 'disable', 'gost'], capture_output=True, timeout=30)
+                        if old_gost_active:
+                            subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=15)
+                            subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=30)
+                        else:
+                            subprocess.run(['systemctl', 'stop', 'gost'], capture_output=True, timeout=30)
 
                 if not installed:
                     # 把【每个源】的错误都报出来。
