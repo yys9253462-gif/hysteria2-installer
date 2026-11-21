@@ -633,10 +633,11 @@ render_server_config() {
     s4v="$(meta_get S4)"
     [[ "$s4v" =~ ^[0-9]+$ ]] || s4v=0
     mtu=$(( 1420 - 10#$s4v ))
+    (( mtu < 1280 )) && mtu=1280
 
     local tmp
-    tmp="$(mktemp "${AWG_DIR}/.conf.XXXXXX")"
-    {
+    tmp="$(umask 077 && mktemp "${AWG_DIR}/.conf.XXXXXX")"
+    if ! {
         echo "# ============================================================"
         echo "# AmneziaWG 服务端配置 —— 由 hy2-awgctl 自动生成，请勿手工编辑"
         echo "# 协议线: AWG ${line}.x    监听: UDP ${port}    出口网卡: ${wan}"
@@ -693,10 +694,15 @@ render_server_config() {
                 "\n[Peer]\n# \(.name)\nPublicKey = \(.public_key)\nPresharedKey = \(.preshared_key)\nAllowedIPs = \(.address)/32"
             ' "$AWG_PEERS_FILE"
         fi
-    } > "$tmp"
+    } > "$tmp"; then
+        rm -f "$tmp"
+        die "渲染 AmneziaWG 服务端配置失败"
+    fi
 
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$AWG_CONFIG"
+    if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$AWG_CONFIG"; then
+        rm -f "$tmp"
+        die "落盘 AmneziaWG 服务端配置失败"
+    fi
 }
 
 # 生成客户端配置文本
@@ -714,6 +720,7 @@ render_client_config() {
     s4v="$(meta_get S4)"
     [[ "$s4v" =~ ^[0-9]+$ ]] || s4v=0
     mtu=$(( 1420 - 10#$s4v ))
+    (( mtu < 1280 )) && mtu=1280
 
     priv="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .private_key' "$AWG_PEERS_FILE")"
     psk="$(jq  -r --arg n "$name" '.peers[]? | select(.name==$n) | .preshared_key' "$AWG_PEERS_FILE")"
@@ -769,7 +776,11 @@ render_client_config() {
 # ==============================================================================
 
 write_service() {
-    cat > "$AWG_SERVICE" <<EOF
+    local svc_dir tmp
+    svc_dir="$(dirname "$AWG_SERVICE")"
+    mkdir -p "$svc_dir"
+    tmp="$(mktemp "${svc_dir}/.awg-service.XXXXXX")"
+    if ! cat > "$tmp" <<EOF
 [Unit]
 Description=AmneziaWG Server (userspace daemon via awg-quick)
 Documentation=https://github.com/${AWG_REPO}
@@ -793,7 +804,14 @@ LimitNOFILE=65535
 [Install]
 WantedBy=multi-user.target
 EOF
-    chmod 644 "$AWG_SERVICE"
+    then
+        rm -f "$tmp"
+        die "写入 ${AWG_SERVICE} 失败"
+    fi
+    if ! chmod 644 "$tmp" || ! mv -f "$tmp" "$AWG_SERVICE"; then
+        rm -f "$tmp"
+        die "替换 ${AWG_SERVICE} 失败"
+    fi
     systemctl daemon-reload
 }
 
@@ -836,8 +854,12 @@ revoke_firewall() {
 peers_init() {
     if [[ ! -f "$AWG_PEERS_FILE" ]]; then
         mkdir -p "$AWG_DIR"
-        echo '{"peers":[]}' > "$AWG_PEERS_FILE"
-        chmod 600 "$AWG_PEERS_FILE"
+        local tmp
+        tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers-init.XXXXXX")"
+        if ! printf '{"peers":[]}\n' > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$AWG_PEERS_FILE"; then
+            rm -f "$tmp"
+            die "初始化客户端列表失败：${AWG_PEERS_FILE}"
+        fi
     fi
 }
 
@@ -865,8 +887,10 @@ next_peer_address() {
 peer_apply_live_add() {
     local pub="$1" psk="$2" addr="$3"
     service_active || return 0
-    local pskf
-    pskf="$(mktemp)"
+    local pskf=""
+    trap 'rm -f "${pskf:-}"' RETURN
+    pskf="$(umask 077 && mktemp)"
+    chmod 600 "$pskf"
     printf '%s\n' "$psk" > "$pskf"
     if ! "$AWG_BIN" set "$AWG_LINK" peer "$pub" preshared-key "$pskf" allowed-ips "${addr}/32" 2>/dev/null; then
         rm -f "$pskf"
@@ -878,7 +902,6 @@ peer_apply_live_add() {
         log_warn "无法热添加该客户端，已按新配置重启 AmneziaWG（其他客户端会短暂重连）。"
         return 0
     fi
-    rm -f "$pskf"
     return 0
 }
 
