@@ -24,6 +24,10 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     )
     if not valid_ts:
         raise ValueError('invalid sampled_at')
+    if active_users is not None:
+        if isinstance(active_users, (str, bytes)) or not hasattr(active_users, '__iter__'):
+            raise ValueError('invalid active_users')
+        active_users = set(active_users)
     clean = {}
     for uid, pair in counters.items():
         if not isinstance(uid, str) or not isinstance(pair, dict):
@@ -69,9 +73,6 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     if 'totals' in new and not isinstance(new.get('totals'), dict):
         raise ValueError('invalid totals')
     totals = new.setdefault('totals', {})
-    # 加上增量前校验原值，负数/布尔值不能被一次采样洗成正常整数。
-    for uid in clean:
-        total_bytes(new, uid)
     retired_value = new.get('retired_users', [])
     retired = {uid for uid in retired_value if isinstance(uid, str)} if isinstance(retired_value, list) else set()
     if active_users is not None:
@@ -84,6 +85,10 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     ignored_counters = {uid: clean.pop(uid) for uid in ignored if uid in clean}
     for uid in retired:
         totals.pop(uid, None)
+    # 加上增量前校验活跃用户的原值，负数/布尔值不能被一次采样洗成正常整数；
+    # 已退役用户的残余脏 totals 已在上方清掉，不再拖死正常用户的计量。
+    for uid in clean:
+        total_bytes(new, uid)
     adjustments = new.get('adjustments')
     if isinstance(adjustments, dict):
         # 账户删除并清空 totals 时，必须一并清掉平级 adjustments[uid]；

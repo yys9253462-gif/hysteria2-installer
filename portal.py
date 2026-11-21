@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.59'
+PORTAL_VERSION = '2.60'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -493,7 +493,7 @@ def validate_outbound(entry):
             return False, None, "SOCKS5 地址不能包含控制字符"
         # 支持 host:port 与 [IPv6]:port 两种形式，且必须带合法端口
         if addr.startswith('['):
-            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:(\d{1,5})', addr)
+            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:([0-9]{1,5})', addr)
             if not m_v6:
                 return False, None, "SOCKS5 IPv6 地址格式应为 [IPv6]:port，例如 [::1]:1080"
             try:
@@ -504,7 +504,7 @@ def validate_outbound(entry):
                 return False, None, "SOCKS5 方括号内必须是 IPv6 地址"
             port_str = m_v6.group(2)
         else:
-            if not re.fullmatch(r'[^\s:\[\]]+:\d{1,5}', addr):
+            if not re.fullmatch(r'[^\s:\[\]]+:[0-9]{1,5}', addr):
                 return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
             _, port_str = addr.rsplit(':', 1)
         if not (0 < int(port_str) < 65536):
@@ -1047,19 +1047,34 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
             data['outbound_mode'] = 'rules'
             state['outbound_mode'] = 'rules'
     rendered = render_egress_config(original, state)
+    replaced = False
     try:
         before = _hy2_runtime_identity()
         if rendered == original and _hy2_config_loaded(cfg, before):
             return True, ''
+        orig_mode = cfg.stat().st_mode & 0o777
         fd, tmp = tempfile.mkstemp(prefix='.config.yaml.warp-', dir=str(cfg.parent))
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                fd = None
                 stream.write(rendered)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.chmod(tmp, cfg.stat().st_mode & 0o777)
+            os.chmod(tmp, orig_mode)
             os.replace(tmp, cfg)
+            replaced = True
+            if hasattr(os, 'O_DIRECTORY'):
+                dir_fd = os.open(cfg.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
         finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if os.path.exists(tmp):
                 os.unlink(tmp)
         # 整机流量超额停用期间不能启动服务，但配置应当落盘并视为成功 ——
@@ -1082,6 +1097,8 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
     except Exception as exc:
         detail = '应用 WARP 分流配置失败: %s' % exc
 
+    if not replaced:
+        return False, detail
     rollback_state = _rollback_outbounds(cfg, original)
     if rollback_state != 'active':
         return False, '%s；并且恢复原配置后服务状态为 %s' % (detail, rollback_state)
@@ -1554,9 +1571,19 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20,
     全节点用户连不上，控制台也没法远程修 —— 所以重启后轮询 /api/health，
     限时内没有响应就把 .bak 换回去、删掉本次新增的文件，再重启一次。
     """
+    if isinstance(port, bool):
+        raise ValueError('invalid portal port')
+    port_num = int(port)
+    if not 1 <= port_num <= 65535:
+        raise ValueError('invalid portal port')
+    if isinstance(wait_seconds, bool):
+        raise ValueError('invalid wait_seconds')
+    wait_num = int(wait_seconds)
+    if not 1 <= wait_num <= 600:
+        raise ValueError('invalid wait_seconds')
     probe = ("import urllib.request; "
              "urllib.request.urlopen('http://127.0.0.1:%d/api/health', timeout=2).read()"
-             % int(port))
+             % port_num)
     restore = ' '.join('cp -p -f %s %s;' % (shlex.quote(str(bak)), shlex.quote(str(dest)))
                        for dest, bak in backups)
     remove = ' '.join('rm -f %s;' % shlex.quote(str(dest)) for dest in created)
@@ -1579,7 +1606,7 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20,
             '{ logger -t hysteria-portal "回滚后已恢复"; exit 0; }; done; '
             'logger -t hysteria-portal "回滚后仍未启动，需要人工介入"; '
             'echo "portal rollback failed at $(date -Is)" > %s'
-            % (int(wait_seconds), shlex.quote(probe), marker, restore, remove,
+            % (wait_num, shlex.quote(probe), marker, restore, remove,
                shlex.quote(probe), marker))
 
 
@@ -2496,7 +2523,7 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
     """
     try:
         text = Path(config_path).read_text(encoding='utf-8')
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return None
     for line in text.split('\n'):
         stripped = line.strip()
@@ -2508,7 +2535,7 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
             # 形如 ":11690" / "0.0.0.0:11690" / "11690"
             # 去掉可能的引号（`: "8443"` 这种写法 YAML 完全合法）。
             raw = raw.rsplit(':', 1)[-1].strip().strip('"').strip("'")
-            if raw.isdigit():
+            if raw.isascii() and raw.isdigit():
                 port = int(raw)
                 # 端口 0 或越界不能当作有效值返回：调用方会把它拼进订阅链接，
                 # 生成一个永远连不上的地址（2026-10-25 修）。
@@ -2631,6 +2658,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     # meta 字段先清洗再用（2026-11-06 修）：server_name / public_ip 为数字、列表或 null 时
     # 下面的 html.escape 抛 AttributeError，整个管理页 500；is_insecure 写成字符串 "false"
     # 时被当成真，标题换成公网 IP 并显示伪装 SNI 提示。
+    m = m if isinstance(m, dict) else {}
     is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 自签模式下 server_name 是**伪装 SNI**（如 www.bing.com），机主既不拥有它、
     # 它也不指向本机。此前 <h1> 直接显示 server_name，于是每个自签节点的门户
@@ -7591,8 +7619,14 @@ def _valid_port(value):
     """
     if isinstance(value, bool):
         return 0
-    if isinstance(value, float) and not value.is_integer():
-        return 0
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return 0
+    if isinstance(value, str):
+        s = value.strip()
+        if not (s.isascii() and s.isdigit()):
+            return 0
+        value = s
     try:
         port = int(value)
     except (TypeError, ValueError, OverflowError):
@@ -7635,7 +7669,7 @@ def clean_hop_range(value):
     """端口跳跃区间规范成 (起, 止)；格式不对或越界返回 None（按未开启处理）。"""
     if not isinstance(value, str):
         return None
-    hit = re.fullmatch(r'\s*(\d{1,5})\s*[-:]\s*(\d{1,5})\s*', value)
+    hit = re.fullmatch(r'\s*([0-9]{1,5})\s*[-:]\s*([0-9]{1,5})\s*', value)
     if not hit:
         return None
     lo, hi = int(hit.group(1)), int(hit.group(2))
@@ -7655,6 +7689,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     改返回结构会让任何漏改的一处静默错位。VMess 的 vmess:// 直链由
     vmess_uri_for_user() 单独生成，在需要的端点里作为额外字段下发。
     """
+    m = m if isinstance(m, dict) else {}
     is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 标签会进 quote() 与客户端配置；非字符串（调用方传错或数据被改坏）
     # 会抛 TypeError，把整页渲染和订阅下载一起打断。
@@ -7904,6 +7939,8 @@ def sync_pin(m, root, meta_path):
     Self-signed   -> a valid lowercase HEX64 pin, recomputed from cert/server.crt
                      whenever it is missing or malformed.
     """
+    if not isinstance(m, dict):
+        return
     # is_insecure 写成字符串 "false" 时不能当成自签（2026-11-06 修），否则会给可信证书节点写 pin。
     if clean_node_identity(m)[0]:
         cur = m.get('pin_sha256')
@@ -7923,14 +7960,16 @@ def sync_pin(m, root, meta_path):
 
 
 def prepare(meta_path, port, node_api_key=None):
-    if isinstance(port, bool):
+    port_num = _valid_port(port)
+    if not port_num:
         raise ValueError('门户端口必须是 1-65535 的整数')
-    try:
-        port_num = int(port)
-    except (TypeError, ValueError):
-        raise ValueError('门户端口必须是 1-65535 的整数') from None
-    if not (1 <= port_num <= 65535):
-        raise ValueError('门户端口必须是 1-65535 的整数')
+    if node_api_key is not None:
+        if not isinstance(node_api_key, str):
+            raise ValueError('node_api_key 必须是字符串')
+        if node_api_key:
+            if (not node_api_key.isascii()
+                    or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in node_api_key)):
+                raise ValueError('node_api_key 不能包含空白、控制字符或非 ASCII 字符')
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     if not isinstance(m, dict):
@@ -8968,6 +9007,9 @@ def serve(path):
                     continue
                 try:
                     subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError) as rf_exc:
+                    _log_ignored('traffic_resume_reset_failed', rf_exc)
+                try:
                     r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
                     results[u] = r.returncode == 0
                 except Exception:
@@ -8998,10 +9040,13 @@ def serve(path):
                 if not succeeded or (not suspend and unit in _retired):
                     continue
                 compensate = 'start' if suspend else 'stop'
-                try:
-                    if compensate == 'start':
+                if compensate == 'start':
+                    try:
                         subprocess.run(['systemctl', 'reset-failed', unit],
                                        capture_output=True, timeout=5)
+                    except (OSError, subprocess.SubprocessError) as rf_exc:
+                        _log_ignored('traffic_compensate_reset_failed', rf_exc)
+                try:
                     subprocess.run(['systemctl', compensate, unit],
                                    capture_output=True, timeout=20)
                 except Exception:
@@ -10688,17 +10733,36 @@ if __name__ == '__main__':
                 # 先解析出客户端地址再限流：限流按来源分桶（H4，2026-11-02）。
                 try:
                     length = int(self.headers.get('Content-Length', 0))
-                    body = self.rfile.read(length).decode('utf-8', errors='replace')
+                    if length < 0 or length > 65536:
+                        raise ValueError('invalid auth content-length')
+                    body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                     req_data = json.loads(body)
+                    if not isinstance(req_data, dict):
+                        raise ValueError('auth payload must be an object')
                     client_auth = req_data.get('auth', '')
                     if not isinstance(client_auth, str):
                         raise ValueError('auth must be a string')
                     client_addr = req_data.get('addr', '')
+                    if client_addr is None:
+                        client_addr = ''
+                    if not isinstance(client_addr, str):
+                        raise ValueError('addr must be a string')
                     # ⚠️ hysteria HTTP auth 的 tx/rx 是客户端**带宽声明**，
                     # 不是实际传输字节。把它累加进用量会让数字虚高且离谱。
                     # 真实用量由计量模块从 hysteria trafficStats / xray stats
                     # 的单调计数器累计（见 usage-meter-core）。
-                    client_ip = client_addr.rsplit(':', 1)[0].strip('[]') if client_addr else ''
+                    raw_addr = client_addr.strip()
+                    client_ip = ''
+                    if raw_addr:
+                        if raw_addr.startswith('[') and ']' in raw_addr:
+                            client_ip = raw_addr[1:raw_addr.index(']')]
+                        else:
+                            try:
+                                # 先直接解析裸 IPv4 / 裸 IPv6，避免 rsplit(':') 截断无端口 IPv6。
+                                ipaddress.ip_address(raw_addr)
+                                client_ip = raw_addr
+                            except ValueError:
+                                client_ip = raw_addr.rsplit(':', 1)[0].strip('[]')
                     try:  # 与计量模块同一写法，避免 IPv6 表示不同导致同一设备被算两次
                         _addr = ipaddress.ip_address(client_ip) if client_ip else None
                         # 双栈监听时 IPv4 客户端报成 ::ffff:a.b.c.d（2026-11-06 修）：拦截名单与
@@ -10755,7 +10819,7 @@ if __name__ == '__main__':
                                 raw_tracker = ip_tracker.get(matched_uid)
                                 active_ips = (
                                     {ip: t for ip, t in raw_tracker.items()
-                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                                     if isinstance(raw_tracker, dict) else {}
                                 )
                                 ip_tracker[matched_uid] = active_ips
@@ -10774,7 +10838,7 @@ if __name__ == '__main__':
                                 tracker = ip_tracker.get(matched_uid)
                                 tracker = (
                                     {ip: t for ip, t in tracker.items()
-                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                     if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
                                     if isinstance(tracker, dict) else {}
                                 )
                                 tracker[client_ip] = now_ts
@@ -10799,6 +10863,8 @@ if __name__ == '__main__':
 
                 try:
                     length = int(self.headers.get('Content-Length', 0))
+                    if length < 0 or length > 1048576:
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
                     body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '{}'
                     params = json.loads(body)
                 except Exception:
@@ -10823,6 +10889,11 @@ if __name__ == '__main__':
                                 value = params[key]
                                 if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
                                     raise ValueError()
+                                if isinstance(value, str):
+                                    sval = value.strip()
+                                    if not (sval.isascii() and sval.isdigit()):
+                                        raise ValueError()
+                                    value = sval
                                 params[key] = int(value)
                                 if params[key] < (1 if key == 'duration_days' else 0):
                                     raise ValueError()
@@ -10830,6 +10901,8 @@ if __name__ == '__main__':
                             # 与上面的整数字段一样拒绝 bool（2026-11-04 修）：float(True) == 1.0，
                             # {"traffic_gb": true} 被当成 1 GB 配额写进去。
                             if isinstance(params['traffic_gb'], bool):
+                                raise ValueError()
+                            if isinstance(params['traffic_gb'], str) and not params['traffic_gb'].isascii():
                                 raise ValueError()
                             params['traffic_gb'] = float(params['traffic_gb'])
                             if not math.isfinite(params['traffic_gb']) or params['traffic_gb'] < 0:
@@ -10862,6 +10935,9 @@ if __name__ == '__main__':
                     if pwd != pwd.strip():
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: password must not start or end with whitespace'})
+                    if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: password must not contain control characters'})
                     # 🔴 2026-10-25 修：这些值直接来自请求体，`int('abc')` 会抛
                     # ValueError。该分支不在任何 try 里，异常会穿透 do_POST →
                     # 连接被掐断，客户端只看到 "Remote end closed connection"，
@@ -10992,6 +11068,10 @@ if __name__ == '__main__':
                                     data['users'][user_id] = record
                                     save_data()
                                 except ValueError:
+                                    if previous_meter is missing:
+                                        data.pop('usage_meter', None)
+                                    else:
+                                        data['usage_meter'] = previous_meter
                                     conflict = (409, 'Invalid meter ledger; reconciliation not applied')
                                 except AtomicWriteDurabilityError:
                                     # 文件已替换：保留新值并继续同步协议，随后返回不确定状态。
@@ -11001,6 +11081,8 @@ if __name__ == '__main__':
                                         if isinstance(data.get('users'), dict):
                                             data['users'].pop(user_id, None)
                                     else:
+                                        if not isinstance(data.get('users'), dict):
+                                            data['users'] = {}
                                         data['users'][user_id] = existing
                                     if previous_meter is missing:
                                         data.pop('usage_meter', None)
@@ -11009,6 +11091,9 @@ if __name__ == '__main__':
                                     conflict = (503, 'Reconciliation save failed; disk state may require verification')
                             elif conflict is None:
                                 previous_record = copy.deepcopy(existing)
+                                missing = object()
+                                previous_meter = (copy.deepcopy(data['usage_meter'])
+                                                  if 'usage_meter' in data else missing)
                                 restore_meter_user(data, user_id)
                                 if not isinstance(data.get('users'), dict):
                                     data['users'] = {}
@@ -11022,7 +11107,13 @@ if __name__ == '__main__':
                                         if isinstance(data.get('users'), dict):
                                             data['users'].pop(user_id, None)
                                     else:
+                                        if not isinstance(data.get('users'), dict):
+                                            data['users'] = {}
                                         data['users'][user_id] = previous_record
+                                    if previous_meter is missing:
+                                        data.pop('usage_meter', None)
+                                    else:
+                                        data['usage_meter'] = previous_meter
                                     reality_registry(data)
                                     conflict = (503, 'User save failed; disk state may require verification')
                             if conflict is None:
@@ -11122,9 +11213,10 @@ if __name__ == '__main__':
                     try:
                         changes = {}
                         if 'password' in params:
-                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修）。
+                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修），且拒绝控制字符。
                             if (not isinstance(params['password'], str) or not params['password'].strip()
-                                    or params['password'] != params['password'].strip()):
+                                    or params['password'] != params['password'].strip()
+                                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in params['password'])):
                                 raise ValueError()
                             changes['password'] = params['password']
                         if 'expires_at' in params:
@@ -11301,7 +11393,7 @@ if __name__ == '__main__':
                         _raw_tracker = ip_tracker.get(user_id)
                         recent = ({
                             ip for ip, t in _raw_tracker.items()
-                            if isinstance(t, (int, float)) and not isinstance(t, bool)
+                            if isinstance(t, (int, float)) and not isinstance(t, bool) and math.isfinite(t)
                             and 0 <= now_ts - t < IP_TIMEOUT_SECONDS
                         } if isinstance(_raw_tracker, dict) else set())
                     # 只对「新加入拦截、且此刻在线」的 IP 踢一次：控制台每轮续期不会反复踢人。
@@ -11327,11 +11419,31 @@ if __name__ == '__main__':
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
                         previous_global_deny = copy.deepcopy(global_ip_deny.get(user_id))
+                        previous_had_pending_key = '_pending_revocations' in data
+                        previous_user_was_pending = user_id in pending_revocations(data)
+                        meter_obj = data.get('usage_meter')
+                        previous_had_meter_total = False
+                        previous_meter_total = None
+                        previous_had_meter_adj = False
+                        previous_meter_adj = None
+                        previous_had_retired_key = False
+                        previous_retired_val = None
+                        previous_user_was_retired = False
+                        if isinstance(meter_obj, dict):
+                            totals_obj = meter_obj.get('totals')
+                            if isinstance(totals_obj, dict) and user_id in totals_obj:
+                                previous_had_meter_total = True
+                                previous_meter_total = copy.deepcopy(totals_obj[user_id])
+                            adj_obj = meter_obj.get('adjustments')
+                            if isinstance(adj_obj, dict) and user_id in adj_obj:
+                                previous_had_meter_adj = True
+                                previous_meter_adj = copy.deepcopy(adj_obj[user_id])
+                            previous_had_retired_key = 'retired_users' in meter_obj
+                            previous_retired_val = copy.deepcopy(meter_obj.get('retired_users'))
+                            if isinstance(previous_retired_val, list):
+                                previous_user_was_retired = user_id in previous_retired_val
                         previous = {
                             'user': copy.deepcopy(users_map.get(user_id)),
-
-                            'pending': copy.deepcopy(data.get('_pending_revocations')),
-                            'meter': copy.deepcopy(data.get('usage_meter')),
                             'ip': copy.deepcopy(ip_tracker.get(user_id)),
                             'speed': copy.deepcopy(speed_tracker.get(user_id)),
                         }
@@ -11341,7 +11453,7 @@ if __name__ == '__main__':
                         # successful idempotent deletion must clear that stale scope.
                         global_ip_deny.pop(user_id, None)
                         if previous_had_user:
-                            del data['users'][user_id]
+                            data['users'].pop(user_id, None)
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
@@ -11356,15 +11468,31 @@ if __name__ == '__main__':
                     except OSError:
                         with data_lock:
                             if previous_had_user:
-                                data.setdefault('users', {})[user_id] = previous['user']
-                            if previous['pending'] is None:
-                                data.pop('_pending_revocations', None)
-                            else:
-                                data['_pending_revocations'] = previous['pending']
-                            if previous['meter'] is None:
-                                data.pop('usage_meter', None)
-                            else:
-                                data['usage_meter'] = previous['meter']
+                                if not isinstance(data.get('users'), dict):
+                                    data['users'] = {}
+                                data['users'][user_id] = previous['user']
+                            if not previous_user_was_pending:
+                                remaining_pending = sorted(pending_revocations(data) - {user_id})
+                                if remaining_pending or previous_had_pending_key:
+                                    data['_pending_revocations'] = remaining_pending
+                                else:
+                                    data.pop('_pending_revocations', None)
+                            meter_obj = data.get('usage_meter')
+                            if isinstance(meter_obj, dict):
+                                if previous_had_meter_total and isinstance(meter_obj.get('totals'), dict):
+                                    meter_obj['totals'][user_id] = previous_meter_total
+                                if previous_had_meter_adj and isinstance(meter_obj.get('adjustments'), dict):
+                                    meter_obj['adjustments'][user_id] = previous_meter_adj
+                                if not previous_user_was_retired and isinstance(meter_obj.get('retired_users'), list):
+                                    rem_retired = [uid for uid in meter_obj['retired_users'] if uid != user_id]
+                                    if rem_retired:
+                                        meter_obj['retired_users'] = rem_retired
+                                    elif not previous_had_retired_key:
+                                        meter_obj.pop('retired_users', None)
+                                    elif isinstance(previous_retired_val, list):
+                                        meter_obj['retired_users'] = []
+                                    else:
+                                        meter_obj['retired_users'] = previous_retired_val
                             if previous['ip'] is None:
                                 ip_tracker.pop(user_id, None)
                             else:
@@ -14463,6 +14591,9 @@ if __name__ == '__main__':
                 previous_had_meter_total = False
                 previous_meter_adj = None
                 previous_had_meter_adj = False
+                previous_had_retired_key = False
+                previous_retired_val = None
+                previous_user_was_retired = False
                 previous_ip = None
                 previous_speed = None
                 previous_deny = None
@@ -14571,6 +14702,10 @@ if __name__ == '__main__':
                                 if isinstance(adj_obj, dict) and user_id in adj_obj:
                                     previous_had_meter_adj = True
                                     previous_meter_adj = copy.deepcopy(adj_obj[user_id])
+                                previous_had_retired_key = 'retired_users' in meter_obj
+                                previous_retired_val = copy.deepcopy(meter_obj.get('retired_users'))
+                                if isinstance(previous_retired_val, list):
+                                    previous_user_was_retired = user_id in previous_retired_val
                             previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
                             previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
                             previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
@@ -14617,6 +14752,16 @@ if __name__ == '__main__':
                                     meter_obj['totals'][user_id] = previous_meter_total
                                 if previous_had_meter_adj and isinstance(meter_obj.get('adjustments'), dict):
                                     meter_obj['adjustments'][user_id] = previous_meter_adj
+                                if not previous_user_was_retired and isinstance(meter_obj.get('retired_users'), list):
+                                    rem_retired = [uid for uid in meter_obj['retired_users'] if uid != user_id]
+                                    if rem_retired:
+                                        meter_obj['retired_users'] = rem_retired
+                                    elif not previous_had_retired_key:
+                                        meter_obj.pop('retired_users', None)
+                                    elif isinstance(previous_retired_val, list):
+                                        meter_obj['retired_users'] = []
+                                    else:
+                                        meter_obj['retired_users'] = previous_retired_val
                             if previous_ip is None:
                                 ip_tracker.pop(user_id, None)
                             else:
@@ -15976,8 +16121,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         for source, sample in sources.items():
                             if (isinstance(sample, (tuple, list)) and len(sample) >= 3
                                     and all(isinstance(v, (int, float))
-                                            and not isinstance(v, bool) for v in sample[:3])
-                                    and cur_mono - sample[0] <= SPEED_WINDOW_SECONDS):
+                                            and not isinstance(v, bool)
+                                            and v == v and (v - v == 0) for v in sample[:3])
+                                    and sample[1] >= 0 and sample[2] >= 0
+                                    and 0 <= cur_mono - sample[0] <= SPEED_WINDOW_SECONDS):
                                 recent[source] = sample
                     if recent:
                         speed_tracker[uid] = recent

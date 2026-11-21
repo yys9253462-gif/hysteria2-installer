@@ -2,6 +2,7 @@
 import copy
 import importlib.util
 import json
+import math
 import pathlib
 import sys
 import threading
@@ -13,6 +14,8 @@ ROOT = pathlib.Path(__file__).parent
 
 def load(name, filename):
     spec=importlib.util.spec_from_file_location(name, ROOT / filename)
+    if spec is None or spec.loader is None:
+        raise RuntimeError('unable to load module: ' + str(filename))
     mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod); return mod
 
 core=load('usage_meter_core', 'usage-meter-core-20261007-v1.py')
@@ -174,8 +177,13 @@ class PortalMeter:
         cfg=self.config.get("reality", {})
         if self.read == self._read and "reality" in sources and isinstance(cfg, dict):
             binary = cfg.get("binary")
-            if isinstance(binary, str) and binary and not pathlib.Path(binary).is_file():
-                sources.remove("reality")
+            if isinstance(binary, str) and binary:
+                try:
+                    exists = ('\x00' not in binary) and pathlib.Path(binary).is_file()
+                except (OSError, ValueError):
+                    exists = False
+                if not exists:
+                    sources.remove("reality")
         return sources
 
     def enabled_sources(self):
@@ -374,6 +382,7 @@ class PortalMeter:
                         and isinstance(self.live_snapshot.get('users'), dict)
                         and isinstance(self.live_sampled_at, (int, float))
                         and not isinstance(self.live_sampled_at, bool)
+                        and math.isfinite(self.live_sampled_at)
                         and 0 <= now_ts - self.live_sampled_at < 45)
             live_entry=self.live_snapshot['users'].get(uid) if live_fresh else None
             if not isinstance(live_entry, dict):
@@ -381,6 +390,7 @@ class PortalMeter:
             online_fresh=(isinstance(online_counts, dict)
                           and isinstance(online_sampled_at, (int, float))
                           and not isinstance(online_sampled_at, bool)
+                          and math.isfinite(online_sampled_at)
                           and 0 <= now_ts - online_sampled_at < 30)
             return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),

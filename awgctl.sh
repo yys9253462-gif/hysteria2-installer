@@ -835,6 +835,10 @@ EOF
 
 allow_firewall() {
     local port="$1"
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+        log_warn "跳过无效防火墙端口放行: ${port}"
+        return 1
+    fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw allow "${port}/udp" >/dev/null 2>&1 || true
         log_info "已放行 UFW: ${port}/udp"
@@ -849,7 +853,7 @@ allow_firewall() {
 
 revoke_firewall() {
     local port="$1"
-    [[ "$port" =~ ^[0-9]+$ ]] || return 0
+    [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || return 0
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
     fi
@@ -963,21 +967,20 @@ cmd_peer_add() {
     peers_init
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
-    local priv pub psk addr tmp peers_backup config_backup had_config=0
+    local priv pub psk addr tmp="" peers_backup="" config_backup="" had_config=0
+    trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"' RETURN
     # 先生成密钥、分配地址，再做备份（2026-11-03 修）：地址池满 / genkey 失败时
     # 旧实现在备份之后 die，每次都留下一份带全部客户端私钥的备份文件。
     priv="$(genkey)"
     pub="$(pubkey_of "$priv")"
     psk="$(genpsk)"
     addr="$(next_peer_address)" || die "隧道地址池已满（10.66.66.0/24 上限 253 个客户端）"
-    config_backup="${AWG_DIR}/.conf-backup.$$"
-    peers_backup="${AWG_DIR}/.peers-backup.$$"
-    (umask 077; cp -p "$AWG_PEERS_FILE" "$peers_backup") || { rm -f "$peers_backup"; die "无法备份客户端列表"; }
+    peers_backup="$(umask 077 && mktemp "${AWG_DIR}/.peers-backup.XXXXXX")" || die "无法创建客户端列表备份临时文件"
+    config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || die "无法创建服务端配置备份临时文件"
+    (umask 077; cp "$AWG_PEERS_FILE" "$peers_backup" && chmod 600 "$peers_backup") || die "无法备份客户端列表"
     if [[ -f "$AWG_CONFIG" ]]; then
-        (umask 077; cp -p "$AWG_CONFIG" "$config_backup") || { rm -f "$peers_backup" "$config_backup"; die "无法备份服务端配置"; }
+        (umask 077; cp "$AWG_CONFIG" "$config_backup" && chmod 600 "$config_backup") || die "无法备份服务端配置"
         had_config=1
-    else
-        (umask 077; : > "$config_backup")
     fi
 
     tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers.XXXXXX")"
@@ -1021,16 +1024,15 @@ cmd_peer_del() {
     [[ -n "$name" ]] || die "用法: hy2-awgctl peer-del <名称>"
     peer_exists "$name" || die "客户端不存在: ${name}"
 
-    local pub tmp peers_backup config_backup had_config=0
+    local pub tmp="" peers_backup="" config_backup="" had_config=0
+    trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"' RETURN
     pub="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .public_key // empty' "$AWG_PEERS_FILE")"
-    peers_backup="${AWG_DIR}/.peers-backup.$$"
-    config_backup="${AWG_DIR}/.conf-backup.$$"
-    (umask 077; cp -p "$AWG_PEERS_FILE" "$peers_backup") || { rm -f "$peers_backup"; die "无法备份客户端列表"; }
+    peers_backup="$(umask 077 && mktemp "${AWG_DIR}/.peers-backup.XXXXXX")" || die "无法创建客户端列表备份临时文件"
+    config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || die "无法创建服务端配置备份临时文件"
+    (umask 077; cp "$AWG_PEERS_FILE" "$peers_backup" && chmod 600 "$peers_backup") || die "无法备份客户端列表"
     if [[ -f "$AWG_CONFIG" ]]; then
-        (umask 077; cp -p "$AWG_CONFIG" "$config_backup") || { rm -f "$peers_backup" "$config_backup"; die "无法备份服务端配置"; }
+        (umask 077; cp "$AWG_CONFIG" "$config_backup" && chmod 600 "$config_backup") || die "无法备份服务端配置"
         had_config=1
-    else
-        (umask 077; : > "$config_backup")
     fi
 
     tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers.XXXXXX")"
@@ -1418,7 +1420,7 @@ cmd_uninstall() {
     self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
     if [[ "$self" == "$AWG_CTL_INSTALLED" ]]; then
         # 关闭继承的锁描述符 fd 9，避免卸载退出后后台子进程仍占住 /run/hy2-awgctl.lock 阻塞后续操作。
-        nohup bash -c "sleep 2; rm -f '${AWG_CTL_INSTALLED}'" >/dev/null 2>&1 9>&- &
+        nohup bash -c 'sleep 2; rm -f -- "$1"' _ "$AWG_CTL_INSTALLED" >/dev/null 2>&1 9>&- &
         log_info "控制工具 ${AWG_CTL_INSTALLED} 将在本进程退出后自动移除"
     fi
 

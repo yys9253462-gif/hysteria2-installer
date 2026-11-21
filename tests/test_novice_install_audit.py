@@ -385,10 +385,16 @@ class TestYAMLQuoting(unittest.TestCase):
 
     def test_acme_domain_and_email_are_quoted(self):
         text = INSTALL.read_text(encoding="utf-8")
-        self.assertIn('    - "${SERVER_NAME}"', text,
-                      "acme.domains 里的域名必须加引号")
-        self.assertIn('  email: "${ACME_EMAIL}"', text,
-                      "acme.email 必须加引号")
+        self.assertTrue(
+            '    - "${SERVER_NAME}"' in text
+            or "    - $(jq -Rn --arg value \"${SERVER_NAME}\" '$value')" in text,
+            "acme.domains 里的域名必须加引号或经 jq 安全转义",
+        )
+        self.assertTrue(
+            '  email: "${ACME_EMAIL}"' in text
+            or "  email: $(jq -Rn --arg value \"${ACME_EMAIL}\" '$value')" in text,
+            "acme.email 必须加引号或经 jq 安全转义",
+        )
 
 
 @unittest.skipUnless(BASH and shutil.which("jq"), "needs bash + jq")

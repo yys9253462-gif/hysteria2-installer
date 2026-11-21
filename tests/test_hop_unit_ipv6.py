@@ -26,7 +26,7 @@ def bash_path(path):
 @unittest.skipUnless(BASH, 'requires bash')
 class HopUnitIpv6Tests(unittest.TestCase):
     def test_boot_restore_covers_both_families(self):
-        m = re.search(r"cat > /etc/systemd/system/hy2-iptables.service <<EOF\n(.*?)\nEOF\n", SRC, re.S)
+        m = re.search(r'cat > (?:/etc/systemd/system/hy2-iptables\.service|"\$_ipt_unit_tmp") <<EOF\n(.*?)\nEOF\n', SRC, re.S)
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             fake = td / 'bin'

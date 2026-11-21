@@ -2299,9 +2299,22 @@ setup_system_firewall() {
     local port="$1"
     local s_port="$2"
     local e_port="$3"
-    
+
+    if [[ ! "$port" =~ ^[0-9]+$ || ! "${HY2_SUB_PORT:-}" =~ ^[0-9]+$ ]] \
+            || (( 10#$port < 1 || 10#$port > 65535 || 10#$HY2_SUB_PORT < 1 || 10#$HY2_SUB_PORT > 65535 )); then
+        log_err "防火墙放行参数非法（监听端口=${port:-空}，订阅端口=${HY2_SUB_PORT:-空}），已中止。"
+        return 1
+    fi
+    if [[ -n "$s_port" || -n "$e_port" ]]; then
+        if [[ ! "$s_port" =~ ^[0-9]+$ || ! "$e_port" =~ ^[0-9]+$ ]] \
+                || (( 10#$s_port < 1 || 10#$s_port > 65535 || 10#$e_port < 1 || 10#$e_port > 65535 || 10#$s_port > 10#$e_port )); then
+            log_err "防火墙端口跳跃区间非法（${s_port:-空}-${e_port:-空}），已中止。"
+            return 1
+        fi
+    fi
+
     log_step "自动放行系统内部防火墙 (ufw / firewalld / nftables / iptables)..."
-    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw allow "${HY2_SUB_PORT}/tcp" >/dev/null 2>&1 || true
         ufw allow "${port}/udp" >/dev/null 2>&1 || true
         if [[ "$CERT_TYPE" == "acme" ]]; then
@@ -2402,7 +2415,7 @@ setup_system_firewall() {
             command -v "$_ipt" >/dev/null 2>&1 || continue
             _ipt_list="$("$_ipt" -L INPUT -n 2>/dev/null || true)"
             [[ -n "$_ipt_list" ]] || continue
-            _ipt_policy="$(printf '%s\n' "$_ipt_list" | head -n1 | grep -o 'policy [A-Z]*' | awk '{print $2}' || true)"
+            _ipt_policy="$(awk 'NR==1 { if (match($0, /policy [A-Z]+/)) { print substr($0, RSTART+7, RLENGTH-7) } exit }' <<<"$_ipt_list" || true)"
             if [[ "$_ipt_policy" == "DROP" || "$_ipt_policy" == "REJECT" ]] \
                || printf '%s\n' "$_ipt_list" | grep -qE '^[[:space:]]*(DROP|REJECT)[[:space:]]'; then
                 "$_ipt" -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 \
@@ -2520,8 +2533,10 @@ if isinstance(_data, dict):
             _p = _sec.get('port')
             if isinstance(_p, int) and not isinstance(_p, bool):
                 RESERVED.add(_p)
-            elif isinstance(_p, str) and _p.strip().isdigit():
-                RESERVED.add(int(_p.strip()))
+            elif isinstance(_p, str):
+                _ps = _p.strip()
+                if _ps.isascii() and _ps.isdigit():
+                    RESERVED.add(int(_ps))
     _proxies = _data.get('proxy_services')
     if isinstance(_proxies, list):
         for _item in _proxies:
@@ -2529,8 +2544,10 @@ if isinstance(_data, dict):
                 _p = _item.get('port')
                 if isinstance(_p, int) and not isinstance(_p, bool):
                     RESERVED.add(_p)
-                elif isinstance(_p, str) and _p.strip().isdigit():
-                    RESERVED.add(int(_p.strip()))
+                elif isinstance(_p, str):
+                    _ps = _p.strip()
+                    if _ps.isascii() and _ps.isdigit():
+                        RESERVED.add(int(_ps))
 for _ in range(100):
     port = 10000 + secrets.randbelow(50000)
     if port in RESERVED or 20000 <= port <= 40000:
@@ -2660,6 +2677,12 @@ setup_iptables_port_hopping() {
     local e_port="$3"
     local hop_skip=""
 
+    if [[ ! "$l_port" =~ ^[0-9]+$ || ! "$s_port" =~ ^[0-9]+$ || ! "$e_port" =~ ^[0-9]+$ ]] \
+            || (( 10#$l_port < 1 || 10#$l_port > 65535 || 10#$s_port < 1 || 10#$s_port > 65535 || 10#$e_port < 1 || 10#$e_port > 65535 || 10#$s_port > 10#$e_port )); then
+        log_err "端口跳跃参数非法（监听=${l_port}，区间=${s_port}-${e_port}），拒绝配置。"
+        return 1
+    fi
+
     # 没有 iptables 命令（极简镜像 / 纯 nftables 主机）时直接跳过：
     # 旧实现会在 set -e 下以 127 退出，安装停在「二进制与证书已就位、
     # 配置与门户还没写」的半成品状态，还会留下一个开机必失败的
@@ -2718,8 +2741,14 @@ setup_iptables_port_hopping() {
         service iptables save >/dev/null 2>&1 || true
     fi
 
-    # 兜底部署 systemd 端口跳跃自愈守护服务，保证开机/重启 100% 自动恢复规则
-    cat > /etc/systemd/system/hy2-iptables.service <<EOF
+    # 兜底部署 systemd 端口跳跃自愈守护服务（同目录临时文件原子落盘），保证开机/重启 100% 自动恢复规则
+    local _ipt_unit="/etc/systemd/system/hy2-iptables.service"
+    local _ipt_unit_tmp=""
+    _ipt_unit_tmp="$(umask 022; mktemp "${_ipt_unit}.XXXXXX")" || {
+        log_err "无法为 ${_ipt_unit} 创建临时文件。"
+        return 1
+    }
+    if ! cat > "$_ipt_unit_tmp" <<EOF
 [Unit]
 Description=Hysteria 2 Port Hopping iptables persistence
 After=network.target
@@ -2736,6 +2765,16 @@ ExecStart=/bin/bash -c "command -v ip6tables >/dev/null 2>&1 || exit 0; ip6table
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        rm -f "$_ipt_unit_tmp"
+        log_err "写入 ${_ipt_unit} 失败。"
+        return 1
+    fi
+    if ! chmod 644 "$_ipt_unit_tmp" || ! mv -f "$_ipt_unit_tmp" "$_ipt_unit"; then
+        rm -f "$_ipt_unit_tmp"
+        log_err "原子落盘 ${_ipt_unit} 失败。"
+        return 1
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable hy2-iptables.service >/dev/null 2>&1 || true
 
@@ -2800,22 +2839,19 @@ listen: :${LISTEN_PORT}
 EOF
 
     if [[ "$CERT_TYPE" == "acme" ]]; then
-        # ⚠️ SERVER_NAME / ACME_EMAIL 必须加引号（2026-10-09 修）：
-        # 域名/邮箱里出现空格或 '#' 时，未加引号的裸值会被 YAML 解析成
-        # 另一个值、或把 '#' 之后整行当注释吃掉 —— hysteria 随后报一个
-        # 语法错，现象是「装完服务反复重启」，而错误信息完全指不到输入框。
+        # ⚠️ SERVER_NAME / ACME_EMAIL 经 jq 转义输出 YAML 双引号串，防止空格、'#'、引号或反斜杠破坏语法。
         cat >> "$_cfg_tmp" <<EOF
 acme:
   domains:
-    - "${SERVER_NAME}"
-  email: "${ACME_EMAIL}"
+    - $(jq -Rn --arg value "${SERVER_NAME}" '$value')
+  email: $(jq -Rn --arg value "${ACME_EMAIL}" '$value')
   type: http
 EOF
     else
         cat >> "$_cfg_tmp" <<EOF
 tls:
-  cert: "${CERT_FILE}"
-  key: "${KEY_FILE}"
+  cert: $(jq -Rn --arg value "${CERT_FILE}" '$value')
+  key: $(jq -Rn --arg value "${KEY_FILE}" '$value')
 EOF
     fi
 
@@ -3872,7 +3908,7 @@ portal_fetch_files() {
 portal_remote_blob_shas() {
     local ref="${1:-}" json
     [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
-    json="$(mktemp)"
+    json="$(umask 077; mktemp)" || return 1
     if ! curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${AWG_REPO}/contents/?ref=${ref}" -o "$json" 2>/dev/null; then
         rm -f "$json"
@@ -3890,8 +3926,8 @@ rows = []
 for it in items:
     if not isinstance(it, dict):
         continue
-    name, sha = it.get("name"), it.get("sha") or ""
-    if name and re.fullmatch(r"[0-9a-f]{40}", sha):
+    name, sha = it.get("name"), it.get("sha")
+    if isinstance(name, str) and name and not any(c.isspace() for c in name) and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
         rows.append(name + " " + sha)
 print("\n".join(rows))
 ' "$json" || { rm -f "$json"; return 1; }
@@ -3935,9 +3971,11 @@ portal_fetch_py() {
     # 于是「锁定一次提交、三源取同一份」的保证不变，又不会因为限流装不上。
     PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/commits/main" 2>/dev/null |
         python3 -c 'import json,re,sys
-try: s=json.load(sys.stdin).get("sha","")
+try:
+    obj=json.load(sys.stdin)
+    s=obj.get("sha","") if isinstance(obj, dict) else ""
 except Exception: s=""
-assert re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || PORTAL_FETCH_REF=""
+assert isinstance(s, str) and re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/null)" || PORTAL_FETCH_REF=""
     if [[ ! "$PORTAL_FETCH_REF" =~ ^[0-9a-f]{40}$ ]]; then
         # 次选：仓库的 commits Atom feed。它由 github.com 直接提供、不计 API 额度，
         # 且条目里带完整 40 位 commit —— 一样能锁定到具体提交。
@@ -4024,7 +4062,7 @@ portal_ensure_py() {
     fi
 
     if [[ -z "$srcdir" ]]; then
-        tmpdir="$(mktemp -d)"
+        tmpdir="$(umask 077; mktemp -d)"
         if portal_fetch_py "$tmpdir"; then
             srcdir="$tmpdir"
         else
