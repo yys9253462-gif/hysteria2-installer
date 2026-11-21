@@ -6005,6 +6005,7 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
 
 # WARP 出口 IP 探测结果缓存：前端每 10 秒轮询，而每次探测都要走一次外网。
 _warp_probe_cache = {}
+_warp_probe_lock = threading.Lock()
 
 
 _ACCESS_APPLIED = {}
@@ -15042,10 +15043,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(404, {'ok': False, 'error': '该用户不存在（可能已被删除），请刷新页面'})
 
                 m = read_meta_file(meta_path)
+                _, _raw_sn, _raw_ip, _ = clean_node_identity(m)
+                if not (_raw_sn or _raw_ip):
+                    return self.reply_json(503, {'ok': False,
+                        'error': '节点元信息缺失或损坏，请联系管理员检查 client_meta.json'})
                 pwd = u_copy.get('password')
                 if not isinstance(pwd, str) or not pwd:
                     return self.reply_json(503, {'ok': False,
                         'error': '该账号的密码为空或已损坏，请先重置密码再导出配置'})
+                self._extend_deadline(30)
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
@@ -15067,7 +15073,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'uri': uri,
                     # 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）
                     'extra_links': [{'label': label, 'uri': link} for label, link
-                                    in self._user_extra_links(target_uid, clean_node_identity(m)[2])],
+                                    in self._user_extra_links(target_uid, _raw_ip)],
                     'clash': clash_yaml,
                     'sing_box': sing_json,
                     'qr_svg': qr_svg,
@@ -15151,6 +15157,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     self.send_header('Content-Length', str(len(body)))
                     self.send_header('Cache-Control', 'no-store')
                     self.send_header('X-Content-Type-Options', 'nosniff')
+                    self.send_header('X-Frame-Options', 'DENY')
+                    self.send_header('Referrer-Policy', 'no-referrer')
                     self.send_header('X-Robots-Tag', 'noindex, nofollow, noarchive')
                     self.send_header('Connection', 'close')
                     self.end_headers()
@@ -15179,7 +15187,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if is_client_api:
                     self.record_failure()
                     return self.reply(401, b'Authentication required', www_auth=True)
-                page = login_html(data['token'])
+                with data_lock:
+                    portal_token = str(data.get('token') or '')
+                page = login_html(portal_token)
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
             if subpath == '':
@@ -15957,8 +15967,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 出口 IP 探测要真的走一次外网（实测 150-300 ms），而前端每 10 秒
                 # 轮询一次状态。加 30 秒缓存：状态变化本来也不是秒级的，
                 # 且每次探测都占一个并发槽，会拖慢真正需要响应的请求。
-                cached = _warp_probe_cache.get('value')
-                if cached and time.monotonic() - _warp_probe_cache.get('at', 0) < 30:
+                with _warp_probe_lock:
+                    cached = _warp_probe_cache.get('value')
+                    cached_at = _warp_probe_cache.get('at', 0)
+                if cached and time.monotonic() - cached_at < 30:
                     outbound_ip, connected = cached
                 else:
                     for warp_addr in ('127.0.0.1:19898', '127.0.0.1:40000'):
@@ -15966,8 +15978,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         if outbound_ip:
                             connected = True
                             break
-                    _warp_probe_cache['value'] = (outbound_ip, connected)
-                    _warp_probe_cache['at'] = time.monotonic()
+                    with _warp_probe_lock:
+                        _warp_probe_cache['value'] = (outbound_ip, connected)
+                        _warp_probe_cache['at'] = time.monotonic()
             try:
                 cfg_text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
                 applied = cfg_text == render_egress_config(cfg_text, state)
