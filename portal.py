@@ -8726,16 +8726,19 @@ def serve(path):
         binary = address = ''
         while True:
             try:
-                rcfg = (json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}).get('reality') or {}
-                binary, address = rcfg.get('binary', ''), rcfg.get('address', '')
+                _raw_cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+                rcfg = _raw_cfg.get('reality') if isinstance(_raw_cfg, dict) else {}
+                rcfg = rcfg if isinstance(rcfg, dict) else {}
+                binary = rcfg.get('binary', '') if isinstance(rcfg.get('binary'), str) else ''
+                address = rcfg.get('address', '') if isinstance(rcfg.get('address'), str) else ''
                 if not (binary and address and xray_path.exists() and Path(binary).is_file()):
                     time.sleep(30); continue
                 # 模块级代码看不到 main() 内的嵌套函数，必须用 _unit_suspended。
                 if _unit_suspended('xray') or _systemd_state('xray') != 'active':
                     time.sleep(10); continue
                 if not ready:
-                    # 开启路由接口要重启一次 Xray；失败后 10 分钟内不再尝试，免得反复重启。
-                    if time.time() < enable_retry_at:
+                    # 开启路由接口要重启一次 Xray；失败后 10 分钟内不再尝试，用单调时钟防时间回拨。
+                    if time.monotonic() < enable_retry_at:
                         time.sleep(30); continue
                     # 与其它 xray.json 写入者同一把核心锁（2026-11-04 修）：旧实现在核心安装 /
                     # 升级 / 卸载（含另一个进程的 install.sh）替换二进制途中照样重启 Xray。
@@ -8748,7 +8751,7 @@ def serve(path):
                         except RuntimeError:
                             time.sleep(30); continue
                         try:
-                            enable_retry_at = time.time() + 600
+                            enable_retry_at = time.monotonic() + 600
                             spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
                             mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
                             # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
@@ -8767,8 +8770,14 @@ def serve(path):
                 with data_lock:
                     limits = active_ip_limits(user_table(data))
                     now_ts = time.time()
-                    hy2 = {uid: {ip for ip, t in ip_tracker.get(uid, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
-                           for uid in limits}
+                    hy2 = {}
+                    for uid in limits:
+                        tr = ip_tracker.get(uid)
+                        hy2[uid] = (
+                            {ip for ip, t in tr.items()
+                             if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                            if isinstance(tr, dict) else set()
+                        )
                 for uid in limits:
                     hy2[uid] |= live_online_ips(uid)
                 reality = read_reality_online_ips(binary, address, limits)
