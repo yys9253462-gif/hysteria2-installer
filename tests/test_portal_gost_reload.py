@@ -286,7 +286,7 @@ class GostUnitConsistency(unittest.TestCase):
         start = source.index('        def _h_post_install_gost(self, prefix):')
         end = source.index('        def _h_post_install_amneziawg(self, prefix):', start)
         body = source[start:end]
-        unit_write = body.index("Path('/etc/systemd/system/gost.service').write_text")
+        unit_write = body.index("_atomic_write_text(Path('/etc/systemd/system/gost.service'),")
         marker_write = body.index("owner_marker.touch(mode=0o600, exist_ok=True)")
         self.assertLess(unit_write, marker_write)
         self.assertIn("Path('/etc/hysteria/.hy2-gost-owned')", body)

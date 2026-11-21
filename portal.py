@@ -11907,14 +11907,15 @@ if __name__ == '__main__':
                 else:
                     arch = 'linux_amd64'
 
-                # 动态探测最新版本
+                # 动态探测最新版本（严格校验版本号格式，防止异常响应注入路径段）
                 tag = 'v3.3.0'
                 try:
                     req = urllib.request.Request('https://api.github.com/repos/go-gost/gost/releases/latest', headers={'User-Agent': 'Mozilla/5.0'})
                     with urllib.request.urlopen(req, timeout=8) as r:
                         rel_data = json.loads(_read_bounded_bytes(r).decode('utf-8', errors='replace'))
-                        if isinstance(rel_data, dict) and isinstance(rel_data.get('tag_name'), str) and rel_data['tag_name'].strip():
-                            tag = rel_data['tag_name'].strip()
+                        raw_tag = rel_data.get('tag_name').strip() if (isinstance(rel_data, dict) and isinstance(rel_data.get('tag_name'), str)) else ''
+                        if raw_tag and '..' not in raw_tag and re.fullmatch(r'v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}', raw_tag) and raw_tag.lstrip('v'):
+                            tag = raw_tag
                 except Exception:
                     tag = 'v3.3.0'
 
@@ -11977,18 +11978,36 @@ if __name__ == '__main__':
                                 continue
                             src_bin = Path(tmpdir) / 'gost'
                             with tarfile.open(str(archive_path), 'r:gz') as tar:
-                                # 拒绝绝对路径 / `..`，且只接受唯一精确同名的常规成员
-                                member_name = safe_tar_members(
-                                    [m.name for m in tar.getmembers()], 'gost')
-                                member = next(m for m in tar.getmembers()
+                                # 全量校验成员路径并拦截符号/硬链接，再只接受唯一精确同名的常规成员
+                                all_members = tar.getmembers()
+                                regular_names = []
+                                for m in all_members:
+                                    mname = m.name or ''
+                                    clean = mname[2:] if mname.startswith('./') else mname
+                                    if (mname.startswith('/') or clean.startswith('/')
+                                            or '\\' in mname or '\x00' in mname
+                                            or '..' in clean.split('/')):
+                                        raise ValueError('tar 包内含不安全路径成员: %s' % mname)
+                                    if m.issym() or m.islnk():
+                                        raise ValueError('tar 包内含不允许的链接成员: %s' % mname)
+                                    if m.isfile():
+                                        regular_names.append(mname)
+                                member_name = safe_tar_members(regular_names, 'gost')
+                                member = next(m for m in all_members
                                               if m.name == member_name and m.isfile())
-                                with tar.extractfile(member) as source, open(src_bin, 'wb') as dest:
+                                extracted = tar.extractfile(member)
+                                if extracted is None:
+                                    raise ValueError('tar 包内无法读取 gost 成员')
+                                with extracted as source, open(src_bin, 'wb') as dest:
                                     shutil.copyfileobj(source, dest)
                             if src_bin.exists():
                                 staged = Path('/usr/local/bin/gost.new.%s' % os.urandom(6).hex())
                                 replaced = False
                                 try:
-                                    shutil.copyfile(str(src_bin), str(staged))
+                                    with open(src_bin, 'rb') as src_f, open(staged, 'wb') as dst_f:
+                                        shutil.copyfileobj(src_f, dst_f)
+                                        dst_f.flush()
+                                        os.fsync(dst_f.fileno())
                                     os.chmod(str(staged), 0o755)
                                     # 先确认新文件能跑再替换（2026-11-04 修，与 Xray 安装一致）：
                                     # 摘要对得上不代表能执行（架构判错、noexec、依赖缺失），
@@ -12017,31 +12036,39 @@ if __name__ == '__main__':
                 def restore_gost_assets():
                     nonlocal assets_modified
                     assets_modified = True
+                    first_restore_error = None
                     for asset_path, old_asset in old_assets.items():
                         if old_asset is None:
                             try:
                                 asset_path.unlink(missing_ok=True)
-                            except OSError:
-                                pass
+                            except OSError as exc:
+                                if first_restore_error is None:
+                                    first_restore_error = exc
                         else:
                             contents, mode = old_asset
-                            asset_path.parent.mkdir(parents=True, exist_ok=True)
-                            # 同目录私有临时文件 + 原子替换：避免覆写运行中二进制报 ETXTBSY，
-                            # 同时消除敏感配置文件与私钥的默认 umask 暴露窗口。
                             tmp_asset = asset_path.with_name(
                                 asset_path.name + '.rollback.' + os.urandom(4).hex())
                             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
                             if hasattr(os, 'O_NOFOLLOW'):
                                 flags |= os.O_NOFOLLOW
                             try:
+                                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                                # 同目录私有临时文件 + 刷盘 + 原子替换：避免覆写运行中二进制报 ETXTBSY，
+                                # 同时消除敏感配置文件与私钥的默认 umask 暴露窗口。
                                 fd = os.open(str(tmp_asset), flags, 0o600)
                                 with os.fdopen(fd, 'wb') as fh:
                                     fh.write(contents)
+                                    fh.flush()
+                                    os.fsync(fh.fileno())
                                 os.chmod(str(tmp_asset), mode)
                                 os.replace(str(tmp_asset), str(asset_path))
-                            except BaseException:
-                                tmp_asset.unlink(missing_ok=True)
-                                raise
+                            except Exception as exc:
+                                try:
+                                    tmp_asset.unlink(missing_ok=True)
+                                except OSError:
+                                    pass
+                                if first_restore_error is None:
+                                    first_restore_error = exc
                     if not had_cert_dir and cert_dir.exists():
                         try:
                             cert_dir.rmdir()
@@ -12090,6 +12117,8 @@ if __name__ == '__main__':
                                 subprocess.run(['systemctl', 'stop', 'gost'], capture_output=True, timeout=30)
                             except Exception:
                                 pass
+                    if first_restore_error is not None:
+                        raise first_restore_error
 
                 if not installed:
                     # 把【每个源】的错误都报出来。
@@ -12105,7 +12134,7 @@ if __name__ == '__main__':
                     raise RuntimeError('无法写入启动自检脚本 %s（单元的 ExecStartPost 依赖它，写不进去 gost 必然启动失败）'
                                        % GOST_SELFCHECK_PATH)
                 service_content = GOST_UNIT_CONTENT
-                Path('/etc/systemd/system/gost.service').write_text(service_content, encoding='utf-8')
+                _atomic_write_text(Path('/etc/systemd/system/gost.service'), service_content, mode=0o644)
                 owner_marker = Path('/etc/hysteria/.hy2-gost-owned')
                 owner_marker.touch(mode=0o600, exist_ok=True)
                 owner_marker.chmod(0o600)
