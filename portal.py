@@ -4351,6 +4351,7 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
     meta = meta if isinstance(meta, dict) else {}
     cert_file, cn, sans, self_signed = _resolve_live_cert(root, config_path)
 
+    meta_insecure = clean_node_identity(meta)[0]
     info = {
         'ok': False,
         'cert_exists': cert_file.exists(),
@@ -4367,8 +4368,8 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
         'warn_level': 'unknown',      # unknown | ok | warn | critical | expired
         'server_name': meta.get('server_name', ''),
         'cert_type': meta.get('cert_type', ''),
-        'is_insecure': bool(meta.get('is_insecure')),
-        'renewal_managed': meta.get('cert_type') == 'acme' and not bool(meta.get('is_insecure')),
+        'is_insecure': meta_insecure,
+        'renewal_managed': meta.get('cert_type') == 'acme' and not meta_insecure,
         'pin_sha256': meta.get('pin_sha256', ''),
         'healed_at': 0,
         'heal_count': 0,
@@ -4654,7 +4655,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     if m.get('cert_type') != new_type:
         m['cert_type'] = new_type
         changed = True
-    if bool(m.get('is_insecure')) != bool(new_insecure):
+    if m.get('is_insecure') is not bool(new_insecure):
         m['is_insecure'] = new_insecure
         changed = True
     if m.get('server_name') != new_sn:
@@ -7857,7 +7858,7 @@ def ensure_portal_access(root, meta, data):
     password = secrets.token_urlsafe(32)
     auth = base64.b64encode(f'{username}:{password}'.encode())
     data['auth_hash'] = hashlib.sha256(auth).hexdigest()
-    host = meta['public_ip'] if meta.get('is_insecure') else meta.get('server_name', 'localhost')
+    host = meta_display_host(meta)
     sub_port, _src = resolve_subscription_port(meta)
     url = f"https://{_host_for_url(host)}:{sub_port}/{data.get('token', '')}/"
     access = portal_access_payload(url, username, password, data.get('api_key', ''))
@@ -9425,7 +9426,7 @@ if __name__ == '__main__':
         root = portal_path.parent
         access_file = root / 'portal-access.json'
         access = read_access_file(access_file)
-        host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+        host = meta_display_host(m)
         subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
         
         now_ts = int(time.time())
@@ -10867,7 +10868,7 @@ if __name__ == '__main__':
                     with data_lock:
                         items = proxy_services(data)
                     m = read_meta_file(meta_path)
-                    host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+                    host = meta_display_host(m)
                     # 不脱敏 password, 调用方是受信 API key
                     return self.reply_json(200, {
                         'ok': True,
@@ -11378,7 +11379,7 @@ if __name__ == '__main__':
                     return 500, {'ok': False, 'applied': False,
                         'error': '防火墙放行失败，代理记录已恢复；请检查本机防火墙状态'}
                 m = read_meta_file(meta_path)
-                host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+                host = meta_display_host(m)
                 host_part = '[' + host + ']' if ':' in host and not host.startswith('[') else host
                 uri = '%s://%s:%s@%s:%s' % (ptype, quote(username, safe=''), quote(password, safe=''), host_part, port)
                 qr_svg = ''
@@ -14223,7 +14224,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         'node': {
                             'public_ip': m.get('public_ip', ''),
                             'server_name': m.get('server_name', ''),
-                            'is_insecure': bool(m.get('is_insecure')),
+                            'is_insecure': clean_node_identity(m)[0],
                             'hop_port_range': m.get('hop_port_range', ''),
                             'users_count': d_snap['users_count'],
                         },
@@ -14296,7 +14297,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 面板只看这条 API: 补齐 host 与 gost 运行状态,
                     # 否则列表显示不出主机名, 也无法区分"服务真的可用"和"条目存在".
                     m = read_meta_file(meta_path)
-                    host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+                    host = meta_display_host(m)
                     return self.reply_json(200, {
                         'ok': True,
                         'count': len(items),
@@ -14716,8 +14717,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 root = portal_path.parent
                 access_file = root / 'portal-access.json'
                 access = read_access_file(access_file)
-                host = (m.get('public_ip', '127.0.0.1') if m.get('is_insecure')
-                        else m.get('server_name', 'localhost'))
+                host = meta_display_host(m)
                 with data_lock:
                     users = {uid: dict(u) for uid, u in users_list_rows(user_table(data))
                              if isinstance(u, dict)}
@@ -14820,7 +14820,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             with data_lock:
                 services = proxy_services(data)
             m = read_meta_file(meta_path)
-            host = m.get('public_ip', '127.0.0.1') if m.get('is_insecure') else m.get('server_name', 'localhost')
+            host = meta_display_host(m)
             return self.reply_json(200, {
                 'ok': True,
                 'gost_installed': Path('/usr/local/bin/gost').exists(),
