@@ -36,7 +36,7 @@ class IplimitCoreLockTests(unittest.TestCase):
         enabled = []
         mod = mock.Mock(enable_iplimit_routing=lambda *a: enabled.append(a) or {'changed': False})
         spec = mock.Mock(loader=mock.Mock(exec_module=lambda m: None))
-        env = dict(time=mock.Mock(time=time.time, sleep=lambda s: None), os=mock.Mock(),
+        env = dict(time=mock.Mock(time=time.time, monotonic=time.monotonic, sleep=lambda s: None), os=mock.Mock(),
                    importlib=mock.Mock(util=mock.Mock(spec_from_file_location=lambda *a: spec,
                                                       module_from_spec=lambda s: mod)),
                    core_operation_lock=core_lock, access_apply_lock=threading.Lock(),

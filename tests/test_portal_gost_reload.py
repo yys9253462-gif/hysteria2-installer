@@ -148,7 +148,8 @@ class ReloadGostChecksReturncode(unittest.TestCase):
                       'reload_gost 缺少 restart 兜底')
 
     def test_restart_reachable_when_reload_returns_nonzero(self):
-        run = Mock(side_effect=[SimpleNamespace(returncode=3), SimpleNamespace(returncode=0)])
+        run = Mock(side_effect=lambda args, **kw: SimpleNamespace(
+            returncode=3 if args[:2] == ['systemctl', 'reload'] else 0))
         env = {'Path': lambda path: SimpleNamespace(exists=lambda: True),
                'gost_operation_lock': threading.RLock(), 'ensure_gost_unit': Mock(),
                'write_gost_config': Mock(), 'gost_status': lambda: True,
@@ -410,6 +411,36 @@ class GostSelfcheckScript(unittest.TestCase):
         exec(compile(_const('GOST_SELFCHECK_SCRIPT'),
                      'gost_selfcheck_under_test', 'exec'), mod.__dict__)
         return mod
+
+
+    def test_reload_gost_resets_failed_before_restart(self):
+        tree = ast.parse((ROOT / 'portal.py').read_text(encoding='utf-8'))
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'reload_gost')
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return SimpleNamespace(returncode=0)
+
+        ns = {
+            'Path': lambda p: SimpleNamespace(exists=lambda: True),
+            'gost_operation_lock': threading.RLock(),
+            'ensure_gost_unit': lambda: None,
+            'write_gost_config': lambda: None,
+            '_unit_suspended': lambda u: False,
+            'gost_status': Mock(side_effect=[False, True]),
+            'gost_ports_ready': lambda: True,
+            'subprocess': SimpleNamespace(run=fake_run),
+            'time': SimpleNamespace(sleep=lambda s: None),
+        }
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), '<reload-gost>', 'exec'), ns)
+        self.assertTrue(ns['reload_gost']())
+        self.assertIn(['systemctl', 'reset-failed', 'gost'], calls)
+        self.assertIn(['systemctl', 'restart', 'gost'], calls)
+        self.assertLess(
+            calls.index(['systemctl', 'reset-failed', 'gost']),
+            calls.index(['systemctl', 'restart', 'gost']),
+        )
 
 
 if __name__ == '__main__':

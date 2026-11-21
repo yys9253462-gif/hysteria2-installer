@@ -62,7 +62,8 @@ leaf_pub () {
 # 只改 tls: 段里的 cert: 行，按字面替换（2026-11-04 修）：旧实现 sed 全文替换且把路径当
 # 正则，key: "/x/a.cer.key" 这种同前缀路径会一起被改坏，hysteria 随即起不来。
 set_tls_cert () {   # $1=config $2=new path
-    local tmp; tmp="$(mktemp "${1}.XXXXXX")" || return 1
+    local tmp
+    tmp="$(umask 077 && mktemp "${1}.XXXXXX")" || return 1
     NEW_CERT="$2" awk '
         /^tls:[[:space:]]*(#.*)?$/ {f=1; print; next}
         /^[^[:space:]]/ {f=0}
@@ -70,9 +71,17 @@ set_tls_cert () {   # $1=config $2=new path
             match($0, /^[[:space:]]+cert:/); print substr($0, 1, RLENGTH) " \"" ENVIRON["NEW_CERT"] "\""
             done=1; next
         }
-        {print}' "$1" > "$tmp" || { rm -f "$tmp"; return 1; }
-    chmod --reference="$1" "$tmp" 2>/dev/null || true
+        {print}
+        END { if (!done) exit 1 }' "$1" > "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod --reference="$1" "$tmp" 2>/dev/null || chmod 600 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$1"
+}
+# 通过同目录临时文件原子回滚配置，避免覆盖过程中断留下半截 config.yaml。
+restore_config_file () {   # $1=backup $2=target
+    local tmp
+    tmp="$(umask 077 && mktemp "${2}.restore.XXXXXX")" || return 1
+    cp -a "$1" "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$2"
 }
 # 重启前先清失败计数（2026-11-12 修，与 do_upgrade.sh 同理）：证书出问题时服务常已反复崩溃、
 # 撞上 StartLimitBurst，这时 restart 被直接拒绝，修好的链被当成「起不来」回滚。
@@ -91,7 +100,7 @@ masq_https_port () {   # $1=config
             sub(/[[:space:]]+#.*$/, "", v)
             gsub(/["\047[:space:]]/, "", v)
             n = split(v, parts, ":"); v = parts[n]
-            if (v ~ /^[0-9]+$/ && v + 0 >= 1 && v + 0 <= 65535) { print v; exit }
+            if (v ~ /^[0-9]+$/ && v + 0 >= 1 && v + 0 <= 65535) { print v + 0; exit }
         }' "$1"
 }
 # 验证用的 SNI：先取 SAN 里第一个 DNS 名（通配符换成 www.），没有 SAN 再退回 CN，
@@ -168,7 +177,7 @@ else
     cp -a "$CONFIG" "$BK" || { err "备份配置失败，未做任何修改。"; exit 1; }
     info "已备份原配置：$BK"
 
-    set_tls_cert "$CONFIG" "$FULL" || { cp -a "$BK" "$CONFIG"; err "写入配置失败，已恢复备份。"; exit 1; }
+    set_tls_cert "$CONFIG" "$FULL" || { restore_config_file "$BK" "$CONFIG" || true; err "写入配置失败，已恢复备份。"; exit 1; }
     NEW="$(cert_of "$CONFIG")"
     ok "tls.cert 已更新为：$NEW"
     FINAL_CERT="$FULL"
@@ -187,7 +196,7 @@ if [[ "$CHANGED" == "1" ]]; then
     # 起不来就恢复原配置（2026-11-04 修）：旧实现留着改坏的配置，节点直接掉线。
     if ! systemctl is-active --quiet hysteria-server 2>/dev/null; then
         err "新配置下 hysteria-server 未能启动，已恢复原配置：$BK"
-        cp -a "$BK" "$CONFIG"
+        restore_config_file "$BK" "$CONFIG" || true
         restart_hysteria
         exit 1
     fi

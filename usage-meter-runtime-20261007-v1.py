@@ -231,7 +231,10 @@ class PortalMeter:
                 # 失败回滚必须是同一事务，避免对账看到未提交的累计。
                 # on_speed 留在锁外，避免回调引入额外锁顺序。
                 with self.lock:
-                    meter=copy.deepcopy(self.data.get('usage_meter',{}))
+                    raw_meter=self.data.get('usage_meter',{})
+                    if not isinstance(raw_meter, dict):
+                        raise ValueError('invalid usage_meter container')
+                    meter=copy.deepcopy(raw_meter)
                     # 每个账户首次基线：不将已存在、未归属新窗口的进程计数混入。
                     # 注意：registered_users 只用于诊断（首次接入时记录当时的账户集合），
                     # 计量准入完全由 totals/sources 决定，没有任何代码读取它。
@@ -306,7 +309,8 @@ class PortalMeter:
                     old_meter=self.data.get('usage_meter',missing)
                     failed_meter=self.data.setdefault('usage_meter',{})
                     if not isinstance(failed_meter, dict):
-                        # 财务状态损坏时保留原件，不能清零，也不能让诊断再次杀死线程。
+                        # 财务状态损坏时保留原件，不能清零，同时标定来源失败以免误报健康。
+                        self.failed_sources.add(source)
                         print('[meter] invalid usage_meter container', file=sys.stderr)
                         continue
                     old_health=failed_meter.get('health',missing)
@@ -354,14 +358,23 @@ class PortalMeter:
                 gaps=[{'reason': 'invalid_gaps_container'}]
             user=_users_view(self.data).get(uid,{})
             legacy=user.get('legacy_auth_value',user.get('used_bytes',0)) if isinstance(user,dict) else None
+            now_ts=time.time()
+            live_fresh=(isinstance(self.live_snapshot, dict)
+                        and isinstance(self.live_snapshot.get('users'), dict)
+                        and 0 <= now_ts - self.live_sampled_at < 45)
+            live_entry=self.live_snapshot['users'].get(uid, {}) if live_fresh else None
+            if not isinstance(live_entry, dict):
+                live_entry={'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'}
+            online_fresh=(isinstance(online_counts, dict)
+                          and 0 <= now_ts - online_sampled_at < 30)
             return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),
                 'measurement_ok':initialized and fresh and not _recent_gaps(m),
                 'measurement_current_ok': initialized and fresh,
                 'measurement_complete': initialized and not gaps,
-                'current_online': copy.deepcopy(self.live_snapshot.get('users',{}).get(uid,{})) if self.live_snapshot is not None and time.time()-self.live_sampled_at < 45 else {'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'},
+                'current_online': copy.deepcopy(live_entry),
                 'online_ip_scope': 'recent_authentication',
-                'online_devices': online_counts.get(uid, 0) if online_counts is not None and time.time()-online_sampled_at < 30 else None,
+                'online_devices': online_counts.get(uid, 0) if online_fresh else None,
                 'online_devices_scope': 'hysteria_core_instances_only',
                 'measurement_scope':'since_measurement_started',
                 'measurement_sources':{s:copy.deepcopy(health.get(s, {})) for s in enabled},

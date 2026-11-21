@@ -74,6 +74,33 @@ class FixCertChainPathTest(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn('已包含完整链', out)
 
+    def test_set_tls_cert_fails_when_tls_cert_line_missing(self):
+        cfg = self.root / 'no_cert.yaml'
+        orig = 'listen: :443\ntls:\n  key: "/tmp/a.key"\n'
+        cfg.write_text(orig, encoding='utf-8')
+        body = SCRIPT.read_text(encoding='utf-8')
+        fn_start = body.index('set_tls_cert ()')
+        fn_end = body.index('\n# 重启前先清失败计数', fn_start)
+        cmd = body[fn_start:fn_end] + '\nset_tls_cert "$1" "/tmp/fullchain.cer"\n'
+        res = subprocess.run([BASH, '-c', cmd, '_', str(cfg)], capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(res.returncode, 0, '缺少 tls.cert 行时 set_tls_cert 不应静默返回 0')
+        self.assertEqual(cfg.read_text(encoding='utf-8'), orig)
+
+    def test_masq_https_port_strips_leading_zeros(self):
+        cfg = self.root / 'zero_port.yaml'
+        cfg.write_text('masquerade:\n  listenHTTPS: "0.0.0.0:08443" # 端口\n', encoding='utf-8')
+        body = SCRIPT.read_text(encoding='utf-8')
+        fn_start = body.index('masq_https_port ()')
+        fn_end = body.index('\n# 验证用的 SNI', fn_start)
+        cmd = body[fn_start:fn_end] + '\nmasq_https_port "$1"\n'
+        res = subprocess.run([BASH, '-c', cmd, '_', str(cfg)], capture_output=True, text=True, timeout=15)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), '8443')
+
+    def test_rollback_uses_atomic_replace_helper(self):
+        body = SCRIPT.read_text(encoding='utf-8')
+        self.assertNotIn('cp -a "$BK" "$CONFIG"', body, '回滚恢复配置应通过同目录临时文件原子替换')
+
 
 if __name__ == '__main__':
     unittest.main()

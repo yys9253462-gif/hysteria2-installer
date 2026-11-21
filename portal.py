@@ -212,7 +212,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.48'
+PORTAL_VERSION = '2.49'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1993,22 +1993,59 @@ def _unit_failure_hint(unit, lines=6):
     return ('：' + ' | '.join(line[:140] for line in tail[-3:])) if tail else ''
 
 
+def _write_private_bytes(target, payload, mode=0o600, call_path_chmod=False):
+    """以指定权限直接创建并落盘敏感配置，避免默认 umask 先落明文再改权。"""
+    target = Path(target)
+    mode = (mode & 0o777) or 0o600
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            fd = None
+            handle.write(payload)
+            handle.flush()
+            if hasattr(os, 'fchmod'):
+                os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+    finally:
+        if fd is not None:
+            os.close(fd)
+    if call_path_chmod:
+        target.chmod(mode)
+    os.chmod(str(target), mode)
+
+
 def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                   binary='/usr/local/bin/xray', restart=True,
                                   enable=True):
     """Validate a candidate before replacing; restore prior config on start failure."""
     path = Path(config_path)
     original = path.read_bytes() if path.exists() else None
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    mode = (path.stat().st_mode & 0o777) or 0o600 if path.exists() else 0o600
     candidate = path.with_name(path.name + '.portal-candidate.json')
     was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
                                 text=True, timeout=5).stdout.strip() == 'active'
     was_enabled = subprocess.run(['systemctl', 'is-enabled', 'xray'], capture_output=True,
                                  text=True, timeout=5).stdout.strip() == 'enabled'
+
+    def _write_priv(target, payload, file_mode):
+        file_mode = (file_mode & 0o777) or 0o600
+        fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, file_mode)
+        try:
+            with os.fdopen(fd, 'wb') as handle:
+                fd = None
+                handle.write(payload)
+                handle.flush()
+                if hasattr(os, 'fchmod'):
+                    os.fchmod(handle.fileno(), file_mode)
+                os.fsync(handle.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+        target.chmod(file_mode)
+
     replaced = False
     try:
-        candidate.write_text(json.dumps(config, indent=2), encoding='utf-8')
-        candidate.chmod(mode)
+        _write_priv(candidate, json.dumps(config, indent=2).encode('utf-8'), mode)
         test = subprocess.run([binary, 'run', '-test', '-c', str(candidate)],
                               capture_output=True, text=True, timeout=10)
         if test.returncode != 0:
@@ -2046,18 +2083,20 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
             if original is None:
                 path.unlink(missing_ok=True)
             else:
-                candidate.write_bytes(original)
-                candidate.chmod(mode)
+                _write_priv(candidate, original, mode)
                 os.replace(candidate, path)
-            if was_enabled:
-                subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
-            else:
-                subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
-            if original is not None and was_active:
-                subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
-                subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
-            elif not was_active:
-                subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
+            try:
+                if was_enabled:
+                    subprocess.run(['systemctl', 'enable', 'xray'], capture_output=True, timeout=15)
+                else:
+                    subprocess.run(['systemctl', 'disable', 'xray'], capture_output=True, timeout=15)
+                if original is not None and was_active:
+                    subprocess.run(['systemctl', 'reset-failed', 'xray'], capture_output=True, timeout=5)
+                    subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
+                elif not was_active:
+                    subprocess.run(['systemctl', 'stop', 'xray'], capture_output=True, timeout=15)
+            except (OSError, subprocess.SubprocessError) as rb_exc:
+                _log_ignored('xray_transaction_rollback', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
@@ -4575,10 +4614,7 @@ def record_cert_heal(root, state, before, after):
             'fields': [k for k in ('cert_type', 'server_name', 'is_insecure', 'pin_sha256')
                        if before.get(k) != after.get(k)],
         })
-        tmp = state_path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
-        tmp.chmod(0o600)
-        tmp.replace(state_path)
+        atomic_write_private(state_path, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
     except Exception as e:
         print('[portal] 写入证书自愈痕迹失败: %s' % str(e)[:120], file=sys.stderr)
 
@@ -5318,10 +5354,9 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
     config_path = Path(config_path)
     original = config_path.read_bytes() if config_path.exists() else None
     candidate = config_path.with_name(config_path.stem + '.candidate.json')
-    candidate.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding='utf-8')
-    os.chmod(str(candidate), 0o600)
     replaced = False
     try:
+        _write_private_bytes(candidate, json.dumps(config, indent=2, ensure_ascii=False).encode('utf-8'), 0o600)
         run([ANYTLS_BINARY, 'check', '-c', str(candidate)],
             capture_output=True, timeout=15, check=True)
         candidate.replace(config_path)
@@ -6781,17 +6816,19 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         idx,_inbound=managed_inbound_index(xcfg,tag)
         xcfg['inbounds'][idx].setdefault('settings',{})['clients']=wanted
     candidate=xj.with_name('xray.expiry-candidate.json')
-    candidate.write_text(json.dumps(xcfg,indent=2),encoding='utf-8')
-    candidate.chmod(orig_mode)
+    last_good=xj.with_name('xray.expiry-last-good.json')
+    last_good_tmp=xj.with_name('xray.expiry-last-good.json.tmp')
     reality_cfg=meter_config.get('reality') if isinstance(meter_config, dict) else None
     reality_cfg=reality_cfg if isinstance(reality_cfg, dict) else {}
     binary=reality_cfg.get('binary','/usr/local/bin/xray')
     replaced=False
     try:
+        _write_private_bytes(candidate, json.dumps(xcfg,indent=2).encode('utf-8'), orig_mode, call_path_chmod=True)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
         if xj.read_bytes()!=original:
             raise RuntimeError('Xray configuration changed concurrently; retry')
-        shutil.copy2(xj,xj.with_name('xray.expiry-last-good.json'))
+        _write_private_bytes(last_good_tmp, original, orig_mode)
+        os.replace(last_good_tmp, last_good)
         candidate.replace(xj); replaced=True
         state=subprocess.run(['systemctl','is-active','xray'],capture_output=True,text=True,timeout=4).stdout.strip()
         if state in ('inactive','failed'):
@@ -6806,14 +6843,17 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
         return True
     except Exception:
         if replaced:
-            candidate.write_bytes(original)
-            candidate.chmod(orig_mode)
+            _write_private_bytes(candidate, original, orig_mode, call_path_chmod=True)
             candidate.replace(xj)
-            subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
-            subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
+            try:
+                subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4)
+                subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12)
+            except (OSError, subprocess.SubprocessError) as rb_exc:
+                _log_ignored('xray_access_rollback', rb_exc)
         raise
     finally:
         candidate.unlink(missing_ok=True)
+        last_good_tmp.unlink(missing_ok=True)
 
 
 
@@ -8136,6 +8176,8 @@ def repair_missing_api_key(portal_path, data):
     try:
         if old_access is not None:
             access = json.loads(old_access.decode('utf-8'))
+            if not isinstance(access, dict):
+                raise ValueError('portal-access.json 顶层不是 JSON 对象')
             access['api_key'] = new_key
             atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
         data['api_key'] = new_key
@@ -8457,7 +8499,7 @@ def serve(path):
     def node_default_ifaces():
         ifaces = set()
         try:
-            with open('/proc/net/route', encoding='ascii') as fh:
+            with open('/proc/net/route', encoding='utf-8', errors='replace') as fh:
                 next(fh, None)
                 for line in fh:
                     parts = line.split()
@@ -8466,7 +8508,7 @@ def serve(path):
         except OSError:
             pass
         try:
-            with open('/proc/net/ipv6_route', encoding='ascii') as fh:
+            with open('/proc/net/ipv6_route', encoding='utf-8', errors='replace') as fh:
                 for line in fh:
                     parts = line.split()
                     if len(parts) >= 10 and parts[0] == '0' * 32 and parts[1] == '00':
@@ -8480,7 +8522,7 @@ def serve(path):
         wanted = set(node_default_ifaces())
         rx = tx = 0
         seen = []
-        with open('/proc/net/dev', encoding='ascii') as fh:
+        with open('/proc/net/dev', encoding='utf-8', errors='replace') as fh:
             for line in fh:
                 if ':' not in line:
                     continue
@@ -8489,11 +8531,19 @@ def serve(path):
                 if name not in wanted:
                     continue
                 cols = rest.split()
-                rx += int(cols[0])
-                tx += int(cols[8])
+                if len(cols) < 9:
+                    continue
+                try:
+                    rx_val, tx_val = int(cols[0]), int(cols[8])
+                except ValueError:
+                    continue
+                if rx_val < 0 or tx_val < 0:
+                    continue
+                rx += rx_val
+                tx += tx_val
                 seen.append(name)
         try:
-            boot_id = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='ascii').strip()
+            boot_id = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8', errors='replace').strip()
         except OSError:
             boot_id = ''
         return {'rx_bytes': rx, 'tx_bytes': tx, 'interfaces': seen, 'boot_id': boot_id}
@@ -8703,16 +8753,19 @@ def serve(path):
         binary = address = ''
         while True:
             try:
-                rcfg = (json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}).get('reality') or {}
-                binary, address = rcfg.get('binary', ''), rcfg.get('address', '')
+                _raw_cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+                rcfg = _raw_cfg.get('reality') if isinstance(_raw_cfg, dict) else {}
+                rcfg = rcfg if isinstance(rcfg, dict) else {}
+                binary = rcfg.get('binary', '') if isinstance(rcfg.get('binary'), str) else ''
+                address = rcfg.get('address', '') if isinstance(rcfg.get('address'), str) else ''
                 if not (binary and address and xray_path.exists() and Path(binary).is_file()):
                     time.sleep(30); continue
                 # 模块级代码看不到 main() 内的嵌套函数，必须用 _unit_suspended。
                 if _unit_suspended('xray') or _systemd_state('xray') != 'active':
                     time.sleep(10); continue
                 if not ready:
-                    # 开启路由接口要重启一次 Xray；失败后 10 分钟内不再尝试，免得反复重启。
-                    if time.time() < enable_retry_at:
+                    # 开启路由接口要重启一次 Xray；失败后 10 分钟内不再尝试，用单调时钟防时间回拨。
+                    if time.monotonic() < enable_retry_at:
                         time.sleep(30); continue
                     # 与其它 xray.json 写入者同一把核心锁（2026-11-04 修）：旧实现在核心安装 /
                     # 升级 / 卸载（含另一个进程的 install.sh）替换二进制途中照样重启 Xray。
@@ -8725,7 +8778,7 @@ def serve(path):
                         except RuntimeError:
                             time.sleep(30); continue
                         try:
-                            enable_retry_at = time.time() + 600
+                            enable_retry_at = time.monotonic() + 600
                             spec = importlib.util.spec_from_file_location('portal_iplimit_cfg', stats_path)
                             mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)
                             # 与到期收回（access_apply_lock）、Reality 重生成（reality_apply_lock）串行，
@@ -8744,8 +8797,14 @@ def serve(path):
                 with data_lock:
                     limits = active_ip_limits(user_table(data))
                     now_ts = time.time()
-                    hy2 = {uid: {ip for ip, t in ip_tracker.get(uid, {}).items() if now_ts - t < IP_TIMEOUT_SECONDS}
-                           for uid in limits}
+                    hy2 = {}
+                    for uid in limits:
+                        tr = ip_tracker.get(uid)
+                        hy2[uid] = (
+                            {ip for ip, t in tr.items()
+                             if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                            if isinstance(tr, dict) else set()
+                        )
                 for uid in limits:
                     hy2[uid] |= live_online_ips(uid)
                 reality = read_reality_online_ips(binary, address, limits)
@@ -8907,7 +8966,6 @@ def serve(path):
         if not probed:
             return True      # 探测不了就不阻断，交给服务状态判断
         return all(port in listening for port in ports)
-        return True
 
     def reload_gost():
         """Return real application success, including expected listener readiness."""
@@ -8934,6 +8992,7 @@ def serve(path):
                             if gost_status() and gost_ports_ready():
                                 return True
                             time.sleep(0.2)
+                subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=5)
                 r = subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=12)
                 if r.returncode != 0:
                     return False
@@ -10238,9 +10297,12 @@ if __name__ == '__main__':
                         if deny is None:
                             # -------- 同时在线 IP 限制检查 -------- #
                             if ip_limit > 0 and client_ip:
-                                tracker = ip_tracker.setdefault(matched_uid, {})
-                                active_ips = {ip: t for ip, t in tracker.items()
-                                              if now_ts - t < IP_TIMEOUT_SECONDS}
+                                raw_tracker = ip_tracker.get(matched_uid)
+                                active_ips = (
+                                    {ip: t for ip, t in raw_tracker.items()
+                                     if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                    if isinstance(raw_tracker, dict) else {}
+                                )
                                 ip_tracker[matched_uid] = active_ips
                                 # 已连着的设备即使超过 180 秒没重新鉴权也要算在内。
                                 # Reality 放行中的 IP 也占名额：两个协议共用同一个设备上限。
@@ -10255,8 +10317,11 @@ if __name__ == '__main__':
                                 # 换 IP 频繁的长期在线用户（移动网络 / CGNAT）表项无界增长，
                                 # users/list 与 /traffic-speed 每次都要遍历。
                                 tracker = ip_tracker.get(matched_uid)
-                                tracker = {ip: t for ip, t in tracker.items()
-                                           if now_ts - t < IP_TIMEOUT_SECONDS} if isinstance(tracker, dict) else {}
+                                tracker = (
+                                    {ip: t for ip, t in tracker.items()
+                                     if isinstance(t, (int, float)) and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                                    if isinstance(tracker, dict) else {}
+                                )
                                 tracker[client_ip] = now_ts
                                 ip_tracker[matched_uid] = tracker
 
@@ -13382,13 +13447,42 @@ if __name__ == '__main__':
                     runtime[key] = result.stdout.strip()
                 paths = [Path('/etc/modules-load.d/bbr.conf'), Path('/etc/sysctl.d/99-bbr.conf')]
                 originals = {path: path.read_bytes() if path.exists() else None for path in paths}
+
+                def _write_bbr_file(target_path, raw_bytes):
+                    tmp_path = target_path.with_name(target_path.name + '.tmp.' + secrets.token_hex(4))
+                    try:
+                        tmp_path.write_bytes(raw_bytes)
+                        os.chmod(str(tmp_path), 0o644)
+                        os.replace(str(tmp_path), str(target_path))
+                    except BaseException:
+                        tmp_path.unlink(missing_ok=True)
+                        raise
+
+                def _rollback_bbr_files_and_runtime():
+                    for path, content in originals.items():
+                        try:
+                            if content is None:
+                                path.unlink(missing_ok=True)
+                            else:
+                                _write_bbr_file(path, content)
+                        except OSError as rb_exc:
+                            _log_ignored('bbr_rollback_file', rb_exc)
+                    for key, value in runtime.items():
+                        try:
+                            subprocess.run(['sysctl', '-w', key + '=' + value],
+                                           capture_output=True, timeout=3)
+                        except Exception as rb_exc:
+                            _log_ignored('bbr_rollback_sysctl', rb_exc)
+
                 try:
                     # 带上归属标记，卸载时据此认出并删除（2026-11-03 修）：旧文件没有标记，
                     # 卸载后重启仍加载 BBR 模块、套用这些 sysctl。
-                    paths[0].write_text(BBR_FILE_MARKER + '\ntcp_' + target + '\n', encoding='utf-8')
-                    paths[1].write_text(BBR_FILE_MARKER + '\n'
-                                        + '\n'.join('%s = %s' % item for item in settings.items()) + '\n',
-                                        encoding='utf-8')
+                    _write_bbr_file(paths[0], (BBR_FILE_MARKER + '\ntcp_' + target + '\n').encode('utf-8'))
+                    _write_bbr_file(
+                        paths[1],
+                        (BBR_FILE_MARKER + '\n'
+                         + '\n'.join('%s = %s' % item for item in settings.items()) + '\n').encode('utf-8'),
+                    )
                     applied = subprocess.run(['sysctl', '-p', str(paths[1])], capture_output=True, text=True, timeout=5)
                     if applied.returncode != 0:
                         raise RuntimeError('sysctl 应用失败')
@@ -13397,13 +13491,7 @@ if __name__ == '__main__':
                         if actual.returncode != 0 or actual.stdout.strip() != settings[key]:
                             raise RuntimeError('sysctl 读回与目标不一致')
                 except Exception:
-                    for path, content in originals.items():
-                        if content is None:
-                            path.unlink(missing_ok=True)
-                        else:
-                            path.write_bytes(content)
-                    for key, value in runtime.items():
-                        subprocess.run(['sysctl', '-w', key + '=' + value], capture_output=True, timeout=3)
+                    _rollback_bbr_files_and_runtime()
                     return self.reply_json(500, {'ok': False, 'error': 'BBR 应用失败，已恢复原文件并尝试恢复原运行参数'})
                 with data_lock:
                     old_target = data.get('bbr_target_version')
@@ -13414,19 +13502,13 @@ if __name__ == '__main__':
                 except AtomicWriteDurabilityError:
                     raise
                 except OSError:
-                    for path, content in originals.items():
-                        if content is None:
-                            path.unlink(missing_ok=True)
-                        else:
-                            path.write_bytes(content)
-                    for key, value in runtime.items():
-                        subprocess.run(['sysctl', '-w', key + '=' + value],
-                                       capture_output=True, timeout=3)
+                    # 先还原内存目标版本，再逐项隔离恢复文件与运行参数，避免某次 sysctl 超时导致内存残留脏版本。
                     with data_lock:
                         if had_target:
                             data['bbr_target_version'] = old_target
                         else:
                             data.pop('bbr_target_version', None)
+                    _rollback_bbr_files_and_runtime()
                     return self.reply_json(500, {'ok': False,
                         'error': 'BBR 状态保存失败，已恢复原配置并尝试恢复原运行参数'})
                 return self.reply_json(200, {'ok': True, 'applied': True, 'current': target,
