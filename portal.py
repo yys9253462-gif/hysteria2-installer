@@ -11972,7 +11972,7 @@ if __name__ == '__main__':
                         core_lock_fd = acquire_core_operation_lock()
                     except RuntimeError as exc:
                         if str(exc) == 'another core operation is running':
-                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                            return self.reply_json(409, {'ok': False, 'error': '另一个核心操作正在进行，请稍后再试'})
                         raise
                     try:
                         if xray_unit_foreign():
@@ -12613,7 +12613,7 @@ if __name__ == '__main__':
                         core_lock_fd = acquire_core_operation_lock()
                     except RuntimeError as exc:
                         if str(exc) == 'another core operation is running':
-                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                            return self.reply_json(409, {'ok': False, 'error': '另一个核心操作正在进行，请稍后再试'})
                         raise
                     try:
                         if name == 'xray' and xray_unit_foreign():
@@ -12666,6 +12666,9 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
+                if not self._extend_deadline(120, heavy=True):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '已有重型任务在运行（安装 / 更新 / 卸载），完成后再试'})
                 length = int(self.headers.get('Content-Length', 0))
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
@@ -12679,12 +12682,12 @@ if __name__ == '__main__':
                         core_lock_fd = acquire_core_operation_lock()
                     except RuntimeError as exc:
                         if str(exc) == 'another core operation is running':
-                            return self.reply_json(409, {'ok': False, 'error': str(exc)})
+                            return self.reply_json(409, {'ok': False, 'error': '另一个核心操作正在进行，请稍后再试'})
                         raise
                     try:
-                        # Keep the usage check inside the same process-wide lock as
-                        # protocol installation, so a concurrent enable cannot race
-                        # between this check and binary removal.
+                        if name == 'xray' and xray_unit_foreign():
+                            return self.reply_json(409, {'ok': False, 'error': XRAY_FOREIGN_ERROR})
+                        # 在跨进程核心锁内检查在用协议，防止并发启用与删除二进制竞态
                         in_use = self._core_users(name)
                         if in_use:
                             return self.reply_json(409, {'ok': False, 'error':
@@ -12692,23 +12695,36 @@ if __name__ == '__main__':
                         unit_states = {}
                         for unit in unit_names:
                             active = _systemd_state(unit) == 'active'
-                            enabled_state = subprocess.run(
+                            is_en = subprocess.run(
                                 ['systemctl', 'is-enabled', unit], capture_output=True,
-                                text=True, timeout=5).stdout.strip()
-                            unit_states[unit] = (active, enabled_state == 'enabled')
+                                text=True, timeout=5)
+                            enabled_state = is_en.stdout.strip()
+                            unit_absent = (
+                                not active
+                                and not Path('/etc/systemd/system/%s.service' % unit).exists()
+                                and (enabled_state == 'not-found' or (is_en.returncode != 0 and not enabled_state))
+                            )
+                            unit_states[unit] = (active, enabled_state == 'enabled', unit_absent)
                         for unit in unit_names:
+                            _, _, unit_absent = unit_states[unit]
+                            if unit_absent:
+                                continue
                             stop_result = subprocess.run(
                                 ['systemctl', 'disable', '--now', unit],
                                 capture_output=True, timeout=30)
                             state = _systemd_state(unit)
                             if not _service_stop_confirmed(stop_result, state):
-                                # Restore every unit's original active and enabled
-                                # state, including units already stopped in this pass.
+                                # 恢复每个原本存在单元的激活与开机自启状态（含本轮已停掉的单元）
                                 restore_failed = []
-                                for restore_unit, (was_active, was_enabled) in unit_states.items():
+                                for restore_unit, (was_active, was_enabled, restore_absent) in unit_states.items():
+                                    if restore_absent:
+                                        continue
                                     enable_result = subprocess.run(
                                         ['systemctl', 'enable' if was_enabled else 'disable', restore_unit],
                                         capture_output=True, timeout=30)
+                                    if was_active:
+                                        subprocess.run(['systemctl', 'reset-failed', restore_unit],
+                                                       capture_output=True, timeout=5)
                                     action_result = subprocess.run(
                                         ['systemctl', 'start' if was_active else 'stop', restore_unit],
                                         capture_output=True, timeout=30)
