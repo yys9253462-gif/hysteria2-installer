@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.56'
+PORTAL_VERSION = '2.57'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -6655,6 +6655,8 @@ def _nft_port_rule(proto, port):
 
 def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
     """Whether another configured protocol still needs an open firewall port."""
+    if isinstance(port, bool):
+        return False
     try:
         port = int(port)
     except (TypeError, ValueError):
@@ -6670,17 +6672,20 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
             continue
         if isinstance(section, dict) and (key not in ('anytls_config', 'tuic_config') or section.get('enabled')):
             try:
-                if int(section.get('port') or 0) == port:
+                raw_p = section.get('port')
+                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
                     return True
             except (TypeError, ValueError):
                 pass
     tags = {REALITY_INBOUND_TAG, VMESS_INBOUND_TAG, VLESSENC_INBOUND_TAG}
     if isinstance(xray_config, dict):
-        for inbound in xray_config.get('inbounds', []):
+        inbounds = xray_config.get('inbounds')
+        for inbound in (inbounds if isinstance(inbounds, list) else []):
             if not isinstance(inbound, dict) or inbound.get('tag') not in tags:
                 continue
             try:
-                if int(inbound.get('port') or 0) == port:
+                raw_p = inbound.get('port')
+                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
                     section_key = {REALITY_INBOUND_TAG: 'reality_config',
                                    VMESS_INBOUND_TAG: 'vmess_config',
                                    VLESSENC_INBOUND_TAG: 'vlessenc_config'}[inbound['tag']]
@@ -6688,23 +6693,27 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
                         return True
             except (TypeError, ValueError):
                 continue
-    for service in (ANYTLS_SERVICE, TUIC_SERVICE):
+    for service, cfg_key in ((ANYTLS_SERVICE, 'anytls_config'), (TUIC_SERVICE, 'tuic_config')):
+        if exclude_key == cfg_key:
+            continue
         config_path = Path('/etc/hysteria') / (ANYTLS_CONFIG_NAME if service == ANYTLS_SERVICE else TUIC_CONFIG_NAME)
         if _systemd_state(service) == 'active' and config_path.exists():
             try:
                 config = json.loads(config_path.read_text(encoding='utf-8'))
                 listeners = config.get('inbounds', []) if isinstance(config, dict) else []
-                if any(int(item.get('listen_port') or 0) == port for item in listeners
-                       if isinstance(item, dict)):
+                if isinstance(listeners, list) and any(
+                        not isinstance(item.get('listen_port'), bool) and int(item.get('listen_port') or 0) == port
+                        for item in listeners if isinstance(item, dict)):
                     return True
             except (OSError, ValueError, TypeError):
                 return True
-    if proto == 'tcp':
+    if proto == 'tcp' and exclude_key != 'proxy_services':
         for item in data.get('proxy_services', []) if isinstance(data.get('proxy_services'), list) else []:
             if not isinstance(item, dict):
                 continue
             try:
-                if int(item.get('port') or 0) == port:
+                raw_p = item.get('port')
+                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
                     return True
             except (TypeError, ValueError):
                 pass
@@ -6718,6 +6727,8 @@ def firewall_port(port, proto='tcp', open_=True):
     Hy2 与 AWG 的端口由安装脚本放行；门户自己装的 Reality 和 GOST 代理端口要在这里处理，
     否则开着防火墙的系统上本机探测一切正常，外网却连不上。
     """
+    if isinstance(port, bool):
+        return False
     try:
         port = int(port)
     except (TypeError, ValueError):
@@ -7790,8 +7801,18 @@ def sync_pin(m, root, meta_path):
 
 
 def prepare(meta_path, port, node_api_key=None):
+    if isinstance(port, bool):
+        raise ValueError('门户端口必须是 1-65535 的整数')
+    try:
+        port_num = int(port)
+    except (TypeError, ValueError):
+        raise ValueError('门户端口必须是 1-65535 的整数') from None
+    if not (1 <= port_num <= 65535):
+        raise ValueError('门户端口必须是 1-65535 的整数')
     root = Path(meta_path).parent
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    if not isinstance(m, dict):
+        raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     # 先修信任模型（cert_type/server_name/is_insecure/pin），再对齐 pin。
     # 顺序不能反：sync_pin 依赖 is_insecure 判断 pin 该不该留，而 is_insecure
     # 本身可能正漂移着（自签证书被换成正式证书后仍是 true）。
@@ -7840,7 +7861,7 @@ def prepare(meta_path, port, node_api_key=None):
                      username=user, password=password)
     auth = base64.b64encode(f'{user}:{password}'.encode())
 
-    data = dict(port=int(port), token=token, auth_hash=hashlib.sha256(auth).hexdigest(),
+    data = dict(port=port_num, token=token, auth_hash=hashlib.sha256(auth).hexdigest(),
                 session_secret=session_secret, api_key=api_key, users=users,
                 proxy_services=[], page=page, qr=qr_svg.decode('utf-8', 'replace'), clash=clash, sing=sing)
     for filename, value in [('portal.json', data), ('portal-access.json', portal_access_payload(base, user, password, api_key))]:
@@ -10090,7 +10111,7 @@ if __name__ == '__main__':
 
             new_rcfg = {
                 'private_key': priv_key, 'public_key': pub_key, 'short_id': short_id,
-                'dest_sni': dest_sni, 'port': listen_port,
+                'dest_sni': dest_sni, 'port': listen_port, 'enabled': True,
             }
             new_rcfg['uuid'] = reality_uuid_for_user(MASTER_USER_ID)
             new_rcfg['uri'] = reality_uri_for_user(new_rcfg, MASTER_USER_ID, public_ip,
@@ -10939,16 +10960,26 @@ if __name__ == '__main__':
                                 raise ValueError()
                             changes['password'] = params['password']
                         if 'expires_at' in params:
-                            changes['expires_at'] = int(params['expires_at'])
+                            raw_exp = params['expires_at']
+                            if isinstance(raw_exp, bool) or isinstance(raw_exp, float):
+                                raise ValueError()
+                            if isinstance(raw_exp, str) and (not raw_exp.isascii() or not raw_exp.isdigit()):
+                                raise ValueError()
+                            changes['expires_at'] = int(raw_exp)
                             # 与 create / renew 使用同一上界（9999-12-31）。
                             if not 0 <= changes['expires_at'] <= 253402300799: raise ValueError()
                         if 'ip_limit' in params:
-                            changes['ip_limit'] = int(params['ip_limit'])
+                            raw_ipl = params['ip_limit']
+                            if isinstance(raw_ipl, bool) or isinstance(raw_ipl, float):
+                                raise ValueError()
+                            if isinstance(raw_ipl, str) and (not raw_ipl.isascii() or not raw_ipl.isdigit()):
+                                raise ValueError()
+                            changes['ip_limit'] = int(raw_ipl)
                             if not 0 <= changes['ip_limit'] <= 1000: raise ValueError()
                         if 'status' in params:
                             if params['status'] not in ('active', 'disabled'): raise ValueError()
                             changes['status'] = params['status']
-                    except (ValueError, TypeError):
+                    except (ValueError, TypeError, OverflowError):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid attribute'})
                     conflict = None
                     durability_uncertain = False
@@ -11031,6 +11062,8 @@ if __name__ == '__main__':
                                 # 旧实现 int(None or 0) 当成早已过期，写成「今天 + N 天」，extend_days
                                 # 缺省 30 —— 商城只想加流量时，永久用户被悄悄改成 30 天后停。
                                 raw_expiry = u.get('expires_at')
+                                if isinstance(raw_expiry, bool):
+                                    raise ValueError()
                                 if raw_expiry is None:
                                     new_expiry = None
                                 else:
@@ -11038,7 +11071,10 @@ if __name__ == '__main__':
                                     new_expiry = int(base_time) + days * 86400
                                 # limit_bytes=0 表示不限量：加流量不能把它变成「只有本次加的量」，
                                 # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
-                                old_limit = int(u.get('limit_bytes') or 0)
+                                raw_limit = u.get('limit_bytes')
+                                if isinstance(raw_limit, bool):
+                                    raise ValueError()
+                                old_limit = int(raw_limit or 0)
                                 new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
                                 if ((new_expiry is not None and not 0 <= new_expiry <= 253402300799)
                                         or not 0 <= new_limit <= 2**63 - 1):
@@ -11307,6 +11343,8 @@ if __name__ == '__main__':
                     # 主控制台的节点流量限额：超额时停代理服务，新周期恢复。
                     if not isinstance(params.get('suspended'), bool):
                         return self.reply_json(400, {'ok': False, 'error': 'suspended must be a boolean'})
+                    # 停用或恢复涉及多个 systemd 单元启停，续期死线避免撞上默认 30 秒超时。
+                    self._extend_deadline(120)
                     state, results = set_traffic_suspension(params['suspended'])
                     failed = [u for u, ok in results.items() if not ok]
                     return self.reply_json(200 if not failed else 500, {
@@ -11320,7 +11358,11 @@ if __name__ == '__main__':
                 return self.reply(429, b'Too many requests')
 
             # 3. Web 网页版管理通道 (用户管理 / WARP 开关 / 触发升级)
-            prefix = '/' + data['token'] + '/'
+            with data_lock:
+                _portal_tok = data.get('token')
+            if not isinstance(_portal_tok, str) or not _portal_tok:
+                return self.reply(503, b'Portal token unavailable')
+            prefix = '/' + _portal_tok + '/'
             if self.path == prefix + 'do-upgrade':
                 return self._h_post_do_upgrade(prefix)
 
@@ -12386,6 +12428,8 @@ if __name__ == '__main__':
 
                 if action in ('start', 'stop', 'restart'):
                     label = {'start': '启动', 'stop': '停止', 'restart': '重启'}.get(action, action)
+                    # 等 awg_operation_lock 与 30 秒 systemctl 合计可能超过默认 30 秒连接死线，先续期。
+                    self._extend_deadline(120)
                     # 与 peer 增删 / 更新串行（2026-11-04 修）：在它们中途停掉接口，热添加会
                     # 落在正在关闭的接口上，更新自己的重启也会和这里打架。
                     with awg_operation_lock:
@@ -12393,8 +12437,11 @@ if __name__ == '__main__':
                             # 先清失败计数（2026-11-13 修，同终端菜单与 awgctl）：单元是 StartLimitBurst=5 /
                             # 300 秒，连续加客户端（热加入失败会兜底重启）再点几次重启就撞上限，之后 5 分钟内
                             # 点「启动」只会拿到 start of the service was attempted too often。
-                            subprocess.run(['systemctl', 'reset-failed', AWG_SVC_NAME],
-                                           capture_output=True, timeout=5)
+                            try:
+                                subprocess.run(['systemctl', 'reset-failed', AWG_SVC_NAME],
+                                               capture_output=True, timeout=5)
+                            except (OSError, subprocess.SubprocessError):
+                                pass
                         proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
                                               capture_output=True, text=True, timeout=30)
                     if proc.returncode != 0:
@@ -12573,6 +12620,9 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             binary_replaced = False
             try:
+                if unit_suspended('xray'):
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '节点因流量超额停用中，请在控制台恢复节点后再安装并启用 Reality'})
                 # 三个下载源 × 45 秒 + 校验/解压，全程远超 30 秒默认死线。
                 if not self._extend_deadline(300, heavy=True):
                     return self.reply_json(409, {'ok': False, 'error':
@@ -12622,7 +12672,9 @@ if __name__ == '__main__':
                             '最常见原因是 TCP 443 已被其他服务（如 Caddy / Nginx）占用。'
                             '日志尾部：%s' % (xr_state, xr_log.strip()[-400:])})
 
-                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % config_section(data, 'reality_config').get('port', '')})
+                with data_lock:
+                    reality_port = config_section(data, 'reality_config').get('port', '')
+                return self.reply_json(200, {'ok': True, 'message': 'Xray-core 安装成功，VLESS-Reality 已在 TCP %s 端口就绪！' % reality_port})
             except Exception as e:
                 # 二进制已经换成新版后，后续配置一步失败（例如找不到空闲端口）时要说清楚：
                 # 旧回复只有「安装执行异常」，管理员不知道正在跑的协议下次重启就会用新核心。
@@ -12682,11 +12734,36 @@ if __name__ == '__main__':
                                 current = cfg_now
                             if not isinstance(current, dict):
                                 current = cfg_now
+                            original_config = copy.deepcopy(current)
+                            with data_lock:
+                                old_state = copy.deepcopy(data.get('reality_config'))
                             remove_managed_inbound(current, REALITY_INBOUND_TAG)
                             apply_xray_config_transaction(
                                 current, config_path=str(xray_path),
                                 binary='/usr/local/bin/xray',
                                 restart=not unit_suspended('xray'))
+                        with data_lock:
+                            _kept = dict(config_section(data, 'reality_config'))
+                            _kept['enabled'] = False
+                            data['reality_config'] = _kept
+                        try:
+                            save_data()
+                        except AtomicWriteDurabilityError:
+                            raise
+                        except OSError:
+                            try:
+                                with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
+                                    apply_xray_config_transaction(
+                                        original_config, config_path=str(xray_path),
+                                        binary='/usr/local/bin/xray',
+                                        restart=not unit_suspended('xray'))
+                            finally:
+                                with data_lock:
+                                    if old_state is not None:
+                                        data['reality_config'] = old_state
+                                    else:
+                                        data.pop('reality_config', None)
+                            raise
                         # 停用后重建连接页与订阅缓存，避免订阅中残留已关闭的 Reality 节点。
                         regenerate_page()
                         new_active = False
@@ -14021,7 +14098,10 @@ if __name__ == '__main__':
                 if ver not in ('v1', 'v2', 'v3'):
                     return self.reply_json(400, {'ok': False, 'error': '不支持的 BBR 版本（仅支持 v1、v2 或 v3）'})
                 target = {'v1': 'bbr', 'v2': 'bbr2', 'v3': 'bbr3'}[ver]
-                subprocess.run(['modprobe', 'tcp_' + target], capture_output=True, timeout=5)
+                try:
+                    subprocess.run(['modprobe', 'tcp_' + target], capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
                 available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
                                            capture_output=True, text=True, timeout=3)
                 if available.returncode != 0:
@@ -14050,9 +14130,13 @@ if __name__ == '__main__':
                 originals = {path: path.read_bytes() if path.exists() else None for path in paths}
 
                 def _write_bbr_file(target_path, raw_bytes):
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp_path = target_path.with_name(target_path.name + '.tmp.' + secrets.token_hex(4))
                     try:
-                        tmp_path.write_bytes(raw_bytes)
+                        with open(tmp_path, 'wb') as fh:
+                            fh.write(raw_bytes)
+                            fh.flush()
+                            os.fsync(fh.fileno())
                         os.chmod(str(tmp_path), 0o644)
                         os.replace(str(tmp_path), str(target_path))
                     except BaseException:
@@ -14943,6 +15027,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             cc = ''
                         return (cc.startswith('bbr'), cc)
 
+                    singbox_installed = bool(_singbox_version())
+                    bbr_enabled, bbr_algo = _bbr_now()
+                    vmess_port = _valid_port(d_snap['vmess'].get('port'))
+                    vlessenc_port = _valid_port(d_snap['vlessenc'].get('port'))
+                    anytls_port = _valid_port(d_snap['anytls'].get('port'))
+                    tuic_port = _valid_port(d_snap['tuic'].get('port'))
+
                     # 节点门户自身版本：流式扫描 __file__ 命中 PORTAL_VERSION 即停，
                     # 避免旧版 [:80] 截断漏掉定义及整文件读入内存；不可读时回落模块常量。
                     portal_version = PORTAL_VERSION
@@ -15005,8 +15096,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'active': d_snap['vmess_inbound'],
                                     'configured': bool(d_snap['vmess'].get('domain')),
                                 },
-                                **({'port': _valid_port(d_snap['vmess'].get('port'))}
-                                   if d_snap['vmess'].get('port') else {}),
+                                **({'port': vmess_port} if vmess_port else {}),
                                 **({'domain': d_snap['vmess']['domain']}
                                    if d_snap['vmess'].get('domain') else {}),
                                 **({'ws_path': d_snap['vmess']['ws_path']}
@@ -15022,8 +15112,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'active': d_snap['vlessenc_inbound'],
                                     'configured': bool(d_snap['vlessenc'].get('domain')),
                                 },
-                                **({'port': _valid_port(d_snap['vlessenc'].get('port'))}
-                                   if d_snap['vlessenc'].get('port') else {}),
+                                **({'port': vlessenc_port} if vlessenc_port else {}),
                                 **({'domain': d_snap['vlessenc']['domain']}
                                    if d_snap['vlessenc'].get('domain') else {}),
                                 **({'sni': d_snap['vlessenc']['sni']}
@@ -15034,7 +15123,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             # 同样只给客户端公开参数，secret（服务端派生密钥）不外泄。
                             'anytls': dict(
                                 {
-                                    'installed': bool(_singbox_version()),
+                                    'installed': singbox_installed,
                                     # 与 /anytls-status、_active_*_config 同一判据：
                                     # 「已启用且配置文件在」。只看服务状态会在
                                     # 配置被删/损坏但进程还在时误报能力可用。
@@ -15042,8 +15131,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                               and _svc_active(ANYTLS_SERVICE),
                                     'configured': bool(d_snap['anytls'].get('domain')),
                                 },
-                                **({'port': _valid_port(d_snap['anytls'].get('port'))}
-                                   if d_snap['anytls'].get('port') else {}),
+                                **({'port': anytls_port} if anytls_port else {}),
                                 **({'domain': d_snap['anytls']['domain']}
                                    if d_snap['anytls'].get('domain') else {}),
                                 **({'sni': d_snap['anytls']['sni']}
@@ -15052,13 +15140,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             # TUIC（2026-10-31 加）：同样由 sing-box 承载，端口为 UDP。
                             'tuic': dict(
                                 {
-                                    'installed': bool(_singbox_version()),
+                                    'installed': singbox_installed,
                                     'active': _active_tuic_config() is not None
                                               and _svc_active(TUIC_SERVICE),
                                     'configured': bool(d_snap['tuic'].get('domain')),
                                 },
-                                **({'port': _valid_port(d_snap['tuic'].get('port'))}
-                                   if d_snap['tuic'].get('port') else {}),
+                                **({'port': tuic_port} if tuic_port else {}),
                                 **({'domain': d_snap['tuic']['domain']}
                                    if d_snap['tuic'].get('domain') else {}),
                                 **({'sni': d_snap['tuic']['sni']}
@@ -15076,7 +15163,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'warp': {'installed': Path('/etc/hysteria/warp').exists()
                                      or _bin('wireproxy'),
                                      'enabled': d_snap['warp_enabled']},
-                            'bbr': {'enabled': _bbr_now()[0], 'algo': _bbr_now()[1]},
+                            'bbr': {'enabled': bbr_enabled, 'algo': bbr_algo},
                             # 证书到期一并带出（2026-10-09）：主面板的节点列表
                             # 需要在**到期前**就把临期节点标出来，而不是等用户
                             # 报障「昨天还好好的今天连不上」才回来查。只给面板
@@ -15174,7 +15261,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.check_rate_limit(bucket='web'):
                 return self.reply(429, b'Too many requests')
 
-            prefix = '/' + data['token'] + '/'
+            with data_lock:
+                _portal_tok = data.get('token')
+            if not isinstance(_portal_tok, str) or not _portal_tok:
+                return self.reply(503, b'Portal token unavailable')
+            prefix = '/' + _portal_tok + '/'
             if not self.path.startswith(prefix):
                 return self.reply(404, b'Not found')
 
@@ -15209,9 +15300,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     #      否则知道门户 token 的人可以逐个试出哪些 user_id 存在；
                     #   2. hmac.compare_digest 遇到非 ASCII 的 str 会抛 TypeError
                     #      （do_GET 没有兜底，连接直接被重置），所以先挡非 ASCII。
-                    ok_key = (bool(k_val) and k_val.isascii() and u_copy is not None
+                    ok_key = (bool(k_val) and k_val.isascii() and isinstance(expected_k, str)
+                              and expected_k.isascii() and u_copy is not None
                               and hmac.compare_digest(k_val, expected_k))
                     if not ok_key:
+                        self.record_failure()
                         return self.reply(403, b'Access denied: invalid key')
                 elif u_copy is None:
                     return self.reply(404, b'User not found')
@@ -15265,9 +15358,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 elif action_file == 'qr.svg':
                     try:
                         qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
-                        return self.reply(200, qr_bytes, 'image/svg+xml')
                     except Exception:
-                        return self.reply(500, b'QR generation failed')
+                        qr_bytes = b''
+                    if b'<svg' not in qr_bytes:
+                        qr_bytes = QR_UNAVAILABLE_SVG.encode('utf-8')
+                    return self.reply(200, qr_bytes, 'image/svg+xml')
                 elif action_file == '':
                     try:
                         qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
@@ -15276,9 +15371,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
                     _insecure, server_name, _pub_clean, host = clean_node_identity(m)
-                    listen_port = m.get('listen_port', 19984)
+                    listen_port = _valid_port(m.get('listen_port')) or 19984
                     obfs_badge = "Salamander" if m.get('obfs_password') else "QUIC"
-                    page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, data['token'], expected_k, resolve_subscription_port(m)[0],
+                    page = user_page_html(server_name, host, listen_port, obfs_badge, target_uid, u_copy, uri, clash_yaml, sing_json, qr_svg, _portal_tok, expected_k, resolve_subscription_port(m)[0],
                                           extra_links=self._user_extra_links(target_uid, _pub_clean, with_qr=True))
                     return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
                 else:
@@ -16023,7 +16118,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 conf_path = Path('/etc/sysctl.d/99-bbr.conf')
                 configured_bbr = ''
                 if conf_path.exists():
-                    c_text = conf_path.read_text(encoding='utf-8')
+                    try:
+                        c_text = conf_path.read_text(encoding='utf-8')
+                    except (OSError, UnicodeDecodeError):
+                        c_text = ''
                     for line in c_text.splitlines():
                         stripped = line.strip()
                         if not stripped or stripped.startswith('#') or stripped.startswith(';'):
@@ -16050,13 +16148,18 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 # tcp_available_congestion_control 只列出**已加载**的模块：新机器上
                 # tcp_bbr 还没 modprobe，只会看到 "reno cubic"，前端据此把按钮全禁用。
-                # 所以把「内核里装了、可被 modprobe 的模块」也算作可用。
+                # 所以把「内核里装了、可被 modprobe 的模块」也算作可用；未装 modinfo 时平稳跳过。
                 available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
                                            capture_output=True, text=True, timeout=2).stdout.split()
                 for algo in ('bbr', 'bbr2', 'bbr3'):
-                    if algo not in available and subprocess.run(
-                            ['modinfo', '-n', 'tcp_' + algo], capture_output=True, timeout=2).returncode == 0:
-                        available.append(algo)
+                    if algo in available:
+                        continue
+                    try:
+                        if subprocess.run(
+                                ['modinfo', '-n', 'tcp_' + algo], capture_output=True, timeout=2).returncode == 0:
+                            available.append(algo)
+                    except (OSError, subprocess.SubprocessError):
+                        continue
 
                 return self.reply_json(200, {
                     'ok': True,

@@ -545,7 +545,9 @@ if [ -z "$PASSWORD" ]; then
         PASSWORD="$(ask "新系统 root 密码（字母、数字或 ._@%+=:,~^-）[回车使用随机密码]： " "$_random_pwd")"
     fi
     if [ "$PASSWORD" = "$_random_pwd" ]; then
-        warn "已自动生成 root 密码：$PASSWORD"
+        # 仅向终端显示明文随机密码，绝不通过 warn() 写入持久化日志文件 $LOG。
+        printf '%s[!]%s 已自动生成 root 密码：%s\n' "$c_y" "$c_0" "$PASSWORD"
+        log_line "[!] 已自动生成随机 root 密码（已省略明文）"
         warn "★ 请务必记下这个密码，重装后要用它登录！"
     fi
     unset _random_pwd

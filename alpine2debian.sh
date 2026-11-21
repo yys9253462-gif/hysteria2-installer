@@ -756,11 +756,13 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s chroot 配置脚本内容：\n' "$c_ylw" "$c_rst"
     printf '%s\n' "$BODY" | sed 's/^/        /'
 else
+    trap 'rm -f "$MOUNT_DIR/tmp/_setup.sh" "$MOUNT_DIR/tmp/_rootpw"' EXIT INT TERM
     printf '%s\n' "$BODY" > "$MOUNT_DIR/tmp/_setup.sh"
     ( umask 077; printf 'root:%s\n' "$ROOT_PWD" > "$MOUNT_DIR/tmp/_rootpw" )
     _chroot_rc=0
     chroot "$MOUNT_DIR" /bin/sh /tmp/_setup.sh || _chroot_rc=$?
     rm -f "$MOUNT_DIR/tmp/_setup.sh" "$MOUNT_DIR/tmp/_rootpw"
+    trap - EXIT INT TERM
     [ "$_chroot_rc" -eq 0 ] || die "chroot 配置失败（退出码 ${_chroot_rc}），已清理临时密码文件"
     ok "chroot 配置完成"
 fi

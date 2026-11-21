@@ -2410,7 +2410,8 @@ backup_state_before_reconfigure() {
     for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
              "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
         [[ -f "$f" ]] || continue
-        if cp -a "$f" "${f}.bak-${snapshot_id}" 2>/dev/null; then
+        if (umask 077 && cp -p "$f" "${f}.bak-${snapshot_id}" 2>/dev/null) \
+                && chmod 600 "${f}.bak-${snapshot_id}" 2>/dev/null; then
             saved=$((saved + 1))
         else
             failed=$((failed + 1))
@@ -2430,23 +2431,20 @@ backup_state_before_reconfigure() {
         log_warn "没有可快照的现有配置文件（可能是首次安装）。"
         return 0
     fi
-    # 每个文件只保留最近 5 份快照（含本次）：超出的按时间戳排序后删除。
-    local _old _snapshot_list _snapshot_count
+    # 每个文件只保留最近 5 份快照（含本次）：在内存数组中排序淘汰，不在配置目录写临时清单文件。
+    local _old
+    local -a _snaps
     for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
              "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
-        # The list filename must not match the *.bak-* snapshot glob itself.
-        _snapshot_list="${f}.snapshot-list-$$"
-        : > "$_snapshot_list" || continue
+        _snaps=()
         for _old in "${f}".bak-*; do
-            [[ -f "$_old" ]] && printf '%s\n' "$_old" >> "$_snapshot_list"
+            [[ -f "$_old" ]] && _snaps+=("$_old")
         done
-        _snapshot_count="$(wc -l < "$_snapshot_list")"
-        if (( _snapshot_count > 5 )); then
-            sort -r "$_snapshot_list" | tail -n +6 | while IFS= read -r _old; do
+        if (( ${#_snaps[@]} > 5 )); then
+            printf '%s\n' "${_snaps[@]}" | sort -r | tail -n +6 | while IFS= read -r _old; do
                 [[ -n "$_old" ]] && rm -f -- "$_old" 2>/dev/null || true
             done
         fi
-        rm -f "$_snapshot_list"
     done
     log_info "已备份 ${saved} 个关键文件（后缀 .bak-${snapshot_id}），改配置出问题可回滚。"
 }
@@ -2483,10 +2481,23 @@ try:
 except (OSError, ValueError):
     _data = {}
 if isinstance(_data, dict):
-    for _key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config'):
+    for _key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config', 'tuic_config'):
         _sec = _data.get(_key)
-        if isinstance(_sec, dict) and isinstance(_sec.get('port'), int) and not isinstance(_sec.get('port'), bool):
-            RESERVED.add(_sec['port'])
+        if isinstance(_sec, dict):
+            _p = _sec.get('port')
+            if isinstance(_p, int) and not isinstance(_p, bool):
+                RESERVED.add(_p)
+            elif isinstance(_p, str) and _p.strip().isdigit():
+                RESERVED.add(int(_p.strip()))
+    _proxies = _data.get('proxy_services')
+    if isinstance(_proxies, list):
+        for _item in _proxies:
+            if isinstance(_item, dict):
+                _p = _item.get('port')
+                if isinstance(_p, int) and not isinstance(_p, bool):
+                    RESERVED.add(_p)
+                elif isinstance(_p, str) and _p.strip().isdigit():
+                    RESERVED.add(int(_p.strip()))
 for _ in range(100):
     port = 10000 + secrets.randbelow(50000)
     if port in RESERVED or 20000 <= port <= 40000:

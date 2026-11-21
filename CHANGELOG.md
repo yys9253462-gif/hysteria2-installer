@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十七批十项修复，门户 2.57
+
+- 端口占用排除键与布尔端口防护及 BBR 状态缺失工具容错（`portal.py` 的 `protocol_port_in_use`、`firewall_port` 与 `_h_get_bbr_status`）：`protocol_port_in_use` 遵循 `exclude_key='proxy_services'` / `'anytls_config'` / `'tuic_config'` 避免自排冲突，拦截 `xray_config.inbounds` 非列表损坏，并与 `firewall_port` 统一拒绝布尔型 `port`（防 `int(True)` 误认端口 1）；`_h_get_bbr_status` 容忍 `99-bbr.conf` 非 UTF-8 损坏编码及精简系统缺失 `modinfo` 导致的 `FileNotFoundError`。
+- Xray 一键安装停用护栏与门户初始化校验（`portal.py` 的 `_h_post_install_xray` 与 `prepare`）：`_h_post_install_xray` 在申领重型槽前拦截整机流量超额停用状态返回 409，并在 `data_lock` 内读取 `reality_config.port`；`prepare` 校验 `client_meta.json` 顶层必为 JSON 对象并拦截布尔与越界门户端口。
+- Reality 启停状态持久化与保存失败回滚（`portal.py` 的 `_generate_and_apply_reality` 与 `_h_post_manage_reality`）：启用写入 `'enabled': True`，停用分支与 VMess / VLESS Encryption 对齐持久化 `data['reality_config']['enabled'] = False`，修复停用 Reality 后旧端口仍被 `protocol_port_in_use` 永久占用的缺陷，并在 `save_data()` 失败时完整回滚 Xray 配置与内存状态。
+- AmneziaWG 启停死线续期与 BBR 应用落盘刷盘（`portal.py` 的 `_h_post_manage_amneziawg` 与 `_set_bbr_locked`）：AWG `start`/`stop`/`restart` 在等待 `awg_operation_lock` 前补齐 `self._extend_deadline(120)` 防撞 30 秒连接死线，且 `systemctl reset-failed` 隔离超时异常不阻断主操作；`_set_bbr_locked` 容忍 `modprobe` 缺失不阻断内核已内建 `tcp_bbr`，`_write_bbr_file` 自动建父目录并在替换前执行 `flush()` + `os.fsync()`。
+- 流量计量运行时 UTC 时区修正、新建用户在线占位与坏源配置校验（`usage-meter-runtime-20261007-v1.py`）：`_source_fresh` 与 `_recent_gaps` 解析不带时区的 naive ISO 时间戳时默认按 UTC 处理，消除非 UTC 时区主机 8 小时偏移误判；`summary()` 对未出现在上轮 `live_snapshot` 中的新建用户返回完整标准不可用结构而非缺字段空字典 `{}`；`_read()` 拦截非字典源配置统一抛出 `ValueError`。
+- REST 接口用户更新布尔/溢出校验、续费布尔存量防护与停用死线续期（`portal.py`）：`POST /api/v1/users/update` 拦截 `expires_at`/`ip_limit` 传入 JSON 布尔、浮点或非纯数字串并捕获 `OverflowError`；`users/renew` 拦截存量用户损坏的布尔 `expires_at`/`limit_bytes`；`node/suspend` 补齐 `self._extend_deadline(120)` 覆盖多单元启停耗时。
+- 节点能力接口子进程去重与门户路由令牌加锁读取（`portal.py`）：`GET /api/v1/capabilities` 单次调用 `_singbox_version()` 与 `_bbr_now()` 消除重复子进程开销，并在端口非法时省略 `port` 键避免输出 `port: null`；`do_GET` 与 `do_POST` 统一在 `data_lock` 内读取门户令牌并在缺失或损坏时回 503。
+- 专属分享路由防爆破、二维码降级图与端口清洗（`portal.py` 的 `u/<uid>`）：未鉴权密钥错误记入 `record_failure()` 限流桶并校验 `expected_k.isascii()`；`u/<uid>/qr.svg` 在 `qrencode` 缺失或输出异常时回退可读提示图 `QR_UNAVAILABLE_SVG`；渲染分享页复用锁内已读 `_portal_tok` 并经 `_valid_port` 清洗 `listen_port`。
+- 主安装脚本重配置快照权限加固与订阅端口避让补全（`install.sh`）：`backup_state_before_reconfigure` 在 `umask 077` 下创建副本并收紧 `chmod 600`，旧快照淘汰改用内存数组彻底移除 `.snapshot-list-$$` 磁盘临时文件；`select_subscription_port` 将 `tuic_config` 与 `proxy_services` 全部端口纳入 `RESERVED` 避让集合。
+- 重装脚本明文密码防泄漏与登录脚本判空（`reinstall-debian13.sh`、`alpine2debian.sh` 与 `portal_assets.py`）：`reinstall-debian13.sh` 自动生成随机 root 密码仅输出到终端不再经 `warn()` 写入持久化日志；`alpine2debian.sh` 写明文 `_rootpw` 前注册 `EXIT INT TERM` 清理陷阱防止中断残留；`LOGIN_SCRIPT` 的 `toggleSecret` 增加缺失元素判空。
+
 ## 2026-11-22 — 第四十六批十项修复，门户 2.56
 
 - 核心升级候选刷盘、回滚异常隔离与核心锁描述符防泄漏（`portal.py` 的 `_upgrade_core_binary_locked` 与 `acquire_core_operation_lock`）：候选核心落盘后执行 `flush()` 与 `os.fsync()` 刷盘再替换；回滚阶段的 `tempfile.mkstemp` 与文件写入移入独立 `try` 块，避免磁盘写满掩盖原升级失败并跳过 `_restart_hy2()` 恢复；`acquire_core_operation_lock` 遇非 `BlockingIOError` 异常同样关闭 `lock_fd` 消除文件描述符泄漏。
