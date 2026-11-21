@@ -173,8 +173,8 @@ else
         exit 0
     fi
 
-    BK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-    cp -a "$CONFIG" "$BK" || { err "备份配置失败，未做任何修改。"; exit 1; }
+    BK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S).$$"
+    (umask 077 && cp -a "$CONFIG" "$BK") || { rm -f "$BK"; err "备份配置失败，未做任何修改。"; exit 1; }
     info "已备份原配置：$BK"
 
     set_tls_cert "$CONFIG" "$FULL" || { restore_config_file "$BK" "$CONFIG" || true; err "写入配置失败，已恢复备份。"; exit 1; }

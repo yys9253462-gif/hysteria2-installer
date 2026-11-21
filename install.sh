@@ -57,7 +57,7 @@ curl() {
     for _a in "$@"; do
         case "$_a" in
             https://api.github.com/*)
-                [[ -r "$HY2_GITHUB_TOKEN_FILE" ]] && _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
+                [[ -f "$HY2_GITHUB_TOKEN_FILE" && -r "$HY2_GITHUB_TOKEN_FILE" ]] && _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
                 break ;;
         esac
     done
@@ -4026,12 +4026,15 @@ try:
         written.append(f)
 except Exception:
     for f in reversed(written):
-        if existing[f]:
-            restore = stage / f
-            shutil.copy2(backup / f, restore)
-            os.replace(restore, dest / f)
-        else:
-            (dest / f).unlink()
+        try:
+            if existing[f]:
+                restore = stage / f
+                shutil.copy2(backup / f, restore)
+                os.replace(restore, dest / f)
+            else:
+                (dest / f).unlink(missing_ok=True)
+        except OSError as rb_exc:
+            print(f'回滚 {f} 失败: {rb_exc}', file=sys.stderr)
     raise
 print('门户整包备份: ' + str(backup))
 PYINSTALLBUNDLE
