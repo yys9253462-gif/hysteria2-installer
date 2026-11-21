@@ -11705,7 +11705,7 @@ if __name__ == '__main__':
                                 with tar.extractfile(member) as source, open(src_bin, 'wb') as dest:
                                     shutil.copyfileobj(source, dest)
                             if src_bin.exists():
-                                staged = Path('/usr/local/bin/gost.new.%s' % secrets.token_hex(6))
+                                staged = Path('/usr/local/bin/gost.new.%s' % os.urandom(6).hex())
                                 replaced = False
                                 try:
                                     shutil.copyfile(str(src_bin), str(staged))
