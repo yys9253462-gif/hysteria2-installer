@@ -12121,12 +12121,29 @@ if __name__ == '__main__':
                 endpoint_error = awg_endpoint_error(endpoint)
                 if endpoint_error:
                     return self.reply_json(400, {'ok': False, 'error': endpoint_error})
-                # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃冲突的取值
+                # 端口若由用户指定，提前拦掉会与 Hysteria2 端口跳跃或主监听端口冲突的取值
                 if port:
                     if not port.isdigit() or not (1 <= int(port) <= 65535):
                         return self.reply_json(400, {'ok': False, 'error': '端口必须是 1-65535 的数字'})
-                    if 20000 <= int(port) <= 40000:
+                    port_num = int(port)
+                    if 20000 <= port_num <= 40000:
                         return self.reply_json(400, {'ok': False, 'error': '该端口落在 Hysteria2 的端口跳跃区间 20000-40000 内，会导致 AWG 收不到握手包，请改用 50000-59000'})
+                    try:
+                        m_now = read_meta_file(meta_path)
+                    except Exception:
+                        m_now = {}
+                    if isinstance(m_now, dict):
+                        hy2_listen = _valid_port(m_now.get('listen_port'))
+                        if hy2_listen and port_num == hy2_listen:
+                            return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 已被 Hysteria2 主监听端口占用，请更换其它 UDP 端口'})
+                        hop_range = str(m_now.get('hop_port_range') or '').strip()
+                        hop_match = re.fullmatch(r'(\d{1,5})-(\d{1,5})', hop_range)
+                        if hop_match:
+                            hs, he = int(hop_match.group(1)), int(hop_match.group(2))
+                            if 1 <= hs <= he <= 65535 and hs <= port_num <= he:
+                                return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 落在当前 Hysteria2 端口跳跃区间 {hs}-{he} 内，请更换其它 UDP 端口'})
+                if unit_suspended(AWG_SVC_NAME):
+                    return self.reply_json(409, {'ok': False, 'error': '节点因流量超额停用中，请在控制台恢复节点后再安装 AmneziaWG'})
                 if not ensure_awgctl():
                     return self.reply_json(500, {'ok': False, 'error': '无法获取 hy2-awgctl（服务器可能无法访问 github.com），请手动执行 install.sh 的 AmneziaWG 菜单'})
                 # 安装要下载并核验两个二进制，awgctl 超时 420 秒。
