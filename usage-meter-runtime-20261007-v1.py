@@ -30,6 +30,23 @@ def _parse_iso_utc_ts(raw):
     return dt.timestamp()
 
 
+def _parse_ts(raw):
+    """把 ISO 字符串或有限数值时间戳转为 UTC epoch 秒；非法抛 ValueError。"""
+    if isinstance(raw, bool):
+        raise ValueError('bool timestamp')
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+        if not math.isfinite(val):
+            raise ValueError('non-finite timestamp')
+        return val
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError('empty timestamp')
+    val = _parse_iso_utc_ts(raw)
+    if not math.isfinite(val):
+        raise ValueError('non-finite timestamp')
+    return val
+
+
 def _source_fresh(health, source, max_age=30):
     """某来源的健康条目是否新鲜且可用。
 
@@ -44,10 +61,8 @@ def _source_fresh(health, source, max_age=30):
     if not isinstance(entry, dict) or not entry.get('ok'):
         return False
     raw = entry.get('sampled_at')
-    if not isinstance(raw, str) or not raw:
-        return False
     try:
-        when = _parse_iso_utc_ts(raw)
+        when = _parse_ts(raw)
     except (TypeError, ValueError, OSError, OverflowError):
         return False
     return 0 <= time.time() - when < max_age
@@ -79,25 +94,25 @@ def _recent_gaps(m, window_seconds=86400):
     cache_key = (gaps, int(time.time() // 30), window_seconds)
     with _recent_gaps_lock:
         if _recent_gaps_cache.get('key') == cache_key:
-            return _recent_gaps_cache['value']
+            return list(_recent_gaps_cache['value'])
     cutoff = time.time() - window_seconds
     recent = []
     for gap in gaps:
         at = (gap or {}).get('at') if isinstance(gap, dict) else None
-        if not at:
+        if at is None or at == '':
             recent.append(gap)
             continue
         try:
-            when = _parse_iso_utc_ts(str(at))
+            when = _parse_ts(at)
         except (TypeError, ValueError, OSError, OverflowError):
             recent.append(gap)
             continue
         if when >= cutoff:
             recent.append(gap)
-    # 内容快照保留原地修改检测；命中时直接比较结构，避免逐用户序列化整表。
+    # 内容快照保留原地修改检测；命中时返回副本，防止调用方修改污染缓存。
     with _recent_gaps_lock:
-        _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=recent)
-    return recent
+        _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=list(recent))
+    return list(recent)
 
 def _users_view(data):
     """门户的用户表；损坏（null/list/str）时按空表处理。
@@ -392,6 +407,10 @@ class PortalMeter:
                           and not isinstance(online_sampled_at, bool)
                           and math.isfinite(online_sampled_at)
                           and 0 <= now_ts - online_sampled_at < 30)
+            online_dev = None
+            if online_fresh:
+                raw_dev = online_counts.get(uid, 0)
+                online_dev = raw_dev if (type(raw_dev) is int and raw_dev >= 0) else 0
             return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),
                 'measurement_ok':initialized and fresh and not _recent_gaps(m),
@@ -399,10 +418,10 @@ class PortalMeter:
                 'measurement_complete': initialized and not gaps,
                 'current_online': copy.deepcopy(live_entry),
                 'online_ip_scope': 'recent_authentication',
-                'online_devices': online_counts.get(uid, 0) if online_fresh else None,
+                'online_devices': online_dev,
                 'online_devices_scope': 'hysteria_core_instances_only',
                 'measurement_scope':'since_measurement_started',
-                'measurement_sources':{s:copy.deepcopy(health.get(s, {})) for s in enabled},
+                'measurement_sources':{s:(copy.deepcopy(health[s]) if isinstance(health.get(s), dict) else {}) for s in enabled},
                 'measurement_gaps':copy.deepcopy(gaps),
                 'legacy_auth_value':legacy}
 

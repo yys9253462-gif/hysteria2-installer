@@ -10,7 +10,7 @@ def service_epoch(service):
         raise ValueError('unsupported service')
     r = subprocess.run(['systemctl','show',service,'--property=InvocationID','--value'],
                        capture_output=True, timeout=5, check=True)
-    value = r.stdout.decode().strip()
+    value = r.stdout.decode('utf-8', errors='replace').strip()
     if not value:
         raise RuntimeError('missing InvocationID')
     return value
@@ -186,10 +186,15 @@ def parse_events(rows):
             return 0
         if isinstance(raw_ts, bool):
             raise ValueError('invalid_connection_event')
+        if isinstance(raw_ts, str):
+            s = raw_ts.strip()
+            if not (s.isascii() and (s.isdigit() or (s.startswith('-') and s[1:].isdigit()))):
+                raise ValueError('invalid_connection_event')
+            return int(s)
         return int(raw_ts)
     try:
         rows=sorted(rows,key=_event_sort_ts)
-    except (TypeError,ValueError):
+    except (TypeError,ValueError,OverflowError):
         raise ValueError('invalid_connection_event') from None
     for row in rows:
         message=row.get('MESSAGE','')
