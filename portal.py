@@ -14444,16 +14444,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             cc = ''
                         return (cc.startswith('bbr'), cc)
 
-                    # 节点门户自身版本：这个文件里写着版本号常量，
-                    # 主面板据此判断"节点跑的是新 portal 还是老 portal"。
-                    portal_version = ''
+                    # 节点门户自身版本：流式扫描 __file__ 命中 PORTAL_VERSION 即停，
+                    # 避免旧版 [:80] 截断漏掉定义及整文件读入内存；不可读时回落模块常量。
+                    portal_version = PORTAL_VERSION
                     try:
-                        for line in Path(__file__).read_text(encoding='utf-8').splitlines()[:80]:
-                            if line.startswith('PORTAL_VERSION'):
-                                portal_version = line.split('=', 1)[1].strip().strip('"\'')
-                                break
+                        with Path(__file__).open(encoding='utf-8') as _ver_fp:
+                            for line in _ver_fp:
+                                if line.startswith('PORTAL_VERSION'):
+                                    parsed_ver = line.split('=', 1)[1].strip().strip('"\'')
+                                    if parsed_ver:
+                                        portal_version = parsed_ver
+                                    break
                     except Exception:
-                        portal_version = ''
+                        portal_version = PORTAL_VERSION
 
                     # 端口一律经 _valid_port（2026-11-03 修）：任何一个协议段的端口被改坏成
                     # 字符串，旧写法 int() 抛异常，整个 capabilities 回 500，控制台看不到这台节点。
