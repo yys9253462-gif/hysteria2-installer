@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.52'
+PORTAL_VERSION = '2.53'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -489,11 +489,25 @@ def validate_outbound(entry):
     if otype == 'socks5':
         raw_addr = entry.get('addr')
         addr = raw_addr.strip() if isinstance(raw_addr, str) else ''
-        # 必须带端口；只给域名或IP 是不够的
-        if not re.match(r'^[^\s:]+:\d{1,5}$', addr):
-            return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
-        host, port = addr.rsplit(':', 1)
-        if not (0 < int(port) < 65536):
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in addr):
+            return False, None, "SOCKS5 地址不能包含控制字符"
+        # 支持 host:port 与 [IPv6]:port 两种形式，且必须带合法端口
+        if addr.startswith('['):
+            m_v6 = re.fullmatch(r'\[([^\s\[\]]+)\]:(\d{1,5})', addr)
+            if not m_v6:
+                return False, None, "SOCKS5 IPv6 地址格式应为 [IPv6]:port，例如 [::1]:1080"
+            try:
+                ip_obj = ipaddress.ip_address(m_v6.group(1))
+            except ValueError:
+                return False, None, "SOCKS5 方括号内不是合法 IPv6 地址"
+            if ip_obj.version != 6:
+                return False, None, "SOCKS5 方括号内必须是 IPv6 地址"
+            port_str = m_v6.group(2)
+        else:
+            if not re.fullmatch(r'[^\s:\[\]]+:\d{1,5}', addr):
+                return False, None, "SOCKS5 地址格式应为 host:port，例如 1.2.3.4:1080"
+            _, port_str = addr.rsplit(':', 1)
+        if not (0 < int(port_str) < 65536):
             return False, None, "端口超出范围"
         cleaned['addr'] = addr
         # 账号密码会**逐字拼进 YAML**（render_outbound_yaml），
@@ -515,10 +529,21 @@ def validate_outbound(entry):
     elif otype == 'http':
         raw_url = entry.get('url')
         url = raw_url.strip() if isinstance(raw_url, str) else ''
-        # 路径里也不允许空白：旧正则的 `.*` 允许空格，带空格的 URL
-        # curl 会直接拒绝，而配置照样写进 YAML（2026-10-30 修）。
-        if not re.match(r'^https?://[^\s/]+(?:/.*)?$', url, re.I) or re.search(r'\s', url):
-            return False, None, "HTTP 代理地址格式应为 http://host:port 或 https://host:port（不能含空格）"
+        # 路径与主机里不允许空白或控制字符，并用 urlsplit 校验主机与端口合法性。
+        if (not re.match(r'^https?://[^\s/]+(?:/.*)?$', url, re.I)
+                or re.search(r'\s', url)
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in url)):
+            return False, None, "HTTP 代理地址格式应为 http://host:port 或 https://host:port（不能含空格或控制字符）"
+        try:
+            parsed_url = urlsplit(url)
+            parsed_host = parsed_url.hostname
+            parsed_port = parsed_url.port
+        except ValueError:
+            return False, None, "HTTP 代理地址或端口格式无效"
+        if not parsed_host:
+            return False, None, "HTTP 代理地址缺少主机名"
+        if parsed_port is not None and not (0 < parsed_port < 65536):
+            return False, None, "HTTP 代理端口超出范围"
         cleaned['url'] = url
         # insecure 只接受明确的一串真值，其他一律当false（别把 "no" 当 true）
         cleaned['insecure'] = str(entry.get('insecure', '')).strip().lower() in ('1', 'true', 'yes', 'on')
@@ -989,9 +1014,21 @@ def _hy2_config_loaded(config_path, identity=None):
         # 被判成已加载，apply_egress_config 直接返回成功（面板显示已生效，
         # 实际 Hysteria 还在用旧 ACL）。这里显式解析末尾时区段。
         when = ' '.join(fields[1:3])
-        timestamp = time.mktime(time.strptime(when, '%Y-%m-%d %H:%M:%S'))
+        tm = time.strptime(when, '%Y-%m-%d %H:%M:%S')
         if len(fields) >= 4 and fields[3] in ('UTC', 'GMT'):
-            timestamp -= time.timezone or 0
+            # 纯算术将 UTC 年月日时分秒转为纪元秒：既避免夏令时下 time.mktime 与
+            # time.timezone 差 1 小时导致误判，又只依赖 time 模块保持最小依赖。
+            y, mo, d = tm.tm_year, tm.tm_mon, tm.tm_mday
+            if mo <= 2:
+                y -= 1
+            era = y // 400
+            yoe = y - era * 400
+            doy = (153 * (mo + (12 if mo <= 2 else 0) - 3) + 2) // 5 + d - 1
+            doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+            days = era * 146097 + doe - 719468
+            timestamp = days * 86400 + tm.tm_hour * 3600 + tm.tm_min * 60 + tm.tm_sec
+        else:
+            timestamp = time.mktime(tm)
         return state == 'active' and pid not in ('', '0') and Path(config_path).stat().st_mtime <= timestamp + 1
     except Exception:
         return False
@@ -5968,6 +6005,7 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
 
 # WARP 出口 IP 探测结果缓存：前端每 10 秒轮询，而每次探测都要走一次外网。
 _warp_probe_cache = {}
+_warp_probe_lock = threading.Lock()
 
 
 _ACCESS_APPLIED = {}
@@ -8640,6 +8678,7 @@ def serve(path):
             # 一台服务都没停。这里统一走 suspend_state 的清洗规则。
             state = suspend_state(data)
         results = {}
+        _retired = set()
         if suspend:
             units = state.get('units') if state.get('suspended') else None
             if units is None:
@@ -8703,13 +8742,16 @@ def serve(path):
                 else:
                     data.pop('traffic_suspend', None)
             for unit, succeeded in results.items():
-                if not succeeded:
+                if not succeeded or (not suspend and unit in _retired):
                     continue
                 compensate = 'start' if suspend else 'stop'
                 try:
+                    if compensate == 'start':
+                        subprocess.run(['systemctl', 'reset-failed', unit],
+                                       capture_output=True, timeout=5)
                     subprocess.run(['systemctl', compensate, unit],
                                    capture_output=True, timeout=20)
-                except OSError:
+                except Exception:
                     pass
             raise
         return new_state, results
@@ -10572,7 +10614,9 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     password_changed = False
                     with data_lock:
-                        existing = data.get('users', {}).get(user_id)
+                        _raw_users = data.get('users')
+                        users_map = _raw_users if isinstance(_raw_users, dict) else {}
+                        existing = users_map.get(user_id)
                         # 条目被改坏时按「不存在」覆盖掉（2026-11-06 修）：否则
                         # `'view_nonce' in existing` / existing.get 抛 TypeError/AttributeError，
                         # 坏条目也没法通过重建修复。
@@ -10586,7 +10630,7 @@ if __name__ == '__main__':
                             # 同名旧账号的收回还没完成（2026-11-04 修）：此时重建，worker 每 5 秒
                             # 会把新账号当成待收回对象踢下线，故障不消失就一直踢。
                             conflict = (409, 'Revocation of the previous account with this user_id is still pending; retry later')
-                        elif params.get('password') and password_taken(data.get('users', {}), pwd, user_id):
+                        elif params.get('password') and password_taken(users_map, pwd, user_id):
                             conflict = (409, 'Password already in use by another user')
                         if conflict is None:
                             record = {
@@ -10643,7 +10687,9 @@ if __name__ == '__main__':
                                 try:
                                     reconcile_meter_usage(data, user_id, initial_used)
                                     restore_meter_user(data, user_id)
-                                    data.setdefault('users', {})[user_id] = record
+                                    if not isinstance(data.get('users'), dict):
+                                        data['users'] = {}
+                                    data['users'][user_id] = record
                                     save_data()
                                 except ValueError:
                                     conflict = (409, 'Invalid meter ledger; reconciliation not applied')
@@ -10652,7 +10698,8 @@ if __name__ == '__main__':
                                     durability_uncertain = True
                                 except OSError:
                                     if existing is None:
-                                        data.get('users', {}).pop(user_id, None)
+                                        if isinstance(data.get('users'), dict):
+                                            data['users'].pop(user_id, None)
                                     else:
                                         data['users'][user_id] = existing
                                     if previous_meter is missing:
@@ -10663,16 +10710,19 @@ if __name__ == '__main__':
                             elif conflict is None:
                                 previous_record = copy.deepcopy(existing)
                                 restore_meter_user(data, user_id)
-                                data.setdefault('users', {})[user_id] = record
+                                if not isinstance(data.get('users'), dict):
+                                    data['users'] = {}
+                                data['users'][user_id] = record
                                 try:
                                     save_data()
                                 except AtomicWriteDurabilityError:
                                     durability_uncertain = True
                                 except OSError:
                                     if previous_record is None:
-                                        data.get('users', {}).pop(user_id, None)
+                                        if isinstance(data.get('users'), dict):
+                                            data['users'].pop(user_id, None)
                                     else:
-                                        data.setdefault('users', {})[user_id] = previous_record
+                                        data['users'][user_id] = previous_record
                                     reality_registry(data)
                                     conflict = (503, 'User save failed; disk state may require verification')
                             if conflict is None:
@@ -10793,10 +10843,12 @@ if __name__ == '__main__':
                     durability_uncertain = False
                     password_changed = False
                     with data_lock:
-                        u = data.get('users', {}).get(user_id)
+                        _raw_users = data.get('users')
+                        users_map = _raw_users if isinstance(_raw_users, dict) else {}
+                        u = users_map.get(user_id)
                         if not isinstance(u, dict):   # 条目改坏同样按不存在（2026-11-06 修）
                             conflict = (404, 'User not found')
-                        elif 'password' in changes and password_taken(data.get('users', {}), changes['password'], user_id):
+                        elif 'password' in changes and password_taken(users_map, changes['password'], user_id):
                             conflict = (409, 'Password already in use by another user')
                         else:
                             previous = copy.deepcopy(u)
@@ -10853,7 +10905,8 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     with data_lock:
-                        u = data.get('users', {}).get(user_id)
+                        _raw_users = data.get('users')
+                        u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
                         # 条目被改成数字 / 字符串时按不存在处理（2026-11-06 修）：`not u` 放行后
                         # u.get 抛 AttributeError，续费在锁内 500。
                         if not isinstance(u, dict):
@@ -10948,16 +11001,18 @@ if __name__ == '__main__':
                     if user_id == MASTER_USER_ID:
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot delete the master account'})
                     with data_lock:
+                        _raw_users = data.get('users')
+                        users_map = _raw_users if isinstance(_raw_users, dict) else {}
                         previous_global_deny = copy.deepcopy(global_ip_deny.get(user_id))
                         previous = {
-                            'user': copy.deepcopy(data.get('users', {}).get(user_id)),
+                            'user': copy.deepcopy(users_map.get(user_id)),
 
                             'pending': copy.deepcopy(data.get('_pending_revocations')),
                             'meter': copy.deepcopy(data.get('usage_meter')),
                             'ip': copy.deepcopy(ip_tracker.get(user_id)),
                             'speed': copy.deepcopy(speed_tracker.get(user_id)),
                         }
-                        previous_had_user = user_id in data.get('users', {})
+                        previous_had_user = user_id in users_map
                         data['_pending_revocations'] = sorted(pending_revocations(data) | {user_id})
                         # Even an already-absent account may have a live IP-deny row;
                         # successful idempotent deletion must clear that stale scope.
@@ -11028,7 +11083,8 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     with data_lock:
-                        u = data.get('users', {}).get(user_id)
+                        _raw_users = data.get('users')
+                        u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
                         # 同上：`not u` 对 7 / "x" 为假，随后 u.get / u['status'] 抛异常，
                         # 滥用用户根本停不掉（2026-11-06 修）。
                         missing = not isinstance(u, dict)
@@ -11214,6 +11270,8 @@ if __name__ == '__main__':
                         save_data()
                     except OSError as exc:
                         _log_ignored('logout_epoch_save', exc)
+                with data_lock:
+                    portal_token = str(data.get('token') or '')
                 self.send_response(302)
                 self._responded = True
                 self.send_header('Location', prefix)
@@ -11224,8 +11282,11 @@ if __name__ == '__main__':
                 _secure = '; Secure' if self._is_https_request() else ''
                 self.send_header('Set-Cookie',
                                  'hy2_session=; Path=/%s/; HttpOnly; SameSite=Strict%s; Max-Age=0'
-                                 % (data['token'], _secure))
+                                 % (portal_token, _secure))
                 self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('X-Frame-Options', 'DENY')
+                self.send_header('Referrer-Policy', 'no-referrer')
                 self.send_header('Connection', 'close')
                 self.end_headers()
                 return
@@ -13841,7 +13902,14 @@ if __name__ == '__main__':
                 if action not in ('create', 'delete'):
                     return self.reply(400, '请求无效，请刷新页面后重试'.encode('utf-8'))
                 with data_lock:
-                    previous_user = copy.deepcopy(data.get('users', {}).get(user_id))
+                    users_map = user_table(data)
+                    previous_had_user = user_id in users_map
+                    previous_user = copy.deepcopy(users_map.get(user_id))
+                    previous_pending = copy.deepcopy(data.get('_pending_revocations')) if '_pending_revocations' in data else None
+                    previous_meter = copy.deepcopy(data.get('usage_meter')) if 'usage_meter' in data else None
+                    previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
+                    previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
+                    previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
 
 
                 if not VALID_USER_ID_RE.match(user_id):
@@ -13881,7 +13949,9 @@ if __name__ == '__main__':
                     # 现在显式 409，并回显密码尾号帮机主确认自己是不是认错了人。
                     conflict = None
                     with data_lock:
-                        existing = data.get('users', {}).get(user_id)
+                        if not isinstance(data.get('users'), dict):
+                            data['users'] = {}
+                        existing = data['users'].get(user_id)
                         if not isinstance(existing, dict):   # 条目改坏＝不存在（2026-11-06 修）
                             existing = None
                         if existing is not None:
@@ -13895,12 +13965,12 @@ if __name__ == '__main__':
                                 _used = 0
                             used_gb = round(_used / (1024 ** 3), 2)
                             conflict = ('exists', tail, used_gb)
-                        elif password_taken(data.get('users', {}), pwd, user_id):
+                        elif password_taken(data['users'], pwd, user_id):
                             conflict = ('password',)
                         elif user_id in pending_revocations(data):
                             conflict = ('pending',)
                         else:
-                            data.setdefault('users', {})[user_id] = {
+                            data['users'][user_id] = {
                                 'password': pwd,
                                 'expires_at': now_ts + days * 86400,
                                 'ip_limit': ip_limit,
@@ -13933,7 +14003,8 @@ if __name__ == '__main__':
                         return self.reply(400, '机主账号不能删除'.encode('utf-8'))
                     delete_missing = False
                     with data_lock:
-                        if user_id not in data.get('users', {}):
+                        users_map = user_table(data)
+                        if user_id not in users_map:
                             delete_missing = True
                         else:
                             data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
@@ -13953,7 +14024,39 @@ if __name__ == '__main__':
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply(404, '该用户已不存在（可能已在别处删除），请刷新页面'.encode('utf-8'))
 
-                save_data()
+                try:
+                    save_data()
+                except AtomicWriteDurabilityError:
+                    raise
+                except OSError:
+                    with data_lock:
+                        if previous_had_user:
+                            data.setdefault('users', {})[user_id] = previous_user
+                        else:
+                            if isinstance(data.get('users'), dict):
+                                data['users'].pop(user_id, None)
+                        if action == 'delete':
+                            if previous_pending is None:
+                                data.pop('_pending_revocations', None)
+                            else:
+                                data['_pending_revocations'] = previous_pending
+                            if previous_meter is None:
+                                data.pop('usage_meter', None)
+                            else:
+                                data['usage_meter'] = previous_meter
+                            if previous_ip is None:
+                                ip_tracker.pop(user_id, None)
+                            else:
+                                ip_tracker[user_id] = previous_ip
+                            if previous_speed is None:
+                                speed_tracker.pop(user_id, None)
+                            else:
+                                speed_tracker[user_id] = previous_speed
+                            if previous_deny is None:
+                                global_ip_deny.pop(user_id, None)
+                            else:
+                                global_ip_deny[user_id] = previous_deny
+                    raise
                 if not self._sync_reality_clients():
                     with data_lock:
                         if action == 'delete':
@@ -13961,7 +14064,8 @@ if __name__ == '__main__':
                         else:
                             revoked_pending = False
                             if previous_user is None:
-                                data.get('users', {}).pop(user_id, None)
+                                if isinstance(data.get('users'), dict):
+                                    data['users'].pop(user_id, None)
                             else:
                                 data.setdefault('users', {})[user_id] = previous_user
                     if revoked_pending:
@@ -13969,13 +14073,21 @@ if __name__ == '__main__':
                         regenerate_page()
                         return self.reply(503, '用户已删除，但节点上的旧连接还没确认断开，后台会自动重试；请稍后刷新页面确认'
                                           .encode('utf-8'))
-                    save_data()
+                    try:
+                        save_data()
+                    except Exception as rb_exc:
+                        _log_ignored('manage_user_rollback_save', rb_exc)
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
                 regenerate_page()
                 self.send_response(302)
                 self._responded = True
                 self.send_header('Location', prefix + '#users')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('X-Frame-Options', 'DENY')
+                self.send_header('Referrer-Policy', 'no-referrer')
+                self.send_header('Connection', 'close')
                 self.end_headers()
                 return
             except (ValueError, TypeError, UnicodeDecodeError):
@@ -13992,7 +14104,7 @@ if __name__ == '__main__':
             """POST /login 的处理逻辑（从 do_POST 机械搬移而来）。"""
             try:
                 length = int(self.headers.get('Content-Length', 0))
-                if length > 4096:
+                if length < 0 or length > 4096:
                     return self.reply(400, b'Bad request')
                 body = self.rfile.read(length).decode('utf-8', errors='ignore')
                 params = parse_qs(body)
@@ -14002,9 +14114,13 @@ if __name__ == '__main__':
             except Exception:
                 return self.reply(400, b'Bad request')
 
+            with data_lock:
+                portal_token = str(data.get('token') or '')
+                expected_hash = data.get('auth_hash')
+
             if self.login_rate_limited():
                 # 与密码错误用同一页面形态，不给爆破者「已被限流」的区分信号。
-                page = login_html(data['token'],
+                page = login_html(portal_token,
                                   error_msg='尝试次数过多，请 10 分钟后再试', username=user)
                 return self.reply(429, page.encode('utf-8'), 'text/html; charset=utf-8')
 
@@ -14014,13 +14130,14 @@ if __name__ == '__main__':
             if (user.strip(), pwd.strip()) != (user, pwd):
                 attempts.append((user.strip(), pwd.strip()))
             matched = False
-            for _user, _pwd in attempts:
-                submitted_digest = hashlib.sha256(base64.b64encode(f'{_user}:{_pwd}'.encode())).hexdigest()
-                matched = hmac.compare_digest(submitted_digest, data['auth_hash']) or matched
+            if isinstance(expected_hash, str) and expected_hash and expected_hash.isascii():
+                for _user, _pwd in attempts:
+                    submitted_digest = hashlib.sha256(base64.b64encode(f'{_user}:{_pwd}'.encode())).hexdigest()
+                    matched = hmac.compare_digest(submitted_digest, expected_hash) or matched
 
             if not matched:
                 self.record_login_failure()
-                page = login_html(data['token'], error_msg='用户名或密码不正确，请重新输入', username=user)
+                page = login_html(portal_token, error_msg='用户名或密码不正确，请重新输入', username=user)
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
             # 🔴 2026-10-31：登录成功必须清空失败桶。
@@ -14028,7 +14145,7 @@ if __name__ == '__main__':
             # 而且这个桶是全局的（所有请求都从 127.0.0.1 经 masquerade 进来，
             # 无法按来源区分），知道 token 的人刷 10 次就能把管理员锁出去。
             self.clear_login_failures()
-            sess_val = sign_session(data['token'])
+            sess_val = sign_session(portal_token)
             max_age = f'; Max-Age={SESSION_MAX_AGE}' if remember else ''
             # 🔴 2026-10-31：Secure 只在**真的是 HTTPS** 时加。
             # 门户本体监听 127.0.0.1 的明文 HTTP，运维排障时常用
@@ -14038,13 +14155,17 @@ if __name__ == '__main__':
             # 判断依据只看本请求是否经 TLS（masquerade 会带
             # X-Forwarded-Proto），不看配置 —— 配置读错会把所有人锁在门外。
             secure = '; Secure' if self._is_https_request() else ''
-            cookie = (f'hy2_session={sess_val}; Path=/{data["token"]}/; '
+            cookie = (f'hy2_session={sess_val}; Path=/{portal_token}/; '
                       f'HttpOnly; SameSite=Strict{secure}{max_age}')
             self.send_response(302)
             self._responded = True
             self.send_header('Location', prefix)
             self.send_header('Set-Cookie', cookie)
             self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Connection', 'close')
             self.end_headers()
             return
 
@@ -14673,7 +14794,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid user_id format'})
                     with data_lock:
-                        u = data.get('users', {}).get(user_id)
+                        _raw_users = data.get('users')
+                        u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
                         # 条目不是对象时按不存在返回 404（2026-11-06 修），旧实现 u.items() 抛异常
                         missing_user = not isinstance(u, dict)
                         result = None
@@ -14927,10 +15049,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(404, {'ok': False, 'error': '该用户不存在（可能已被删除），请刷新页面'})
 
                 m = read_meta_file(meta_path)
+                _, _raw_sn, _raw_ip, _ = clean_node_identity(m)
+                if not (_raw_sn or _raw_ip):
+                    return self.reply_json(503, {'ok': False,
+                        'error': '节点元信息缺失或损坏，请联系管理员检查 client_meta.json'})
                 pwd = u_copy.get('password')
                 if not isinstance(pwd, str) or not pwd:
                     return self.reply_json(503, {'ok': False,
                         'error': '该账号的密码为空或已损坏，请先重置密码再导出配置'})
+                self._extend_deadline(30)
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
@@ -14952,7 +15079,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     'uri': uri,
                     # 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）
                     'extra_links': [{'label': label, 'uri': link} for label, link
-                                    in self._user_extra_links(target_uid, clean_node_identity(m)[2])],
+                                    in self._user_extra_links(target_uid, _raw_ip)],
                     'clash': clash_yaml,
                     'sing_box': sing_json,
                     'qr_svg': qr_svg,
@@ -15036,6 +15163,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     self.send_header('Content-Length', str(len(body)))
                     self.send_header('Cache-Control', 'no-store')
                     self.send_header('X-Content-Type-Options', 'nosniff')
+                    self.send_header('X-Frame-Options', 'DENY')
+                    self.send_header('Referrer-Policy', 'no-referrer')
                     self.send_header('X-Robots-Tag', 'noindex, nofollow, noarchive')
                     self.send_header('Connection', 'close')
                     self.end_headers()
@@ -15064,7 +15193,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if is_client_api:
                     self.record_failure()
                     return self.reply(401, b'Authentication required', www_auth=True)
-                page = login_html(data['token'])
+                with data_lock:
+                    portal_token = str(data.get('token') or '')
+                page = login_html(portal_token)
                 return self.reply(200, page.encode('utf-8'), 'text/html; charset=utf-8')
 
             if subpath == '':
@@ -15744,6 +15875,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             missing_outbound = True
                         else:
                             data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
+                            # 删光最后一个自定义出站时同步切回按域名分流，避免持久化留下 global + 空出站。
+                            if not data['custom_outbounds'] and data.get('outbound_mode') == 'global':
+                                data['outbound_mode'] = 'rules'
                             # 🔴 必须同步清理引用它的分流规则，否则 ACL 里会留下
                             #    不存在的出站名 ⇒ Hysteria 启动失败（且用户毫无察觉）。
                             data['warp_rules'] = [r for r in normalize_route_rules(state['warp_rules'])
@@ -15839,8 +15973,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 出口 IP 探测要真的走一次外网（实测 150-300 ms），而前端每 10 秒
                 # 轮询一次状态。加 30 秒缓存：状态变化本来也不是秒级的，
                 # 且每次探测都占一个并发槽，会拖慢真正需要响应的请求。
-                cached = _warp_probe_cache.get('value')
-                if cached and time.monotonic() - _warp_probe_cache.get('at', 0) < 30:
+                with _warp_probe_lock:
+                    cached = _warp_probe_cache.get('value')
+                    cached_at = _warp_probe_cache.get('at', 0)
+                if cached and time.monotonic() - cached_at < 30:
                     outbound_ip, connected = cached
                 else:
                     for warp_addr in ('127.0.0.1:19898', '127.0.0.1:40000'):
@@ -15848,8 +15984,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         if outbound_ip:
                             connected = True
                             break
-                    _warp_probe_cache['value'] = (outbound_ip, connected)
-                    _warp_probe_cache['at'] = time.monotonic()
+                    with _warp_probe_lock:
+                        _warp_probe_cache['value'] = (outbound_ip, connected)
+                        _warp_probe_cache['at'] = time.monotonic()
             try:
                 cfg_text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
                 applied = cfg_text == render_egress_config(cfg_text, state)
