@@ -114,8 +114,8 @@ meta_set() {
     local key="$1" value="$2" tmp
     mkdir -p "$AWG_DIR"
     chmod 700 "$AWG_DIR"
-    [[ -f "$AWG_META_FILE" ]] || echo '{}' > "$AWG_META_FILE"
-    tmp="$(mktemp "${AWG_DIR}/.meta.XXXXXX")"
+    [[ -f "$AWG_META_FILE" ]] || (umask 077; echo '{}' > "$AWG_META_FILE")
+    tmp="$(umask 077; mktemp "${AWG_DIR}/.meta.XXXXXX")"
     if jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$AWG_META_FILE" > "$tmp" 2>/dev/null; then
         chmod 600 "$tmp"
         mv -f "$tmp" "$AWG_META_FILE"
@@ -142,7 +142,7 @@ service_active() {
 
 awg_transaction_snapshot() {
     local path index=0 state_file
-    AWG_TRANSACTION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hy2-awg-transaction.XXXXXX")" || return 1
+    AWG_TRANSACTION_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/hy2-awg-transaction.XXXXXX")" || return 1
     chmod 700 "$AWG_TRANSACTION_DIR" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
     AWG_TRANSACTION_DIR_MODE=0
     if [[ -d "$AWG_DIR" ]]; then
@@ -464,20 +464,30 @@ download_binaries() {
     fi
     log_info "SHA256 校验通过"
 
-    # 拒绝含绝对路径 / `..` 的成员，防止以 root 写出临时目录之外。
+    # 拒绝含绝对路径 / `..` / 反斜杠以及符号链接、硬链接、设备节点的成员，防止以 root 写出临时目录之外。
     # ⚠️ 必须先把清单读出来并检查 tar 的返回码：旧写法用进程替换，
     # `tar -t` 失败时循环一次都不执行，检查被当成「通过」（fail-open，
     # 2026-10-29 修）。install.sh 的同名逻辑一直是 fail-closed。
-    local member listing
+    local member listing verbose_listing vline
     if ! listing="$(tar -tzf "${tmpd}/awg.tar.gz" 2>/dev/null)"; then
         rm -rf "$tmpd"; log_err "无法读取安装包清单（包可能已损坏），已放弃安装"; return 1
     fi
     [ -n "$listing" ] || { rm -rf "$tmpd"; log_err "安装包为空，已放弃安装"; return 1; }
     while IFS= read -r member; do
         case "$member" in
-            /*|..|../*|*/../*|*/..) rm -rf "$tmpd"; log_err "安装包内含不安全路径成员，已放弃安装"; return 1 ;;
+            /*|..|../*|*/../*|*/..|*\\*) rm -rf "$tmpd"; log_err "安装包内含不安全路径成员，已放弃安装"; return 1 ;;
         esac
     done <<< "$listing"
+    if ! verbose_listing="$(tar -tvzf "${tmpd}/awg.tar.gz" 2>/dev/null)"; then
+        rm -rf "$tmpd"; log_err "无法校验安装包成员类型（包可能已损坏），已放弃安装"; return 1
+    fi
+    [ -n "$verbose_listing" ] || { rm -rf "$tmpd"; log_err "安装包成员清单为空，已放弃安装"; return 1; }
+    while IFS= read -r vline; do
+        case "$vline" in
+            -*|d*) ;;
+            *) rm -rf "$tmpd"; log_err "安装包内含不允许的链接或特殊文件成员，已放弃安装"; return 1 ;;
+        esac
+    done <<< "$verbose_listing"
 
     if ! tar -xzf "${tmpd}/awg.tar.gz" -C "$tmpd" 2>/dev/null; then
         rm -rf "$tmpd"; log_err "解压失败（包可能已损坏）"; return 1
@@ -485,8 +495,8 @@ download_binaries() {
 
     local f
     for f in amneziawg-go awg awg-quick; do
-        if [[ ! -f "${tmpd}/${f}" ]]; then
-            rm -rf "$tmpd"; log_err "包内缺少组件: ${f}"; return 1
+        if [[ ! -f "${tmpd}/${f}" || -L "${tmpd}/${f}" ]]; then
+            rm -rf "$tmpd"; log_err "包内缺少组件或组件为非法符号链接: ${f}"; return 1
         fi
     done
 
@@ -501,13 +511,17 @@ download_binaries() {
     mkdir -p "$AWG_DIR"
     # 覆盖现役二进制前先备份，并使用同目录临时文件原子替换，避免覆写运行中程序触发 ETXTBSY。
     local bakd f
-    bakd="$(mktemp -d "${AWG_DIR}/.binbak.XXXXXX")"
+    bakd="$(umask 077; mktemp -d "${AWG_DIR}/.binbak.XXXXXX")"
     for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
         [[ -e "$f" ]] && cp -a "$f" "$bakd/$(basename "$f")"
     done
     _restore_bins() {
         for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
-            [[ -e "$bakd/$(basename "$f")" ]] && awg_atomic_install_bin "$bakd/$(basename "$f")" "$f"
+            if [[ -e "$bakd/$(basename "$f")" ]]; then
+                awg_atomic_install_bin "$bakd/$(basename "$f")" "$f" || true
+            else
+                rm -f "$f" || true
+            fi
         done
         rm -rf "$bakd"
     }
@@ -518,7 +532,7 @@ download_binaries() {
         log_err "写入二进制失败，已恢复原有版本"
         return 1
     fi
-    if [[ -f "${tmpd}/VERSION" ]]; then
+    if [[ -f "${tmpd}/VERSION" && ! -L "${tmpd}/VERSION" ]]; then
         awg_atomic_copy_file "${tmpd}/VERSION" "$AWG_VERSION_FILE"
         chmod 600 "$AWG_VERSION_FILE"
     fi
