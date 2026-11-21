@@ -1179,7 +1179,8 @@ def _rollback_outbounds(cfg, original):
     """
     state = 'unknown'
     try:
-        cfg.write_text(original, encoding='utf-8')
+        # 原子写回并保持 0600 私有权限，避免断电半写或权限退化泄露混淆与鉴权密码。
+        atomic_write_private(cfg, original.encode('utf-8'))
         # 🔴 必须走 _restart_hy2（内含 reset-failed），
         #    这里原来直接 restart，会被 start-limit 挡住 ——
         #    后果是「回滚也失败」，用户彻底没救（真实事故）。
@@ -4649,7 +4650,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         changed = True
 
     if changed:
-        Path(meta_path).write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
         print(f"[portal] 证书信任模型已自愈: cert_type={new_type} "
               f"is_insecure={new_insecure} server_name={new_sn} "
               f"pin={'<set>' if new_pin else '<empty>'} (证书={cert_file})",
@@ -7527,10 +7528,10 @@ def sync_pin(m, root, meta_path):
             new = pin_sha256_of_file(live) if Path(live).exists() else get_cert_pin_sha256(root)
             if new != m.get('pin_sha256'):
                 m['pin_sha256'] = new
-                Path(meta_path).write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
+                atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
     elif m.get('pin_sha256'):
         m['pin_sha256'] = ''
-        Path(meta_path).write_text(json.dumps(m, ensure_ascii=False), encoding='utf-8')
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
 
 
 def prepare(meta_path, port, node_api_key=None):
@@ -7561,7 +7562,7 @@ def prepare(meta_path, port, node_api_key=None):
     sub_port, sub_port_src = resolve_subscription_port(m)
     if m.get('subscription_port') != sub_port:
         m['subscription_port'] = sub_port
-        Path(meta_path).write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding='utf-8')
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, indent=2).encode('utf-8'))
         print(f'[portal] 订阅端口已自愈为 {sub_port}（来源: {sub_port_src}）', file=sys.stderr)
     base = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
     subscription = f"https://{user}:{password}@{_host_for_url(host)}:{sub_port}/{token}/clash.yaml"
