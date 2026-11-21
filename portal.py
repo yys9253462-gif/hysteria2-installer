@@ -72,37 +72,46 @@ except ImportError as _e:      # pragma: no cover - 只在部署缺文件时触�
 # 用 unredirected header，跳转到别的主机时不会被转发。
 GITHUB_TOKEN_FILE = Path('/etc/hysteria/github-token')
 _github_token_cache = {'mtime': None, 'token': ''}
+_github_token_lock = threading.Lock()
 
 
 def github_token():
-    """读取 token（按 mtime 缓存）；文件不存在、为空或格式不对时返回空串。"""
+    """读取 token（按元信息快照缓存，含权限位与 ctime）；文件不存在、权限过宽或格式不对时返回空串。"""
     try:
-        mtime = GITHUB_TOKEN_FILE.stat().st_mtime
+        st = GITHUB_TOKEN_FILE.stat()
     except OSError:
-        _github_token_cache.update(mtime=None, token='')
+        with _github_token_lock:
+            _github_token_cache.update(mtime=None, token='')
         return ''
-    if mtime != _github_token_cache['mtime']:
-        # 权限必须足够严：token 等同于账号凭据，0644 时同机其它用户可以读走。
-        # 之前只校验字符集，权限过宽的文件照常被使用（2026-10-29 修）。
-        try:
-            mode = GITHUB_TOKEN_FILE.stat().st_mode & 0o777
-        except OSError:
-            mode = 0
-        # 只在 POSIX 上检查：Windows 没有对应的权限位语义，
-        # stat() 恒返回 0666，照此判断会让所有 Windows 环境都无法使用 token。
-        if os.name == 'posix' and mode and mode & 0o077:
-            print('[portal] %s 权限为 %o，应改为 600；本次忽略该 token'
-                  % (GITHUB_TOKEN_FILE, mode), file=sys.stderr)
-            _github_token_cache.update(mtime=mtime, token='')
-            return ''
-        try:
-            value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
-        except OSError:
-            value = ''
-        # 只接受 token 字符集，防止把换行等注入到请求头里。
-        _github_token_cache.update(mtime=mtime,
-                                   token=value if re.fullmatch(r'[A-Za-z0-9_]{20,255}', value) else '')
-    return _github_token_cache['token']
+    # 将权限位与 ctime 纳入缓存键：chmod 644 不改 mtime，仅按 mtime 缓存会导致过宽权限令牌继续生效。
+    stamp = (
+        getattr(st, 'st_mtime_ns', st.st_mtime),
+        getattr(st, 'st_ctime_ns', getattr(st, 'st_ctime', 0)),
+        getattr(st, 'st_mode', 0),
+        getattr(st, 'st_ino', 0),
+        getattr(st, 'st_size', 0),
+    )
+    with _github_token_lock:
+        if stamp == _github_token_cache.get('mtime'):
+            return _github_token_cache.get('token', '')
+    mode = getattr(st, 'st_mode', 0) & 0o777
+    # 只在 POSIX 上检查：Windows 没有对应的权限位语义，
+    # stat() 恒返回 0666，照此判断会让所有 Windows 环境都无法使用 token。
+    if os.name == 'posix' and mode and mode & 0o077:
+        print('[portal] %s 权限为 %o，应改为 600；本次忽略该 token'
+              % (GITHUB_TOKEN_FILE, mode), file=sys.stderr)
+        with _github_token_lock:
+            _github_token_cache.update(mtime=stamp, token='')
+        return ''
+    try:
+        value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
+    except OSError:
+        value = ''
+    # 只接受 token 字符集，防止把换行等注入到请求头里。
+    valid = value if re.fullmatch(r'[A-Za-z0-9_]{20,255}', value) else ''
+    with _github_token_lock:
+        _github_token_cache.update(mtime=stamp, token=valid)
+        return _github_token_cache['token']
 
 
 class GitHubTokenHandler(urllib.request.BaseHandler):
@@ -212,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.51'
+PORTAL_VERSION = '2.52'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -9619,18 +9628,20 @@ if __name__ == '__main__':
         access_file = root / 'portal-access.json'
         access = read_access_file(access_file)
         host = meta_display_host(m)
-        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml"
-        
+
         now_ts = int(time.time())
         display_users = {}
         # 只把「拍快照」放在锁内，渲染与落盘放到锁外（2026-10-25 修）。
         # page_html 在 2000 用户时约 27 ms，/auth 每个连接都要拿 data_lock，
         # 持锁渲染会短暂阻塞新连接鉴权；而渲染本身不依赖锁。
         with data_lock:
-            # 清理离线已久的 ip_tracker 键
-            dead_uids = [u for u, tr in ip_tracker.items()
-                         if not isinstance(tr, dict)
-                         or not any(now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())]
+            # 清理离线已久或时间戳已损坏的 ip_tracker 键，避免非数字时间戳导致 TypeError 白屏。
+            dead_uids = [
+                u for u, tr in ip_tracker.items()
+                if not isinstance(tr, dict)
+                or not any(isinstance(t, (int, float)) and not isinstance(t, bool)
+                           and 0 <= now_ts - t < IP_TIMEOUT_SECONDS for t in tr.values())
+            ]
             for du in dead_uids:
                 ip_tracker.pop(du, None)
 
@@ -9641,12 +9652,17 @@ if __name__ == '__main__':
                     continue
                 u_copy = dict(uinfo)
                 tracked = ip_tracker.get(uid)
-                u_copy['online_ips'] = ({ip: t for ip, t in tracked.items()
-                                         if now_ts - t < IP_TIMEOUT_SECONDS}
-                                        if isinstance(tracked, dict) else {})
+                u_copy['online_ips'] = (
+                    {ip: t for ip, t in tracked.items()
+                     if isinstance(t, (int, float)) and not isinstance(t, bool)
+                     and 0 <= now_ts - t < IP_TIMEOUT_SECONDS}
+                    if isinstance(tracked, dict) else {}
+                )
                 display_users[uid] = u_copy
             _api_key = data.get('api_key')
             _token = data['token']
+
+        subscription = f"https://{access.get('username','')}:{access.get('password','')}@{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{_token}/clash.yaml"
 
         # 渲染与二维码都在锁外做（2026-10-29 修，注释此前与实现不符）：
         # page_html 在上千用户时约 27 ms，qrencode 最坏 20 秒，而 /auth
@@ -9713,21 +9729,31 @@ if __name__ == '__main__':
         # 不用 SimpleCookie（2026-11-04 修）：同一 Cookie 头里只要有一个不合 RFC 的值
         # （同域其它应用 / 统计脚本写的带空格或裸 JSON 的 cookie），load() 会把**全部**
         # cookie 丢掉且不抛异常，管理员登录后刷新就回到登录页，日志里什么也没有。
-        value = None
+        # 收集所有同名 hy2_session 候选值逐个验签，防止排在后面的旧路径失效 Cookie 覆盖有效会话。
+        candidates = []
         for part in str(cookie_header).split(';'):
             name, sep, val = part.strip().partition('=')
             if sep and name == 'hy2_session':
-                value = val.strip().strip('"')
-        if value is None:
+                candidates.append(val.strip().strip('"'))
+        if not candidates:
             return False
-        parts = value.split('.')
-        if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
+        with data_lock:
+            expected_token = data.get('token')
+            epoch = session_epoch()
+        if not isinstance(expected_token, str) or not expected_token or not expected_token.isascii():
             return False
-        t, issued_at, sig = parts
-        if not 0 <= time.time() - int(issued_at) <= SESSION_MAX_AGE:
-            return False
-        expected = _session_sig(t, issued_at, session_epoch())
-        return hmac.compare_digest(t, data['token']) and hmac.compare_digest(sig, expected)
+        now = time.time()
+        for value in candidates:
+            parts = value.split('.')
+            if len(parts) != 3 or not parts[1].isdigit() or not parts[0].isascii() or not parts[2].isascii():
+                continue
+            t, issued_at, sig = parts
+            if not 0 <= now - int(issued_at) <= SESSION_MAX_AGE:
+                continue
+            expected = _session_sig(t, issued_at, epoch)
+            if hmac.compare_digest(t, expected_token) and hmac.compare_digest(sig, expected):
+                return True
+        return False
 
     # SPEEDTEST_TARGETS 是 /api/v1/speedtest 的**唯一**靶点来源。
     #
@@ -12007,8 +12033,8 @@ if __name__ == '__main__':
                 if action not in known_actions:
                     return self.reply_json(400, {'ok': False, 'error': '未知操作: ' + (action or '(空)')})
 
-                # peer_add 的参数同理先于安装状态校验：输入本身非法时应直接指出
-                # 哪里错，而不是笼统地报「尚未安装」。
+                # peer_add / peer_del / set_line 的参数同理先于安装状态与重型槽校验：
+                # 输入本身非法时应直接 400 指出哪里错，而不是笼统报「尚未安装」或空占重型槽。
                 if action == 'peer_add':
                     name = (form.get('name', [''])[0] or '').strip()
                     endpoint = (form.get('endpoint', [''])[0] or '').strip()
@@ -12019,6 +12045,14 @@ if __name__ == '__main__':
                     endpoint_error = awg_endpoint_error(endpoint)
                     if endpoint_error:
                         return self.reply_json(400, {'ok': False, 'error': endpoint_error})
+                elif action == 'peer_del':
+                    name = (form.get('name', [''])[0] or '').strip()
+                    if not VALID_AWG_NAME_RE.match(name):
+                        return self.reply_json(400, {'ok': False, 'error': '客户端名称非法'})
+                elif action == 'set_line':
+                    target = (form.get('line', [''])[0] or '').strip()
+                    if target not in ('2', '3'):
+                        return self.reply_json(400, {'ok': False, 'error': '协议线只能是 2 或 3'})
 
                 if not awg_installed():
                     return self.reply_json(400, {'ok': False, 'error': 'AmneziaWG 尚未安装'})
@@ -12076,8 +12110,9 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'message': f'已切换到 AWG {target}.x。⚠️ 所有客户端必须重新导入配置。'})
 
                 if action == 'update':
-                    # 先把控制工具自身刷新到最新，否则引擎会永久停在首装版本
-                    ensure_awgctl(force=True)
+                    # 先把控制工具自身刷新到最新，刷新失败则明确中止而非静默继续跑旧版本。
+                    if not ensure_awgctl(force=True):
+                        return self.reply_json(500, {'ok': False, 'error': '刷新最新 hy2-awgctl 失败，已中止更新，请检查网络后重试'})
                     rc, out, err = awg_run(['update'], timeout=420)
                     if rc != 0:
                         return self.reply_json(500, {'ok': False, 'error': '更新失败：' + awg_err_tail(rc, out, err)})
@@ -12352,6 +12387,9 @@ if __name__ == '__main__':
                     except ValueError:
                         return self.reply_json(500, {'ok': False, 'error':
                             'xray.json 不是合法 JSON，未做任何修改'})
+                    if cfg_now is not None and not isinstance(cfg_now, dict):
+                        return self.reply_json(500, {'ok': False, 'error':
+                            'xray.json 不是合法 JSON 对象，未做任何修改'})
                     reality_on = bool(cfg_now) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)
                     # 也接受明确的 enable / disable（2026-11-13 加，与 VMess 等协议一致）：调用方按自己看到的
                     # 状态下指令，状态已经符合时什么都不动。页面停留久了或在别处改过时，toggle 会把「想开」变成关掉。
@@ -12369,11 +12407,15 @@ if __name__ == '__main__':
                                 current = json.loads(xray_path.read_text(encoding='utf-8'))
                             except (OSError, ValueError):
                                 current = cfg_now
+                            if not isinstance(current, dict):
+                                current = cfg_now
                             remove_managed_inbound(current, REALITY_INBOUND_TAG)
                             apply_xray_config_transaction(
                                 current, config_path=str(xray_path),
                                 binary='/usr/local/bin/xray',
                                 restart=not unit_suspended('xray'))
+                        # 停用后重建连接页与订阅缓存，避免订阅中残留已关闭的 Reality 节点。
+                        regenerate_page()
                         new_active = False
                         if old_reality_port and not close_protocol_port(
                                 old_reality_port, 'tcp', 'reality_config'):
@@ -12402,7 +12444,7 @@ if __name__ == '__main__':
                                    if xray_path.exists() else None)
                     except ValueError:
                         cfg_now = None
-                    if not (cfg_now and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
+                    if not (isinstance(cfg_now, dict) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
                         return self.reply_json(409, {'ok': False, 'error':
                             'Reality 当前未开启；请先开启 Reality，再重置密钥'})
                     # force=True：只有「重置密钥」按钮才真的换密钥对。
@@ -12731,8 +12773,15 @@ if __name__ == '__main__':
                 if action not in ('toggle', 'enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 VMess 操作类型，请刷新页面后重试'})
                 xray_path = Path('/etc/hysteria/xray.json')
-                config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                          if xray_path.exists() else None)
+                try:
+                    config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                              if xray_path.exists() else None)
+                except ValueError:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'xray.json 不是合法 JSON，未做任何修改'})
+                if config is not None and not isinstance(config, dict):
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'xray.json 不是合法 JSON 对象，未做任何修改'})
                 enabled = bool(config) and has_managed_inbound(config, VMESS_INBOUND_TAG)
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
@@ -12756,6 +12805,8 @@ if __name__ == '__main__':
                     try:
                         current = json.loads(xray_path.read_text(encoding='utf-8'))
                     except (OSError, ValueError):
+                        current = config
+                    if not isinstance(current, dict):
                         current = config
                     original_config = copy.deepcopy(current)
                     with data_lock:
@@ -12785,6 +12836,8 @@ if __name__ == '__main__':
                         with data_lock:
                             if old_state is not None:
                                 data['vmess_config'] = old_state
+                            else:
+                                data.pop('vmess_config', None)
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
@@ -13227,9 +13280,16 @@ if __name__ == '__main__':
                     with anytls_apply_lock:
                         with data_lock:
                             data['anytls_config'] = old_acfg
-                        if previous_file is not None:
-                            _restore_config_atomically(cfg_path, previous_file)
-                        if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state):
+                        rollback_failed = False
+                        try:
+                            if previous_file is None:
+                                cfg_path.unlink(missing_ok=True)
+                            else:
+                                _restore_config_atomically(cfg_path, previous_file)
+                        except OSError as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('anytls_disable_rollback_cfg', rb_exc)
+                        if not _restore_systemd_service_state(ANYTLS_SERVICE, service_state) or rollback_failed:
                             raise RuntimeError('AnyTLS 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
@@ -13439,11 +13499,16 @@ if __name__ == '__main__':
                         with data_lock:
                             data['tuic_config'] = old_tcfg
                         cfg_path = portal_path.parent / TUIC_CONFIG_NAME
-                        if previous_file is None:
-                            cfg_path.unlink(missing_ok=True)
-                        else:
-                            _restore_config_atomically(cfg_path, previous_file)
-                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state):
+                        rollback_failed = False
+                        try:
+                            if previous_file is None:
+                                cfg_path.unlink(missing_ok=True)
+                            else:
+                                _restore_config_atomically(cfg_path, previous_file)
+                        except OSError as rb_exc:
+                            rollback_failed = True
+                            _log_ignored('tuic_disable_rollback_cfg', rb_exc)
+                        if not _restore_systemd_service_state(TUIC_SERVICE, service_state) or rollback_failed:
                             raise RuntimeError('TUIC 停用保存失败，且原服务状态未能完整恢复')
                     raise
                 regenerate_page()
@@ -13503,8 +13568,15 @@ if __name__ == '__main__':
                 if action not in ('toggle', 'enable', 'disable'):
                     return self.reply_json(400, {'ok': False, 'error': '未知的 VLESS Encryption 操作类型，请刷新页面后重试'})
                 xray_path = Path('/etc/hysteria/xray.json')
-                config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                          if xray_path.exists() else None)
+                try:
+                    config = (json.loads(xray_path.read_text(encoding='utf-8'))
+                              if xray_path.exists() else None)
+                except ValueError:
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'xray.json 不是合法 JSON，未做任何修改'})
+                if config is not None and not isinstance(config, dict):
+                    return self.reply_json(500, {'ok': False, 'error':
+                        'xray.json 不是合法 JSON 对象，未做任何修改'})
                 enabled = bool(config) and has_managed_inbound(config, VLESSENC_INBOUND_TAG)
                 if action == 'toggle':
                     action = 'disable' if enabled else 'enable'
@@ -13526,6 +13598,8 @@ if __name__ == '__main__':
                     try:
                         current = json.loads(xray_path.read_text(encoding='utf-8'))
                     except (OSError, ValueError):
+                        current = config
+                    if not isinstance(current, dict):
                         current = config
                     original_config = copy.deepcopy(current)
                     with data_lock:
@@ -13555,6 +13629,8 @@ if __name__ == '__main__':
                         with data_lock:
                             if old_state is not None:
                                 data['vlessenc_config'] = old_state
+                            else:
+                                data.pop('vlessenc_config', None)
                     raise
                 # 停用后同样重建连接页：否则订阅里仍带着已关闭的节点。
                 regenerate_page()
@@ -14444,16 +14520,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             cc = ''
                         return (cc.startswith('bbr'), cc)
 
-                    # 节点门户自身版本：这个文件里写着版本号常量，
-                    # 主面板据此判断"节点跑的是新 portal 还是老 portal"。
-                    portal_version = ''
+                    # 节点门户自身版本：流式扫描 __file__ 命中 PORTAL_VERSION 即停，
+                    # 避免旧版 [:80] 截断漏掉定义及整文件读入内存；不可读时回落模块常量。
+                    portal_version = PORTAL_VERSION
                     try:
-                        for line in Path(__file__).read_text(encoding='utf-8').splitlines()[:80]:
-                            if line.startswith('PORTAL_VERSION'):
-                                portal_version = line.split('=', 1)[1].strip().strip('"\'')
-                                break
+                        with Path(__file__).open(encoding='utf-8') as _ver_fp:
+                            for line in _ver_fp:
+                                if line.startswith('PORTAL_VERSION'):
+                                    parsed_ver = line.split('=', 1)[1].strip().strip('"\'')
+                                    if parsed_ver:
+                                        portal_version = parsed_ver
+                                    break
                     except Exception:
-                        portal_version = ''
+                        portal_version = PORTAL_VERSION
 
                     # 端口一律经 _valid_port（2026-11-03 修）：任何一个协议段的端口被改坏成
                     # 字符串，旧写法 int() 抛异常，整个 capabilities 回 500，控制台看不到这台节点。
@@ -14691,7 +14770,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
                 authed = self.is_authenticated()
                 with data_lock:
-                    u = data.get('users', {}).get(target_uid)
+                    u = user_table(data).get(target_uid)
                     # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
                     u_copy = dict(u) if isinstance(u, dict) else None
 
@@ -14722,6 +14801,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                       'text/html; charset=utf-8')
 
                 m = read_meta_file(meta_path)
+                # meta 损坏（含非字符串或纯空白 server_name/public_ip）时 artifacts 会退回 localhost，
+                # 生成一条永远连不上的链接却返回 200，这里只接受清洗后的非空字符串身份。
+                _raw_sn = m.get('server_name').strip() if isinstance(m.get('server_name'), str) else ''
+                _raw_ip = m.get('public_ip').strip() if isinstance(m.get('public_ip'), str) else ''
+                if not (_raw_sn or _raw_ip):
+                    return self.reply(503, share_unavailable_html(
+                        '节点元信息缺失或损坏，请联系管理员检查 client_meta.json').encode('utf-8'),
+                        'text/html; charset=utf-8')
                 # 🔴 2026-10-31：这个分享页要跑 qrencode：Hy2 一张（10 秒超时），2026-11-13 起每个
                 # 备用协议再各一张（5 秒超时，最多 5 张），最坏约 35 秒；
                 # 而默认连接死线 30 秒、且并发受 BoundedSemaphore(8) 限制。
@@ -14729,12 +14816,6 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
                 # 与其它带子进程的端点一致：先续期再干活。
                 self._extend_deadline(60)
-                # meta 损坏时 artifacts 会退回 localhost/默认端口，生成一条
-                # 永远连不上的链接却返回 200（2026-10-29 修）。
-                if not (m.get('server_name') or m.get('public_ip')):
-                    return self.reply(503, share_unavailable_html(
-                        '节点元信息缺失或损坏，请联系管理员检查 client_meta.json').encode('utf-8'),
-                        'text/html; charset=utf-8')
                 # 密码缺失/被改坏时不能生成链接：空密码会拼出
                 # `hysteria2://@host`，客户端导入即失败，页面却显示成功。
                 pwd = u_copy.get('password')
@@ -14838,7 +14919,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not VALID_USER_ID_RE.match(target_uid):
                     return self.reply_json(400, {'ok': False, 'error': '用户标识格式不合法'})
                 with data_lock:
-                    u = data.get('users', {}).get(target_uid)
+                    u = user_table(data).get(target_uid)
                     # 条目被改成数字 / 字符串时按「不存在」处理（2026-11-06 修），旧实现 dict(7) 抛异常 → 500
                     u_copy = dict(u) if isinstance(u, dict) else None
                 if not u_copy:
@@ -15294,10 +15375,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 rcfg = dict(config_section(data, 'reality_config'))
 
             qr_svg = ''
-            if rcfg.get('uri'):
+            _ruri = rcfg.get('uri')
+            if is_active and isinstance(_ruri, str) and _ruri:
                 try:
                     qr_res = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
-                                            input=rcfg['uri'].encode('utf-8'), capture_output=True, timeout=3)
+                                            input=_ruri.encode('utf-8'), capture_output=True, timeout=3)
                     if qr_res.returncode == 0:
                         qr_svg = qr_res.stdout.decode('utf-8')
                 except Exception:

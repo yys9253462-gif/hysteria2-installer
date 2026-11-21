@@ -57,7 +57,7 @@ curl() {
     for _a in "$@"; do
         case "$_a" in
             https://api.github.com/*)
-                [[ -r "$HY2_GITHUB_TOKEN_FILE" ]] && _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
+                [[ -f "$HY2_GITHUB_TOKEN_FILE" && -r "$HY2_GITHUB_TOKEN_FILE" ]] && _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
                 break ;;
         esac
     done
@@ -2240,7 +2240,6 @@ setup_system_firewall() {
         ufw allow "${port}/udp" >/dev/null 2>&1 || true
         if [[ "$CERT_TYPE" == "acme" ]]; then
             ufw allow 80/tcp >/dev/null 2>&1 || true
-            ufw allow "${HY2_SUB_PORT}/tcp" >/dev/null 2>&1 || true
         fi
         if [[ -n "$s_port" && -n "$e_port" ]]; then
             ufw allow "${s_port}:${e_port}/udp" >/dev/null 2>&1 || true
@@ -2254,7 +2253,6 @@ setup_system_firewall() {
         firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
         if [[ "$CERT_TYPE" == "acme" ]]; then
             firewall-cmd --add-port="80/tcp" --permanent >/dev/null 2>&1 || true
-            firewall-cmd --add-port="${HY2_SUB_PORT}/tcp" --permanent >/dev/null 2>&1 || true
         fi
         if [[ -n "$s_port" && -n "$e_port" ]]; then
             firewall-cmd --add-port="${s_port}-${e_port}/udp" --permanent >/dev/null 2>&1 || true
@@ -2327,31 +2325,38 @@ setup_system_firewall() {
             unset -f _nft_has _nft_ensure
         done <<<"$nft_inputs"
     fi
-    # 裸 iptables 兜底（既无 ufw/firewalld，也无 nft 的情况）。
-    # 注意：这里处理的是 filter/INPUT 的放行，与端口跳跃的 nat/REDIRECT 无关。
-    if command -v iptables >/dev/null 2>&1 \
+    # 裸 iptables / ip6tables 兜底（既无 ufw/firewalld，也无 nft 的情况）。
+    # 同时覆盖 IPv4 与 IPv6，并识别「policy DROP/REJECT」以及「policy ACCEPT + 链内 DROP/REJECT 规则」。
+    if { command -v iptables >/dev/null 2>&1 || command -v ip6tables >/dev/null 2>&1; } \
        && ! { command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; } \
        && ! { command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; } \
        && ! command -v nft >/dev/null 2>&1; then
-        local chain_policy
-        chain_policy=$(iptables -L INPUT -n 2>/dev/null | head -n1 | grep -o 'policy [A-Z]*' | awk '{print $2}')
-        if [[ "$chain_policy" == "DROP" ]]; then
-            iptables -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 \
-                || iptables -I INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
-            iptables -C INPUT -p tcp --dport "${HY2_SUB_PORT}" -j ACCEPT >/dev/null 2>&1 \
-                || iptables -I INPUT -p tcp --dport "${HY2_SUB_PORT}" -j ACCEPT >/dev/null 2>&1 || true
-            if [[ -n "$s_port" && -n "$e_port" ]]; then
-                iptables -C INPUT -p udp --dport "${s_port}:${e_port}" -j ACCEPT >/dev/null 2>&1 \
-                    || iptables -I INPUT -p udp --dport "${s_port}:${e_port}" -j ACCEPT >/dev/null 2>&1 || true
+        local _ipt _ipt_list _ipt_policy _ipt_saved=0
+        for _ipt in iptables ip6tables; do
+            command -v "$_ipt" >/dev/null 2>&1 || continue
+            _ipt_list="$("$_ipt" -L INPUT -n 2>/dev/null || true)"
+            [[ -n "$_ipt_list" ]] || continue
+            _ipt_policy="$(printf '%s\n' "$_ipt_list" | head -n1 | grep -o 'policy [A-Z]*' | awk '{print $2}' || true)"
+            if [[ "$_ipt_policy" == "DROP" || "$_ipt_policy" == "REJECT" ]] \
+               || printf '%s\n' "$_ipt_list" | grep -qE '^[[:space:]]*(DROP|REJECT)[[:space:]]'; then
+                "$_ipt" -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 \
+                    || "$_ipt" -I INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || true
+                "$_ipt" -C INPUT -p tcp --dport "${HY2_SUB_PORT}" -j ACCEPT >/dev/null 2>&1 \
+                    || "$_ipt" -I INPUT -p tcp --dport "${HY2_SUB_PORT}" -j ACCEPT >/dev/null 2>&1 || true
+                if [[ -n "$s_port" && -n "$e_port" ]]; then
+                    "$_ipt" -C INPUT -p udp --dport "${s_port}:${e_port}" -j ACCEPT >/dev/null 2>&1 \
+                        || "$_ipt" -I INPUT -p udp --dport "${s_port}:${e_port}" -j ACCEPT >/dev/null 2>&1 || true
+                fi
+                if [[ "$CERT_TYPE" == "acme" ]]; then
+                    "$_ipt" -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 \
+                        || "$_ipt" -I INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
+                fi
+                log_info "已放行 ${_ipt} INPUT (udp ${port} + tcp ${HY2_SUB_PORT})。"
+                _ipt_saved=1
             fi
-            if [[ "$CERT_TYPE" == "acme" ]]; then
-                iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 \
-                    || iptables -I INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
-            fi
-            log_info "已放行 iptables INPUT (udp ${port} + tcp ${HY2_SUB_PORT})。"
-            if command -v netfilter-persistent >/dev/null 2>&1; then
-                netfilter-persistent save >/dev/null 2>&1 || true
-            fi
+        done
+        if [[ "$_ipt_saved" == "1" ]] && command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1 || true
         fi
     fi
 }
@@ -2705,7 +2710,13 @@ generate_server_config() {
         METER_SECRET="$(openssl rand -hex 16)"
     fi
 
-    cat > "$HY2_CONFIG" <<EOF
+    local _cfg_tmp=""
+    _cfg_tmp="$(umask 077; mktemp "${HY2_CONFIG}.XXXXXX")" || {
+        log_err "无法为 ${HY2_CONFIG} 创建临时文件，原配置未改动。"
+        return 1
+    }
+
+    cat > "$_cfg_tmp" <<EOF
 # Hysteria 2 Server Configuration
 # Generated by hysteria2-installer
 listen: :${LISTEN_PORT}
@@ -2716,7 +2727,7 @@ EOF
         # 域名/邮箱里出现空格或 '#' 时，未加引号的裸值会被 YAML 解析成
         # 另一个值、或把 '#' 之后整行当注释吃掉 —— hysteria 随后报一个
         # 语法错，现象是「装完服务反复重启」，而错误信息完全指不到输入框。
-        cat >> "$HY2_CONFIG" <<EOF
+        cat >> "$_cfg_tmp" <<EOF
 acme:
   domains:
     - "${SERVER_NAME}"
@@ -2724,7 +2735,7 @@ acme:
   type: http
 EOF
     else
-        cat >> "$HY2_CONFIG" <<EOF
+        cat >> "$_cfg_tmp" <<EOF
 tls:
   cert: "${CERT_FILE}"
   key: "${KEY_FILE}"
@@ -2733,14 +2744,14 @@ EOF
 
     # 商城版固定走门户鉴权：门户按用户/到期/流量/IP 限制逐连接判定。
     # 单机固定密码模式已移除（HY2_NODE_MODE 只接受 2）。
-    cat >> "$HY2_CONFIG" <<EOF
+    cat >> "$_cfg_tmp" <<EOF
 auth:
   type: http
   http:
     url: http://127.0.0.1:${PORTAL_LOCAL_PORT}/auth
 EOF
 
-    cat >> "$HY2_CONFIG" <<EOF
+    cat >> "$_cfg_tmp" <<EOF
 
 masquerade:
   type: proxy
@@ -2793,6 +2804,22 @@ acl:
     - reject(fe80::/10)
     - direct_ipv4(all)
 EOF
+
+    # 写入混淆（如果有），在原子替换前拼齐，避免半截配置落盘
+    if [[ -n "$OBFS_PASSWORD" ]]; then
+        cat >> "$_cfg_tmp" <<EOF
+
+obfs:
+  type: salamander
+  salamander:
+    password: $(jq -Rn --arg value "$OBFS_PASSWORD" '$value')
+EOF
+    fi
+    if ! chmod 600 "$_cfg_tmp" || ! mv -f "$_cfg_tmp" "$HY2_CONFIG"; then
+        rm -f "$_cfg_tmp"
+        log_err "原子写入 ${HY2_CONFIG} 失败。"
+        return 1
+    fi
 
     # 写入 toggle_warp.sh 控制脚本，供 portal.py 或命令行无感知调用
     cat > "$HY2_DIR/toggle_warp.sh" <<'EOTW'
@@ -3385,17 +3412,6 @@ fi
 EOUG
     chmod +x "$HY2_DIR/do_upgrade.sh"
 
-    # 写入混淆（如果有）
-    if [[ -n "$OBFS_PASSWORD" ]]; then
-        cat >> "$HY2_CONFIG" <<EOF
-
-obfs:
-  type: salamander
-  salamander:
-    password: $(jq -Rn --arg value "$OBFS_PASSWORD" '$value')
-EOF
-    fi
-
     # 提取证书 SHA-256 指纹：必须是【纯 HEX 64 位】—— 客户端(v2rayNG/v2rayN)会把它直接填进
     # Xray 的 pinnedPeerCertSha256，写 base64 会触发 `encoding/hex: invalid byte`。
     PIN_SHA256=""
@@ -3404,13 +3420,24 @@ EOF
         [[ "$PIN_SHA256" =~ ^[0-9a-f]{64}$ ]] || PIN_SHA256=""
     fi
 
-    jq -n --arg public_ip "$PUBLIC_IP" --arg server_name "$SERVER_NAME" \
+    local _meta_tmp=""
+    _meta_tmp="$(umask 077; mktemp "${HY2_META_FILE}.XXXXXX")" || {
+        log_err "无法为 ${HY2_META_FILE} 创建临时文件。"
+        return 1
+    }
+    if ! jq -n --arg public_ip "$PUBLIC_IP" --arg server_name "$SERVER_NAME" \
         --arg auth_password "$AUTH_PASSWORD" --arg obfs_password "$OBFS_PASSWORD" \
         --arg hop_port_range "$HOP_PORT_RANGE" --arg cert_type "$CERT_TYPE" \
         --arg pin_sha256 "$PIN_SHA256" \
         --argjson listen_port "$LISTEN_PORT" --argjson is_insecure "$IS_INSECURE" \
         --argjson subscription_port "$HY2_SUB_PORT" \
-        '$ARGS.named' > "$HY2_META_FILE"
+        '$ARGS.named' > "$_meta_tmp" \
+        || ! chmod 600 "$_meta_tmp" \
+        || ! mv -f "$_meta_tmp" "$HY2_META_FILE"; then
+        rm -f "$_meta_tmp"
+        log_err "原子写入 ${HY2_META_FILE} 失败。"
+        return 1
+    fi
     # PORTAL_BUNDLE_PLACED 只给这一次 setup_portal 用；菜单循环里下一次操作要重新取包。
     local _portal_rc=0
     setup_portal || _portal_rc=$?
@@ -3434,7 +3461,9 @@ setup_systemd() {
         log_err "/etc/sysctl.d/99-hysteria2.conf 已存在且不属于本安装器，拒绝覆盖。"
         return 1
     fi
-    cat > /etc/sysctl.d/99-hysteria2.conf <<EOF
+    local _sysctl_tmp="" _svc_tmp="" _dropin_tmp=""
+    _sysctl_tmp="$(mktemp /etc/sysctl.d/99-hysteria2.conf.XXXXXX)" || return 1
+    if ! cat > "$_sysctl_tmp" <<EOF
 # Hysteria 2 内核网络与 UDP 缓冲调优 (由 hysteria2-installer 自动生成)
 net.core.rmem_max = 8388608
 net.core.wmem_max = 8388608
@@ -3445,9 +3474,18 @@ net.ipv4.udp_mem = 102400 873800 16777216
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 EOF
+    then
+        rm -f "$_sysctl_tmp"
+        return 1
+    fi
+    if ! chmod 644 "$_sysctl_tmp" || ! mv -f "$_sysctl_tmp" /etc/sysctl.d/99-hysteria2.conf; then
+        rm -f "$_sysctl_tmp"
+        return 1
+    fi
     sysctl -p /etc/sysctl.d/99-hysteria2.conf >/dev/null 2>&1 || true
     
-    cat > "$HY2_SERVICE" <<EOF
+    _svc_tmp="$(mktemp "${HY2_SERVICE}.XXXXXX")" || return 1
+    if ! cat > "$_svc_tmp" <<EOF
 [Unit]
 Description=Hysteria 2 Server Service
 Documentation=https://v2.hysteria.network/
@@ -3472,6 +3510,14 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        rm -f "$_svc_tmp"
+        return 1
+    fi
+    if ! chmod 644 "$_svc_tmp" || ! mv -f "$_svc_tmp" "$HY2_SERVICE"; then
+        rm -f "$_svc_tmp"
+        return 1
+    fi
 
     # 日志级别 drop-in：显式指定 HY2_LOG_LEVEL 时覆盖；未指定且已存在时保留用户的修改。
     case "$HY2_LOG_LEVEL" in
@@ -3480,11 +3526,14 @@ EOF
     esac
     if [[ -n "$HY2_LOG_LEVEL_EXPLICIT" || ! -f "$HY2_LOG_DROPIN" ]]; then
         mkdir -p "${HY2_LOG_DROPIN%/*}"
-        cat > "$HY2_LOG_DROPIN" <<EOF
+        _dropin_tmp="$(mktemp "${HY2_LOG_DROPIN}.XXXXXX")" || return 1
+        {
+            cat > "$_dropin_tmp" <<EOF
 # 由 hysteria2-installer 生成：Hysteria 服务端日志级别（debug|info|warn|error）
 [Service]
 Environment=HYSTERIA_LOG_LEVEL=${HY2_LOG_LEVEL}
 EOF
+        } && chmod 644 "$_dropin_tmp" && mv -f "$_dropin_tmp" "$HY2_LOG_DROPIN" || { rm -f "$_dropin_tmp"; return 1; }
     fi
 
     systemctl daemon-reload
@@ -3976,12 +4025,15 @@ try:
         written.append(f)
 except Exception:
     for f in reversed(written):
-        if existing[f]:
-            restore = stage / f
-            shutil.copy2(backup / f, restore)
-            os.replace(restore, dest / f)
-        else:
-            (dest / f).unlink()
+        try:
+            if existing[f]:
+                restore = stage / f
+                shutil.copy2(backup / f, restore)
+                os.replace(restore, dest / f)
+            else:
+                (dest / f).unlink(missing_ok=True)
+        except OSError as rb_exc:
+            print(f'回滚 {f} 失败: {rb_exc}', file=sys.stderr)
     raise
 print('门户整包备份: ' + str(backup))
 PYINSTALLBUNDLE

@@ -1,3 +1,16 @@
+## 2026-11-22 — 第四十二批十项修复，门户 2.52
+
+- 节点能力接口门户版本截断修复（`portal.py` 的 `/api/v1/capabilities`）：此前按前 80 行扫描 `PORTAL_VERSION`，但常量定义已位于第 215 行，导致运维面板读取的 `portal_version` 恒为空串；改为流式逐行扫描命中即停并回落模块常量，同时省去每次请求将整份门户源码读入内存的开销。
+- Reality 停用订阅清理与配置结构校验（`portal.py` 的 `_h_post_manage_reality`）：停用 Reality 后同步调用 `regenerate_page()` 刷新连接页与下载订阅缓存，消除停用后订阅仍残留旧节点的缺陷；增加对非对象 `xray.json`（如数组）的拦截并给出清晰中文 500 提示。
+- 混淆隧道升 3.x 参数全量校验与列表输出加固（`awgctl.sh` 的 `cmd_install`、`cmd_update`、`cmd_peer_list` 与配置渲染）：升级或安装 AWG 3.x 时逐项检查 `S1`~`S4` 全部为纯数字且不小于 12（修复此前只检 `S4` 遗漏 `S1`~`S3` 的协议违规缺陷）；`cmd_peer_list` 改用环境变量 `ENVIRON["AWG_TR"]` 传递多行流量表消除 `mawk` 遇换行报错；渲染服务端与客户端配置计算 MTU 前校验 `S4` 为纯数字并按十进制解析。
+- 会话验签多同名 Cookie 兼容与 GitHub 令牌缓存失效修复（`portal.py` 的 `verify_session` 与 `github_token`）：`verify_session` 收集全部同名 `hy2_session` 候选逐个验签并在数据锁内校验字符串类型，避免排在后面的旧路径失效 Cookie 覆盖有效会话或损坏 `token` 触发 `TypeError`；`github_token` 将文件权限位、`ctime`、索引节点与体积纳入缓存键并加锁，修复 `chmod` 放宽权限后缓存不失效仍沿用不安全令牌的问题。
+- 页面重建与用户分享路由损坏数据容错（`portal.py` 的 `regenerate_page`、`/u/<uid>` 与 `/user-config`）：`regenerate_page` 过滤非数字或时钟回拨产生的异常 `ip_tracker` 时间戳，避免渲染时抛出 `TypeError` 白屏，并改在数据锁内读取门户令牌；`/u/<uid>` 与 `/user-config` 统一经 `user_table(data)` 访问用户表，且 `/u/<uid>` 校验清洗后的非空字符串节点身份防止非字符串绕过退回 `localhost`。
+- 多协议停用路径配置校验与回滚容错加固（`portal.py` 的 `_h_post_manage_vmess`、`_h_post_manage_vlessenc`、`_h_post_manage_anytls` 与 `_h_post_manage_tuic`）：VMess 与 VLESS-Enc 停用增加 `xray.json` 非法与非对象校验，且 `save_data()` 失败回滚时若原无配置则清除脏键；AnyTLS 与 TUIC 停用回滚时隔离配置文件恢复异常，确保必定继续恢复原服务状态（AnyTLS 同步补齐原无配置时的清理）。
+- 安装脚本主配置、元数据与系统服务单元原子落盘（`install.sh` 的 `generate_server_config` 与 `setup_systemd`）：`config.yaml`（连同末尾 `obfs:` 段）与 `client_meta.json` 改在 `umask 077` 下写入同目录临时文件、设 `0600` 后原子替换，消除写盘中断截断现役配置与私钥权限窗口；`99-hysteria2.conf`、`hysteria-server.service` 与日志级别 drop-in 同步改为同目录临时文件原子替换。
+- 门户整包回滚异常隔离、常规令牌校验与证书链脚本私有备份（`install.sh` 与 `fix_cert_chain.sh`）：`portal_ensure_py` 发布事务失败回滚时逐个隔离文件 `OSError` 并使用 `unlink(missing_ok=True)`，避免单次恢复失败打断其余文件回滚；`install.sh` 的 `curl()` 包装器读取令牌前增加 `-f` 常规文件校验；`fix_cert_chain.sh` 备份配置增加进程号防同秒撞名并在 `umask 077` 下创建、失败即清理残片。
+- 防火墙兜底补齐 IPv6 与末尾拦截规则识别（`install.sh` 的 `setup_system_firewall`）：裸 `iptables` 兜底块同步支持 `ip6tables` 避免双栈主机 IPv6 端口漏放行，并同时识别 `policy DROP/REJECT` 及云镜像常见的 `policy ACCEPT` 加末尾 `DROP`/`REJECT` 拦截规则；移除 `ufw` 与 `firewalld` 分支中重复放行订阅端口的冗余调用。
+- Reality 状态页子进程按需调用与混淆隧道管理参数前置校验（`portal.py` 的 `_h_get_reality_status` 与 `_h_post_manage_amneziawg`）：Reality 未启用时跳过无意义的 `qrencode` 子进程调用；将 `peer_del` 客户端名与 `set_line` 协议线校验前置到安装检查与重型槽申领之前；`update` 分支检查 `ensure_awgctl(force=True)` 返回值，刷新失败立即报错中止。
+
 ## 2026-11-22 — 第四十一批十项修复，门户 2.51
 
 - 辅助协议服务单元原子落盘与回滚隔离（`portal.py` 的 AnyTLS / TUIC 启用路径）：写入服务单元文件改用 `_restore_systemd_unit_file` 同目录临时文件原子替换；启用失败回滚时逐项隔离配置恢复、单元恢复与 `systemctl daemon-reload` 异常，防止重载超时或非零退出跳过原有服务状态恢复。

@@ -630,8 +630,9 @@ render_server_config() {
 
     # MTU 必须扣掉 S4：S4 是每个 Data 包的随机填充，不扣掉外层会分片。
     # 基准 1420 = 1500 - 20(IP) - 8(UDP) - 32(WG 数据包头+认证标签) - 20(预留)。
-    s4v="$(meta_get S4)"; s4v="${s4v:-0}"
-    mtu=$(( 1420 - s4v ))
+    s4v="$(meta_get S4)"
+    [[ "$s4v" =~ ^[0-9]+$ ]] || s4v=0
+    mtu=$(( 1420 - 10#$s4v ))
 
     local tmp
     tmp="$(mktemp "${AWG_DIR}/.conf.XXXXXX")"
@@ -710,8 +711,9 @@ render_client_config() {
     port="$(meta_get port)"
     hp="$(meta_get HeaderProtectionKey)"
     pub="$(meta_get server_public_key)"
-    s4v="$(meta_get S4)"; s4v="${s4v:-0}"
-    mtu=$(( 1420 - s4v ))
+    s4v="$(meta_get S4)"
+    [[ "$s4v" =~ ^[0-9]+$ ]] || s4v=0
+    mtu=$(( 1420 - 10#$s4v ))
 
     priv="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .private_key' "$AWG_PEERS_FILE")"
     psk="$(jq  -r --arg n "$name" '.peers[]? | select(.name==$n) | .preshared_key' "$AWG_PEERS_FILE")"
@@ -1049,8 +1051,9 @@ cmd_peer_list() {
         printf '%-20s %-16s %-20s %s\n' "名称" "隧道地址" "创建时间" "流量(下行/上行)"
         printf -- '--------------------------------------------------------------------------------\n'
         jq -r '.peers[]? | [.name, .address, .created_at, .public_key] | @tsv' "$AWG_PEERS_FILE"
-    } | awk -F'\t' -v tr="$transfer_data" '
+    } | AWG_TR="$transfer_data" awk -F'\t' '
         BEGIN {
+            tr = ENVIRON["AWG_TR"]
             n = split(tr, lines, "\n")
             for (i = 1; i <= n; i++) {
                 if (split(lines[i], f, /[ \t]+/) >= 3) { rx[f[1]] = f[2]; tx[f[1]] = f[3] }
@@ -1191,13 +1194,28 @@ cmd_install() {
     fi
 
     # 混淆参数（已存在则保留 —— 否则所有客户端立刻失效）。
-    # 例外同 cmd_update：在 2.x 安装上 install --line 3 时，旧 S4<12 不满足 3.x 头部
-    # 保护，沿用会让服务起不来、事务回滚，换协议线永远装不上（2026-11-04 修）。
+    # 例外同 cmd_update：在 2.x 安装上 install --line 3 时，旧 S1~S4 任一项 < 12 均不满足
+    # 3.x 头部保护，沿用会让服务起不来、事务回滚，换协议线永远装不上。
     local _s4
     _s4="$(meta_get S4)"
-    if [[ -n "$(meta_get S1)" && "$line" == "3" ]] && { [[ ! "$_s4" =~ ^[0-9]+$ ]] || (( 10#$_s4 < 12 )); }; then
-        log_warn "旧 S4=${_s4} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
-        meta_set S1 ""
+    if [[ -n "$(meta_get S1)" && "$line" == "3" ]]; then
+        local _sk _sv _need_regen=0
+        if [[ ! "$_s4" =~ ^[0-9]+$ ]] || (( 10#$_s4 < 12 )); then
+            log_warn "旧 S4=${_s4} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
+            _need_regen=1
+        else
+            for _sk in S1 S2 S3; do
+                _sv="$(meta_get "$_sk")"
+                if [[ -n "$_sv" ]] && { [[ ! "$_sv" =~ ^[0-9]+$ ]] || (( 10#$_sv < 12 )); }; then
+                    log_warn "旧 ${_sk}=${_sv} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
+                    _need_regen=1
+                    break
+                fi
+            done
+        fi
+        if [[ "$_need_regen" == "1" ]]; then
+            meta_set S1 ""
+        fi
     fi
     if [[ -z "$(meta_get S1)" ]]; then
         gen_obfs_params "$line"
@@ -1463,11 +1481,17 @@ cmd_update() {
         log_warn "参数体系不同，将重新生成混淆参数 —— 所有已发放的客户端配置都会失效！"
         meta_set line "$line"
         if [[ "$line" == "3" ]]; then
-            # 3.x 要求 S1~S4 >= 12，2.x 的 S4 可能是 0~11，必须重生成
-            local s4
-            s4="$(meta_get S4)"
-            if [[ ! "$s4" =~ ^[0-9]+$ ]] || (( 10#$s4 < 12 )); then
-                log_warn "旧 S4=${s4} 不满足 3.x 头部保护的 >=12 要求，正在重新生成全部混淆参数"
+            # 3.x 要求 S1~S4 全部 >= 12，任一项非法或低于 12 必须重生成全部混淆参数
+            local _sk _sv _need_regen=0
+            for _sk in S1 S2 S3 S4; do
+                _sv="$(meta_get "$_sk")"
+                if [[ ! "$_sv" =~ ^[0-9]+$ ]] || (( 10#$_sv < 12 )); then
+                    log_warn "旧 ${_sk}=${_sv} 不满足 3.x 头部保护的 >=12 要求，正在重新生成全部混淆参数"
+                    _need_regen=1
+                    break
+                fi
+            done
+            if [[ "$_need_regen" == "1" ]]; then
                 gen_obfs_params "$line"
                 meta_set Jc "$AWG_JC"; meta_set Jmin "$AWG_JMIN"; meta_set Jmax "$AWG_JMAX"
                 meta_set S1 "$AWG_S1"; meta_set S2 "$AWG_S2"
