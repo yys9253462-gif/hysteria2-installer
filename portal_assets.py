@@ -2445,13 +2445,14 @@ function certSetField(id, value) {
 function certShortIssuer(issuer) {
   if (!issuer) return '--';
   // "CN=Fake Root CA, O=..., C=US" -> 只留 CN，界面上更清爽
-  const m = issuer.match(/CN=([^,]+)/);
-  return m ? m[1] : issuer;
+  const text = String(issuer);
+  const m = text.match(/CN=([^,]+)/);
+  return m ? m[1] : text;
 }
 
 async function checkCertStatus() {
   if (!certBadge) return;
-  let json;
+  let json = null;
   // 取不到状态也要在卡片上说出来（2026-11-04 修）：旧实现静默 return，卡片一直停在
   // 「检测中…」—— 而这张卡片的用途正是把证书故障摆到眼前。
   const showFetchError = (msg) => {
@@ -2462,9 +2463,9 @@ async function checkCertStatus() {
   };
   try {
     const res = await fetch(location.pathname + 'cert-status', { credentials: 'same-origin' });
-    json = await res.json();
+    try { json = await res.json(); } catch (_) { json = null; }
     // HTTP 失败 = 状态取不到；HTTP 200 + ok:false 是「证书不可读」，交给下面正常渲染。
-    if (!res.ok || !json) {
+    if (res.ok === false || !json) {
       showFetchError((json && json.error) || ('服务器返回 ' + res.status));
       return;
     }
@@ -2495,7 +2496,7 @@ async function checkCertStatus() {
     }
   }
   certSetField('cert-servername', json.server_name || '--');
-  certSetField('cert-pin', json.is_insecure ? (json.pin_sha256 ? json.pin_sha256.slice(0, 16) + '…' : '未设置') : '不需要（可信链）');
+  certSetField('cert-pin', json.is_insecure ? (json.pin_sha256 ? String(json.pin_sha256).slice(0, 16) + '…' : '未设置') : '不需要（可信链）');
 
   const days = json.expires_in_days;
   certSetField('cert-daysleft', (days === null || days === undefined) ? '--' : days);
@@ -2576,6 +2577,7 @@ async function checkCertStatus() {
 
 document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
   btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
     const ver = btn.getAttribute('data-version') || 'v1';
     const label = { v1: 'BBR V1 (经典官方)', v2: 'BBR V2 (低丢包)', v3: 'BBR V3 (极限吞吐)' }[ver];
     const confirmed = await showConfirm({
@@ -2596,12 +2598,13 @@ document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'version=' + encodeURIComponent(ver)
       });
-      const json = await res.json();
-      if (json.ok) {
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (res.ok !== false && json && json.ok) {
         showToast(json.message || '配置成功！', 'success');
         await checkBbrStatus();
       } else {
-        showToast(json.error || '配置失败', 'error');
+        showToast((json && json.error) || ('配置失败（HTTP ' + res.status + '）'), 'error');
       }
     } catch (e) {
       alert('请求异常: ' + e.message);
@@ -2652,9 +2655,10 @@ if (btnRebootServer) {
       });
       // 看服务器怎么答（2026-11-04 修）：有重型任务在跑时回 409、会话过期回 401，
       // 旧实现一律倒计时 25 秒再刷新，机器其实从未重启。
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        alert('未能发起重启：' + (json.error || ('服务器返回 ' + res.status)));
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (res.ok === false || !json || !json.ok) {
+        alert('未能发起重启：' + ((json && json.error) || ('服务器返回 ' + res.status)));
         btnRebootServer.disabled = false;
         btnRebootServer.textContent = '🔄 立即重启服务器生效';
         return;
@@ -2830,9 +2834,10 @@ async function loadCores() {
   const seq = ++coresSeq;
   try {
     const res = await fetch(location.pathname + 'cores-status', { credentials: 'same-origin' });
-    const json = await res.json();
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
     if (seq !== coresSeq) return;
-    if (!res.ok || !json.ok) throw new Error(json.error || ('HTTP ' + res.status));
+    if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('HTTP ' + res.status));
     coreGrid.textContent = '';
     // 后端异常时 cores 可能不是数组（错误对象/undefined），直接 forEach 会
     // 抛出未处理的 rejection，核心卡片停在「读取中」且没有提示。
@@ -2845,6 +2850,7 @@ async function loadCores() {
 }
 
 async function installCore(core, btn) {
+  if (btn.disabled) return;
   const confirmed = await showConfirm({
     title: (core.installed ? '重新安装 ' : '安装 ') + core.name,
     text: '将从官方 Release 下载并校验 SHA256 后安装，只安装核心程序，不会自动开启任何协议。可能需要一两分钟。',
@@ -2864,7 +2870,7 @@ async function installCore(core, btn) {
     });
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
-    if (json && json.ok) showToast(json.message || '安装完成', 'success');
+    if (res.ok !== false && json && json.ok) showToast(json.message || '安装完成', 'success');
     else alert((json && json.error) || ('安装失败（HTTP ' + res.status + '）'));
   } catch (e) {
     alert('请求异常: ' + e.message);
@@ -2876,6 +2882,7 @@ async function installCore(core, btn) {
 }
 
 async function uninstallCore(core, btn) {
+  if (btn.disabled) return;
   const confirmed = await showConfirm({
     title: '卸载 ' + core.name,
     text: '将停止并删除 ' + core.name + ' 程序与 systemd 服务。若还有协议在使用它会被拒绝，请先到协议页关闭。协议的配置会保留，重新安装后再开启即可沿用。',
@@ -2896,7 +2903,7 @@ async function uninstallCore(core, btn) {
     });
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
-    if (json && json.ok) showToast(json.message || '已卸载', 'success');
+    if (res.ok !== false && json && json.ok) showToast(json.message || '已卸载', 'success');
     else alert((json && json.error) || ('卸载失败（HTTP ' + res.status + '）'));
   } catch (e) {
     alert('请求异常: ' + e.message);
