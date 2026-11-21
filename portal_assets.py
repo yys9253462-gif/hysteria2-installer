@@ -1117,7 +1117,6 @@ const obEls = {
   httpInsecure: document.getElementById('ob-http-insecure'),
   directMode: document.getElementById('ob-direct-mode'),
   blockDirect: document.getElementById('ob-block-direct'),
-  quickBox: document.getElementById('ob-quick-box'),
   btnSave: document.getElementById('btn-ob-save'),
   btnCancel: document.getElementById('btn-ob-cancel'),
   msg: document.getElementById('ob-form-msg'),
@@ -1519,8 +1518,11 @@ async function obTestForm() {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
     });
-    const json = await res.json();
-    if (!json.ok) throw new Error(json.error || '测试失败');
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (res.ok === false || !json || !json.ok) {
+      throw new Error((json && json.error) || ('测试失败（HTTP ' + res.status + '）'));
+    }
     if (json.ip) obMsg('✓ 连通，出口 IP：' + json.ip, 'ok');
     else obMsg('✗ 连不通：请检查地址、端口与认证信息', 'err');
   } catch (e) {
@@ -1698,7 +1700,7 @@ if (obEls.list) {
         obEls.probeAddr.hidden = (kind !== 'socks5' && kind !== 'http');
       }
       await probeOutbound(kind, addr, insecure);
-      window.scrollTo({ top: obEls.ip.offsetTop - 200, behavior: 'smooth' });
+      if (obEls.ip) window.scrollTo({ top: obEls.ip.offsetTop - 200, behavior: 'smooth' });
     }
   });
 }
@@ -1846,8 +1848,10 @@ async function protocolSwitchAction(btn, name) {
 
 if (btnToggleReality) {
   btnToggleReality.addEventListener('click', async () => {
+    if (btnToggleReality.disabled) return;
     const action = await protocolSwitchAction(btnToggleReality, 'Reality');
     if (!action) return;
+    const prevText = btnToggleReality.textContent;
     btnToggleReality.disabled = true;
     btnToggleReality.textContent = '切换中...';
     try {
@@ -1857,12 +1861,16 @@ if (btnToggleReality) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=' + action
       });
-      const json = await res.json();
-      if (!json.ok) alert(json.error || '切换失败');
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (res.ok === false || !json || !json.ok) {
+        alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
+      }
       await checkRealityStatus();
     } catch (e) {
       alert('请求异常: ' + e.message);
     } finally {
+      if (btnToggleReality.textContent === '切换中...') btnToggleReality.textContent = prevText;
       btnToggleReality.disabled = false;
     }
   });
@@ -1887,13 +1895,14 @@ if (btnResetRealityKeys) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=reset'
       });
-      const json = await res.json();
-      if (json.ok) {
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (res.ok !== false && json && json.ok) {
         // 用服务端的说明（2026-11-03 修）：UUID 从不变；节点停用期间新密钥要等恢复后才生效。
         alert(json.message || '密钥对已重新生成，请让客户端重新导入订阅');
         await checkRealityStatus();
       } else {
-        alert(json.error || '重置失败');
+        alert((json && json.error) || ('重置失败（HTTP ' + res.status + '）'));
       }
     } catch (e) {
       alert('请求异常: ' + e.message);
@@ -1981,13 +1990,13 @@ async function checkVmessStatus() {
     const gotoVmessOk = document.getElementById('vmess-goto-cores');
     if (gotoVmessOk) gotoVmessOk.style.display = 'none';
     if (json.active) {
-      vmessBadge.textContent = '● 运行中 (TCP ' + (json.config.port || '--') + ')';
+      const cfg = json.config || {};
+      vmessBadge.textContent = '● 运行中 (TCP ' + (cfg.port || '--') + ')';
       vmessBadge.style.background = '#eaf3de';
       vmessBadge.style.color = '#27500a';
       btnToggleVmess.textContent = '已开启 (点击关闭)';
       btnToggleVmess.className = 'toggle-btn on';
       if (vmessContentBox) vmessContentBox.style.display = 'block';
-      const cfg = json.config || {};
       if (vmessUriVal) vmessUriVal.value = cfg.uri || '';
       if (vmessQrBox) vmessQrBox.innerHTML = cfg.qr_svg || '';
       if (vmessDomainVal) vmessDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
@@ -2013,6 +2022,7 @@ if (btnToggleVmess) {
     if (btnToggleVmess.disabled) return;
     const action = await protocolSwitchAction(btnToggleVmess, 'VMess');
     if (!action) return;
+    const prevText = btnToggleVmess.textContent;
     btnToggleVmess.disabled = true;
     btnToggleVmess.textContent = '切换中...';
     try {
@@ -2026,7 +2036,7 @@ if (btnToggleVmess) {
       // 直接 res.json() 会抛「Unexpected token <」，把真实原因盖掉。
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
-      if (!res.ok || !json || !json.ok) {
+      if (res.ok === false || !json || !json.ok) {
         alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
       }
       // 只有成功时才刷新；失败保留原状态，避免把错误状态画到界面上。
@@ -2034,8 +2044,8 @@ if (btnToggleVmess) {
     } catch (e) {
       alert('请求异常: ' + e.message);
     } finally {
-      // 只恢复 disabled —— 文案由 checkVmessStatus() 按真实状态决定。
-      // 旧实现在这里写回 orig，会把「已开启 (点击关闭)」又改回「已关闭」。
+      // 仅当状态刷新未更新文案时还原原按钮文字，避免网络异常后卡死在「切换中...」。
+      if (btnToggleVmess.textContent === '切换中...') btnToggleVmess.textContent = prevText;
       btnToggleVmess.disabled = false;
     }
   });
@@ -2086,13 +2096,13 @@ async function checkVlessencStatus() {
     const gotoVlessencOk = document.getElementById('vlessenc-goto-cores');
     if (gotoVlessencOk) gotoVlessencOk.style.display = 'none';
     if (json.active) {
-      vlessencBadge.textContent = '● 运行中 (TCP ' + (json.config.port || '--') + ')';
+      const cfg = json.config || {};
+      vlessencBadge.textContent = '● 运行中 (TCP ' + (cfg.port || '--') + ')';
       vlessencBadge.style.background = '#eaf3de';
       vlessencBadge.style.color = '#27500a';
       btnToggleVlessenc.textContent = '已开启 (点击关闭)';
       btnToggleVlessenc.className = 'toggle-btn on';
       if (vlessencContentBox) vlessencContentBox.style.display = 'block';
-      const cfg = json.config || {};
       if (vlessencUriVal) vlessencUriVal.value = cfg.uri || '';
       if (vlessencQrBox) vlessencQrBox.innerHTML = cfg.qr_svg || '';
       if (vlessencDomainVal) vlessencDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
@@ -2116,6 +2126,7 @@ if (btnToggleVlessenc) {
     if (btnToggleVlessenc.disabled) return;
     const action = await protocolSwitchAction(btnToggleVlessenc, 'VLESS Encryption');
     if (!action) return;
+    const prevText = btnToggleVlessenc.textContent;
     btnToggleVlessenc.disabled = true;
     btnToggleVlessenc.textContent = '切换中...';
     try {
@@ -2127,13 +2138,14 @@ if (btnToggleVlessenc) {
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
-      if (!res.ok || !json || !json.ok) {
+      if (res.ok === false || !json || !json.ok) {
         alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
       }
       await checkVlessencStatus();
     } catch (e) {
       alert('请求异常: ' + e.message);
     } finally {
+      if (btnToggleVlessenc.textContent === '切换中...') btnToggleVlessenc.textContent = prevText;
       btnToggleVlessenc.disabled = false;
     }
   });
@@ -2214,6 +2226,7 @@ if (btnToggleAnytls) {
     if (btnToggleAnytls.disabled) return;
     const action = await protocolSwitchAction(btnToggleAnytls, 'AnyTLS');
     if (!action) return;
+    const prevText = btnToggleAnytls.textContent;
     btnToggleAnytls.disabled = true;
     btnToggleAnytls.textContent = '切换中...';
     try {
@@ -2225,13 +2238,14 @@ if (btnToggleAnytls) {
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
-      if (!res.ok || !json || !json.ok) {
+      if (res.ok === false || !json || !json.ok) {
         alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
       }
       await checkAnytlsStatus();
     } catch (e) {
       alert('请求异常: ' + e.message);
     } finally {
+      if (btnToggleAnytls.textContent === '切换中...') btnToggleAnytls.textContent = prevText;
       btnToggleAnytls.disabled = false;
     }
   });
@@ -2312,6 +2326,7 @@ if (btnToggleTuic) {
     if (btnToggleTuic.disabled) return;
     const action = await protocolSwitchAction(btnToggleTuic, 'TUIC');
     if (!action) return;
+    const prevText = btnToggleTuic.textContent;
     btnToggleTuic.disabled = true;
     btnToggleTuic.textContent = '切换中...';
     try {
@@ -2323,13 +2338,14 @@ if (btnToggleTuic) {
       });
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
-      if (!res.ok || !json || !json.ok) {
+      if (res.ok === false || !json || !json.ok) {
         alert((json && json.error) || ('切换失败（HTTP ' + res.status + '）'));
       }
       await checkTuicStatus();
     } catch (e) {
       alert('请求异常: ' + e.message);
     } finally {
+      if (btnToggleTuic.textContent === '切换中...') btnToggleTuic.textContent = prevText;
       btnToggleTuic.disabled = false;
     }
   });
