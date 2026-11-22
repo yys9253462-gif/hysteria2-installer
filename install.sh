@@ -3242,7 +3242,8 @@ fi
 EOTW
     chmod +x "$HY2_DIR/toggle_warp.sh"
 
-    # 写入 do_upgrade.sh 供 Web 控制台在线升级官方核心或面板
+    # 写入 do_upgrade.sh 供 Web 控制台在线升级官方核心或面板（先防符号链接劫持）
+    [[ ! -L "$HY2_DIR/do_upgrade.sh" ]] || rm -f "$HY2_DIR/do_upgrade.sh"
     cat > "$HY2_DIR/do_upgrade.sh" <<'EOUG'
 #!/usr/bin/env bash
 # 与 install.sh 相同的 umask（2026-11-03 修）：本脚本由门户服务或手工 shell 调用，
@@ -3254,8 +3255,13 @@ HY2_DIR="/etc/hysteria"
 HY2_BIN="/usr/local/bin/hysteria"
 
 if [[ "$TARGET" == "core" ]]; then
-    # 菜单升级与门户终端升级共用锁，避免失败回滚覆盖另一入口成功的新核心。
-    exec 9>"${HY2_DIR}/.core-operation.lock"
+    # 菜单升级与门户终端升级共用锁，避免失败回滚覆盖另一入口成功的新核心；拒绝符号链接防截断劫持。
+    if [[ ! -L "${HY2_DIR}/.core-operation.lock" ]]; then
+        exec 9>>"${HY2_DIR}/.core-operation.lock"
+    else
+        echo "锁文件不能是符号链接，已放弃更新" >&2
+        exit 1
+    fi
     if ! flock -n 9; then
         echo "另一个核心升级正在运行，请稍后重试" >&2
         exit 1
@@ -3271,7 +3277,7 @@ if [[ "$TARGET" == "core" ]]; then
     ASSET="hysteria-linux-${HY_ARCH}"
 
     # 先定版本，再取该版本的官方 hashes.txt —— 绝不拿浮动 latest 的字节当依据。
-    TAG=$(curl -s --max-time 10 https://api.github.com/repos/apernet/hysteria/releases/latest \
+    TAG=$(curl -s --max-time 10 --max-filesize 2097152 https://api.github.com/repos/apernet/hysteria/releases/latest \
           | jq -r '.tag_name // empty' 2>/dev/null) || TAG=""
     if [[ -z "$TAG" || "$TAG" == "null" ]]; then
         _loc=$(curl -fsSIL --max-time 20 "https://download.hysteria.network/app/latest/${ASSET}" 2>/dev/null \
@@ -3281,22 +3287,28 @@ if [[ "$TARGET" == "core" ]]; then
             TAG="app/${BASH_REMATCH[1]}"
         fi
     fi
-    if [[ -z "$TAG" || "$TAG" == "null" ]]; then
-        echo "无法确定 Hysteria 版本，已放弃更新（不做无校验下载）" >&2
+    if [[ -z "$TAG" || "$TAG" == "null" || ! "$TAG" =~ ^(app/)?v[0-9A-Za-z._-]+$ || "$TAG" == *".."* ]]; then
+        echo "无法确定合法的 Hysteria 版本，已放弃更新（不做无校验下载）" >&2
         exit 1
     fi
 
     SUMDIR="$(mktemp -d)"
-    trap 'rm -rf "$SUMDIR"; rm -f "$TMP_FILE"' EXIT
-    if ! curl -fsSL --max-time 30 --retry 2 \
+    TMP_FILE=""
+    trap 'rm -rf "${SUMDIR:-}"; rm -f "${TMP_FILE:-}"' EXIT
+    if ! curl -fsSL --max-time 30 --max-filesize 2097152 --retry 2 \
             "https://github.com/apernet/hysteria/releases/download/${TAG}/hashes.txt" \
             -o "${SUMDIR}/hashes.txt" 2>/dev/null; then
         echo "取不到 ${TAG} 的官方 hashes.txt，已放弃更新，现有核心未改动" >&2
         exit 1
     fi
-    # 精确资产名解析唯一 SHA256；空/重复/畸形一律失败。
-    WANT="$(awk -v a="$ASSET" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==a || n ~ ("/" a "$")) print $1}' \
-            "${SUMDIR}/hashes.txt" | tr 'A-F' 'a-f' | sort -u)"
+    # 精确资产名解析唯一 SHA256；忽略注释行、要求严格双列且循环剥离多层 ./，空/重复/畸形一律失败。
+    WANT="$(awk -v a="$ASSET" '
+        /^[[:space:]]*(#|$)/ { next }
+        NF==2 {
+            n=$2; sub(/^\*/,"",n);
+            while (sub(/^\.\//,"",n)) {}
+            if (n==a || n ~ ("/" a "$")) print $1
+        }' "${SUMDIR}/hashes.txt" | tr 'A-F' 'a-f' | sort -u)"
     if [[ ! "$WANT" =~ ^[0-9a-f]{64}$ ]]; then
         echo "hashes.txt 中 ${ASSET} 的摘要缺失或不唯一（实际: [${WANT}]），已放弃更新" >&2
         exit 1
@@ -3304,7 +3316,7 @@ if [[ "$TARGET" == "core" ]]; then
 
     # mktemp 而不是固定的 /tmp/hy2_update_*：root 写可预测路径会被符号链接劫持。
     TMP_FILE="$(mktemp "${HY2_BIN}.update.XXXXXX")"
-    curl -fsSL --max-time 300 "https://github.com/apernet/hysteria/releases/download/${TAG}/${ASSET}" -o "$TMP_FILE" || {
+    curl -fsSL --max-time 300 --max-filesize 104857600 "https://github.com/apernet/hysteria/releases/download/${TAG}/${ASSET}" -o "$TMP_FILE" || {
         echo "下载失败，现有核心未改动" >&2; exit 1; }
     GOT="$(sha256sum "$TMP_FILE" | awk '{print $1}')"
     if [[ "$GOT" != "$WANT" ]]; then
@@ -3333,9 +3345,17 @@ if [[ "$TARGET" == "core" ]]; then
         exit 1
     fi
     # 老装机补上 masquerade.proxy.xForwarded（见安装模板的注释）。放在核心升级里做，
-    # 是因为这里本来就要重启 Hy2，不会为改配置额外断一次所有用户。
-    if [[ -f "$HY2_DIR/config.yaml" ]] && ! grep -qE '^[[:space:]]+xForwarded:' "$HY2_DIR/config.yaml"; then
-        sed -i -E 's/^([[:space:]]+)rewriteHost:(.*)$/&\n\1xForwarded: true/' "$HY2_DIR/config.yaml" || true
+    # 是因为这里本来就要重启 Hy2，不会为改配置额外断一次所有用户；同目录临时文件原子写入。
+    if [[ ! -L "$HY2_DIR/config.yaml" && -f "$HY2_DIR/config.yaml" ]] && ! grep -qE '^[[:space:]]+xForwarded:' "$HY2_DIR/config.yaml"; then
+        _xfwd_tmp="$(umask 077 && mktemp "${HY2_DIR}/.config.yaml.xfwd.XXXXXX" 2>/dev/null)" || _xfwd_tmp=""
+        if [[ -n "$_xfwd_tmp" ]]; then
+            if sed -E 's/^([[:space:]]+)rewriteHost:(.*)$/&\n\1xForwarded: true/' "$HY2_DIR/config.yaml" > "$_xfwd_tmp" 2>/dev/null && [[ -s "$_xfwd_tmp" ]]; then
+                chmod 600 "$_xfwd_tmp" 2>/dev/null || true
+                mv -f "$_xfwd_tmp" "$HY2_DIR/config.yaml" || rm -f "$_xfwd_tmp"
+            else
+                rm -f "$_xfwd_tmp"
+            fi
+        fi
     fi
     if [[ "$(jq -r '.traffic_suspend.suspended // false' "$HY2_DIR/portal.json" 2>/dev/null)" == "true" ]]; then
         rm -f "$ROLLBACK_FILE"
@@ -3376,10 +3396,12 @@ elif [[ "$TARGET" == "portal" ]]; then
     # 取文件并原子替换），这里保留是为了手工调用 do_upgrade.sh portal 的场景。
     REPO="yys9253462-gif/hysteria2-installer"
     # 固定一次提交后，所有回退源都读取相同快照。
-    _bundle_ref="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/commits/main" |
+    _bundle_ref="$(curl -fsSL --max-time 15 --max-filesize 2097152 "https://api.github.com/repos/${REPO}/commits/main" |
         python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha", ""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)')" || exit 1
     [[ "$_bundle_ref" =~ ^[0-9a-f]{40}$ ]] || { echo "无法固定门户版本，保留全部旧文件" >&2; exit 1; }
     _bundle_dir="$(mktemp -d)"
+    _bundle_map=""
+    trap 'rm -rf "${_bundle_dir:-}" "${_bundle_map:-}"' EXIT
     _bundle_files="portal.py portal_assets.py usage-meter-core-20261007-v1.py usage-meter-readers-20261007-v1.py usage-meter-runtime-20261007-v1.py usage-meter-xray-config-20261007-v1.py"
     # 本脚本是独立生成的文件，不能依赖 install.sh 里的函数：内联 git blob 身份计算。
     # blob sha = sha1("blob <len>\0" + content)，与 GitHub contents API 的 sha 一致，
@@ -3394,7 +3416,7 @@ elif [[ "$TARGET" == "portal" ]]; then
     # 只有内容与该身份一致才算通过 —— 只校验 marker 挡不住 CDN 返回与所 pin
     # commit 不符的内容。
     _bundle_map="$(mktemp)"
-    if ! curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
+    if ! curl -fsSL --max-time 20 --max-filesize 2097152 -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/?ref=${_bundle_ref}" -o "$_bundle_map" 2>/dev/null; then
         rm -rf "$_bundle_dir" "$_bundle_map"
         echo "无法取得 ${_bundle_ref:0:7} 的文件身份，保留全部旧文件" >&2
@@ -3431,7 +3453,7 @@ for it in items if isinstance(items, list) else []:
         for _url in "https://api.github.com/repos/${REPO}/contents/${_m}?ref=${_bundle_ref}" \
                     "https://cdn.jsdelivr.net/gh/${REPO}@${_bundle_ref}/${_m}" \
                     "https://raw.githubusercontent.com/${REPO}/${_bundle_ref}/${_m}"; do
-            if curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" "$_url" -o "$_tmp_m" 2>/dev/null &&
+            if curl -fsSL --max-time 30 --max-filesize 10485760 -H "Accept: application/vnd.github.raw" "$_url" -o "$_tmp_m" 2>/dev/null &&
                grep -Fq "$_marker" "$_tmp_m" &&
                python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$_tmp_m" 2>/dev/null &&
                [[ "$(_blob_sha "$_tmp_m")" == "$_want_sha" ]]; then
@@ -3634,7 +3656,9 @@ EOCS2
                     *)  _cwd="$(dirname "$HY2_DIR/$_cc")" ;;
                 esac
             fi
-            [[ -d "$_cwd" ]] || _cwd="$HY2_DIR/cert"
+            if [[ "$_cwd" == *$'\n'* || "$_cwd" == *$'\r'* || ! -d "$_cwd" ]]; then
+                _cwd="$HY2_DIR/cert"
+            fi
             printf '%s\n' \
               '[Unit]' \
               'Description=Watch certificate dir and self-heal trust model on change' \
