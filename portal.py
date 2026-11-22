@@ -157,6 +157,37 @@ QR_UNAVAILABLE_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="260" heigh
                       '<text x="130" y="118" text-anchor="middle" font-size="16" fill="#5f5e5a">二维码生成失败</text>'
                       '<text x="130" y="146" text-anchor="middle" font-size="12" fill="#5f5e5a">请复制节点直链导入</text>'
                       '</svg>')
+_SVG_EVENT_HANDLER_RE = re.compile(r'[\s/<]on[a-z]+\s*=', re.IGNORECASE)
+
+
+def _is_safe_svg_payload(raw, max_bytes=2 * 1024 * 1024):
+    """校验待输出或内嵌的 SVG 二维码负载，拦截脚本、外联对象、内联事件及超大体积。"""
+    if isinstance(raw, bytes):
+        if not raw or len(raw) > max_bytes:
+            return False
+        text = raw.decode('utf-8', errors='replace')
+    elif isinstance(raw, str):
+        if not raw or len(raw.encode('utf-8')) > max_bytes:
+            return False
+        text = raw
+    else:
+        return False
+    low = text.lower()
+    if '<svg' not in low:
+        return False
+    if '<script' in low or '<foreignobject' in low or 'javascript:' in low:
+        return False
+    if _SVG_EVENT_HANDLER_RE.search(text):
+        return False
+    return True
+
+
+def _safe_cookie_path_token(token):
+    """构造安全的 Cookie Path，剔除分号、空白与换行等注入字符。"""
+    if not isinstance(token, str):
+        return '/'
+    cleaned = re.sub(r'[^A-Za-z0-9._-]', '', token)
+    return f'/{cleaned}/' if cleaned else '/'
 
 
 def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
@@ -12567,15 +12598,16 @@ if __name__ == '__main__':
                     portal_token = str(data.get('token') or '')
                 self.send_response(302)
                 self._responded = True
-                self.send_header('Location', prefix)
+                safe_loc = ''.join(ch for ch in str(prefix) if ord(ch) >= 32 and ord(ch) != 127)
+                self.send_header('Location', safe_loc or '/')
                 # 🔴 2026-10-31：Secure 属性必须与登入时**完全一致**，否则
                 # 清除不掉。HTTP 访问下浏览器不会回写带 Secure 的 Cookie，
                 # 于是「点了退出登录，其实还登录着」—— 共用电脑场景下这是
                 # 真事故（登出入口就是为它加的）。
                 _secure = '; Secure' if self._is_https_request() else ''
                 self.send_header('Set-Cookie',
-                                 'hy2_session=; Path=/%s/; HttpOnly; SameSite=Strict%s; Max-Age=0'
-                                 % (portal_token, _secure))
+                                 'hy2_session=; Path=%s; HttpOnly; SameSite=Strict%s; Max-Age=0'
+                                 % (_safe_cookie_path_token(portal_token), _secure))
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header('X-Frame-Options', 'DENY')
@@ -16038,11 +16070,13 @@ if __name__ == '__main__':
             # 判断依据只看本请求是否经 TLS（masquerade 会带
             # X-Forwarded-Proto），不看配置 —— 配置读错会把所有人锁在门外。
             secure = '; Secure' if self._is_https_request() else ''
-            cookie = (f'hy2_session={sess_val}; Path=/{portal_token}/; '
+            cookie_path = _safe_cookie_path_token(portal_token)
+            cookie = (f'hy2_session={sess_val}; Path={cookie_path}; '
                       f'HttpOnly; SameSite=Strict{secure}{max_age}')
             self.send_response(302)
             self._responded = True
-            self.send_header('Location', prefix)
+            safe_loc = ''.join(ch for ch in str(prefix) if ord(ch) >= 32 and ord(ch) != 127)
+            self.send_header('Location', safe_loc or '/')
             self.send_header('Set-Cookie', cookie)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
@@ -16545,8 +16579,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 协议是否真的在服务，以 xray.json 里有没有托管入站为准 ——
                     # data 里的配置是「上次生成成功」的残留，停用后仍在。
                     try:
-                        _xcfg = json.loads(Path('/etc/hysteria/xray.json')
-                                           .read_text(encoding='utf-8'))
+                        _xp = Path('/etc/hysteria/xray.json')
+                        _xst = _xp.lstat()
+                        if _xp.is_symlink() or not _xp.is_file() or _xst.st_size > 4 * 1024 * 1024:
+                            raise ValueError('xray.json 非法或过大')
+                        _xcfg = json.loads(_xp.read_bytes().decode('utf-8', errors='replace'))
+                        if not isinstance(_xcfg, dict):
+                            raise ValueError('xray.json 顶层非对象')
                         d_snap['vmess_inbound'] = managed_inbound_active(_xcfg, VMESS_INBOUND_TAG)
                         d_snap['reality_inbound'] = managed_inbound_active(_xcfg, REALITY_INBOUND_TAG)
                         d_snap['vlessenc_inbound'] = managed_inbound_active(_xcfg, VLESSENC_INBOUND_TAG)
@@ -16559,6 +16598,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         try:
                             out = subprocess.run(['systemctl', 'is-active', unit],
                                                  capture_output=True, text=True,
+                                                 encoding='utf-8', errors='replace',
                                                  timeout=3).stdout.strip()
                             return out == 'active'
                         except Exception:
@@ -16577,8 +16617,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         try:
                             cc = subprocess.run(
                                 ['sysctl', '-n', 'net.ipv4.tcp_congestion_control'],
-                                capture_output=True, text=True, timeout=3
+                                capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=3
                             ).stdout.strip()
+                            cc = ''.join(ch for ch in cc if ord(ch) >= 32 and ord(ch) != 127)
                         except Exception:
                             cc = ''
                         return (cc.startswith('bbr'), cc)
@@ -16605,10 +16647,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 避免旧版 [:80] 截断漏掉定义及整文件读入内存；不可读时回落模块常量。
                     portal_version = PORTAL_VERSION
                     try:
-                        with Path(__file__).open(encoding='utf-8') as _ver_fp:
+                        with Path(__file__).open(encoding='utf-8', errors='replace') as _ver_fp:
                             for line in _ver_fp:
                                 if line.startswith('PORTAL_VERSION'):
-                                    parsed_ver = line.split('=', 1)[1].strip().strip('"\'')
+                                    rhs = line.split('=', 1)[1].split('#', 1)[0].strip()
+                                    parsed_ver = rhs.strip('"\'')
                                     if parsed_ver:
                                         portal_version = parsed_ver
                                     break
@@ -16922,7 +16965,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
                     except Exception:
                         qr_bytes = b''
-                    if b'<svg' not in qr_bytes or b'<script' in qr_bytes.lower():
+                    if not _is_safe_svg_payload(qr_bytes):
                         qr_bytes = QR_UNAVAILABLE_SVG.encode('utf-8')
                     return self.reply(200, qr_bytes, 'image/svg+xml')
                 elif action_file == '':
@@ -16930,9 +16973,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                     except Exception:
                         qr_svg = ''
-                    if '<svg' not in qr_svg:
-                        qr_svg = ''
-                    elif '<script' in qr_svg.lower():
+                    if not _is_safe_svg_payload(qr_svg):
                         qr_svg = ''
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
@@ -17168,6 +17209,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 except Exception:
                     return self.reply(500, '二维码生成失败（服务器可能未安装 qrencode），请改用「下载配置」导入'
                                       .encode('utf-8'))
+                if not _is_safe_svg_payload(qr_bytes):
+                    return self.reply(500, '二维码内容异常，请改用「下载配置」导入'.encode('utf-8'))
                 return self.reply(200, qr_bytes, 'image/svg+xml')
 
             if not self.is_authenticated():
@@ -17224,8 +17267,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 连接照样被掐断 —— 这是用户点「下载配置」的路径。
                 raw_content = data.get(key)
                 content = raw_content.encode() if isinstance(raw_content, str) else b''
-            if key == 'qr' and b'<svg' not in content:
-                # 生成不出二维码时给一张说明图（2026-11-13 修）：旧实现回空内容，页面上是一个裂开的图片。
+            if key == 'qr' and not _is_safe_svg_payload(content):
+                # 生成不出二维码或内容异常时给一张说明图（2026-11-13 修）：旧实现回空内容，页面上是一个裂开的图片。
                 content = QR_UNAVAILABLE_SVG.encode('utf-8')
             self.reply(200, content, mime)
 
@@ -17733,7 +17776,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 def _sysctl_read(param):
                     try:
                         return subprocess.run(['sysctl', '-n', param],
-                                              capture_output=True, text=True, timeout=2).stdout.strip()
+                                              capture_output=True, text=True,
+                                              encoding='utf-8', errors='replace',
+                                              timeout=2).stdout.strip()
                     except (OSError, subprocess.SubprocessError):
                         return ''
                 cc_out = _sysctl_read('net.ipv4.tcp_congestion_control')
@@ -17743,8 +17788,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 configured_bbr = ''
                 if conf_path.exists():
                     try:
-                        c_text = conf_path.read_text(encoding='utf-8')
-                    except (OSError, UnicodeDecodeError):
+                        c_st = conf_path.lstat()
+                        if not conf_path.is_symlink() and conf_path.is_file() and c_st.st_size <= 1024 * 1024:
+                            c_text = conf_path.read_bytes().decode('utf-8', errors='replace')
+                        else:
+                            c_text = ''
+                    except OSError:
                         c_text = ''
                     for line in c_text.splitlines():
                         stripped = line.strip()
@@ -17768,7 +17817,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     need_reboot = False
 
                 with data_lock:
-                    target_ver = data.get('bbr_target_version', '')
+                    raw_target_ver = data.get('bbr_target_version', '')
+                target_ver = (''.join(ch for ch in raw_target_ver if ord(ch) >= 32 and ord(ch) != 127)
+                              if isinstance(raw_target_ver, str) else '')
 
                 # tcp_available_congestion_control 只列出**已加载**的模块：新机器上
                 # tcp_bbr 还没 modprobe，只会看到 "reno cubic"，前端据此把按钮全禁用。
@@ -17811,7 +17862,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 applying = bool(data.get('egress_applying'))
                 error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
             try:
-                text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
+                _cfg_p = Path('/etc/hysteria/config.yaml')
+                _cfg_st = _cfg_p.lstat()
+                if _cfg_p.is_symlink() or not _cfg_p.is_file() or _cfg_st.st_size > 4 * 1024 * 1024:
+                    raise ValueError('config.yaml 非法或过大')
+                text = _cfg_p.read_bytes().decode('utf-8', errors='replace')
                 applied = text == render_egress_config(text, state) and _hy2_config_loaded('/etc/hysteria/config.yaml')
             except Exception:
                 applied = False
