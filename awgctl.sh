@@ -162,6 +162,7 @@ awg_transaction_snapshot() {
         : > "$AWG_TRANSACTION_DIR/original-dir.absent" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
     fi
     for path in "$AWG_META_FILE" "$AWG_CONFIG" "$AWG_PEERS_FILE" "$AWG_SERVICE"; do
+        [[ ! -L "$path" ]] || { log_err "${path} 为符号链接，拒绝建立回滚快照"; rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
         if [[ -e "$path" ]]; then
             cp -a -- "$path" "$AWG_TRANSACTION_DIR/$index" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
             : > "$AWG_TRANSACTION_DIR/$index.present" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
@@ -170,6 +171,7 @@ awg_transaction_snapshot() {
     done
     index=4
     for path in "$AWG_VERSION_FILE" "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
+        [[ ! -L "$path" ]] || { log_err "${path} 为符号链接，拒绝建立回滚快照"; rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
         if [[ -e "$path" ]]; then
             cp -a -- "$path" "$AWG_TRANSACTION_DIR/bin.$index" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
             : > "$AWG_TRANSACTION_DIR/bin.$index.present" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
@@ -189,8 +191,9 @@ awg_transaction_snapshot() {
 # 通过同目录临时文件原子复制还原目标，避免覆盖运行中二进制触发 ETXTBSY 或留下半截配置。
 awg_atomic_copy_file() {
     local src="$1" dst="$2" tmp=""
+    [[ ! -L "$dst" ]] || return 1
     trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
-    mkdir -p -- "$(dirname "$dst")" || return 1
+    mkdir -p -- "$(dirname -- "$dst")" || return 1
     tmp="$(umask 077 && mktemp "${dst}.restore.XXXXXX")" || return 1
     if ! cp -a -- "$src" "$tmp"; then
         rm -f -- "$tmp"
@@ -204,8 +207,9 @@ awg_atomic_copy_file() {
 
 awg_atomic_install_bin() {
     local src="$1" dst="$2" tmp=""
+    [[ ! -L "$dst" ]] || return 1
     trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
-    mkdir -p -- "$(dirname "$dst")" || return 1
+    mkdir -p -- "$(dirname -- "$dst")" || return 1
     tmp="$(umask 077 && mktemp "${dst}.new.XXXXXX")" || return 1
     if ! install -m 0755 -- "$src" "$tmp"; then
         rm -f -- "$tmp"
@@ -239,12 +243,13 @@ awg_transaction_restore() {
         index=$((index + 1))
     done
     if [[ -f "$AWG_TRANSACTION_DIR/original-dir.present" ]]; then
-        mkdir -p "$AWG_DIR" || return 1
+        [[ ! -L "$AWG_DIR" ]] || return 1
+        mkdir -p -- "$AWG_DIR" || return 1
         dir_mode="${AWG_TRANSACTION_DIR_MODE:-700}"
         [[ "$dir_mode" =~ ^[0-7]{3,4}$ ]] || dir_mode="700"
-        chmod "$dir_mode" "$AWG_DIR" || return 1
+        chmod "$dir_mode" -- "$AWG_DIR" || return 1
     else
-        rmdir "$AWG_DIR" 2>/dev/null || true
+        [[ ! -L "$AWG_DIR" ]] && rmdir -- "$AWG_DIR" 2>/dev/null || true
     fi
     index=4
     for path in "${binaries[@]}"; do
@@ -255,7 +260,7 @@ awg_transaction_restore() {
         fi
         index=$((index + 1))
     done
-    unit_dir="$(dirname "$AWG_SERVICE")"
+    unit_dir="$(dirname -- "$AWG_SERVICE")"
     # 单元文件可能刚被删除或还原：一律重载，否则 systemd 留着过期单元
     if [[ -d "$unit_dir" ]]; then
         systemctl daemon-reload || return 1
@@ -1123,7 +1128,7 @@ restore_peer_files() {
     if [[ "$had_config" == "1" ]]; then
         awg_atomic_copy_file "$config_backup" "$AWG_CONFIG" || return 1
     else
-        rm -f "$AWG_CONFIG"
+        rm -f -- "$AWG_CONFIG"
     fi
 }
 
@@ -1213,6 +1218,7 @@ cmd_peer_del() {
     [[ -L "$AWG_PEERS_FILE" || -L "$AWG_CONFIG" ]] && die "客户端列表或服务端配置不允许为符号链接"
     peers_init
     [[ -n "$name" ]] || die "用法: hy2-awgctl peer-del <名称>"
+    [[ "$name" =~ [[:cntrl:]] ]] && die "客户端名称不能包含换行或控制字符"
     peer_exists "$name" || die "客户端不存在: ${name}"
 
     local pub tmp="" peers_backup="" config_backup="" had_config=0
@@ -1251,6 +1257,7 @@ cmd_peer_del() {
 
 cmd_peer_list() {
     require_jq
+    [[ -L "$AWG_PEERS_FILE" ]] && die "客户端列表不允许为符号链接：${AWG_PEERS_FILE}"
     if [[ ! -f "$AWG_PEERS_FILE" ]]; then
         if [[ "${1:-}" == "--json" ]]; then
             echo '[]'
@@ -1309,6 +1316,7 @@ cmd_client_conf() {
     require_root
     require_jq
     is_installed || die "AmneziaWG 尚未安装。"
+    [[ -L "$AWG_PEERS_FILE" ]] && die "客户端列表不允许为符号链接：${AWG_PEERS_FILE}"
     [[ -n "$name" ]] || die "用法: hy2-awgctl client-conf <名称> [--endpoint HOST]"
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] || die "客户端名称不合法（仅允许字母/数字/点/下划线/短横，1-32 字符）: ${name}"
     peer_exists "$name" || die "客户端不存在: ${name}"
@@ -1855,6 +1863,7 @@ cmd_qr() {
     # 与 client-conf 同一套检查（2026-11-04 修）：旧实现不查客户端是否存在、只验显式传入
     # 的 --endpoint，存下的坏地址照样编进二维码，扫了永远握不上手。
     require_jq
+    [[ -L "$AWG_PEERS_FILE" ]] && die "客户端列表不允许为符号链接：${AWG_PEERS_FILE}"
     peer_exists "$name" || die "客户端不存在: ${name}"
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
