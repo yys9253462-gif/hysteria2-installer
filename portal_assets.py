@@ -1915,10 +1915,11 @@ async function checkRealityStatus() {
   const seq = ++realityStatusSeq;
   try {
     const res = await fetch(location.pathname + 'reality-status', { credentials: 'same-origin' });
+    if (res.status === 401) { portalSessionExpired = true; if (seq === realityStatusSeq) markStatusUnknown(realityBadge, '登录已过期，请刷新页面重新登录'); return; }
     if (!res.ok) { if (seq === realityStatusSeq) markStatusUnknown(realityBadge); return; }
     const json = await res.json();
     if (seq !== realityStatusSeq) return;
-    if (!json.ok) { markStatusUnknown(realityBadge, json.error); return; }
+    if (!json || !json.ok) { markStatusUnknown(realityBadge, json && json.error); return; }
     const portTag = document.getElementById('reality-port-tag');
     if (portTag) portTag.textContent = 'TCP ' + (json.config?.port || '--');
 
@@ -1940,15 +1941,15 @@ async function checkRealityStatus() {
       realityBadge.textContent = '● 运行中 (TCP ' + (json.config?.port || '--') + ' 端口)';
       realityBadge.style.background = '#eaf3de';
       realityBadge.style.color = '#27500a';
-      btnToggleReality.textContent = '已开启 (点击关闭)';
-      btnToggleReality.className = 'toggle-btn on';
+      if (btnToggleReality) btnToggleReality.textContent = '已开启 (点击关闭)';
+      if (btnToggleReality) btnToggleReality.className = 'toggle-btn on';
       if (realityContentBox) realityContentBox.style.display = 'block';
     } else {
       realityBadge.textContent = '○ 已停止';
       realityBadge.style.background = '#f1efe8';
       realityBadge.style.color = '#5f5e5a';
-      btnToggleReality.textContent = '已关闭 (点击开启)';
-      btnToggleReality.className = 'toggle-btn off';
+      if (btnToggleReality) btnToggleReality.textContent = '已关闭 (点击开启)';
+      if (btnToggleReality) btnToggleReality.className = 'toggle-btn off';
       if (realityContentBox) realityContentBox.style.display = 'none';
     }
 
@@ -1958,7 +1959,7 @@ async function checkRealityStatus() {
       // 没有新二维码时清空旧的（2026-11-04 修，与 VMess 一致）：重置密钥后 qrencode 超时
       // 返回空，旧二维码留在页面上，里面还是旧 pbk，扫了连不上。同时校验只渲染合法 SVG。
       if (realityQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         realityQrBox.innerHTML = _qr;
       }
       if (realitySniVal) realitySniVal.textContent = (cfg.sni || 'www.apple.com') + ':' + (cfg.port || 443);
@@ -1999,6 +2000,7 @@ if (btnToggleReality) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=' + action
       });
+      if (res.status === 401) { portalSessionExpired = true; alert('登录已过期，请刷新页面重新登录'); return; }
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
       if (res.ok === false || !json || !json.ok) {
@@ -2034,6 +2036,7 @@ if (btnResetRealityKeys) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=reset'
       });
+      if (res.status === 401) { portalSessionExpired = true; alert('登录已过期，请刷新页面重新登录'); return; }
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
       if (res.ok !== false && json && json.ok) {
@@ -2117,10 +2120,11 @@ async function checkVmessStatus() {
   const seq = ++vmessStatusSeq;
   try {
     const res = await fetch(location.pathname + 'vmess-status', { credentials: 'same-origin' });
+    if (res.status === 401) { portalSessionExpired = true; if (seq === vmessStatusSeq) markStatusUnknown(vmessBadge, '登录已过期，请刷新页面重新登录'); return; }
     if (!res.ok) { if (seq === vmessStatusSeq) markStatusUnknown(vmessBadge); return; }
     const json = await res.json();
     if (seq !== vmessStatusSeq) return;   // 已有更新的请求，丢弃本次结果
-    if (!json.ok) { markStatusUnknown(vmessBadge, json.error); return; }
+    if (!json || !json.ok) { markStatusUnknown(vmessBadge, json && json.error); return; }
     if (!json.installed) {
       // 没有 Xray 核心时不能显示「已关闭」—— 那会让人以为点一下就能开。
       vmessBadge.textContent = '● 未安装 Xray 核心';
@@ -2140,12 +2144,12 @@ async function checkVmessStatus() {
       vmessBadge.textContent = '● 运行中 (TCP ' + (cfg.port || '--') + ')';
       vmessBadge.style.background = '#eaf3de';
       vmessBadge.style.color = '#27500a';
-      btnToggleVmess.textContent = '已开启 (点击关闭)';
-      btnToggleVmess.className = 'toggle-btn on';
+      if (btnToggleVmess) btnToggleVmess.textContent = '已开启 (点击关闭)';
+      if (btnToggleVmess) btnToggleVmess.className = 'toggle-btn on';
       if (vmessContentBox) vmessContentBox.style.display = 'block';
       if (vmessUriVal) vmessUriVal.value = cfg.uri || '';
       if (vmessQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         vmessQrBox.innerHTML = _qr;
       }
       if (vmessDomainVal) vmessDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
@@ -2157,8 +2161,8 @@ async function checkVmessStatus() {
       vmessBadge.textContent = '○ 已关闭';
       vmessBadge.style.background = '#f1efe8';
       vmessBadge.style.color = '#5f5e5a';
-      btnToggleVmess.textContent = '已关闭 (点击开启)';
-      btnToggleVmess.className = 'toggle-btn off';
+      if (btnToggleVmess) btnToggleVmess.textContent = '已关闭 (点击开启)';
+      if (btnToggleVmess) btnToggleVmess.className = 'toggle-btn off';
       if (vmessContentBox) vmessContentBox.style.display = 'none';
     }
   } catch (_) { if (seq === vmessStatusSeq) markStatusUnknown(vmessBadge); }
@@ -2181,6 +2185,7 @@ if (btnToggleVmess) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=' + action
       });
+      if (res.status === 401) { portalSessionExpired = true; alert('登录已过期，请刷新页面重新登录'); return; }
       // 先看 HTTP 状态：反向代理出错时返回的是 HTML 错误页，
       // 直接 res.json() 会抛「Unexpected token <」，把真实原因盖掉。
       let json = null;
@@ -2227,10 +2232,11 @@ async function checkVlessencStatus() {
   const seq = ++vlessencStatusSeq;
   try {
     const res = await fetch(location.pathname + 'vlessenc-status', { credentials: 'same-origin' });
+    if (res.status === 401) { portalSessionExpired = true; if (seq === vlessencStatusSeq) markStatusUnknown(vlessencBadge, '登录已过期，请刷新页面重新登录'); return; }
     if (!res.ok) { if (seq === vlessencStatusSeq) markStatusUnknown(vlessencBadge); return; }
     const json = await res.json();
     if (seq !== vlessencStatusSeq) return;
-    if (!json.ok) { markStatusUnknown(vlessencBadge, json.error); return; }
+    if (!json || !json.ok) { markStatusUnknown(vlessencBadge, json && json.error); return; }
     if (!json.installed) {
       vlessencBadge.textContent = '● 未安装 Xray 核心';
       const gotoVlessenc = document.getElementById('vlessenc-goto-cores');
@@ -2249,12 +2255,12 @@ async function checkVlessencStatus() {
       vlessencBadge.textContent = '● 运行中 (TCP ' + (cfg.port || '--') + ')';
       vlessencBadge.style.background = '#eaf3de';
       vlessencBadge.style.color = '#27500a';
-      btnToggleVlessenc.textContent = '已开启 (点击关闭)';
-      btnToggleVlessenc.className = 'toggle-btn on';
+      if (btnToggleVlessenc) btnToggleVlessenc.textContent = '已开启 (点击关闭)';
+      if (btnToggleVlessenc) btnToggleVlessenc.className = 'toggle-btn on';
       if (vlessencContentBox) vlessencContentBox.style.display = 'block';
       if (vlessencUriVal) vlessencUriVal.value = cfg.uri || '';
       if (vlessencQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         vlessencQrBox.innerHTML = _qr;
       }
       if (vlessencDomainVal) vlessencDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
@@ -2266,8 +2272,8 @@ async function checkVlessencStatus() {
       vlessencBadge.textContent = '○ 已关闭';
       vlessencBadge.style.background = '#f1efe8';
       vlessencBadge.style.color = '#5f5e5a';
-      btnToggleVlessenc.textContent = '已关闭 (点击开启)';
-      btnToggleVlessenc.className = 'toggle-btn off';
+      if (btnToggleVlessenc) btnToggleVlessenc.textContent = '已关闭 (点击开启)';
+      if (btnToggleVlessenc) btnToggleVlessenc.className = 'toggle-btn off';
       if (vlessencContentBox) vlessencContentBox.style.display = 'none';
     }
   } catch (_) { if (seq === vlessencStatusSeq) markStatusUnknown(vlessencBadge); }
@@ -2288,6 +2294,7 @@ if (btnToggleVlessenc) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=' + action
       });
+      if (res.status === 401) { portalSessionExpired = true; alert('登录已过期，请刷新页面重新登录'); return; }
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
       if (res.ok === false || !json || !json.ok) {
@@ -2332,10 +2339,11 @@ async function checkAnytlsStatus() {
   const seq = ++anytlsStatusSeq;
   try {
     const res = await fetch(location.pathname + 'anytls-status', { credentials: 'same-origin' });
+    if (res.status === 401) { portalSessionExpired = true; if (seq === anytlsStatusSeq) markStatusUnknown(anytlsBadge, '登录已过期，请刷新页面重新登录'); return; }
     if (!res.ok) { if (seq === anytlsStatusSeq) markStatusUnknown(anytlsBadge); return; }
     const json = await res.json();
     if (seq !== anytlsStatusSeq) return;
-    if (!json.ok) { markStatusUnknown(anytlsBadge, json.error); return; }
+    if (!json || !json.ok) { markStatusUnknown(anytlsBadge, json && json.error); return; }
     const gotoAnytls = document.getElementById('anytls-goto-cores');
     if (!json.installed) {
       setAnytlsBadge('● 未安装 sing-box 核心', '#fff1f0', '#cf3c3c');
@@ -2351,13 +2359,13 @@ async function checkAnytlsStatus() {
     const cfg = json.config || {};
     if (json.active) {
       setAnytlsBadge('● 运行中 (TCP ' + (cfg.port || '--') + ')', '#eaf3de', '#27500a');
-      btnToggleAnytls.textContent = '已开启 (点击关闭)';
-      btnToggleAnytls.className = 'toggle-btn on';
+      if (btnToggleAnytls) btnToggleAnytls.textContent = '已开启 (点击关闭)';
+      if (btnToggleAnytls) btnToggleAnytls.className = 'toggle-btn on';
       if (anytlsContentBox) anytlsContentBox.style.display = 'block';
       if (anytlsUriVal) anytlsUriVal.value = cfg.uri || '';
       const qrBox = document.getElementById('anytls-qr-box');
       if (qrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         qrBox.innerHTML = _qr;
       }
       const domainEl = document.getElementById('anytls-domain-val');
@@ -2369,8 +2377,8 @@ async function checkAnytlsStatus() {
     } else {
       if (json.enabled) setAnytlsBadge('● 已启用但服务未运行', '#fff1f0', '#cf3c3c');
       else setAnytlsBadge('○ 已关闭', '#f1efe8', '#5f5e5a');
-      btnToggleAnytls.textContent = json.enabled ? '已启用 (点击关闭)' : '已关闭 (点击开启)';
-      btnToggleAnytls.className = json.enabled ? 'toggle-btn on' : 'toggle-btn off';
+      if (btnToggleAnytls) btnToggleAnytls.textContent = json.enabled ? '已启用 (点击关闭)' : '已关闭 (点击开启)';
+      if (btnToggleAnytls) btnToggleAnytls.className = json.enabled ? 'toggle-btn on' : 'toggle-btn off';
       if (anytlsContentBox) anytlsContentBox.style.display = 'none';
     }
   } catch (_) { if (seq === anytlsStatusSeq) markStatusUnknown(anytlsBadge); }
@@ -2391,6 +2399,7 @@ if (btnToggleAnytls) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=' + action
       });
+      if (res.status === 401) { portalSessionExpired = true; alert('登录已过期，请刷新页面重新登录'); return; }
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
       if (res.ok === false || !json || !json.ok) {
@@ -2435,10 +2444,11 @@ async function checkTuicStatus() {
   const seq = ++tuicStatusSeq;
   try {
     const res = await fetch(location.pathname + 'tuic-status', { credentials: 'same-origin' });
+    if (res.status === 401) { portalSessionExpired = true; if (seq === tuicStatusSeq) markStatusUnknown(tuicBadge, '登录已过期，请刷新页面重新登录'); return; }
     if (!res.ok) { if (seq === tuicStatusSeq) markStatusUnknown(tuicBadge); return; }
     const json = await res.json();
     if (seq !== tuicStatusSeq) return;
-    if (!json.ok) { markStatusUnknown(tuicBadge, json.error); return; }
+    if (!json || !json.ok) { markStatusUnknown(tuicBadge, json && json.error); return; }
     const gotoTuic = document.getElementById('tuic-goto-cores');
     if (!json.installed) {
       setTuicBadge('● 未安装 sing-box 核心', '#fff1f0', '#cf3c3c');
@@ -2454,13 +2464,13 @@ async function checkTuicStatus() {
     const cfg = json.config || {};
     if (json.active) {
       setTuicBadge('● 运行中 (UDP ' + (cfg.port || '--') + ')', '#eaf3de', '#27500a');
-      btnToggleTuic.textContent = '已开启 (点击关闭)';
-      btnToggleTuic.className = 'toggle-btn on';
+      if (btnToggleTuic) btnToggleTuic.textContent = '已开启 (点击关闭)';
+      if (btnToggleTuic) btnToggleTuic.className = 'toggle-btn on';
       if (tuicContentBox) tuicContentBox.style.display = 'block';
       if (tuicUriVal) tuicUriVal.value = cfg.uri || '';
       const qrBox = document.getElementById('tuic-qr-box');
       if (qrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         qrBox.innerHTML = _qr;
       }
       const domainEl = document.getElementById('tuic-domain-val');
@@ -2472,8 +2482,8 @@ async function checkTuicStatus() {
     } else {
       if (json.enabled) setTuicBadge('● 已启用但服务未运行', '#fff1f0', '#cf3c3c');
       else setTuicBadge('○ 已关闭', '#f1efe8', '#5f5e5a');
-      btnToggleTuic.textContent = json.enabled ? '已启用 (点击关闭)' : '已关闭 (点击开启)';
-      btnToggleTuic.className = json.enabled ? 'toggle-btn on' : 'toggle-btn off';
+      if (btnToggleTuic) btnToggleTuic.textContent = json.enabled ? '已启用 (点击关闭)' : '已关闭 (点击开启)';
+      if (btnToggleTuic) btnToggleTuic.className = json.enabled ? 'toggle-btn on' : 'toggle-btn off';
       if (tuicContentBox) tuicContentBox.style.display = 'none';
     }
   } catch (_) { if (seq === tuicStatusSeq) markStatusUnknown(tuicBadge); }
@@ -2494,6 +2504,7 @@ if (btnToggleTuic) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=' + action
       });
+      if (res.status === 401) { portalSessionExpired = true; alert('登录已过期，请刷新页面重新登录'); return; }
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
       if (res.ok === false || !json || !json.ok) {
