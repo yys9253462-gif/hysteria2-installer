@@ -20,11 +20,10 @@ class PortalAssetsConfirmFocusWarpPollProbeReentryAndTypesGuardsTests(unittest.T
         self.assertIn('try { if (previousFocus && typeof previousFocus.focus === \'function\') previousFocus.focus(); } catch (_) {}', block)
 
     def test_warp_status_interval_skips_when_poll_pending(self):
-        """checkWarpStatus 须维护在途状态 warpStatusPending，且 10s 定时器在请求未返回时跳过，避免弱网叠发请求。"""
-        self.assertIn('let warpStatusPending = 0;', ASSETS_SRC)
-        self.assertIn('warpStatusPending++;', ASSETS_SRC)
-        self.assertIn('warpStatusPending = Math.max(0, warpStatusPending - 1);', ASSETS_SRC)
-        self.assertIn('!warpStatusPending && panelVisible(\'proxies\', \'warp\')', ASSETS_SRC)
+        """checkWarpStatus 须维护自足在途状态 checkWarpStatus._pending，且 10s 定时器在请求未返回时跳过，避免弱网叠发请求。"""
+        self.assertIn('checkWarpStatus._pending = (checkWarpStatus._pending || 0) + 1;', ASSETS_SRC)
+        self.assertIn('checkWarpStatus._pending = Math.max(0, (checkWarpStatus._pending || 1) - 1);', ASSETS_SRC)
+        self.assertIn('!checkWarpStatus._pending && panelVisible(\'proxies\', \'warp\')', ASSETS_SRC)
 
     def test_high_risk_confirm_handlers_and_outbound_probe_have_reentry_locks(self):
         """重置规则/密钥、切换更新AWG与出站探活按钮均须具备防连点重入保护。"""

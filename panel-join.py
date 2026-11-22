@@ -126,6 +126,17 @@ def meta_host(meta_text):
 
 
 def read(path):
+    # 先用 lstat 快速拦截符号链接与非常规文件（兼顾跨平台与测试桩），
+    # POSIX 下再以 O_NOFOLLOW + fstat 消除 check-then-open 窗口。
+    try:
+        st0 = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st0.st_mode):
+        return None
+    if st0.st_size > MAX_CONFIG_BYTES:
+        print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
+        return None
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if nofollow:
         fd = None
@@ -152,15 +163,6 @@ def read(path):
                     os.close(fd)
                 except OSError:
                     pass
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return None
-    if not stat.S_ISREG(st.st_mode):
-        return None
-    if st.st_size > MAX_CONFIG_BYTES:
-        print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
-        return None
     try:
         with open(path, "rb") as f:
             raw = f.read(MAX_CONFIG_BYTES + 1)

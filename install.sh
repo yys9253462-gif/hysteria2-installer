@@ -4850,7 +4850,7 @@ refresh_portal() {
 }
 
 setup_portal() {
-    if [[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%$] ]]; then
+    if [[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%\$] ]]; then
         log_err "HY2_DIR 路径不安全（符号链接或含非法控制/占位字符），拒绝初始化门户。"
         return 1
     fi

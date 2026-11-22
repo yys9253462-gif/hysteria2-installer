@@ -942,11 +942,10 @@ function markWarpRulesFailed() {
   markLoadFailed(warpTagsCloud, '分流规则读取失败，请刷新页面重试');
 }
 
-let warpStatusPending = 0;
 async function checkWarpStatus() {
   if (!warpBadge) return;
   const seq = ++warpStatusSeq;
-  warpStatusPending++;
+  checkWarpStatus._pending = (checkWarpStatus._pending || 0) + 1;
   try {
     const res = await fetch(location.pathname + 'warp-status', { credentials: 'same-origin' });
     if (res.status === 401) { portalSessionExpired = true; if (seq === warpStatusSeq) { markStatusUnknown(warpBadge, '登录已过期'); markWarpRulesFailed(); } return; }
@@ -1003,7 +1002,7 @@ async function checkWarpStatus() {
       }
     }
   } catch (_) { if (seq === warpStatusSeq) { markStatusUnknown(warpBadge); markWarpRulesFailed(); } }
-  finally { warpStatusPending = Math.max(0, warpStatusPending - 1); }
+  finally { checkWarpStatus._pending = Math.max(0, (checkWarpStatus._pending || 1) - 1); }
 }
 
 if (btnToggleWarp) {
@@ -1144,7 +1143,7 @@ checkWarpStatus();
 // 网速每 2 秒各请求一次。/warp-status 每次都要 systemctl show、把出站配置重渲染一遍比对，
 // 30 秒一次还要经 WARP 探测出口；/traffic-speed 在 data_lock 内给每个用户算用量摘要，会拖慢鉴权。
 setInterval(() => {
-  if (!document.hidden && !portalSessionExpired && !warpStatusPending && panelVisible('proxies', 'warp')) checkWarpStatus();
+  if (!document.hidden && !portalSessionExpired && !checkWarpStatus._pending && panelVisible('proxies', 'warp')) checkWarpStatus();
 }, 10000);
 
 // ============================================================================

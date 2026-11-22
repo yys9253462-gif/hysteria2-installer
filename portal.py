@@ -12371,10 +12371,8 @@ if __name__ == '__main__':
 
                 # 动态开户 (支持 duration_days, ip_limit, traffic_gb)
                 if sub == 'users/create':
-                    raw_uid = params.get('user_id')
-                    if raw_uid is not None and not isinstance(raw_uid, str):
-                        return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
-                    user_id = ((raw_uid or '') or ('hy2_' + secrets.token_hex(6))).strip()
+                    user_id = ('' if params.get('user_id') is not None and not isinstance(params.get('user_id'), str)
+                               else ((params.get('user_id') or '') or ('hy2_' + secrets.token_hex(6)))).strip()
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
                     if not user_id_shareable(user_id):
@@ -12464,6 +12462,7 @@ if __name__ == '__main__':
                     _missing_meter = object()
                     previous_record = None
                     previous_meter = _missing_meter
+                    previous_reality_users = _missing_meter
                     with data_lock:
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
@@ -12542,6 +12541,8 @@ if __name__ == '__main__':
                             previous_record = copy.deepcopy(existing)
                             previous_meter = (copy.deepcopy(data['usage_meter'])
                                               if 'usage_meter' in data else _missing_meter)
+                            previous_reality_users = (copy.deepcopy(data['reality_users'])
+                                                      if 'reality_users' in data else _missing_meter)
                             if conflict is None and 'used_bytes' in params:
                                 save_err_msg = 'Reconciliation save failed; disk state may require verification'
                                 try:
@@ -12594,7 +12595,10 @@ if __name__ == '__main__':
                                 data.pop('usage_meter', None)
                             else:
                                 data['usage_meter'] = previous_meter
-                            reality_registry(data)
+                            if previous_reality_users is _missing_meter:
+                                data.pop('reality_users', None)
+                            else:
+                                data['reality_users'] = previous_reality_users
                         return self.reply_json(503, {'ok': False, 'error': save_err_msg})
                     if not durability_uncertain:
                         regenerate_page()

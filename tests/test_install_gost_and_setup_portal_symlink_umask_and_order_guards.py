@@ -39,9 +39,9 @@ class InstallGostAndSetupPortalSymlinkUmaskAndOrderGuardsTests(unittest.TestCase
     def test_setup_portal_validates_hy2_dir_upfront_and_guards_chmod_symlinks(self):
         """setup_portal 须在调用 portal.py 之前先拦截符号链接与含控制字符/%/$ 的 HY2_DIR，且 chmod 600 前拒符号链接。"""
         fn = _extract_fn('setup_portal')
-        self.assertIn('[[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%$] ]]', fn)
+        self.assertIn('[[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%\\$] ]]', fn)
         self.assertLess(
-            fn.index('[[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%$] ]]'),
+            fn.index('[[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%\\$] ]]'),
             fn.index('portal_write_meter_config'),
             'HY2_DIR 安全守卫必须前置在 portal_write_meter_config / portal.py 之前',
         )

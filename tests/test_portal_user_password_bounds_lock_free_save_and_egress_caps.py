@@ -71,7 +71,9 @@ class PortalUserPasswordBoundsLockFreeSaveAndEgressCapsTests(unittest.TestCase):
         start = SOURCE.index("if sub == 'users/create':")
         end = SOURCE.index("if sub == 'users/update':", start)
         create_block = SOURCE[start:end]
-        self.assertIn("not isinstance(raw_uid, str)", create_block)
+        self.assertIn("not isinstance(params.get('user_id'), str)", create_block)
+        self.assertIn("previous_reality_users", create_block)
+        self.assertIn("data.pop('reality_users', None)", create_block)
         self.assertIn("len(pwd) > 256", create_block)
         self.assertIn("isinstance(_v, bool)", create_block)
 

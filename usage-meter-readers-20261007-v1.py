@@ -46,6 +46,11 @@ def _read_bounded_json(path, max_bytes=8 * 1024 * 1024):
         if len(text.encode('utf-8')) > max_bytes:
             raise ValueError('config file too large')
         return json.loads(text)
+    st0 = p.lstat()
+    if not stat.S_ISREG(st0.st_mode):
+        raise ValueError('config path must be regular file')
+    if st0.st_size > max_bytes:
+        raise ValueError('config file too large')
     nofollow = getattr(os, 'O_NOFOLLOW', 0)
     if nofollow:
         fd = None
@@ -71,11 +76,6 @@ def _read_bounded_json(path, max_bytes=8 * 1024 * 1024):
                 except OSError:
                     pass
     else:
-        st = p.lstat()
-        if not stat.S_ISREG(st.st_mode):
-            raise ValueError('config path must be regular file')
-        if st.st_size > max_bytes:
-            raise ValueError('config file too large')
         with open(p, 'rb') as fh:
             raw = fh.read(max_bytes + 1)
     if len(raw) > max_bytes:
