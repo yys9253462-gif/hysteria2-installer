@@ -1647,6 +1647,12 @@ def portal_update_restart_prefix():
 
 def portal_start_update(restart_prefix, script, lock_fd, ready_timeout=10):
     """只有持锁子脚本就绪才交接；失败时关闭 go 管道，禁止稍后再执行重启。"""
+    if (isinstance(ready_timeout, bool)
+            or not isinstance(ready_timeout, (int, float))
+            or ready_timeout != ready_timeout
+            or ready_timeout in (float('inf'), float('-inf'))
+            or ready_timeout <= 0):
+        ready_timeout = 10
     if lock_fd is None:  # Windows 开发环境没有 POSIX fd 继承。
         return subprocess.Popen(restart_prefix + [script], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True)
@@ -1683,7 +1689,10 @@ def portal_start_update(restart_prefix, script, lock_fd, ready_timeout=10):
     finally:
         for fd in (ready_r, ready_w, go_r, go_w):
             if fd is not None:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def _prune_portal_backups(directory, keep=3, protected=()):
@@ -2123,6 +2132,11 @@ def _require_disk_space(path, need_bytes):
 
 def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
     binary = Path(binary)
+    backup_root = Path(backup_dir)
+    if binary.is_symlink():
+        raise RuntimeError('核心二进制路径不得为符号链接，已拒绝更新')
+    if backup_root.is_symlink():
+        raise RuntimeError('核心备份目录不得为符号链接，已拒绝更新')
     current = subprocess.run([str(binary), 'version'], capture_output=True, text=True,
                              encoding='utf-8', errors='replace', timeout=5).stdout
     current_line = next((line.split(':', 1)[1].strip() for line in current.splitlines() if line.strip().startswith('Version:')), '')
@@ -2175,6 +2189,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                     headers={'User-Agent': 'hysteria2-installer'})
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     final = resp.geturl() or ''
+                if urlsplit(final).scheme not in ('https', 'http'):
+                    final = ''
                 m = re.search(r'/app/(v[0-9][^/]*)/' + re.escape(asset) + r'$', final)
                 # 下载站只给裸版本号，而 GitHub 的 release tag 是 `app/vX.Y.Z`；
                 # 不补前缀拼出的 hashes.txt / 资产 URL 实测 404，回退路径会永远失败。
@@ -2217,6 +2233,15 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         shutil.copy2(binary, backup)
         before = _hy2_runtime_identity()
         os.replace(candidate, binary)
+        if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+            try:
+                _dfd = os.open(str(binary.parent), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(_dfd)
+                finally:
+                    os.close(_dfd)
+            except OSError:
+                pass
         replaced = True
         if _unit_suspended('hysteria-server'):
             # 整机流量超额停用中（2026-11-03 修，与 install.sh 的核心更新一致）：
@@ -2245,6 +2270,15 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                     os.fsync(rb_fh.fileno())
                 rb_tmp.chmod(0o755)
                 os.replace(rb_tmp, binary)
+                if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+                    try:
+                        _dfd = os.open(str(binary.parent), os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(_dfd)
+                        finally:
+                            os.close(_dfd)
+                    except OSError:
+                        pass
                 rb_tmp = None
             except Exception as rb_exc:
                 _log_ignored('upgrade_core_rollback_replace', rb_exc)
@@ -2278,7 +2312,11 @@ def portal_state_lock_path(directory='/etc/hysteria'):
 @contextlib.contextmanager
 def portal_state_file_lock(directory='/etc/hysteria'):
     """Serialize portal state writes across threads/processes, reentrant per thread."""
-    path = portal_state_lock_path(directory).resolve()
+    raw_path = portal_state_lock_path(directory)
+    if raw_path.is_symlink():
+        raise OSError('portal state lock path must not be a symlink: %s' % raw_path)
+    # 仅解析父目录规范路径，绝不对锁文件本身 resolve()，否则会提前解引符号链接绕过 O_NOFOLLOW。
+    path = raw_path.parent.resolve() / raw_path.name
     with _portal_state_lock_guard:
         thread_lock = _portal_state_locks.setdefault(path, threading.RLock())
     thread_lock.acquire()
@@ -2305,10 +2343,16 @@ def portal_state_file_lock(directory='/etc/hysteria'):
         finally:
             held.pop(path, None)
             if fcntl is not None:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
     finally:
         if lock_fd is not None:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
         thread_lock.release()
 
 
@@ -7459,10 +7503,11 @@ def firewall_port(port, proto='tcp', open_=True):
     try:
         handled = False
         if shutil.which('ufw'):
-            status = subprocess.run(['ufw', 'status'], capture_output=True, text=True, timeout=10)
+            status = subprocess.run(['ufw', 'status'], capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', timeout=10)
             if status.returncode != 0:
                 return False
-            if status.stdout.startswith('Status: active'):
+            if any(ln.startswith('Status: active') for ln in status.stdout.splitlines()):
                 cmd = ['ufw', 'allow', spec] if open_ else ['ufw', 'delete', 'allow', spec]
                 result = subprocess.run(cmd, capture_output=True, timeout=15)
                 if result.returncode != 0:
@@ -7486,7 +7531,8 @@ def firewall_port(port, proto='tcp', open_=True):
             if target:
                 fam, tbl, chain = target
                 listed = subprocess.run(['nft', '-a', 'list', 'chain', fam, tbl, chain],
-                                        capture_output=True, text=True, timeout=5)
+                                        capture_output=True, text=True,
+                                        encoding='utf-8', errors='replace', timeout=5)
                 if listed.returncode != 0:
                     return False
                 matched = [ln for ln in listed.stdout.splitlines()
@@ -8027,7 +8073,7 @@ def _listening_ports_detail():
     for flag in ('-lntH', '-lunH'):
         try:
             result = subprocess.run(['ss', flag], capture_output=True, text=True,
-                                    timeout=5)
+                                    encoding='utf-8', errors='replace', timeout=5)
         except Exception:
             continue
         if result.returncode != 0:
@@ -8042,8 +8088,10 @@ def _listening_ports_detail():
             if ':' not in addr:
                 continue
             tail = addr.rsplit(':', 1)[1]
-            if tail.isdigit():
-                ports.add(int(tail))
+            if tail.isascii() and tail.isdigit():
+                port_num = int(tail)
+                if 1 <= port_num <= 65535:
+                    ports.add(port_num)
     return ports, ok
 
 
