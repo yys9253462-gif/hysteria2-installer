@@ -1142,7 +1142,12 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
     """Apply WARP rules transactionally; success requires a new active process."""
     cfg = Path(config_path)
     try:
-        original = cfg.read_text(encoding='utf-8')
+        if cfg.is_symlink():
+            return False, '读取 Hysteria 配置失败: 配置文件不允许为符号链接'
+        _cfg_st = cfg.lstat()
+        if _cfg_st.st_size > 4 * 1024 * 1024:
+            return False, '读取 Hysteria 配置失败: 配置文件超过 4 MiB 上限'
+        original = cfg.read_bytes().decode('utf-8', errors='replace')
     except Exception as exc:
         return False, '读取 Hysteria 配置失败: %s' % exc
     with data_lock:
@@ -1183,7 +1188,10 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
                 except OSError:
                     pass
             if os.path.exists(tmp):
-                os.unlink(tmp)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         # 整机流量超额停用期间不能启动服务，但配置应当落盘并视为成功 ——
         # 旧实现继续等 active，12 秒后必然「应用失败、已回滚」，
         # 于是停用期间任何 WARP/出站改动都保存不了（2026-10-30 修）。
@@ -1195,7 +1203,7 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
             after = _hy2_runtime_identity()
             if after[0] == 'active' and after[1] not in ('', '0') and after != before:
                 time.sleep(1)
-                if _hy2_runtime_identity() == after and cfg.read_text(encoding='utf-8') == rendered:
+                if _hy2_runtime_identity() == after and cfg.read_bytes().decode('utf-8', errors='replace') == rendered:
                     return True, ''
             if after[0] in ('failed', 'inactive'):
                 break
@@ -5966,15 +5974,24 @@ def _restore_config_atomically(config_path, original):
             os.fsync(stream.fileno())
         os.replace(temp_path, config_path)
         if hasattr(os, 'O_DIRECTORY'):
-            dir_fd = os.open(config_path.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+                dir_fd = os.open(config_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
     except BaseException:
         if fd is not None:
-            os.close(fd)
-        temp_path.unlink(missing_ok=True)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
 
 
@@ -5984,9 +6001,19 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
 
     调用方必须持有对应协议的 apply 锁（AnyTLS / TUIC 共用此函数，service 区分单元）。
     """
+    if (not isinstance(service, str) or not service.strip() or service.strip().startswith('-')
+            or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in service)):
+        raise ValueError('invalid sing-box service name')
     config_path = Path(config_path)
-    original = config_path.read_bytes() if config_path.exists() else None
-    candidate = config_path.with_name(config_path.stem + '.candidate.json')
+    if config_path.is_symlink():
+        raise ValueError('sing-box 配置文件不允许为符号链接')
+    if config_path.exists():
+        if config_path.lstat().st_size > 4 * 1024 * 1024:
+            raise ValueError('sing-box 原配置文件超过 4 MiB 上限')
+        original = config_path.read_bytes()
+    else:
+        original = None
+    candidate = config_path.with_name(f'.{config_path.stem}.candidate.{secrets.token_hex(4)}.json')
     replaced = False
     try:
         _write_private_bytes(
@@ -6068,7 +6095,11 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None, force_ids
         # 一个坏文件就让开户/续费/停用/删除全部返回 503，报错还写成
         # "Reality sync failed"，完全指不到真正的文件。
         try:
-            config = json.loads(path.read_text(encoding='utf-8'))
+            if path.is_symlink():
+                raise OSError('symlink not allowed')
+            if path.lstat().st_size > 4 * 1024 * 1024:
+                raise ValueError('AnyTLS 配置超过 4 MiB 上限')
+            config = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
         except (OSError, ValueError) as exc:
             raise RuntimeError('AnyTLS configuration unreadable; cannot confirm user sync') from exc
         wanted = anytls_users(snapshot)
@@ -6248,7 +6279,11 @@ def sync_tuic_users(root, snapshot, apply=None, service_active=None, force_ids=(
                 raise RuntimeError('TUIC configuration missing while service is active; cannot confirm user sync')
             return False
         try:
-            config = json.loads(path.read_text(encoding='utf-8'))
+            if path.is_symlink():
+                raise OSError('symlink not allowed')
+            if path.lstat().st_size > 4 * 1024 * 1024:
+                raise ValueError('TUIC 配置超过 4 MiB 上限')
+            config = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
         except (OSError, ValueError) as exc:
             raise RuntimeError('TUIC configuration unreadable; cannot confirm user sync') from exc
         wanted = tuic_users(snapshot)
@@ -11128,13 +11163,8 @@ if __name__ == '__main__':
                 # 导致「看起来成功、实际没配置」。抛异常让**所有**调用点
                 # 统一走各自的错误分支，不会有人悄悄拿到 None 当成功用。
                 raise RuntimeError(port_reason)
-            # 端口发生了变更才提示。旧端口可能是非法值（字符串/越界），
-            # 这里同样要容错 —— 别让一个坏的历史值把日志行本身搞崩。
-            try:
-                _old_port = int(rcfg_old.get('port'))
-            except (TypeError, ValueError):
-                _old_port = 0
-            if _old_port and _old_port != listen_port:
+            # 端口发生了变更才提示；复用上方经 _valid_port 校验的 old_port 防止非法/非有限值崩溃。
+            if old_port and old_port != listen_port:
                 print('[portal] Reality 端口变更: %s' % port_reason,
                       file=sys.stderr)
 
@@ -11193,32 +11223,48 @@ if __name__ == '__main__':
                 # 并清掉待撤销记录，再写旧快照就把他加回 Reality，且不会再被撤销。
                 with data_lock:
                     desired_inbound['settings']['clients'] = reality_clients(data)
-                previous_xray_bytes = xray_path.read_bytes() if xray_path.exists() else None
-                previous_xray = json.loads(previous_xray_bytes) if previous_xray_bytes is not None else None
-                previous_service_state = _systemd_service_snapshot('xray')
+                if xray_path.is_symlink():
+                    raise RuntimeError('xray.json 不允许为符号链接')
                 if xray_path.exists():
+                    if xray_path.lstat().st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('xray.json 超过 4 MiB 上限')
+                    previous_xray_bytes = xray_path.read_bytes()
+                    previous_xray = json.loads(previous_xray_bytes.decode('utf-8', errors='replace'))
+                    if not isinstance(previous_xray, dict):
+                        raise ValueError('xray.json 顶层必须为 JSON 对象')
+                else:
+                    previous_xray_bytes = None
+                    previous_xray = None
+                previous_service_state = _systemd_service_snapshot('xray')
+                if previous_xray is not None:
                     # 只按 tag 替换 Reality 自己那一条；VMess 入站、统计 api 入站、
                     # routing、outbounds 一律原样保留。旧版无 tag 的 Reality 由
                     # managed_inbound_index 的 legacy 匹配接住，写入时补上 tag。
-                    previous = json.loads(xray_path.read_text(encoding='utf-8'))
-                    xray_json = upsert_managed_inbound(previous, REALITY_INBOUND_TAG, desired_inbound)
+                    xray_json = upsert_managed_inbound(copy.deepcopy(previous_xray), REALITY_INBOUND_TAG, desired_inbound)
 
                 # 重生成 Reality 配置时保留计量能力；仅添加回环 StatsService。
                 # add_stats 是幂等的，且**不改任何 clients**（有断言兜底），
                 # 所以 VMess / VLESS Encryption 入站及其 clients 不会被它重置。
                 _meter_config_path = portal_path.parent / 'usage-meter-config.json'
                 if _meter_config_path.exists():
-                    _meter_config = json.loads(_meter_config_path.read_text(encoding='utf-8'))
-                    _meter_reality = _meter_config.get('reality')
-                    if _meter_reality:
-                        _address = _meter_reality['address']
-                        if not _address.startswith('127.0.0.1:'):
+                    if _meter_config_path.is_symlink() or _meter_config_path.lstat().st_size > 1024 * 1024:
+                        raise RuntimeError('计量配置文件非法或超过 1 MiB 上限')
+                    _meter_config = json.loads(_meter_config_path.read_bytes().decode('utf-8', errors='replace'))
+                    _meter_reality = _meter_config.get('reality') if isinstance(_meter_config, dict) else None
+                    if isinstance(_meter_reality, dict):
+                        _address = _meter_reality.get('address')
+                        if not isinstance(_address, str) or not _address.startswith('127.0.0.1:'):
                             raise ValueError('统计接口必须为回环地址')
+                        _stats_port = _valid_port(_address.rsplit(':', 1)[1])
+                        if not _stats_port:
+                            raise ValueError('统计接口端口不合法')
                         _stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
                         _stats_spec = importlib.util.spec_from_file_location('portal_stats_cfg', _stats_path)
+                        if _stats_spec is None or _stats_spec.loader is None:
+                            raise RuntimeError('无法加载计量配置模块')
                         _stats_mod = importlib.util.module_from_spec(_stats_spec)
                         _stats_spec.loader.exec_module(_stats_mod)
-                        xray_json = _stats_mod.add_stats(xray_json, int(_address.rsplit(':', 1)[1]))
+                        xray_json = _stats_mod.add_stats(xray_json, _stats_port)
                 # 统一补内网 / 云元数据拦截（Reality 入站同样适用）。
                 xray_json = add_private_network_guard(xray_json)
                 # 流量超额停用期间只落配置、不重启，否则等于替 Reality 解除了停用。
