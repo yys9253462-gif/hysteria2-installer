@@ -2085,7 +2085,10 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 _log_ignored('upgrade_core_rollback_restart', rb_exc)
         raise
     finally:
-        candidate.unlink(missing_ok=True)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 _portal_state_lock_guard = threading.Lock()
@@ -2263,6 +2266,10 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                   binary='/usr/local/bin/xray', restart=True,
                                   enable=True):
     """Validate a candidate before replacing; restore prior config on start failure."""
+    if (not isinstance(binary, str) or not binary.strip() or binary.strip().startswith('-')
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in binary)):
+        raise ValueError('Xray 可执行文件路径无效')
+    candidate_payload = json.dumps(config, indent=2, allow_nan=False).encode('utf-8')
     path = Path(config_path)
     original = path.read_bytes() if path.exists() else None
     mode = (path.stat().st_mode & 0o777) or 0o600 if path.exists() else 0o600
@@ -2301,7 +2308,7 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
 
     replaced = False
     try:
-        _write_priv(candidate, json.dumps(config, indent=2).encode('utf-8'), mode)
+        _write_priv(candidate, candidate_payload, mode)
         test = subprocess.run([binary, 'run', '-test', '-c', str(candidate)],
                               capture_output=True, text=True, timeout=10)
         if test.returncode != 0:
@@ -2370,7 +2377,10 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                     _log_ignored('xray_transaction_rollback', rb_exc)
         raise
     finally:
-        candidate.unlink(missing_ok=True)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def set_outbound_apply_error(data, data_lock, save_data, msg):
@@ -4848,6 +4858,8 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     """
     root = Path(root)
     state_path = Path(state_path) if state_path else root / 'cert-selfheal.json'
+    if not cert_file or not isinstance(cert_file, (str, os.PathLike)):
+        return False
     try:
         cert_file = Path(cert_file)
         if not cert_file.is_file():
@@ -4856,7 +4868,7 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         if not raw_cert:
             return False
         digest = hashlib.sha256(raw_cert).hexdigest()
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return False
     state = {}
     if state_path.exists():
@@ -4890,10 +4902,17 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         return False
     # Record the bytes confirmed by the successful reload attempt. If no service
     # was active, this establishes the baseline for the next certificate update.
-    state['loaded_cert_sha256'] = digest
+    clean_state = {
+        k: v for k, v in state.items()
+        if not (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf')))
+    }
+    clean_state['loaded_cert_sha256'] = digest
     try:
-        atomic_write_private(state_path, json.dumps(state, ensure_ascii=False).encode('utf-8'))
-    except OSError as exc:
+        atomic_write_private(
+            state_path,
+            json.dumps(clean_state, ensure_ascii=False, allow_nan=False).encode('utf-8'),
+        )
+    except (OSError, ValueError, TypeError) as exc:
         print('[portal] 证书运行态指纹写入失败: %s' % str(exc)[:120], file=sys.stderr)
     return True
 
@@ -4915,13 +4934,21 @@ def record_cert_heal(root, state, before, after):
             try:
                 loaded = json.loads(state_path.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
-                    previous = loaded
+                    previous = {
+                        k: v for k, v in loaded.items()
+                        if not (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf')))
+                    }
                 raw_count = previous.get('heal_count')
                 if isinstance(raw_count, bool):
                     prev_count = 0
+                elif isinstance(raw_count, int) and raw_count >= 0:
+                    prev_count = raw_count
+                elif isinstance(raw_count, float) and raw_count.is_integer() and raw_count >= 0:
+                    prev_count = int(raw_count)
+                elif isinstance(raw_count, str) and raw_count.strip().isascii() and raw_count.strip().isdigit():
+                    prev_count = int(raw_count.strip())
                 else:
-                    parsed_count = int(raw_count or 0)
-                    prev_count = parsed_count if parsed_count >= 0 else 0
+                    prev_count = 0
             except Exception:
                 prev_count = 0
         # before/after 是 meta 快照；被改成数字/列表时 `.get` 抛 AttributeError，
@@ -4938,7 +4965,10 @@ def record_cert_heal(root, state, before, after):
             'fields': [k for k in ('cert_type', 'server_name', 'is_insecure', 'pin_sha256')
                        if before.get(k) != after.get(k)],
         })
-        atomic_write_private(state_path, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(
+            state_path,
+            json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8'),
+        )
     except Exception as e:
         print('[portal] 写入证书自愈痕迹失败: %s' % str(e)[:120], file=sys.stderr)
 
@@ -5755,7 +5785,10 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
                         % (service, rollback_exc)) from rollback_exc
         raise
     finally:
-        candidate.unlink(missing_ok=True)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def sync_anytls_users(root, snapshot, apply=None, service_active=None, force_ids=()):
@@ -7317,7 +7350,10 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
                     _log_ignored('xray_access_rollback', rb_exc)
         raise
     finally:
-        candidate.unlink(missing_ok=True)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
         last_good_tmp.unlink(missing_ok=True)
 
 
@@ -9557,13 +9593,15 @@ def serve(path):
                             port = cand_p if 1 <= cand_p <= 65535 else 0
                     elif isinstance(raw_port, str):
                         ps = raw_port.strip()
-                        if ps.isascii() and ps.isdigit():
+                        if ps.isascii() and ps.isdigit() and not (len(ps) > 1 and ps.startswith('0')):
                             cand_p = int(ps)
                             port = cand_p if 1 <= cand_p <= 65535 else 0
                 if not port:
                     continue
                 raw_user = svc.get('username', '')
                 raw_pass = svc.get('password', '')
+                safe_user = ''.join(ch for ch in raw_user if ord(ch) >= 32 and ord(ch) != 127) if isinstance(raw_user, str) else ''
+                safe_pass = ''.join(ch for ch in raw_pass if ord(ch) >= 32 and ord(ch) != 127) if isinstance(raw_pass, str) else ''
                 handler_type = 'socks5' if ptype == 'socks5' else 'http'
                 entry = {
                     'name': f'proxy-{idx}',
@@ -9571,8 +9609,8 @@ def serve(path):
                     'handler': {
                         'type': handler_type,
                         'auth': {
-                            'username': raw_user if isinstance(raw_user, str) else '',
-                            'password': raw_pass if isinstance(raw_pass, str) else '',
+                            'username': safe_user,
+                            'password': safe_pass,
                         },
                     },
                     'listener': {'type': 'tcp'},
@@ -9596,7 +9634,10 @@ def serve(path):
                'bypasses': [{'name': GOST_PRIVATE_BYPASS,
                              'matchers': list(PRIVATE_REJECT_RULES) + ['localhost', '*.localhost']}]}
         # gost.yml 里有代理账号密码，与 portal.json 同样必须一创建就是 0600。
-        atomic_write_private(gost_cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8'))
+        atomic_write_private(
+            gost_cfg_path,
+            json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8'),
+        )
 
     def gost_ports_ready():
         # 只等 write_gost_config 实际写进配置的端口（2026-11-03 修）：旧实现自己再解析
@@ -9633,13 +9674,19 @@ def serve(path):
                         return False
                     return True
                 if gost_status():
-                    r = subprocess.run(['systemctl', 'reload', 'gost'], capture_output=True, timeout=5)
-                    if r.returncode == 0:
-                        for _ in range(10):
-                            if gost_status() and gost_ports_ready():
-                                return True
-                            time.sleep(0.2)
-                subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=5)
+                    try:
+                        r = subprocess.run(['systemctl', 'reload', 'gost'], capture_output=True, timeout=5)
+                        if r.returncode == 0:
+                            for _ in range(10):
+                                if gost_status() and gost_ports_ready():
+                                    return True
+                                time.sleep(0.2)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                try:
+                    subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
                 r = subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=12)
                 if r.returncode != 0:
                     return False
@@ -9672,7 +9719,7 @@ def serve(path):
             cached_data = _ver_cache['data']
         ttl = 300 if cached_data is not None else 60
         if cached_t and now - cached_t < ttl:
-            return cached_data
+            return dict(cached_data) if isinstance(cached_data, dict) else cached_data
         try:
             req = urllib.request.Request(
                 'https://api.github.com/repos/' + AWG_REPO + '/contents/?ref=main',
@@ -9689,8 +9736,9 @@ def serve(path):
             # GitHub 在限流/出错时返回的是对象（{"message": ...}），不是列表；
             # 旧写法 `for it in items` 直接抛 TypeError，虽然被下面 except 兜住，
             # 但每次都白跑一遍请求且永远拿不到缓存。
-            shas = ({it['name']: it.get('sha', '') for it in items
-                     if isinstance(it, dict) and it.get('name')}
+            shas = ({it['name']: (it.get('sha') if isinstance(it.get('sha'), str) else '')
+                     for it in items
+                     if isinstance(it, dict) and isinstance(it.get('name'), str) and it['name']}
                     if isinstance(items, list) else {})
             if shas:
                 try:
@@ -9700,7 +9748,7 @@ def serve(path):
                 except NameError:
                     _ver_cache['t'] = now
                     _ver_cache['data'] = shas
-                return shas
+                return dict(shas)
         except Exception as exc:
             _log_ignored('version_check', exc)
         try:
