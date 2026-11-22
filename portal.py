@@ -953,7 +953,10 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
 def _existing_outbound_names():
     """读当前 config.yaml 里已存在的出站名（供兜底判断用）。"""
     try:
-        cfg = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
+        cfg_p = Path('/etc/hysteria/config.yaml')
+        if cfg_p.is_symlink() or not cfg_p.is_file() or cfg_p.lstat().st_size > 4 * 1024 * 1024:
+            return []
+        cfg = cfg_p.read_bytes().decode('utf-8', errors='replace')
     except Exception:
         return []
     return outbound_names_in(cfg)
@@ -2416,9 +2419,12 @@ def gost_tls_paths(root):
     cert = _config_tls_cert_path(str(config)) or _config_acme_cert_path(str(config))
     key = ''
     in_tls = False
-    if config.is_file():
+    if not config.is_symlink() and config.is_file():
         try:
-            cfg_lines = config.read_text(encoding='utf-8').splitlines()
+            if config.lstat().st_size <= 4 * 1024 * 1024:
+                cfg_lines = config.read_bytes().decode('utf-8', errors='replace').splitlines()
+            else:
+                cfg_lines = []
         except (OSError, UnicodeDecodeError):
             cfg_lines = []
         for raw in cfg_lines:
@@ -4885,7 +4891,10 @@ def _config_acme_cert_path(config_path):
     只匹配配置域名，不拿旧自签证书或别的域名掩盖申请失败。
     """
     try:
-        text = Path(config_path).read_text(encoding='utf-8')
+        cfg_p = Path(config_path)
+        if cfg_p.is_symlink() or not cfg_p.is_file() or cfg_p.lstat().st_size > 4 * 1024 * 1024:
+            return None
+        text = cfg_p.read_bytes().decode('utf-8', errors='replace')
     except (OSError, UnicodeDecodeError):
         return None
     def _split_yaml_value(raw_val):
@@ -6532,7 +6541,13 @@ def xray_unit_foreign(unit_path=XRAY_UNIT_PATH):
     入站在下次重启时静默消失，二进制也被替换。判据与 install.sh 卸载时认领单元一致。
     """
     try:
-        text = Path(unit_path).read_text(encoding='utf-8')
+        unit = Path(unit_path)
+        if unit.is_symlink():
+            return True
+        st = unit.lstat()
+        if st.st_size > 1024 * 1024:
+            return True
+        text = unit.read_bytes().decode('utf-8', errors='replace')
     except FileNotFoundError:
         return False
     except (OSError, UnicodeDecodeError):
@@ -6544,10 +6559,13 @@ def write_xray_unit():
     """写 xray.service 并 daemon-reload；不 enable —— 没有任何协议配置时
     开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
     unit = Path('/etc/systemd/system/xray.service')
+    if unit.is_symlink():
+        raise OSError('xray.service 不允许为符号链接')
     current_text = None
     if unit.exists():
         try:
-            current_text = unit.read_text(encoding='utf-8')
+            if unit.lstat().st_size <= 1024 * 1024:
+                current_text = unit.read_bytes().decode('utf-8', errors='replace')
         except (OSError, UnicodeDecodeError):
             current_text = None
     if current_text != XRAY_UNIT_CONTENT:
@@ -7617,9 +7635,11 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
         if exclude_key == cfg_key:
             continue
         config_path = Path('/etc/hysteria') / (ANYTLS_CONFIG_NAME if service == ANYTLS_SERVICE else TUIC_CONFIG_NAME)
-        if _systemd_state(service) == 'active' and config_path.exists():
+        if _systemd_state(service) == 'active' and (config_path.is_symlink() or config_path.exists()):
             try:
-                config = json.loads(config_path.read_text(encoding='utf-8'))
+                if config_path.is_symlink() or config_path.lstat().st_size > 4 * 1024 * 1024:
+                    return True
+                config = json.loads(config_path.read_bytes().decode('utf-8', errors='replace'))
                 listeners = config.get('inbounds', []) if isinstance(config, dict) else []
                 if isinstance(listeners, list) and any(
                         _strict_port(item.get('listen_port')) == port
