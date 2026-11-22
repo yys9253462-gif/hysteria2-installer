@@ -8556,9 +8556,8 @@ def prepare(meta_path, port, node_api_key=None):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                             capture_output=True, timeout=20)
-        low_qr = qr.stdout.lower() if qr.returncode == 0 and qr.stdout else b''
-        qr_svg = (qr.stdout if (b'<svg' in low_qr and b'<script' not in low_qr
-                                and b'<foreignobject' not in low_qr) else b'')
+        qr_svg = (qr.stdout if (qr.returncode == 0 and qr.stdout
+                                and _is_safe_svg_payload(qr.stdout)) else b'')
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
@@ -8612,7 +8611,7 @@ def qr_svg_for(uri, timeout=20):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                             input=str(uri).encode(), capture_output=True, timeout=timeout)
-        if qr.returncode == 0 and qr.stdout and b'<svg' in qr.stdout:
+        if qr.returncode == 0 and qr.stdout and _is_safe_svg_payload(qr.stdout):
             return qr.stdout.decode('utf-8', 'replace')
     except Exception as exc:
         _log_ignored('qr_refresh', exc)  # 保留旧图，别把框清空
@@ -13230,9 +13229,17 @@ if __name__ == '__main__':
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
                 return 200, dict(entry, ok=True, applied=True, host=host, url=uri, qr=qr_svg,
@@ -13256,6 +13263,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14651,9 +14660,17 @@ if __name__ == '__main__':
                                         input=_uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vmess_qr', exc)
             return self.reply_json(200, {
@@ -15079,6 +15096,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -15200,9 +15219,17 @@ if __name__ == '__main__':
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('anytls_qr', exc)
             return self.reply_json(200, {
@@ -15239,10 +15266,9 @@ if __name__ == '__main__':
             # UDP 端口只会和其它 UDP 服务撞：Hy2 监听端口与跳跃区间、AWG（监听表里能看到）。
             blocked = set()
             for value in (m.get('listen_port'),):
-                try:
-                    blocked.add(int(value))
-                except (TypeError, ValueError):
-                    pass
+                _vp = _valid_port(value)
+                if _vp is not None:
+                    blocked.add(_vp)
             with tuic_apply_lock:
                 # 在服务锁内读取最新用户并完成启用提交。撤销线程要么先完成并反映在
                 # 此快照中，要么随后取得锁并从新启用的配置中移除该用户。
@@ -15341,6 +15367,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -15461,9 +15489,17 @@ if __name__ == '__main__':
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('tuic_qr', exc)
             return self.reply_json(200, {
@@ -15624,9 +15660,17 @@ if __name__ == '__main__':
                                         input=_euri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vlessenc_qr', exc)
             return self.reply_json(200, {
@@ -15670,6 +15714,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -15848,6 +15894,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                if len(_raw_cl_s) > 10:
+                    return self.reply(413, '请求体过大'.encode('utf-8'))
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply(400, '请求体长度不合法'.encode('utf-8'))
@@ -15897,9 +15945,9 @@ if __name__ == '__main__':
                         _raw_days = (form.get('duration_days', ['30'])[0] or '30').strip()
                         _raw_ipl = (form.get('ip_limit', ['0'])[0] or '0').strip()
                         _raw_tgb = (form.get('traffic_gb', ['0'])[0] or '0').strip()
-                        if (not _raw_days.isascii() or not _raw_days.isdigit()
-                                or not _raw_ipl.isascii() or not _raw_ipl.isdigit()
-                                or not _raw_tgb.isascii()):
+                        if (not _raw_days.isascii() or not _raw_days.isdigit() or len(_raw_days) > 24
+                                or not _raw_ipl.isascii() or not _raw_ipl.isdigit() or len(_raw_ipl) > 24
+                                or not _raw_tgb.isascii() or len(_raw_tgb) > 24):
                             raise ValueError()
                         days = int(_raw_days)
                         ip_limit = int(_raw_ipl)
@@ -16137,6 +16185,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply(400, b'Bad request')
+                if len(_raw_cl_s) > 10:
+                    return self.reply(413, b'Payload too large')
                 length = int(_raw_cl_s)
                 if length > 4096:
                     return self.reply(400, b'Bad request')
@@ -17198,9 +17248,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
-                if '<svg' not in qr_svg:
-                    qr_svg = ""
-                elif '<script' in qr_svg.lower():
+                if not _is_safe_svg_payload(qr_svg):
                     qr_svg = ""
 
                 denial = user_access_denial(u_copy)
@@ -17704,9 +17752,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     qr_res = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                                             input=_ruri.encode('utf-8'), capture_output=True, timeout=3)
                     if qr_res.returncode == 0:
-                        qr_svg = qr_res.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr_res.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception:
                     qr_svg = ''
 
