@@ -406,6 +406,22 @@ hy2_acme_disable_auto_upgrade() {
 # $1 = acme.sh 工作目录（默认 $HOME/.acme.sh）。
 hy2_acme_install_verified() {
     local home="${1:-$HOME/.acme.sh}"
+    local _bs='\'
+    local clean_home="${home%/}"
+    clean_home="${clean_home%"$_bs"}"
+    if [[ -z "$clean_home" || "$clean_home" =~ [[:cntrl:]] \
+        || ( "$clean_home" != /*/* && ! "$clean_home" =~ ^[A-Za-z]:[/\\][^/\\]+[/\\].+ ) \
+        || "$clean_home" == *"/../"* || "$clean_home" == *"/.." \
+        || "$clean_home" == *"${_bs}..${_bs}"* || "$clean_home" == *"${_bs}.." ]]; then
+        log_err "acme.sh 目标目录路径不安全（${home:-<empty>}），已放弃安装。"
+        return 1
+    fi
+    case "$clean_home" in
+        /|/etc|/usr|/var|/root|/home|/bin|/sbin|/lib|/lib64|/tmp|/run|/opt|/srv|/boot|/dev|/proc|/sys)
+            log_err "acme.sh 目标目录指向系统受保护路径不安全（${home}），已放弃安装。"
+            return 1
+            ;;
+    esac
     local commit tree_json work path blob dest had_home=0
     local acct="${home}/acme.sh"
 
@@ -1740,8 +1756,13 @@ setup_cert_via_nginx() {
     # 只有最后那一行结果写到 fd 3（原 stdout）。
     exec 3>&1 1>&2
     if [[ -z "$domain" || ${#domain} -gt 253 \
+            || "${domain##*.}" =~ ^[0-9]+$ \
             || ! "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
         log_err "借 Nginx 签发拒绝非法域名: ${domain}"
+        return 1
+    fi
+    if [[ -n "$email" && ( "$email" == -* || "$email" =~ [[:space:][:cntrl:]] ) ]]; then
+        log_err "借 Nginx 签发拒绝非法邮箱参数: ${email}"
         return 1
     fi
     command -v nginx >/dev/null 2>&1 || return 1
@@ -1803,10 +1824,18 @@ EOF
         fi
         chmod 644 "$_nginx_tmp"
         mv -f "$_nginx_tmp" "$conf"
+        _nginx_tmp=""
         created_owned_conf=1
         if ! nginx_reload_checked; then
-            # IPv6 监听不可用时再试一次只监听 IPv4。
-            sed -i '/listen \[::\]:80;/d' "$conf"
+            # IPv6 监听不可用时再试一次只监听 IPv4（走同目录临时文件原子替换）。
+            _nginx_tmp="$(umask 077; mktemp "${conf}.XXXXXX")" || _nginx_tmp=""
+            if [[ -n "$_nginx_tmp" ]] && grep -vF 'listen [::]:80;' "$conf" > "$_nginx_tmp" \
+                    && chmod 644 "$_nginx_tmp" && mv -f "$_nginx_tmp" "$conf"; then
+                _nginx_tmp=""
+            else
+                rm -f "${_nginx_tmp:-}"
+                _nginx_tmp=""
+            fi
             if ! nginx_reload_checked; then
                 rm -f "$conf"
                 nginx_reload_checked || true
@@ -1890,6 +1919,7 @@ setup_cert_via_dns_api() {
     # 会变成「一大段日志 + 路径」，Hysteria 读不到证书（2026-10-29 修）。
     exec 3>&1 1>&2
     if [[ -z "$domain" || ${#domain} -gt 253 \
+            || "${domain##*.}" =~ ^[0-9]+$ \
             || ! "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
         log_err "DNS API 签发拒绝非法域名: ${domain}"
         return 1
@@ -1906,10 +1936,18 @@ setup_cert_via_dns_api() {
     # HY2_CF_EMAIL 才认 Cloudflare，只有 Token（官方推荐）的用户被当成「没有凭据」；
     # Global API Key 要走 CF_Key + CF_Email，旧实现只能塞进 CF_Token，被当成 Bearer 认证失败。
     if [[ -n "${HY2_CF_TOKEN:-}" ]]; then
+        if [[ "$HY2_CF_TOKEN" =~ [[:cntrl:]] || "${HY2_CF_EMAIL:-}" =~ [[:cntrl:]] ]]; then
+            log_err "Cloudflare DNS API 凭据包含换行或控制字符，请清理后重试。"
+            return 1
+        fi
         provider="Cloudflare"; prov_env="HY2_CF_TOKEN"
     elif [[ -n "${HY2_CF_KEY:-}" ]]; then
         if [[ -z "${HY2_CF_EMAIL:-}" ]]; then
             log_err "Cloudflare Global API Key 需要 HY2_CF_KEY 与 HY2_CF_EMAIL 两项，缺 HY2_CF_EMAIL。"
+            return 1
+        fi
+        if [[ "$HY2_CF_KEY" =~ [[:cntrl:]] || "$HY2_CF_EMAIL" =~ [[:cntrl:]] ]]; then
+            log_err "Cloudflare DNS API 凭据包含换行或控制字符，请清理后重试。"
             return 1
         fi
         provider="Cloudflare"; prov_env="HY2_CF_KEY + HY2_CF_EMAIL"
@@ -1919,8 +1957,16 @@ setup_cert_via_dns_api() {
             log_err "阿里云 DNS API 需要 HY2_ALICLOUD_KEY 与 HY2_ALICLOUD_SECRET 两项，缺 HY2_ALICLOUD_SECRET。"
             return 1
         fi
+        if [[ "$HY2_ALICLOUD_KEY" =~ [[:cntrl:]] || "$HY2_ALICLOUD_SECRET" =~ [[:cntrl:]] ]]; then
+            log_err "阿里云 DNS API 凭据包含换行或控制字符，请清理后重试。"
+            return 1
+        fi
         provider="阿里云";    prov_env="HY2_ALICLOUD_KEY + HY2_ALICLOUD_SECRET"
     elif [[ -n "${HY2_DP_TOKEN:-}" ]]; then
+        if [[ "$HY2_DP_TOKEN" =~ [[:cntrl:]] ]]; then
+            log_err "DuckDNS API 凭据包含换行或控制字符，请清理后重试。"
+            return 1
+        fi
         provider="DuckDNS";   prov_env="HY2_DP_TOKEN"
     else
         log_warn "没有可用的 DNS API 凭据，跳过 DNS API 签发。"
