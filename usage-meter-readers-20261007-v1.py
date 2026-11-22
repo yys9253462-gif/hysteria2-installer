@@ -125,10 +125,12 @@ def read_hysteria(url, secret):
         raw=response.read(4*1024*1024+1)
     if len(raw)>4*1024*1024:
         raise ValueError('traffic response too large')
-    result=json.loads(raw)
+    result=json.loads(raw.decode('utf-8', errors='replace'))
     if not isinstance(result,dict): raise ValueError('invalid traffic response')
     for uid, counters in result.items():
-        if not isinstance(uid, str) or not uid or not isinstance(counters, dict):
+        if (not isinstance(uid, str) or not uid
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in uid)
+                or not isinstance(counters, dict)):
             raise ValueError('invalid traffic response')
         for field in ('tx', 'rx'):
             if field in counters:
@@ -199,8 +201,12 @@ def read_hysteria_online(url, secret):
         raw = response.read(4 * 1024 * 1024 + 1)
     if len(raw) > 4 * 1024 * 1024:
         raise ValueError('online response too large')
-    result = json.loads(raw)
-    if not isinstance(result, dict) or any(not isinstance(uid, str) or type(count) is not int or count < 0 for uid, count in result.items()):
+    result = json.loads(raw.decode('utf-8', errors='replace'))
+    if not isinstance(result, dict) or any(
+            not isinstance(uid, str) or not uid
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in uid)
+            or type(count) is not int or count < 0
+            for uid, count in result.items()):
         raise ValueError('invalid online counters')
     return result
 

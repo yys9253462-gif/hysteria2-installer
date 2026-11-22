@@ -270,7 +270,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.72'
+PORTAL_VERSION = '2.73'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -953,7 +953,10 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
 def _existing_outbound_names():
     """读当前 config.yaml 里已存在的出站名（供兜底判断用）。"""
     try:
-        cfg = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
+        cfg_p = Path('/etc/hysteria/config.yaml')
+        if cfg_p.is_symlink() or not cfg_p.is_file() or cfg_p.lstat().st_size > 4 * 1024 * 1024:
+            return []
+        cfg = cfg_p.read_bytes().decode('utf-8', errors='replace')
     except Exception:
         return []
     return outbound_names_in(cfg)
@@ -1566,7 +1569,10 @@ def atomic_write_private(path, payload):
             os.fsync(fh.fileno())
     except BaseException:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             temp.unlink()
         except OSError:
@@ -1625,7 +1631,10 @@ def atomic_write_private(path, payload):
         except OSError as exc:
             raise AtomicWriteDurabilityError('file replaced; directory sync failed') from exc
         finally:
-            os.close(dfd)
+            try:
+                os.close(dfd)
+            except OSError:
+                pass
 
 
 def portal_update_process_lock(base_dir):
@@ -1641,7 +1650,10 @@ def portal_update_process_lock(base_dir):
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BaseException:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         raise
     return fd
 
@@ -2170,7 +2182,10 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
     except FileNotFoundError:
         pass
     fd, name = tempfile.mkstemp(prefix='.hysteria-update-', dir=str(binary.parent))
-    os.close(fd)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
     candidate = Path(name)
     backup = None
     replaced = False
@@ -2380,7 +2395,10 @@ def core_operation_file_lock(directory='/etc/hysteria'):
     try:
         yield
     finally:
-        os.close(lock_fd)
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
 def acquire_core_operation_lock(directory='/etc/hysteria'):
@@ -2391,10 +2409,16 @@ def acquire_core_operation_lock(directory='/etc/hysteria'):
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
             raise RuntimeError('another core operation is running')
         except BaseException:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
             raise
     return lock_fd
 
@@ -2406,7 +2430,10 @@ def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hyste
         try:
             return _upgrade_core_binary_locked(binary, backup_dir, allow_custom)
         finally:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def gost_tls_paths(root):
@@ -2416,9 +2443,12 @@ def gost_tls_paths(root):
     cert = _config_tls_cert_path(str(config)) or _config_acme_cert_path(str(config))
     key = ''
     in_tls = False
-    if config.is_file():
+    if not config.is_symlink() and config.is_file():
         try:
-            cfg_lines = config.read_text(encoding='utf-8').splitlines()
+            if config.lstat().st_size <= 4 * 1024 * 1024:
+                cfg_lines = config.read_bytes().decode('utf-8', errors='replace').splitlines()
+            else:
+                cfg_lines = []
         except (OSError, UnicodeDecodeError):
             cfg_lines = []
         for raw in cfg_lines:
@@ -2495,7 +2525,10 @@ def _write_private_bytes(target, payload, mode=0o600, call_path_chmod=False):
             os.fsync(handle.fileno())
     finally:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     if call_path_chmod:
         target.chmod(mode)
     os.chmod(str(target), mode)
@@ -3223,7 +3256,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     access_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/"
     access_json = json.dumps(
         portal_access_payload(access_url, username_str, password_str, api_key_str),
-        ensure_ascii=False)
+        ensure_ascii=False, allow_nan=False)
     field_access_json = (
         f'<textarea id="teyir-access-json" class="config" aria-label="TEYIR 接入凭据（JSON）" '
         f'readonly spellcheck="false" style="height:92px">{html.escape(access_json)}</textarea>')
@@ -4885,7 +4918,10 @@ def _config_acme_cert_path(config_path):
     只匹配配置域名，不拿旧自签证书或别的域名掩盖申请失败。
     """
     try:
-        text = Path(config_path).read_text(encoding='utf-8')
+        cfg_p = Path(config_path)
+        if cfg_p.is_symlink() or not cfg_p.is_file() or cfg_p.lstat().st_size > 4 * 1024 * 1024:
+            return None
+        text = cfg_p.read_bytes().decode('utf-8', errors='replace')
     except (OSError, UnicodeDecodeError):
         return None
     def _split_yaml_value(raw_val):
@@ -6532,7 +6568,13 @@ def xray_unit_foreign(unit_path=XRAY_UNIT_PATH):
     入站在下次重启时静默消失，二进制也被替换。判据与 install.sh 卸载时认领单元一致。
     """
     try:
-        text = Path(unit_path).read_text(encoding='utf-8')
+        unit = Path(unit_path)
+        if unit.is_symlink():
+            return True
+        st = unit.lstat()
+        if st.st_size > 1024 * 1024:
+            return True
+        text = unit.read_bytes().decode('utf-8', errors='replace')
     except FileNotFoundError:
         return False
     except (OSError, UnicodeDecodeError):
@@ -6544,10 +6586,13 @@ def write_xray_unit():
     """写 xray.service 并 daemon-reload；不 enable —— 没有任何协议配置时
     开机自启只会让它每 3 秒失败重启一次。由首次成功应用配置时再 enable。"""
     unit = Path('/etc/systemd/system/xray.service')
+    if unit.is_symlink():
+        raise OSError('xray.service 不允许为符号链接')
     current_text = None
     if unit.exists():
         try:
-            current_text = unit.read_text(encoding='utf-8')
+            if unit.lstat().st_size <= 1024 * 1024:
+                current_text = unit.read_bytes().decode('utf-8', errors='replace')
         except (OSError, UnicodeDecodeError):
             current_text = None
     if current_text != XRAY_UNIT_CONTENT:
@@ -7161,11 +7206,31 @@ def _valid_stats_secret(secret):
             and not any(ord(ch) < 32 or ord(ch) == 127 for ch in secret))
 
 
+class _NoRedirectStatsHandler(urllib.request.HTTPRedirectHandler):
+    """回环统计接口严禁跟随 3xx 重定向，防止把 Authorization 统计密钥发往非预期地址。"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+_ORIG_URLLIB_URLOPEN = urllib.request.urlopen
+
+
+def _open_loopback_stats(req, timeout=4):
+    """发送回环统计接口请求：生产环境禁用 3xx 重定向，测试打桩 urlopen 时自动兼容。"""
+    if urllib.request.urlopen is not _ORIG_URLLIB_URLOPEN:
+        return urllib.request.urlopen(req, timeout=timeout)
+    opener = urllib.request.build_opener(_NoRedirectStatsHandler)
+    return opener.open(req, timeout=timeout)
+
+
 def kick_hy2_users(root, uids):
     """让 Hy2 核心断开这些用户的全部会话（被拦 IP 断开后重连会在 /auth 被拒，放行的设备会自动重连）。"""
     cfg_path = Path(root) / 'usage-meter-config.json'
     try:
-        cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+        if cfg_path.is_symlink() or not cfg_path.is_file() or cfg_path.lstat().st_size > 1024 * 1024:
+            cfg = {}
+        else:
+            cfg = json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
     except (OSError, ValueError):
         cfg = {}
     # 配置文件可能被截断/手工改坏：hysteria 段是字符串、缺 secret 时
@@ -7184,9 +7249,9 @@ def kick_hy2_users(root, uids):
         return False
     if not clean_uids or not _valid_stats_secret(secret) or not _valid_loopback_stats_url(url):
         return False
-    req = urllib.request.Request(url + '/kick', data=json.dumps(clean_uids).encode(),
+    req = urllib.request.Request(url + '/kick', data=json.dumps(clean_uids, allow_nan=False).encode(),
                                  headers={'Authorization': secret, 'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=4):
+    with _open_loopback_stats(req, timeout=4):
         pass
     return True
 
@@ -7617,9 +7682,11 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
         if exclude_key == cfg_key:
             continue
         config_path = Path('/etc/hysteria') / (ANYTLS_CONFIG_NAME if service == ANYTLS_SERVICE else TUIC_CONFIG_NAME)
-        if _systemd_state(service) == 'active' and config_path.exists():
+        if _systemd_state(service) == 'active' and (config_path.is_symlink() or config_path.exists()):
             try:
-                config = json.loads(config_path.read_text(encoding='utf-8'))
+                if config_path.is_symlink() or config_path.lstat().st_size > 4 * 1024 * 1024:
+                    return True
+                config = json.loads(config_path.read_bytes().decode('utf-8', errors='replace'))
                 listeners = config.get('inbounds', []) if isinstance(config, dict) else []
                 if isinstance(listeners, list) and any(
                         _strict_port(item.get('listen_port')) == port
@@ -7758,7 +7825,10 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
                         if not user_access_allowed(info)})
     cfg_path = root / 'usage-meter-config.json'
     try:
-        cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+        if cfg_path.is_symlink() or not cfg_path.is_file() or cfg_path.lstat().st_size > 1024 * 1024:
+            cfg = {}
+        else:
+            cfg = json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
     except (OSError, ValueError):
         cfg = {}
     if blocked:
@@ -7775,9 +7845,9 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
         if not _valid_stats_secret(secret):
             raise RuntimeError('cannot confirm Hy2 revocation: loopback stats secret unavailable')
         def request_stats(path, payload=None):
-            req = urllib.request.Request(url + path, data=json.dumps(payload).encode() if payload is not None else None,
+            req = urllib.request.Request(url + path, data=json.dumps(payload, allow_nan=False).encode() if payload is not None else None,
                                          headers={'Authorization': secret, 'Content-Type':'application/json'})
-            with urllib.request.urlopen(req, timeout=4) as response:
+            with _open_loopback_stats(req, timeout=4) as response:
                 raw=_read_bounded_bytes(response, 4 * 1024 * 1024)
             return json.loads(raw) if raw.strip() else {}
         def _online_count(online_map, uid):
@@ -7828,6 +7898,8 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
                 if any(_online_count(online, uid) > 0 for uid in active):
                     raise RuntimeError('Hy2 sessions still present after revocation')
     xj=root/'xray.json'
+    if xj.is_symlink():
+        raise OSError('xray.json 不允许为符号链接，无法确认撤销')
     if not xj.exists():
         # A running Xray keeps its last loaded config in memory after the file is
         # deleted. Do not acknowledge a pending revoke merely because the disk copy
@@ -7835,8 +7907,10 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
         if blocked and _systemd_state('xray') == 'active':
             raise RuntimeError('cannot confirm Xray revocation: xray.json missing while Xray is active')
         return True
+    if xj.lstat().st_size > 4 * 1024 * 1024:
+        raise ValueError('xray.json 超过 4 MiB 上限，无法确认撤销')
     original=xj.read_bytes()
-    xcfg=json.loads(original)
+    xcfg=json.loads(original.decode('utf-8', errors='replace'))
     # 运行中的 Xray 可能仍加载旧配置；损坏的磁盘配置不能证明没有入站。
     if not isinstance(xcfg, dict) or ('inbounds' in xcfg and not isinstance(xcfg['inbounds'], list)):
         raise ValueError('invalid Xray configuration; cannot confirm revocation')
@@ -7877,9 +7951,13 @@ def _apply_xray_access_snapshot(root, xj, snapshot, blocked, cfg_path, meter_con
 
 def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, meter_config,
                                        force_ids, wanted_by_tag):
+    if xj.is_symlink():
+        raise OSError('xray.json 不允许为符号链接，无法确认撤销')
+    if xj.lstat().st_size > 4 * 1024 * 1024:
+        raise ValueError('xray.json 超过 4 MiB 上限，无法确认撤销')
     original=xj.read_bytes()
     orig_mode=xj.stat().st_mode & 0o777
-    xcfg=json.loads(original)
+    xcfg=json.loads(original.decode('utf-8', errors='replace'))
     # wanted_by_tag 是锁外读 xray.json 时算的；拿到锁之前可能有协议被停用、
     # 入站被删（2026-11-03 修）。旧实现照旧 tag 集合取下标：找不到时下标是 -1，
     # clients 被写进**最后一个入站**（通常是计量的 usage-meter-api-in），
@@ -7890,8 +7968,8 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
                    if managed_inbound_index(xcfg,tag)[0]>=0}
     if not wanted_by_tag:
         return True
-    signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
-    epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
+    signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True,allow_nan=False).encode()).hexdigest()
+    epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,errors='replace',timeout=4,check=True).stdout.strip()
     current={}
     for tag in wanted_by_tag:
         inbound_settings=xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings')
@@ -7913,24 +7991,29 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
     reality_cfg=meter_config.get('reality') if isinstance(meter_config, dict) else None
     reality_cfg=reality_cfg if isinstance(reality_cfg, dict) else {}
     raw_binary=reality_cfg.get('binary')
-    binary=raw_binary.strip() if isinstance(raw_binary, str) and raw_binary.strip() else '/usr/local/bin/xray'
+    if (isinstance(raw_binary, str) and raw_binary.strip()
+            and not raw_binary.strip().startswith('-')
+            and not any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_binary)):
+        binary=raw_binary.strip()
+    else:
+        binary='/usr/local/bin/xray'
     replaced=False
     try:
-        _write_private_bytes(candidate, json.dumps(xcfg,indent=2).encode('utf-8'), orig_mode, call_path_chmod=True)
+        _write_private_bytes(candidate, json.dumps(xcfg,indent=2,allow_nan=False).encode('utf-8'), orig_mode, call_path_chmod=True)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
-        if xj.read_bytes()!=original:
+        if xj.is_symlink() or xj.lstat().st_size > 4 * 1024 * 1024 or xj.read_bytes()!=original:
             raise RuntimeError('Xray configuration changed concurrently; retry')
         _write_private_bytes(last_good_tmp, original, orig_mode)
         os.replace(last_good_tmp, last_good)
         candidate.replace(xj); replaced=True
-        state=subprocess.run(['systemctl','is-active','xray'],capture_output=True,text=True,timeout=4).stdout.strip()
+        state=subprocess.run(['systemctl','is-active','xray'],capture_output=True,text=True,errors='replace',timeout=4).stdout.strip()
         if state in ('inactive','failed'):
             _ACCESS_APPLIED[str(root)]=(signature,epoch)
             return True
         subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4,check=True)
         subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12,check=True)
         subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=4,check=True)
-        epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
+        epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,errors='replace',timeout=4,check=True).stdout.strip()
         if not epoch:raise RuntimeError('missing Reality runtime epoch')
         _ACCESS_APPLIED[str(root)]=(signature,epoch)
         return True
@@ -8781,7 +8864,7 @@ def sync_pin(m, root, meta_path):
             new = pin_sha256_of_file(live) if (live and Path(live).is_file()) else get_cert_pin_sha256(root)
             if new != m.get('pin_sha256'):
                 m['pin_sha256'] = new
-                atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
+                atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     elif m.get('pin_sha256'):
         m['pin_sha256'] = ''
         atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, allow_nan=False).encode('utf-8'))
@@ -8798,8 +8881,13 @@ def prepare(meta_path, port, node_api_key=None):
             if (not node_api_key.isascii()
                     or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in node_api_key)):
                 raise ValueError('node_api_key 不能包含空白、控制字符或非 ASCII 字符')
-    root = Path(meta_path).parent
-    m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    meta_file = Path(meta_path)
+    if meta_file.is_symlink():
+        raise OSError('client_meta.json 不允许为符号链接')
+    if meta_file.lstat().st_size > 1024 * 1024:
+        raise ValueError('client_meta.json 体积超过 1 MiB 上限')
+    root = meta_file.parent
+    m = json.loads(meta_file.read_bytes().decode('utf-8', errors='replace'))
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     master_pw = m.get('auth_password')
@@ -9171,9 +9259,14 @@ def ensure_portal_access(root, meta, data):
     """
     root = Path(root)
     path = root / 'portal-access.json'
+    if path.is_symlink():
+        raise OSError('portal-access.json 不允许为符号链接')
     if path.exists():
         try:
-            access = json.loads(path.read_text(encoding='utf-8'))
+            if path.lstat().st_size <= 1024 * 1024:
+                access = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
+            else:
+                access = None
             uname = access.get('username') if isinstance(access, dict) else None
             upwd = access.get('password') if isinstance(access, dict) else None
             if (isinstance(uname, str) and uname and ':' not in uname
@@ -9208,9 +9301,14 @@ def restore_egress_into_config(root, config_path=None):
     """
     root = Path(root)
     cfg = Path(config_path) if config_path else root / 'config.yaml'
+    pjson = root / 'portal.json'
     try:
-        data = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
-        original = cfg.read_text(encoding='utf-8')
+        if pjson.is_symlink() or cfg.is_symlink():
+            return False
+        if pjson.lstat().st_size > 8 * 1024 * 1024 or cfg.lstat().st_size > 4 * 1024 * 1024:
+            return False
+        data = json.loads(pjson.read_bytes().decode('utf-8', errors='replace'))
+        original = cfg.read_bytes().decode('utf-8', errors='replace')
     except (OSError, ValueError):
         return False
     if not isinstance(data, dict):
@@ -9261,12 +9359,21 @@ def _adopt_locked(meta_path, port, node_api_key=None):
         if (not isinstance(node_api_key, str) or not node_api_key.isascii()
                 or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in node_api_key)):
             raise ValueError('node_api_key 必须是不含空白和控制字符的纯 ASCII 字符串')
-    root = Path(meta_path).parent
-    m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    meta_file = Path(meta_path)
+    if meta_file.is_symlink():
+        raise OSError('client_meta.json 不允许为符号链接')
+    if meta_file.lstat().st_size > 1024 * 1024:
+        raise ValueError('client_meta.json 体积超过 1 MiB 上限')
+    root = meta_file.parent
+    m = json.loads(meta_file.read_bytes().decode('utf-8', errors='replace'))
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     path = root / 'portal.json'
-    data = json.loads(path.read_text(encoding='utf-8'))
+    if path.is_symlink():
+        raise OSError('portal.json 不允许为符号链接')
+    if path.lstat().st_size > 8 * 1024 * 1024:
+        raise ValueError('portal.json 体积超过 8 MiB 上限')
+    data = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
     if not isinstance(data, dict):
         raise ValueError('portal.json 顶层必须是 JSON 对象')
     access_path = root / 'portal-access.json'
@@ -9405,9 +9512,11 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
                   VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
     current = {}
     try:
-        if path.stat().st_size > 4 * 1024 * 1024:
+        if path.is_symlink():
+            raise OSError('xray.json 不允许为符号链接')
+        if path.lstat().st_size > 4 * 1024 * 1024:
             raise ValueError('xray.json too large')
-        config = json.loads(path.read_text(encoding='utf-8'))
+        config = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
         if not isinstance(config, dict):
             raise ValueError('xray.json top level not dict')
         for tag in MANAGED_INBOUND_TAGS:
@@ -9455,6 +9564,12 @@ def repair_missing_api_key(portal_path, data):
     """Keep portal.json and portal-access.json on one API key after repair."""
     portal_path = Path(portal_path)
     access_path = portal_path.parent / 'portal-access.json'
+    if portal_path.is_symlink() or access_path.is_symlink():
+        raise OSError('portal.json 或 portal-access.json 不允许为符号链接')
+    if portal_path.lstat().st_size > 8 * 1024 * 1024:
+        raise ValueError('portal.json 体积超过 8 MiB 上限')
+    if access_path.exists() and access_path.lstat().st_size > 1024 * 1024:
+        raise ValueError('portal-access.json 体积超过 1 MiB 上限')
     old_portal = portal_path.read_bytes()
     old_access = access_path.read_bytes() if access_path.exists() else None
     old_key = data.get('api_key')
@@ -9462,7 +9577,7 @@ def repair_missing_api_key(portal_path, data):
     phase = 'access'
     try:
         if old_access is not None:
-            access = json.loads(old_access.decode('utf-8'))
+            access = json.loads(old_access.decode('utf-8', errors='replace'))
             if not isinstance(access, dict):
                 raise ValueError('portal-access.json 顶层不是 JSON 对象')
             access['api_key'] = new_key
@@ -9531,8 +9646,12 @@ def persist_interrupted_core_job(portal_path, data):
 
 def serve(path):
     portal_path = Path(path)
+    if portal_path.is_symlink():
+        raise OSError('portal.json 不允许为符号链接')
+    if portal_path.lstat().st_size > 8 * 1024 * 1024:
+        raise ValueError('portal.json 体积超过 8 MiB 上限')
     _loaded_bytes = portal_path.read_bytes()
-    data = json.loads(_loaded_bytes.decode('utf-8'))
+    data = json.loads(_loaded_bytes.decode('utf-8', errors='replace'))
     # 本进程最后一次读到 / 写出的 portal.json 摘要，save_data 用它识别 CLI 带外写入。
     disk_state = {'digest': hashlib.sha256(_loaded_bytes).digest()}
     # 必需字段缺失时给出明确中文错误再退出。旧行为是在后面的 data['port']
@@ -9734,7 +9853,10 @@ def serve(path):
                 return False
             finally:
                 if acquired_core_lock:
-                    os.close(core_lock_fd)
+                    try:
+                        os.close(core_lock_fd)
+                    except OSError:
+                        pass
             with data_lock:
                 # 收回期间新排进来的待撤销项要保留，只清掉本轮已确认的。
                 previous_pending = pending_revocations(data)
@@ -10140,7 +10262,10 @@ def serve(path):
         while True:
             try:
                 try:
-                    _raw_cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.is_file() else {}
+                    if cfg_path.is_symlink() or not cfg_path.is_file() or cfg_path.lstat().st_size > 1024 * 1024:
+                        _raw_cfg = {}
+                    else:
+                        _raw_cfg = json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
                 except (OSError, ValueError):
                     _raw_cfg = {}
                 rcfg = _raw_cfg.get('reality') if isinstance(_raw_cfg, dict) else {}
@@ -10397,7 +10522,10 @@ def serve(path):
                     # 但仍然要确认写出来的是合法 JSON：否则恢复整机时 gost 起不来，
                     # 而此前每次操作都报告成功（2026-10-29 修）。
                     try:
-                        json.loads((portal_path.parent / 'gost.yml').read_text(encoding='utf-8'))
+                        _gost_yml = portal_path.parent / 'gost.yml'
+                        if _gost_yml.is_symlink() or _gost_yml.lstat().st_size > 2 * 1024 * 1024:
+                            return False
+                        json.loads(_gost_yml.read_bytes().decode('utf-8', errors='replace'))
                     except (OSError, ValueError):
                         return False
                     return True
@@ -10611,10 +10739,17 @@ def serve(path):
         unit_path = Path('/etc/systemd/system/gost.service')
         # 不是本工具的 gost 一律不碰（2026-11-04 修）：旧实现在新增 / 删除代理时把机主自己
         # 的 gost.service 整份改写成指向 /etc/hysteria/gost.yml，并重启，原有服务全部停掉。
+        if unit_path.is_symlink():
+            return
         if unit_path.exists() and not gost_owned():
             return
         try:
-            current = unit_path.read_text(encoding='utf-8') if unit_path.exists() else ''
+            if unit_path.exists():
+                if unit_path.lstat().st_size > 1024 * 1024:
+                    return
+                current = unit_path.read_bytes().decode('utf-8', errors='replace')
+            else:
+                current = ''
         except (OSError, UnicodeDecodeError):
             return
         needed = ('ExecReload=/bin/kill -HUP $MAINPID',
@@ -10631,7 +10766,7 @@ def serve(path):
             if all(s in current for s in needed):
                 return                               # 只是补回脚本，单元不用动
             tmp_unit = unit_path.with_name(unit_path.name + '.tmp.' + os.urandom(4).hex())
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
             if hasattr(os, 'O_NOFOLLOW'):
                 flags |= os.O_NOFOLLOW
             try:
@@ -13497,7 +13632,10 @@ if __name__ == '__main__':
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
             finally:
                 if update_lock_fd is not None:
-                    os.close(update_lock_fd)
+                    try:
+                        os.close(update_lock_fd)
+                    except OSError:
+                        pass
 
         def _manage_proxy_operation(self, action, params):
             # 报错在页面上原样弹给管理员（控制台也原样转给操作者），一律中文并说明怎么办（2026-11-13 修）。
@@ -16835,15 +16973,24 @@ fi
 # 旧实现在下载之前就写，下载失败退出后标记留着，之后机主自己装的 wireproxy
 # 会被下次网页安装直接覆盖、被卸载当成本项目的删掉。
 claim_warp_assets() {
+    if [ -L "$WARP_OWNED_MARKER" ]; then
+        echo "WARP 归属标记不允许为符号链接" >&2
+        exit 1
+    fi
     if [ ! -f "$WARP_OWNED_MARKER" ]; then
         (umask 077; : > "$WARP_OWNED_MARKER" && chmod 600 "$WARP_OWNED_MARKER")
     fi
 }
 atomic_write_mode() {
-    local dst="$1" mode="$2" tmp
+    local dst="$1" mode="$2" tmp=""
+    if [ -L "$dst" ]; then
+        echo "${dst} 不允许为符号链接" >&2
+        return 1
+    fi
+    trap 'trap - RETURN; rm -f -- "${tmp:-}"' RETURN
     tmp=$(umask 077; mktemp "${dst}.XXXXXX") || return 1
     if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dst"; then
-        rm -f "$tmp"
+        rm -f -- "$tmp"
         return 1
     fi
 }
@@ -16857,10 +17004,20 @@ case "$ARCH" in
 esac
 
 # ---- 完整性校验辅助（与 install.sh / portal.py 主流程同一套规则）----
-# 从 `<sha256>  <name>` 清单里取唯一匹配摘要；无匹配/多条/畸形 => 失败。
+# 从 `<sha256>  <name>` 清单里取唯一匹配摘要；忽略注释行、要求严格双列 NF==2，无匹配/多条/畸形 => 失败。
 manifest_sha256() {
-    awk -v f="$2" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); b=n; sub(/.*\//,"",b);
-                    if (n==f || b==f) print $1}' "$1" | tr 'A-F' 'a-f' | sort -u |
+    awk -v f="$2" '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        NF != 2 { next }
+        {
+            n = $2
+            sub(/^\*/, "", n)
+            while (index(n, "./") == 1) n = substr(n, 3)
+            b = n
+            sub(/.*\//, "", b)
+            if (n == f || b == f) print $1
+        }
+    ' "$1" | tr 'A-F' 'a-f' | sort -u |
     awk 'NR==1{d=$0} END{if (NR==1 && d ~ /^[0-9a-f]{64}$/) print d; else exit 1}'
 }
 verify_sha() {
@@ -16868,12 +17025,16 @@ verify_sha() {
     [[ "$(sha256sum "$1" | awk '{print $1}')" == "$2" ]]
 }
 tar_member() {
-    local listing vlisting m vline n=0 hit=""
+    local listing vlisting m clean vline n=0 hit=""
     listing=$(tar -tzf - <"$2" 2>/dev/null) || return 1
     while IFS= read -r m; do
         m="${m%$'\r'}"
-        case "$m" in /*|..|../*|*/../*|*/..|*\\*) return 2 ;; esac
-        if [[ "${m#./}" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
+        clean="$m"
+        while [[ "$clean" == ./* ]]; do clean="${clean#./}"; done
+        case "$m" in /*|*\\*|*:* ) return 2 ;; esac
+        [[ "$m" =~ [[:cntrl:]] ]] && return 2
+        case "$clean" in ""|/*|..|../*|*/../*|*/.. ) return 2 ;; esac
+        if [[ "$clean" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
     done <<<"$listing"
     vlisting=$(tar -tvzf - <"$2" 2>/dev/null) || return 1
     while IFS= read -r vline; do
@@ -16884,8 +17045,9 @@ tar_member() {
 }
 
 if [ ! -x "$WGCF_BIN" ]; then
+    [ -L "$WGCF_BIN" ] && { echo "${WGCF_BIN} 不允许为符号链接" >&2; exit 1; }
     log "下载 wgcf 二进制..."
-    RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
+    RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
     if command -v jq >/dev/null 2>&1; then
         TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
     else
@@ -16896,10 +17058,10 @@ if [ ! -x "$WGCF_BIN" ]; then
         VER="2.3.0"
     fi
     WG_DL="wgcf_${VER}_linux_${WG_A}"
-    TD=$(mktemp -d)
+    TD=$(umask 077; mktemp -d)
     trap 'rm -rf "$TD"' EXIT
     # 先取该版本官方 checksums.txt，取不到就放弃（不做无校验下载）。
-    if ! curl -fsSL --max-time 30 --retry 2 -o "${TD}/checksums.txt" \
+    if ! curl -fsSL --max-time 30 --max-filesize=2097152 --retry 2 -o "${TD}/checksums.txt" \
             "https://github.com/ViRb3/wgcf/releases/download/v${VER}/checksums.txt" 2>/dev/null; then
         rm -rf "$TD"; echo "取不到 wgcf v${VER} 的官方 checksums.txt，已放弃安装" >&2; exit 1
     fi
@@ -16907,21 +17069,22 @@ if [ ! -x "$WGCF_BIN" ]; then
     if [ -z "$WANT" ]; then
         rm -rf "$TD"; echo "checksums.txt 中 ${WG_DL} 的摘要缺失或不唯一，已放弃安装" >&2; exit 1
     fi
-    if ! curl -fsSL --max-time 90 -o "${TD}/${WG_DL}" "https://github.com/ViRb3/wgcf/releases/download/v${VER}/${WG_DL}"; then
+    if ! curl -fsSL --max-time 90 --max-filesize=167772160 -o "${TD}/${WG_DL}" "https://github.com/ViRb3/wgcf/releases/download/v${VER}/${WG_DL}"; then
         rm -rf "$TD"; echo "wgcf 下载失败 (v${VER}/${WG_A})" >&2; exit 1
     fi
     if ! verify_sha "${TD}/${WG_DL}" "$WANT"; then
         rm -rf "$TD"; echo "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致" >&2; exit 1
     fi
-    WGCF_STAGE=$(umask 022; mktemp "${WGCF_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
+    WGCF_STAGE=$(umask 077; mktemp "${WGCF_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
     install -m 755 "${TD}/${WG_DL}" "$WGCF_STAGE" || { rm -rf "$TD" "$WGCF_STAGE"; exit 1; }
     rm -rf "$TD"; trap - EXIT
     mv -f "$WGCF_STAGE" "$WGCF_BIN" || { rm -f "$WGCF_STAGE"; exit 1; }
 fi
 
 if [ ! -x "$WP_BIN" ]; then
+    [ -L "$WP_BIN" ] && { echo "${WP_BIN} 不允许为符号链接" >&2; exit 1; }
     log "下载 wireproxy 二进制..."
-    RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
+    RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
     if command -v jq >/dev/null 2>&1; then
         TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
     else
@@ -16935,9 +17098,9 @@ if [ ! -x "$WP_BIN" ]; then
     # 先清掉上一个临时目录：旧 trap 只认当前的 $TD，直接重新赋值会让
     # wgcf 那次 mktemp 的目录永远留在 /tmp（2026-10-30 修）。
     rm -rf "$TD"
-    TD=$(mktemp -d)
+    TD=$(umask 077; mktemp -d)
     trap 'rm -rf "$TD"' EXIT
-    if ! curl -fsSL --max-time 30 --retry 2 -o "${TD}/checksums.txt" \
+    if ! curl -fsSL --max-time 30 --max-filesize=2097152 --retry 2 -o "${TD}/checksums.txt" \
             "https://github.com/whyvl/wireproxy/releases/download/${TAG}/checksums.txt" 2>/dev/null; then
         rm -rf "$TD"; echo "取不到 wireproxy ${TAG} 的官方 checksums.txt，已放弃安装" >&2; exit 1
     fi
@@ -16945,7 +17108,7 @@ if [ ! -x "$WP_BIN" ]; then
     if [ -z "$WANT" ]; then
         rm -rf "$TD"; echo "checksums.txt 中 ${WP_DL} 的摘要缺失或不唯一，已放弃安装" >&2; exit 1
     fi
-    if ! curl -fsSL --max-time 90 -o "${TD}/${WP_DL}" "https://github.com/whyvl/wireproxy/releases/download/${TAG}/${WP_DL}"; then
+    if ! curl -fsSL --max-time 90 --max-filesize=167772160 -o "${TD}/${WP_DL}" "https://github.com/whyvl/wireproxy/releases/download/${TAG}/${WP_DL}"; then
         rm -rf "$TD"; echo "wireproxy 下载失败 (${TAG}/${WP_A})" >&2; exit 1
     fi
     if ! verify_sha "${TD}/${WP_DL}" "$WANT"; then
@@ -16960,13 +17123,17 @@ if [ ! -x "$WP_BIN" ]; then
     if [ ! -f "${TD}/x/${MEMBER}" ] || [ -L "${TD}/x/${MEMBER}" ]; then
         rm -rf "$TD"; echo "wireproxy 解压成员非法，已放弃安装" >&2; exit 1
     fi
-    WP_STAGE=$(umask 022; mktemp "${WP_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
+    WP_STAGE=$(umask 077; mktemp "${WP_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
     install -m 755 "${TD}/x/${MEMBER}" "$WP_STAGE" || { rm -rf "$TD" "$WP_STAGE"; exit 1; }
     rm -rf "$TD"; trap - EXIT
     claim_warp_assets
     mv -f "$WP_STAGE" "$WP_BIN" || { rm -f "$WP_STAGE"; exit 1; }
 fi
 
+if [ -L "$WG_DIR" ] || [ -L "$WGCF_ACCT" ] || [ -L "$WGCF_CONF" ] || [ -L "$WP_CFG" ]; then
+    echo "WireGuard 配置目录或文件不允许为符号链接" >&2
+    exit 1
+fi
 mkdir -p "$WG_DIR"
 chmod 700 "$WG_DIR" 2>/dev/null || true
 if [ ! -f "$WGCF_ACCT" ]; then
@@ -16999,15 +17166,16 @@ if [ ! -f "$WGCF_CONF" ]; then
 fi
 chmod 600 "$WGCF_CONF" 2>/dev/null || true
 
-WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF")
-WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF")
-WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF")
+WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF" | tr -d '\r')
+WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
 # 与 install.sh 一致：用 wgcf 下发的双栈地址，否则解析到 IPv6 的 WARP 域名连不上。
 WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
 [ -n "$WG_ADDR" ] || WG_ADDR="172.16.0.2/32"
 case "$WG_ADDR" in *:*) WG_ALLOWED="0.0.0.0/0, ::/0" ;; *) WG_ALLOWED="0.0.0.0/0" ;; esac
-if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ]; then
-    echo "WireGuard 配置解析失败 (PrivateKey/PublicKey/Endpoint 缺失)" >&2
+if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ] \
+        || [[ "$WG_PRIV$WG_PUB$WG_EP$WG_ADDR" =~ [[:cntrl:]] ]]; then
+    echo "WireGuard 配置解析失败 (PrivateKey/PublicKey/Endpoint 缺失或含控制字符)" >&2
     exit 1
 fi
 
@@ -17059,7 +17227,7 @@ systemctl reset-failed wireproxy >/dev/null 2>&1 || true
 systemctl restart wireproxy >/dev/null 2>&1 || true
 sleep 3
 
-if ! curl --proxy "socks5h://${WARP_SOCKS_ADDR}" --silent --fail --max-time 10 https://api4.ipify.org >/dev/null 2>&1; then
+if ! curl --proxy "socks5h://${WARP_SOCKS_ADDR}" --silent --fail --max-time 10 --max-filesize 65536 https://api4.ipify.org >/dev/null 2>&1; then
     echo "wireproxy 已启动但 WARP socks5 探活失败（上游可能受限或被封禁）" >&2
     exit 1
 fi
@@ -17078,7 +17246,7 @@ atomic_write_mode /usr/local/bin/hy2-warp-watchdog.sh 755 <<'WDE'
 #!/usr/bin/env bash
 set -u
 # 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
-probe() { curl --proxy socks5h://127.0.0.1:19898 --silent --fail --max-time 6 "$1" >/dev/null 2>&1; }
+probe() { curl --proxy socks5h://127.0.0.1:19898 --silent --fail --max-time 6 --max-filesize 65536 "$1" >/dev/null 2>&1; }
 if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
     systemctl reset-failed wireproxy >/dev/null 2>&1 || true
@@ -17134,7 +17302,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 with warp_apply_lock:
                     hy2_conf = Path('/etc/hysteria/config.yaml')
                     try:
-                        conf_text = hy2_conf.read_text(encoding='utf-8')
+                        if hy2_conf.is_symlink() or not hy2_conf.is_file() or hy2_conf.lstat().st_size > 4 * 1024 * 1024:
+                            conf_text = None
+                        else:
+                            conf_text = hy2_conf.read_bytes().decode('utf-8', errors='replace')
                     except OSError:
                         conf_text = None
                     if conf_text is not None:

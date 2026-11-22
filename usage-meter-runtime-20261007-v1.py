@@ -527,4 +527,6 @@ def from_file(data,lock,save,path,on_speed=None):
     if st.st_size > 2 * 1024 * 1024:
         raise ValueError('usage meter config too large')
     config=json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
+    if not isinstance(config, dict):
+        raise ValueError('usage meter config must be a JSON object')
     return PortalMeter(data,lock,save,config,on_speed=on_speed)

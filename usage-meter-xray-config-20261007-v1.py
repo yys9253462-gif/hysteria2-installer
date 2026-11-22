@@ -87,7 +87,10 @@ def _fsync_parent_dir(target):
     except OSError:
         pass
     finally:
-        os.close(dir_fd)
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
 
 
 def _inbound_clients(inbound):
@@ -320,7 +323,7 @@ def enable_iplimit_routing(config_path, binary, address):
     _validate_loopback_address(address)
     path=pathlib.Path(config_path)
     original, orig_mode = _read_regular_config_bytes(path)
-    config=json.loads(original)
+    config=json.loads(original.decode('utf-8', errors='replace'))
     if not isinstance(config, dict):raise ValueError('invalid xray config')
     if iplimit_routing_ready(config):
         return {'enabled':True,'changed':False,'backup':None}
@@ -382,7 +385,7 @@ def enable_reality_online(config_path, binary, address):
     _validate_loopback_address(address)
     path=pathlib.Path(config_path)
     original, orig_mode = _read_regular_config_bytes(path)
-    config=json.loads(original)
+    config=json.loads(original.decode('utf-8', errors='replace'))
     if not isinstance(config, dict):raise ValueError('invalid xray config')
     policy=_ensure_dict(config,'policy')
     levels=_ensure_dict(policy,'levels')
