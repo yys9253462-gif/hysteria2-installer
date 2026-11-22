@@ -2992,6 +2992,46 @@ def read_access_file(access_path):
         print('[portal] portal-access.json unreadable: ' + type(exc).__name__, file=sys.stderr)
         return {}
 
+
+def _read_xray_json(path='/etc/hysteria/xray.json', *, strict=False):
+    """安全读取 xray.json：拒绝符号链接与超过 4 MiB 的异常文件，并使用 UTF-8 替换解码。
+
+    strict=False：不存在、符号链接、超限、解析失败或顶层非 dict 时返回 None（供只读状态查询使用）。
+    strict=True：不存在返回 None；符号链接抛 OSError、超限/坏 JSON 抛 ValueError；顶层非 dict 原样返回交由调用方精确提示。
+    """
+    p = Path(path) if isinstance(path, (str, os.PathLike)) else path
+    try:
+        is_sym = getattr(p, 'is_symlink', None)
+        if callable(is_sym) and is_sym():
+            if strict:
+                raise OSError('xray.json 不得为符号链接，未做任何修改')
+            return None
+        if not p.exists():
+            return None
+        is_file = getattr(p, 'is_file', None)
+        if callable(is_file) and not is_file():
+            if strict:
+                raise OSError('xray.json 不是常规文件，未做任何修改')
+            return None
+        lstat_fn = getattr(p, 'lstat', None)
+        if callable(lstat_fn) and lstat_fn().st_size > 4 * 1024 * 1024:
+            if strict:
+                raise ValueError('xray.json 体积超过 4 MiB 上限，未做任何修改')
+            return None
+        read_bytes = getattr(p, 'read_bytes', None)
+        if callable(read_bytes):
+            raw_text = read_bytes().decode('utf-8', errors='replace')
+        else:
+            raw_text = p.read_text(encoding='utf-8')
+        parsed = json.loads(raw_text)
+    except (OSError, ValueError):
+        if strict:
+            raise
+        return None
+    if not strict and not isinstance(parsed, dict):
+        return None
+    return parsed
+
 def resolve_subscription_port(m, config_path='/etc/hysteria/config.yaml'):
     """解析订阅链接该用的端口。按优先级取值，**绝不返回伪造的 8443**。
 
@@ -9586,10 +9626,7 @@ def serve(path):
         r'^[A-Za-z0-9_.\-]+(?::[0-9]{1,5})?$|^\[[0-9A-Fa-f:.]+\](?::[0-9]{1,5})?$')
 
     def close_protocol_port(port, proto, exclude_key):
-        try:
-            xray_config = json.loads((portal_path.parent / 'xray.json').read_text(encoding='utf-8'))
-        except (OSError, ValueError):
-            xray_config = None
+        xray_config = _read_xray_json(portal_path.parent / 'xray.json')
         if protocol_port_in_use(port, proto, data, xray_config, exclude_key):
             return True
         return firewall_port(port, proto, open_=False)
@@ -11040,11 +11077,8 @@ if __name__ == '__main__':
         为什么按入站判断而不是 data['reality_config']：后者是「上次生成成功」
         的残留。Reality 被停掉后它还在，照着它生成订阅会下发一个连不上的节点。
         """
-        try:
-            cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-        except Exception:
-            return None
-        if not managed_inbound_active(cfg, REALITY_INBOUND_TAG):
+        cfg = _read_xray_json('/etc/hysteria/xray.json')
+        if cfg is None or not managed_inbound_active(cfg, REALITY_INBOUND_TAG):
             return None
         with data_lock:
             # 值可能是数字/字符串：dict(7) 抛 TypeError，订阅生成与状态卡片
@@ -11055,11 +11089,8 @@ if __name__ == '__main__':
 
     def _active_vmess_config():
         """VMess 的配置，同样以托管入站是否存在为准。"""
-        try:
-            cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-        except Exception:
-            return None
-        if not managed_inbound_active(cfg, VMESS_INBOUND_TAG):
+        cfg = _read_xray_json('/etc/hysteria/xray.json')
+        if cfg is None or not managed_inbound_active(cfg, VMESS_INBOUND_TAG):
             return None
         with data_lock:
             _v = data.get('vmess_config')
@@ -11068,11 +11099,8 @@ if __name__ == '__main__':
 
     def _active_vlessenc_config():
         """VLESS Encryption 的配置，同样以托管入站是否存在为准。"""
-        try:
-            cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-        except Exception:
-            return None
-        if not managed_inbound_active(cfg, VLESSENC_INBOUND_TAG):
+        cfg = _read_xray_json('/etc/hysteria/xray.json')
+        if cfg is None or not managed_inbound_active(cfg, VLESSENC_INBOUND_TAG):
             return None
         with data_lock:
             _e = data.get('vlessenc_config')
@@ -13468,11 +13496,7 @@ if __name__ == '__main__':
                     # 旧实现只在 12000-58000 里随机，撞上订阅端口就会
                     # 「保存成功但 gost 起不来」，然后回滚（2026-10-30 修）。
                     _meta_now = read_meta_file(meta_path)
-                    try:
-                        _cfg_parsed = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                        _cfg_now = _cfg_parsed if isinstance(_cfg_parsed, dict) else None
-                    except (OSError, ValueError):
-                        _cfg_now = None
+                    _cfg_now = _read_xray_json('/etc/hysteria/xray.json')
                     with data_lock:
                         _data_now = dict(data)
                     _avoid = managed_reserved_ports(_meta_now, _data_now, _cfg_now, keep_disabled=True)
@@ -14485,11 +14509,10 @@ if __name__ == '__main__':
                     # 移除/写回自己的入站，再重启一次（restart，不是 stop）。
                     xray_path = Path('/etc/hysteria/xray.json')
                     try:
-                        cfg_now = (json.loads(xray_path.read_text(encoding='utf-8'))
-                                   if xray_path.exists() else None)
-                    except ValueError:
+                        cfg_now = _read_xray_json(xray_path, strict=True)
+                    except (OSError, ValueError) as _xerr:
                         return self.reply_json(500, {'ok': False, 'error':
-                            'xray.json 不是合法 JSON，未做任何修改'})
+                            str(_xerr) if '未做任何修改' in str(_xerr) else 'xray.json 不是合法 JSON，未做任何修改'})
                     if cfg_now is not None and not isinstance(cfg_now, dict):
                         return self.reply_json(500, {'ok': False, 'error':
                             'xray.json 不是合法 JSON 对象，未做任何修改'})
@@ -14506,10 +14529,7 @@ if __name__ == '__main__':
                         old_reality_port = _valid_port(config_section(data, 'reality_config').get('port')) or 0
                     if action == 'disable':
                         with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
-                            try:
-                                current = json.loads(xray_path.read_text(encoding='utf-8'))
-                            except (OSError, ValueError):
-                                current = cfg_now
+                            current = _read_xray_json(xray_path) or cfg_now
                             if not isinstance(current, dict):
                                 current = cfg_now
                             original_config = copy.deepcopy(current)
@@ -14558,7 +14578,8 @@ if __name__ == '__main__':
                             return self.reply_json(500, {'ok': False, 'error': 'Xray 未安装'})
                         try:
                             actual = subprocess.run(['systemctl', 'is-active', 'xray'],
-                                                    capture_output=True, text=True, timeout=3).stdout.strip()
+                                                    capture_output=True, text=True,
+                                                    encoding='utf-8', errors='replace', timeout=3).stdout.strip()
                         except (OSError, subprocess.SubprocessError):
                             actual = ''
                         if actual != 'active':
@@ -14570,11 +14591,7 @@ if __name__ == '__main__':
                     # Reality 已关闭时不能借「重置密钥」把它重新打开（2026-11-04 修）：重建会
                     # 写回入站、重启 Xray、重新放行端口，而回复只说「已重置密钥」。
                     xray_path = Path('/etc/hysteria/xray.json')
-                    try:
-                        cfg_now = (json.loads(xray_path.read_text(encoding='utf-8'))
-                                   if xray_path.exists() else None)
-                    except (OSError, ValueError):
-                        cfg_now = None
+                    cfg_now = _read_xray_json(xray_path)
                     if not (isinstance(cfg_now, dict) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
                         return self.reply_json(409, {'ok': False, 'error':
                             'Reality 当前未开启；请先开启 Reality，再重置密钥'})
@@ -14965,11 +14982,10 @@ if __name__ == '__main__':
                     self._extend_deadline(120)
                 xray_path = Path('/etc/hysteria/xray.json')
                 try:
-                    config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                              if xray_path.exists() else None)
-                except ValueError:
+                    config = _read_xray_json(xray_path, strict=True)
+                except (OSError, ValueError) as _xerr:
                     return self.reply_json(500, {'ok': False, 'error':
-                        'xray.json 不是合法 JSON，未做任何修改'})
+                        str(_xerr) if '未做任何修改' in str(_xerr) else 'xray.json 不是合法 JSON，未做任何修改'})
                 if config is not None and not isinstance(config, dict):
                     return self.reply_json(500, {'ok': False, 'error':
                         'xray.json 不是合法 JSON 对象，未做任何修改'})
@@ -14993,10 +15009,7 @@ if __name__ == '__main__':
                     closed_port = _valid_port(config_section(data, 'vmess_config').get('port')) or 0
                 # 在统一锁序内重读并删，防止并发启用丢配置或核心卸载竞态。
                 with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
-                    try:
-                        current = json.loads(xray_path.read_text(encoding='utf-8'))
-                    except (OSError, ValueError):
-                        current = config
+                    current = _read_xray_json(xray_path) or config
                     if not isinstance(current, dict):
                         current = config
                     original_config = copy.deepcopy(current)
@@ -15048,13 +15061,8 @@ if __name__ == '__main__':
             self._extend_deadline(30)
             installed = Path('/usr/local/bin/xray').exists()
             xray_path = Path('/etc/hysteria/xray.json')
-            active = False
-            if xray_path.exists():
-                try:
-                    cfg = json.loads(xray_path.read_text(encoding='utf-8'))
-                    active = managed_inbound_active(cfg, VMESS_INBOUND_TAG)
-                except Exception:
-                    active = False
+            cfg = _read_xray_json(xray_path)
+            active = cfg is not None and managed_inbound_active(cfg, VMESS_INBOUND_TAG)
             with data_lock:
                 # 配置可能被改成数字/字符串：dict(7) 抛 TypeError，
                 # 整个 /vmess-status 500，协议卡片整块空白。
@@ -15977,11 +15985,10 @@ if __name__ == '__main__':
                     self._extend_deadline(120)
                 xray_path = Path('/etc/hysteria/xray.json')
                 try:
-                    config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                              if xray_path.exists() else None)
-                except ValueError:
+                    config = _read_xray_json(xray_path, strict=True)
+                except (OSError, ValueError) as _xerr:
                     return self.reply_json(500, {'ok': False, 'error':
-                        'xray.json 不是合法 JSON，未做任何修改'})
+                        str(_xerr) if '未做任何修改' in str(_xerr) else 'xray.json 不是合法 JSON，未做任何修改'})
                 if config is not None and not isinstance(config, dict):
                     return self.reply_json(500, {'ok': False, 'error':
                         'xray.json 不是合法 JSON 对象，未做任何修改'})
@@ -16003,10 +16010,7 @@ if __name__ == '__main__':
                     closed_port = _valid_port(config_section(data, 'vlessenc_config').get('port')) or 0
                 # 在统一锁序内重读并删，防止并发启用丢配置或核心卸载竞态。
                 with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
-                    try:
-                        current = json.loads(xray_path.read_text(encoding='utf-8'))
-                    except (OSError, ValueError):
-                        current = config
+                    current = _read_xray_json(xray_path) or config
                     if not isinstance(current, dict):
                         current = config
                     original_config = copy.deepcopy(current)
@@ -16058,14 +16062,8 @@ if __name__ == '__main__':
             self._extend_deadline(30)
             installed = Path('/usr/local/bin/xray').exists()
             xray_path = Path('/etc/hysteria/xray.json')
-            active = False
-            if xray_path.exists():
-                try:
-                    active = managed_inbound_active(
-                        json.loads(xray_path.read_text(encoding='utf-8')),
-                        VLESSENC_INBOUND_TAG)
-                except Exception:
-                    active = False
+            _vle_cfg = _read_xray_json(xray_path)
+            active = _vle_cfg is not None and managed_inbound_active(_vle_cfg, VLESSENC_INBOUND_TAG)
             with data_lock:
                 # 同 /vmess-status：非 dict 配置会让 dict() 抛异常。
                 _e = data.get('vlessenc_config')
@@ -18159,14 +18157,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             # Reality 链接根本连不上（2026-10-24 接入 VMess 时暴露）。
             is_active = False
             if is_installed:
-                try:
-                    xray_path = Path('/etc/hysteria/xray.json')
-                    if xray_path.exists():
-                        is_active = managed_inbound_active(
-                            json.loads(xray_path.read_text(encoding='utf-8')),
-                            REALITY_INBOUND_TAG)
-                except Exception:
-                    is_active = False
+                _rcfg_disk = _read_xray_json(Path('/etc/hysteria/xray.json'))
+                is_active = _rcfg_disk is not None and managed_inbound_active(_rcfg_disk, REALITY_INBOUND_TAG)
 
             with data_lock:
                 rcfg = dict(config_section(data, 'reality_config'))
@@ -19040,10 +19032,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         if _enabled['reality_config'] and not Path('/etc/hysteria/xray.json').exists():
             _missing.append('Reality')
         if _enabled['vmess_config'] or _enabled['vlessenc_config']:
-            try:
-                _cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-            except (OSError, ValueError):
-                _cfg = {'inbounds': []}
+            _cfg = _read_xray_json('/etc/hysteria/xray.json') or {'inbounds': []}
             if _enabled['vmess_config'] and not has_managed_inbound(_cfg, VMESS_INBOUND_TAG):
                 _missing.append('VMess')
             if _enabled['vlessenc_config'] and not has_managed_inbound(_cfg, VLESSENC_INBOUND_TAG):
