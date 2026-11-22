@@ -14750,11 +14750,22 @@ if __name__ == '__main__':
 
         def _set_bbr_locked(self):
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '')
                 ver = form.get('version', ['v1'])[0].lower()
@@ -14796,12 +14807,22 @@ if __name__ == '__main__':
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp_path = target_path.with_name(target_path.name + '.tmp.' + secrets.token_hex(4))
                     try:
-                        with open(tmp_path, 'wb') as fh:
+                        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+                        fd = os.open(str(tmp_path), flags, 0o644)
+                        with os.fdopen(fd, 'wb') as fh:
                             fh.write(raw_bytes)
                             fh.flush()
                             os.fsync(fh.fileno())
                         os.chmod(str(tmp_path), 0o644)
                         os.replace(str(tmp_path), str(target_path))
+                        try:
+                            dir_fd = os.open(str(target_path.parent), os.O_RDONLY)
+                            try:
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
+                        except OSError:
+                            pass
                     except BaseException:
                         tmp_path.unlink(missing_ok=True)
                         raise
@@ -14848,7 +14869,8 @@ if __name__ == '__main__':
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
-                    raise
+                    return self.reply_json(503, {'ok': False,
+                        'error': 'BBR 已应用，但状态持久化确认不确定，请稍后刷新核对'})
                 except OSError:
                     # 先还原内存目标版本，再逐项隔离恢复文件与运行参数，避免某次 sysctl 超时导致内存残留脏版本。
                     with data_lock:
@@ -14906,11 +14928,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply(401, '登录已失效，请刷新页面重新登录'.encode('utf-8'))
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply(400, '请求体长度不合法'.encode('utf-8'))
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply(400, '请求体长度不合法'.encode('utf-8'))
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -14953,11 +14986,18 @@ if __name__ == '__main__':
                     pwd = pwd.strip() or secrets.token_hex(16)
                     if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
                         return self.reply(400, '密码不能包含换行或控制字符'.encode('utf-8'))
-                    # 同 REST 通道：非数字输入必须回 400，而不是让异常掐断连接。
+                    # 同 REST 通道：非数字或全角数字输入必须回 400，而不是让异常掐断连接。
                     try:
-                        days = int(form.get('duration_days', ['30'])[0] or 30)
-                        ip_limit = int(form.get('ip_limit', ['0'])[0] or 0)
-                        traffic_gb = float(form.get('traffic_gb', ['0'])[0] or 0)
+                        _raw_days = (form.get('duration_days', ['30'])[0] or '30').strip()
+                        _raw_ipl = (form.get('ip_limit', ['0'])[0] or '0').strip()
+                        _raw_tgb = (form.get('traffic_gb', ['0'])[0] or '0').strip()
+                        if (not _raw_days.isascii() or not _raw_days.isdigit()
+                                or not _raw_ipl.isascii() or not _raw_ipl.isdigit()
+                                or not _raw_tgb.isascii()):
+                            raise ValueError()
+                        days = int(_raw_days)
+                        ip_limit = int(_raw_ipl)
+                        traffic_gb = float(_raw_tgb)
                     except (ValueError, TypeError, OverflowError):
                         return self.reply(400, QUOTA_RANGE_ERROR)
                     # 上限 1e6 GB：没有上限时超大值会在 int() 处抛 OverflowError。
@@ -14966,7 +15006,7 @@ if __name__ == '__main__':
                             or not 0 <= traffic_gb <= 1000000):
                         return self.reply(400, QUOTA_RANGE_ERROR)
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
-                    note = form.get('note', [''])[0].strip()[:200]
+                    note = re.sub(r'[\x00-\x1f\x7f]', ' ', form.get('note', [''])[0]).strip()[:200]
                     # 🔴 2026-10-09 修：原来是无条件赋值，同名 id 会被**静默覆盖** ——
                     # 密码被改、used_bytes 归零（已购/已用流量凭空消失）、有效期重算，
                     # 而用户拿到的是 200 成功响应。API 那条路径有 create_only 守卫，
@@ -14984,12 +15024,16 @@ if __name__ == '__main__':
                         if existing is not None:
                             _pw = existing.get('password')
                             tail = _pw[-4:] if isinstance(_pw, str) else ''
-                            # 数据被改坏时 int('x') 会抛 ValueError，这里只影响
+                            # 数据被改坏时 int('x') / int(inf) 会抛异常，这里只影响
                             # 一条提示文案，不值得让整个 409 变成 500（2026-10-30 修）。
-                            try:
-                                _used = int(existing.get('used_bytes') or 0)
-                            except (TypeError, ValueError):
+                            _raw_used = existing.get('used_bytes')
+                            if isinstance(_raw_used, bool):
                                 _used = 0
+                            else:
+                                try:
+                                    _used = max(0, int(_raw_used or 0))
+                                except (TypeError, ValueError, OverflowError):
+                                    _used = 0
                             used_gb = round(_used / (1024 ** 3), 2)
                             conflict = ('exists', tail, used_gb)
                         elif password_taken(data['users'], pwd, user_id):
@@ -15055,8 +15099,9 @@ if __name__ == '__main__':
                             previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
                             previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
                             previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
-                            data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
-                            data['users'].pop(user_id, None)
+                            data['_pending_revocations'] = sorted(pending_revocations(data) | {user_id})
+                            if isinstance(data.get('users'), dict):
+                                data['users'].pop(user_id, None)
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
@@ -15072,10 +15117,12 @@ if __name__ == '__main__':
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply(404, '该用户已不存在（可能已在别处删除），请刷新页面'.encode('utf-8'))
 
+                durability_uncertain = False
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
-                    raise
+                    # 文件已替换但目录 fsync 失败：仍须执行协议同步/撤权，并返回明确 503。
+                    durability_uncertain = True
                 except OSError:
                     with data_lock:
                         if previous_had_user:
@@ -15123,7 +15170,7 @@ if __name__ == '__main__':
                     raise
                 if not self._sync_reality_clients():
                     with data_lock:
-                        if action == 'delete':
+                        if action == 'delete' or durability_uncertain:
                             revoked_pending = True
                         else:
                             revoked_pending = False
@@ -15134,8 +15181,9 @@ if __name__ == '__main__':
                                 data.setdefault('users', {})[user_id] = previous_user
                     if revoked_pending:
                         # 锁外重建页面并持久化：用户已删仅待断开连接，页面状态须与最新 users 对齐。
-                        regenerate_page()
-                        return self.reply(503, '用户已删除，但节点上的旧连接还没确认断开，后台会自动重试；请稍后刷新页面确认'
+                        if not durability_uncertain:
+                            regenerate_page()
+                        return self.reply(503, '用户操作已落盘，但节点状态同步尚未确认，后台会自动重试；请稍后刷新页面确认'
                                           .encode('utf-8'))
                     try:
                         save_data()
@@ -15143,6 +15191,8 @@ if __name__ == '__main__':
                         _log_ignored('manage_user_rollback_save', rb_exc)
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
+                if durability_uncertain:
+                    return self.reply(503, '用户操作已提交，但持久化目录同步不确定，请刷新页面核对状态'.encode('utf-8'))
                 regenerate_page()
                 self.send_response(302)
                 self._responded = True
