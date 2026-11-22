@@ -108,21 +108,26 @@ die()  {
 
 log_line() {
     [ -n "$LOG" ] || return 0
+    [ ! -L "$LOG" ] || return 0
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null || true
 }
 
 # 日志文件可能初始化失败（比如 /root 不存在、或目录只读）。
 # ★ 踩坑：曾经直接 `: > "$LOG"` 且不接错误处理，一旦失败就整个脚本崩在
 #   这里，且错误信息一行 `No such file or directory` 让人摸不着头脑。
-#   现在：显式判断目录 → 建目录 → 试写 → 不行就把 LOG 置空（降级为不打日志，
+#   现在：显式判断目录 → 建目录 → 拒绝符号链接 → 试写 → 不行就把 LOG 置空（降级为不打日志，
 #   而不是让脚本挂掉）。
 init_log() {
     [ -n "$LOG" ] || return 0
+    if [ -L "$LOG" ]; then
+        LOG=""
+        return 0
+    fi
     _logdir="$(dirname "$LOG")"
     if [ ! -d "$_logdir" ]; then
         mkdir -p "$_logdir" 2>/dev/null || { LOG=""; return 0; }
     fi
-    if ! ( umask 077; : > "$LOG" ) 2>/dev/null; then
+    if [ -L "$LOG" ] || ! ( umask 077; : > "$LOG" ) 2>/dev/null; then
         LOG=""
         return 0
     fi
@@ -221,6 +226,41 @@ disk_devices() {
     esac
 }
 
+# 校验网卡名、IPv4 地址与掩码长度，避免把畸形网络参数传给 InstallNET 导致重装后失联
+valid_iface() {
+    case "${1:-}" in
+        ''|.|..|-*|*[!A-Za-z0-9._:@-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 15 ]
+}
+
+valid_ipv4() {
+    _vi_ip="${1:-}"
+    case "$_vi_ip" in
+        ''|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+    esac
+    _vi_old_ifs="$IFS"
+    IFS='.'
+    # shellcheck disable=SC2086
+    set -- $_vi_ip
+    IFS="$_vi_old_ifs"
+    [ $# -eq 4 ] || return 1
+    for _vi_o in "$1" "$2" "$3" "$4"; do
+        case "$_vi_o" in
+            ''|0?*|*[!0-9]*) return 1 ;;
+        esac
+        [ "${#_vi_o}" -le 3 ] && [ "$_vi_o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+valid_cidr() {
+    case "${1:-}" in
+        ''|0*|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#1}" -le 2 ] && [ "$1" -ge 1 ] && [ "$1" -le 32 ]
+}
+
 # 打印开头整段注释：写死行号会把后面的常量与默认值代码一起打出来（2026-11-12 修）。
 print_help() {
     for _f in "$0" rd13.sh; do
@@ -256,15 +296,17 @@ esac
 case "$PORT" in
     ''|0*|*[!0-9]*) die "SSH 端口必须是无前导零的正整数，当前是：$PORT" ;;
 esac
-[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "SSH 端口超出范围（1-65535）：$PORT"
+[ "${#PORT}" -le 5 ] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "SSH 端口超出范围（1-65535）：$PORT"
 
 case "$SWAP_MB" in
-    ''|*[!0-9]*) die "swap 大小必须是非负整数（MB），当前是：$SWAP_MB" ;;
+    ''|0?*|*[!0-9]*) die "swap 大小必须是无前导零的非负整数（MB），当前是：$SWAP_MB" ;;
 esac
+[ "${#SWAP_MB}" -le 6 ] || die "swap 大小数值过大（上限 999999 MB），当前是：$SWAP_MB"
 
 case "$RELEASE" in
     ''|0*|*[!0-9]*) die "Debian 版本号必须是正整数（如 12 / 13），当前是：$RELEASE" ;;
 esac
+[ "${#RELEASE}" -le 2 ] || die "Debian 版本号超出合理位数（当前是：$RELEASE）"
 
 [ -n "$MIRROR" ] || die "镜像地址不能为空"
 case "$MIRROR" in
@@ -389,6 +431,10 @@ if [ -z "$MAIN_IFACE" ] || [ -z "$MAIN_IP" ] || [ -z "$MAIN_GATE" ] || [ -z "$CI
        网卡=[$MAIN_IFACE] IP=[$MAIN_IP] 网关=[$MAIN_GATE] 掩码=[$CIDR_NUM]
        请确认已联网后再运行本脚本"
 fi
+valid_iface "$MAIN_IFACE" || die "提取到的网卡名格式异常：$MAIN_IFACE"
+valid_ipv4 "$MAIN_IP" || die "提取到的 IPv4 地址格式异常：$MAIN_IP"
+valid_ipv4 "$MAIN_GATE" || die "提取到的默认网关格式异常：$MAIN_GATE"
+valid_cidr "$CIDR_NUM" || die "提取到的子网掩码长度异常：$CIDR_NUM"
 
 printf '\n'
 printf '   %s网卡%s    %s\n' "$c_c" "$c_0" "$MAIN_IFACE"
@@ -557,7 +603,10 @@ info "第 5/6 步：确认重装参数"
 if [ -z "$PASSWORD" ]; then
     # 默认密码一律随机生成：原来交互模式回车给的是 rd13+月日，总共约 372 种可能，
     # 而新系统开着 root 密码登录 SSH，装好就会被扫到。
-    _random_pwd="$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-16)"
+    _random_pwd="$(head -c 18 /dev/urandom | od -An -tx1 | tr -d ' \t\r\n' | cut -c1-16)"
+    if [ "${#_random_pwd}" -lt 12 ] || ! password_ok "$_random_pwd"; then
+        die "随机密码生成失败（/dev/urandom 或 od 异常），请通过 --pwd 显式指定 root 密码"
+    fi
     if [ "$ASSUME_YES" = "1" ]; then
         PASSWORD="$_random_pwd"
     else
@@ -698,9 +747,13 @@ download_installnet || die "下载 InstallNET.sh 失败。请检查网络后重�
 chmod 700 "$IN_FILE" 2>/dev/null || true
 
 # 校验下载完整性：InstallNET.sh 正常有 270KB 左右
-_size="$(wc -c < "$IN_FILE" 2>/dev/null | tr -d ' ')"
-if [ -z "$_size" ] || [ "$_size" -lt 50000 ]; then
-    die "下载的文件异常（只有 ${_size:-0} 字节，应为 270KB 左右）。
+[ ! -L "$IN_FILE" ] || die "下载目标 $IN_FILE 为符号链接，已拒绝执行"
+_size="$(wc -c < "$IN_FILE" 2>/dev/null | tr -d '[:space:]')"
+case "$_size" in
+    ''|*[!0-9]*) _size="" ;;
+esac
+if [ -z "$_size" ] || [ "${#_size}" -gt 8 ] || [ "$_size" -lt 50000 ] || [ "$_size" -gt 2097152 ]; then
+    die "下载的文件异常（${_size:-0} 字节，应在 50000~2097152 字节之间）。
        可能是网络被劫持或返回了错误页面。请重试或检查网络。"
 fi
 ok "已下载 InstallNET.sh（$_size 字节）"

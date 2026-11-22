@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import pathlib
+import stat
 import sys
 import threading
 import time
@@ -60,6 +61,9 @@ def _source_fresh(health, source, max_age=30):
     """
     if not isinstance(health, dict):
         return False
+    if (isinstance(max_age, bool) or not isinstance(max_age, (int, float))
+            or not math.isfinite(max_age) or max_age <= 0):
+        max_age = 30
     entry = health.get(source)
     if not isinstance(entry, dict) or not entry.get('ok'):
         return False
@@ -84,6 +88,8 @@ def _recent_gaps(m, window_seconds=86400):
     与「计量真的坏了」（2026-10-29 修）。
     没有时间戳的条目按「最近」处理（保守，宁可报异常）。
     """
+    if not isinstance(m, dict):
+        return [{'reason': 'invalid_meter_container'}]
     gaps = m.get('gaps', [])
     if not isinstance(gaps, list):
         return [{'reason': 'invalid_gaps_container'}]
@@ -100,7 +106,7 @@ def _recent_gaps(m, window_seconds=86400):
     cache_key = (gaps, int(time.time() // 30), window_seconds)
     with _recent_gaps_lock:
         if _recent_gaps_cache.get('key') == cache_key:
-            return list(_recent_gaps_cache['value'])
+            return copy.deepcopy(_recent_gaps_cache['value'])
     cutoff = time.time() - window_seconds
     recent = []
     for gap in gaps:
@@ -115,10 +121,11 @@ def _recent_gaps(m, window_seconds=86400):
             continue
         if when >= cutoff:
             recent.append(gap)
-    # 内容快照保留原地修改检测；命中时返回副本，防止调用方修改污染缓存。
+    # 内容快照保留原地修改检测；命中与返回均提供深拷贝副本，防止调用方修改内部字典污染缓存。
+    snapshot_val = copy.deepcopy(recent)
     with _recent_gaps_lock:
-        _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=list(recent))
-    return list(recent)
+        _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=snapshot_val)
+    return copy.deepcopy(snapshot_val)
 
 def _users_view(data):
     """门户的用户表；损坏（null/list/str）时按空表处理。
@@ -132,7 +139,7 @@ def _users_view(data):
 
 
 def _measurement_total(meter, enabled, uid):
-    if not isinstance(uid, str):
+    if not isinstance(uid, str) or not uid:
         return None
     sources=meter.get('sources')
     if not enabled or not isinstance(sources,dict):
@@ -195,6 +202,8 @@ class PortalMeter:
         self.live_next_at=0
 
     def configured_sources(self):
+        if not isinstance(self.config, dict):
+            return []
         sources=[s for s in ("hysteria", "reality") if self.config.get(s)]
         # 默认安装会写 Reality 配置，但未安装 xray 时不应阻塞 Hy2 计量。
         cfg=self.config.get("reality", {})
@@ -275,12 +284,17 @@ class PortalMeter:
                     if idle:
                         continue
                 before=self.epoch(service)
+                if (not isinstance(before, str) or not before
+                        or any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in before)):
+                    raise ValueError('invalid_service_epoch')
                 counters=self.read(source,cfg)
                 if self.epoch(service)!=before: raise RuntimeError('service_changed_during_read')
                 # self.lock 是门户共享的可重入 data_lock：采样写入、保存及
                 # 失败回滚必须是同一事务，避免对账看到未提交的累计。
                 # on_speed 留在锁外，避免回调引入额外锁顺序。
                 with self.lock:
+                    if not isinstance(self.data, dict):
+                        raise ValueError('invalid portal data container')
                     raw_meter=self.data.get('usage_meter',{})
                     if not isinstance(raw_meter, dict):
                         raise ValueError('invalid usage_meter container')
@@ -289,11 +303,11 @@ class PortalMeter:
                     # 注意：registered_users 只用于诊断（首次接入时记录当时的账户集合），
                     # 计量准入完全由 totals/sources 决定，没有任何代码读取它。
                     users_view=_users_view(self.data)
-                    meter.setdefault('registered_users', list(users_view))
+                    meter.setdefault('registered_users', [u for u in users_view if isinstance(u, str) and u])
                     # 已存在客户在后续才第一次出现在计数器中时，core 从零累加是有效的：
                     # 当前服务为所有用户保持单调累计，且初始窗口无计数表示0。
                     active_users = ({uid for uid, user in users_view.items()
-                                     if isinstance(user, dict) and self.user_allowed(user)}
+                                     if isinstance(uid, str) and uid and isinstance(user, dict) and self.user_allowed(user)}
                                     if self.user_allowed is not None else None)
                     outcome = core.apply_sample(meter,source,before,counters,now,
                                                 active_users=active_users)
@@ -303,15 +317,24 @@ class PortalMeter:
                     meter.setdefault('started_at',now)
                     old=self.data.get('usage_meter')
                     user_changes=[]
-                    # 先验证所有待写账户，后面的损坏累计不能让前面的账户半提交。
+                    # 先验证所有待写账户，后面的损坏累计不能让前面的账户半提交；
+                    # 跳过空串或非字符串脏用户键，防止单条坏键拖死全节点流量采样。
                     adjusted={uid: core.adjusted_bytes(meter, uid)
                               for uid, user in users_view.items()
-                              if isinstance(user, dict)}
+                              if isinstance(uid, str) and uid and isinstance(user, dict)}
                     for uid, user in users_view.items():
-                        if not isinstance(user, dict):
+                        if not isinstance(uid, str) or not uid or not isinstance(user, dict):
                             continue
                         user_before={k: user[k] for k in ('used_bytes', 'legacy_auth_value') if k in user}
-                        user.setdefault('legacy_auth_value', user.get('used_bytes', 0))
+                        if 'legacy_auth_value' not in user:
+                            raw_used = user.get('used_bytes', 0)
+                            if (isinstance(raw_used, int) and not isinstance(raw_used, bool) and raw_used >= 0):
+                                user['legacy_auth_value'] = raw_used
+                            elif (isinstance(raw_used, float) and math.isfinite(raw_used)
+                                  and raw_used >= 0 and raw_used.is_integer()):
+                                user['legacy_auth_value'] = int(raw_used)
+                            else:
+                                user['legacy_auth_value'] = 0
                         user['used_bytes']=adjusted[uid]
                         user_after={k: user[k] for k in ('used_bytes', 'legacy_auth_value')}
                         user_changes.append((uid, user, user_before, user_after))
@@ -347,14 +370,20 @@ class PortalMeter:
                 with self.lock:
                     self.failed_sources.discard(source)
                 self.sample_times[source]=sampled
-                if self.on_speed is not None and interval > 0:
+                if self.on_speed is not None and math.isfinite(interval) and interval > 0:
                     for uid, pair in deltas.items():
+                        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                            continue
                         try:
                             self.on_speed(uid, pair[0], pair[1], interval, source)
                         except Exception as exc:
                             print(f'[meter] on_speed failed: {type(exc).__name__}', file=sys.stderr)
             except Exception as exc:
                 with self.lock:
+                    if not isinstance(self.data, dict):
+                        self.failed_sources.add(source)
+                        print('[meter] invalid portal data container', file=sys.stderr)
+                        continue
                     missing=object()
                     old_meter=self.data.get('usage_meter',missing)
                     failed_meter=self.data.setdefault('usage_meter',{})
@@ -491,7 +520,10 @@ class PortalMeter:
 
 def from_file(data,lock,save,path,on_speed=None):
     cfg_path = pathlib.Path(path)
-    if cfg_path.stat().st_size > 2 * 1024 * 1024:
+    st = cfg_path.lstat()
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ValueError('usage meter config must be a regular file')
+    if st.st_size > 2 * 1024 * 1024:
         raise ValueError('usage meter config too large')
     config=json.loads(cfg_path.read_text(encoding='utf-8'))
     return PortalMeter(data,lock,save,config,on_speed=on_speed)

@@ -1424,12 +1424,17 @@ async function probeOutbound(kind, addr, insecure = false) {
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
     if (seq !== probeOutbound._seq) return;
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      throw new Error('登录已失效，请刷新页面重新登录');
+    }
     if (res.ok === false || !json || !json.ok) {
       throw new Error((json && json.error) || ('探测失败（HTTP ' + res.status + '）'));
     }
-    if (json.ip) {
-      obEls.ip.textContent = json.ip;
-      if (obEls.ipNote) obEls.ipNote.textContent = '探测地址：' + json.ip + '；客户端实际出口仍取决于当前模式与分流规则';
+    const probedIp = (typeof json.ip === 'string') ? json.ip.trim() : '';
+    if (probedIp) {
+      obEls.ip.textContent = probedIp;
+      if (obEls.ipNote) obEls.ipNote.textContent = '探测地址：' + probedIp + '；客户端实际出口仍取决于当前模式与分流规则';
     } else {
       obEls.ip.textContent = '探测失败';
       if (obEls.ipNote) {
@@ -2926,7 +2931,10 @@ function renderCore(core) {
   head.appendChild(coreEl('div', 'core-name', core.name));
   const pill = coreEl('span', 'status-pill');
   if (core.installed) {
-    const st = CORE_STATE_TEXT[core.state] || ['● ' + core.state, '#f1efe8', '#5f5e5a'];
+    const stateKey = (typeof core.state === 'string') ? core.state : '';
+    const st = Object.prototype.hasOwnProperty.call(CORE_STATE_TEXT, stateKey)
+      ? CORE_STATE_TEXT[stateKey]
+      : ['● ' + (stateKey || '状态未知'), '#f1efe8', '#5f5e5a'];
     pill.textContent = '已安装 · ' + st[0];
     pill.style.background = st[1];
     pill.style.color = st[2];
@@ -2947,7 +2955,7 @@ function renderCore(core) {
   };
   line('版本', core.installed ? (core.version || '未知') : '—');
   line('服务', core.service || '—');
-  line('用于', Array.isArray(core.used_by) ? core.used_by.join('、') : (typeof core.used_by === 'string' ? core.used_by : ''));
+  line('用于', Array.isArray(core.used_by) ? core.used_by.filter(x => typeof x === 'string' && x).join('、') : (typeof core.used_by === 'string' ? core.used_by : ''));
   card.appendChild(meta);
   if (core.note) card.appendChild(coreEl('div', 'core-note', core.note));
 
@@ -2983,6 +2991,10 @@ async function loadCores() {
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
     if (seq !== coresSeq) return;
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      throw new Error('登录已失效，请刷新页面重新登录');
+    }
     if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('HTTP ' + res.status));
     coreGrid.textContent = '';
     // 后端异常时 cores 可能不是数组（错误对象/undefined），直接 forEach 会
@@ -2996,7 +3008,7 @@ async function loadCores() {
 }
 
 async function installCore(core, btn) {
-  if (btn.disabled) return;
+  if (!core || !btn || btn.disabled) return;
   const confirmed = await showConfirm({
     title: (core.installed ? '重新安装 ' : '安装 ') + core.name,
     text: '将从官方 Release 下载并校验 SHA256 后安装，只安装核心程序，不会自动开启任何协议。可能需要一两分钟。',
@@ -3028,7 +3040,7 @@ async function installCore(core, btn) {
 }
 
 async function uninstallCore(core, btn) {
-  if (btn.disabled) return;
+  if (!core || !btn || btn.disabled) return;
   const confirmed = await showConfirm({
     title: '卸载 ' + core.name,
     text: '将停止并删除 ' + core.name + ' 程序与 systemd 服务。若还有协议在使用它会被拒绝，请先到协议页关闭。协议的配置会保留，重新安装后再开启即可沿用。',
@@ -3680,6 +3692,10 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       // 若网关返回非 JSON 502 错误页则优雅回退为含状态码提示，不暴露底层 SyntaxError。
       const json = await res.json().catch(() => null);
       if (mySeq !== userModalSeq) return;
+      if (res.status === 401) {
+        if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+        throw new Error('登录已失效，请刷新页面重新登录');
+      }
       if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('网络请求异常 (HTTP ' + res.status + ')'));
       
       uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
@@ -3704,16 +3720,26 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       // 与用户表、后端 format_bytes 同一写法（2026-11-13 修）：此前 KB 显示两位小数，
       // 同一个用量在表格里是「1.5 KB」、弹窗里是「1.50 KB」。
       const fmtBytes = v => fmtUnits(v, ['B', 'KB', 'MB', 'GB', 'TB'], [0, 1, 2, 2, 2]);
-      let trafficText = (json.traffic_limit > 0)
+      const hasLimit = typeof json.traffic_limit === 'number' && Number.isFinite(json.traffic_limit) && json.traffic_limit > 0;
+      let trafficText = hasLimit
         ? (fmtBytes(json.traffic_used) + ' / ' + fmtBytes(json.traffic_limit))
         : (fmtBytes(json.traffic_used) + ' (不限)');
       // 与后端 _expiry_text 同一条规则：只有「没有到期时间」才是永久。
       // 旧阈值 2e9（2033 年）会把十年有效的用户显示成永久有效（2026-10-30 修）。
       // 优先用服务端渲染的文本（带服务器时区），与用户表 / 分享页一字不差（2026-11-04 修）
-      let expireText = json.expires_text || ((json.expires_at === null || json.expires_at === undefined)
-        ? '永久有效'
-        : new Date(json.expires_at * 1000).toLocaleString());
-      let ipText = (json.ip_limit > 0) ? (json.ip_limit + ' IP') : '不限';
+      let expireText = (typeof json.expires_text === 'string' && json.expires_text) ? json.expires_text : '';
+      if (!expireText) {
+        if (json.expires_at === null || json.expires_at === undefined) {
+          expireText = '永久有效';
+        } else if (typeof json.expires_at === 'number' && Number.isFinite(json.expires_at)) {
+          const dt = new Date(json.expires_at * 1000);
+          expireText = Number.isFinite(dt.getTime()) ? dt.toLocaleString() : '未知';
+        } else {
+          expireText = '未知';
+        }
+      }
+      const hasIpLimit = typeof json.ip_limit === 'number' && Number.isFinite(json.ip_limit) && json.ip_limit > 0;
+      let ipText = hasIpLimit ? (json.ip_limit + ' IP') : '不限';
       
       uModalBody.innerHTML = `${userStatusBanner(json.status_text)}
         <div class="user-meta-bar">
@@ -3821,8 +3847,12 @@ function awgPost(endpoint, params) {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams(params).toString()
+    body: new URLSearchParams(params || {}).toString()
   }).then(async r => {
+    if (r.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      return { ok: false, error: '登录已过期，请刷新页面重新登录' };
+    }
     const data = await r.json().catch(() => null);
     if (!data || typeof data !== 'object') {
       return { ok: false, error: '服务返回非 JSON 响应 (HTTP ' + r.status + ')' };
