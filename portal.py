@@ -14604,16 +14604,15 @@ if __name__ == '__main__':
             cert_file, key_file, sni = self._vmess_certificate(domain, 'VLESS Encryption')
             with data_lock:
                 old = dict(config_section(data, 'vlessenc_config'))
-                blocked_ports = set()
-                for _cand_p in (
-                    m.get('listen_port'),
-                    m.get('subscription_port'),
-                    config_section(data, 'reality_config').get('port'),
-                    config_section(data, 'vmess_config').get('port'),
-                ):
-                    _vp = _valid_port(_cand_p)
-                    if _vp:
-                        blocked_ports.add(_vp)
+                blocked_ports = {
+                    _valid_port(_cand_p) or None
+                    for _cand_p in (
+                        m.get('listen_port'),
+                        m.get('subscription_port'),
+                        config_section(data, 'reality_config').get('port'),
+                        config_section(data, 'vmess_config').get('port'),
+                    )
+                }
             try:
                 _xp_cfg = Path('/etc/hysteria/xray.json')
                 if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:

@@ -32,11 +32,16 @@ class TestAwgctlSnapshotFirewallUpdateHpkeyClientQrAndCliGuards(unittest.TestCas
         allow = _extract_fn('allow_firewall')
         self.assertIn('if ufw allow "${port}/udp" >/dev/null 2>&1; then', allow)
         self.assertIn('log_warn "UFW 放行 ${port}/udp 失败', allow)
-        self.assertIn('if firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then', allow)
+        self.assertIn('firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1', allow)
+        self.assertIn('&& firewall-cmd --reload >/dev/null 2>&1 || _fw_rc=$?', allow)
+        self.assertIn('if (( _fw_rc == 0 )); then', allow)
+        self.assertIn('log_warn "firewalld 放行 ${port}/udp 失败', allow)
 
         revoke = _extract_fn('revoke_firewall')
         self.assertIn('if ufw delete allow "${port}/udp" >/dev/null 2>&1; then', revoke)
-        self.assertIn('if firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then', revoke)
+        self.assertIn('firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1', revoke)
+        self.assertIn('&& firewall-cmd --reload >/dev/null 2>&1 || _fw_rc=$?', revoke)
+        self.assertIn('log_warn "firewalld 收回 ${port}/udp 失败', revoke)
 
     def test_cmd_update_regenerates_dirty_hpkey_and_rejects_blank_or_ctrl_genkey(self):
         """cmd_update 升至 3.x 时遇到含空白/控制字符的脏 HeaderProtectionKey 必须重新生成，且校验新密钥不含控制字符。"""

@@ -936,7 +936,10 @@ allow_firewall() {
         fi
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        if firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then
+        local _fw_rc=0
+        firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 \
+            && firewall-cmd --reload >/dev/null 2>&1 || _fw_rc=$?
+        if (( _fw_rc == 0 )); then
             log_info "已放行 firewalld: ${port}/udp"
         else
             log_warn "firewalld 放行 ${port}/udp 失败，请手工核查防火墙规则"
@@ -956,7 +959,10 @@ revoke_firewall() {
         fi
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        if firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then
+        local _fw_rc=0
+        firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1 \
+            && firewall-cmd --reload >/dev/null 2>&1 || _fw_rc=$?
+        if (( _fw_rc == 0 )); then
             revoked=1
         else
             log_warn "firewalld 收回 ${port}/udp 失败，请手工核查防火墙规则"
