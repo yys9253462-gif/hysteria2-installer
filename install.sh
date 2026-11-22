@@ -1553,7 +1553,10 @@ setup_cert_via_existing_caddy() {
     command -v caddy >/dev/null 2>&1 || { log_err "未找到 caddy 命令。"; return 1; }
     local domain_lc
     domain_lc="$(printf '%s' "$domain" | tr 'A-Z' 'a-z')"
-    if ! is_valid_domain "$domain_lc"; then
+    # 零外部函数依赖的内联域名校验（独立摘出本函数测试时无需依赖 is_valid_domain）
+    if [[ -z "$domain_lc" || ${#domain_lc} -gt 253 || "$domain_lc" == *..* \
+        || "${domain_lc##*.}" =~ ^[0-9]+$ \
+        || ! "$domain_lc" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
         log_err "域名格式不合法，已拒绝写入 Caddyfile: ${domain}"
         return 1
     fi

@@ -137,11 +137,19 @@ class FixCertChainHardeningTests(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual(res.stdout.strip(), "1", f"注释行不应计作证书，实际={res.stdout!r}")
 
-    def test_masq_https_port_rejects_leading_zero_and_overlong_digits(self):
+    def test_masq_https_port_strips_leading_zero_and_rejects_overlong_or_out_of_range_digits(self):
         with tempfile.TemporaryDirectory(prefix="hy2-fcc-port-") as td:
             cfg = Path(td) / "config.yaml"
             cfg_posix = "/" + cfg.as_posix()[0].lower() + cfg.as_posix()[2:] if os.name == "nt" and cfg.as_posix()[1] == ":" else cfg.as_posix()
-            for bad in ("  listenHTTPS: :08443\n", "  listenHTTPS: :000443\n", "  listenHTTPS: :123456\n"):
+            # 既有契约：合法前导零端口须规范化剥零
+            cfg.write_text('listen: :443\nmasquerade:\n  listenHTTPS: "0.0.0.0:08443"\n', encoding="utf-8")
+            res_ok = subprocess.run(
+                [BASH, "-c", self._func("masq_https_port") + f'masq_https_port "{cfg_posix}"\n'],
+                capture_output=True, text=True, encoding="utf-8", timeout=15,
+            )
+            self.assertEqual(res_ok.stdout.strip(), "8443")
+
+            for bad in ("  listenHTTPS: :0\n", "  listenHTTPS: :123456\n", "  listenHTTPS: :" + "9" * 40 + "\n"):
                 cfg.write_text("listen: :443\nmasquerade:\n" + bad, encoding="utf-8")
                 res = subprocess.run(
                     [BASH, "-c", self._func("masq_https_port") + f'masq_https_port "{cfg_posix}"\n'],

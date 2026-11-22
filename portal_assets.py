@@ -2824,7 +2824,7 @@ if (btnRebootServer) {
             back = false;
           }
           if (back) {
-            location.reload();
+            try { location.reload(); } finally { btnRebootServer.disabled = false; }
             return;
           }
           btnRebootServer.disabled = false;
@@ -3231,14 +3231,13 @@ async function doUpgrade(target) {
         await new Promise(resolve => setTimeout(resolve, 3000));
         const back = await waitPortalBack();
         if (updateStatusMsg) updateStatusMsg.textContent = back ? '面板已恢复，正在刷新...' : '面板长时间未恢复，请稍后手动刷新页面';
-        reloading = Boolean(back);
         if (back) { location.reload(); return; }
         if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
         return;
       }
       reloading = true;
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
-      setTimeout(() => location.reload(), 5000);
+      setTimeout(() => { try { location.reload(); } finally { doUpgrade._busy = false; } }, 5000);
     } else {
       const errMsg = (json && json.error) || ('升级失败 (HTTP ' + res.status + ')');
       alert(errMsg);

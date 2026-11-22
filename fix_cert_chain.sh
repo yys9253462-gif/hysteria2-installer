@@ -110,7 +110,7 @@ masq_https_port () {   # $1=config
             sub(/[[:space:]]+#.*$/, "", v)
             gsub(/["\047[:space:]]/, "", v)
             n = split(v, parts, ":"); v = parts[n]
-            if (v ~ /^[1-9][0-9]*$/ && length(v) <= 5 && v + 0 >= 1 && v + 0 <= 65535) { print v + 0; exit }
+            if (v ~ /^[0-9]+$/ && length(v) <= 16 && v + 0 >= 1 && v + 0 <= 65535) { print v + 0; exit }
         }' "$1"
 }
 # 验证用的 SNI：先取 SAN 里第一个 DNS 名（通配符换成 www.），没有 SAN 再退回 CN，
