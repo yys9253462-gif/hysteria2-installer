@@ -2591,7 +2591,7 @@ setup_system_firewall() {
             # 用 read 拆分而不是 set --，避免覆盖函数自身的位置参数（$1/$2/$3）。
             local nft_fam nft_tbl nft_chain
             read -r nft_fam nft_tbl nft_chain <<<"$nft_input"
-            if [[ ! "$nft_fam" =~ ^[A-Za-z0-9_.-]+$ || ! "$nft_tbl" =~ ^[A-Za-z0-9_.-]+$ || ! "$nft_chain" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            if [[ ! "$nft_fam" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ || ! "$nft_tbl" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ || ! "$nft_chain" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ ]]; then
                 continue
             fi
             # 幂等判据必须**逐条规则**判断。旧实现只在「主 UDP 端口已放行」时
@@ -3866,6 +3866,20 @@ EOUG
 
 setup_systemd() {
     log_step "配置 systemd 系统守护服务: ${HY2_SERVICE}..."
+    local _unit_v
+    for _unit_v in "$HY2_DIR" "$HY2_BIN" "$HY2_CONFIG" "$HY2_SERVICE" "$HY2_LOG_DROPIN"; do
+        case "$_unit_v" in
+            *$'\n'*|*$'\r'*) log_err "systemd 服务路径含非法换行字符，已中止。"; return 1 ;;
+        esac
+        if [[ "$_unit_v" =~ [[:cntrl:]] || "$_unit_v" =~ [%$] ]]; then
+            log_err "systemd 服务路径含非法控制字符或说明符（%/$），已中止。"
+            return 1
+        fi
+    done
+    if [[ -L "$HY2_DIR" ]]; then
+        log_err "${HY2_DIR} 是符号链接，拒绝写入。"
+        return 1
+    fi
     mkdir -p "$HY2_DIR"
     if [[ -L "$HY2_DIR/.hy2-installer-owned" ]]; then
         log_err "${HY2_DIR}/.hy2-installer-owned 是符号链接，拒绝写入。"
@@ -3878,12 +3892,6 @@ setup_systemd() {
         log_err "${HY2_SERVICE} 是符号链接，拒绝写入。"
         return 1
     fi
-    local _unit_v
-    for _unit_v in "$HY2_DIR" "$HY2_BIN" "$HY2_CONFIG" "$HY2_SERVICE" "$HY2_LOG_DROPIN"; do
-        case "$_unit_v" in
-            *$'\n'*|*$'\r'*) log_err "systemd 服务路径含非法换行字符，已中止。"; return 1 ;;
-        esac
-    done
     
     # 系统内核网络与 UDP 缓冲优化 (BUGFIX #13: 同时持久化到 /etc/sysctl.d/)
     # 共享路径已有非本安装器文件或符号链接时禁止覆盖；卸载也只会移除 marker 所属文件。
@@ -3961,8 +3969,8 @@ EOF
         *) log_warn "HY2_LOG_LEVEL=${HY2_LOG_LEVEL} 不受支持，改用 info"; HY2_LOG_LEVEL=info ;;
     esac
     if [[ -n "$HY2_LOG_LEVEL_EXPLICIT" || ! -f "$HY2_LOG_DROPIN" ]]; then
-        if [[ -L "$HY2_LOG_DROPIN" ]]; then
-            log_err "${HY2_LOG_DROPIN} 是符号链接，拒绝写入。"
+        if [[ -L "${HY2_LOG_DROPIN%/*}" || -L "$HY2_LOG_DROPIN" ]]; then
+            log_err "${HY2_LOG_DROPIN} 或其父目录是符号链接，拒绝写入。"
             return 1
         fi
         mkdir -p "${HY2_LOG_DROPIN%/*}"
@@ -6786,7 +6794,8 @@ uninstall_all() {
             done
         fi
         # 本工具装的 acme.sh 续期定时器（无 cron 的机器）：描述行是归属标记。
-        if grep -qF '(hysteria2-installer)' /etc/systemd/system/hy2-acme-renew.timer 2>/dev/null; then
+        if [[ ! -L /etc/systemd/system/hy2-acme-renew.timer ]] \
+                && grep -qF '(hysteria2-installer)' /etc/systemd/system/hy2-acme-renew.timer 2>/dev/null; then
             systemctl disable --now hy2-acme-renew.timer >/dev/null 2>&1 || true
             rm -f /etc/systemd/system/hy2-acme-renew.timer /etc/systemd/system/hy2-acme-renew.service
         fi
@@ -6808,16 +6817,20 @@ uninstall_all() {
         # 机主自己的 gost 保留了配置，它的代理端口也照旧放行。
         if [[ "$preserve_gost_config" == 1 ]]; then close_installer_ports 0; else close_installer_ports 1; fi
         rm -f "$HY2_SERVICE"
-        if [[ -f "$HY2_LOG_DROPIN" ]] && grep -qF '由 hysteria2-installer 生成' "$HY2_LOG_DROPIN"; then
-            rm -f "$HY2_LOG_DROPIN"
-            rmdir "${HY2_LOG_DROPIN%/*}" 2>/dev/null || true
+        if [[ ! -L "$HY2_LOG_DROPIN" && -f "$HY2_LOG_DROPIN" ]] && grep -qF '由 hysteria2-installer 生成' "$HY2_LOG_DROPIN"; then
+            rm -f -- "$HY2_LOG_DROPIN"
+            rmdir -- "${HY2_LOG_DROPIN%/*}" 2>/dev/null || true
         fi
         systemctl daemon-reload
 
         log_step "清理二进制与配置目录..."
-        rm -f "$HY2_BIN"
+        rm -f -- "$HY2_BIN"
         # 保留持锁 inode：删除它后并发安装器可能新建另一个锁文件并越过当前卸载。
-        # 防误删守卫：拒绝空串、根目录、顶层系统目录与含 .. 的路径。
+        # 防误删守卫：拒绝符号链接、空串、根目录、顶层系统目录与含 .. 的路径。
+        if [[ -L "$HY2_DIR" ]]; then
+            log_err "拒绝清理符号链接目录 HY2_DIR='$HY2_DIR'。"
+            return 1
+        fi
         local _bs='\'
         local _hy2_clean="$HY2_DIR"
         while [[ "$_hy2_clean" == */ && "$_hy2_clean" != "/" ]]; do _hy2_clean="${_hy2_clean%/}"; done
@@ -6866,7 +6879,7 @@ uninstall_all() {
                 rm -f "$AWG_SERVICE"
                 local _awg_clean="${AWG_DIR:-}"
                 while [[ "$_awg_clean" == */ && "$_awg_clean" != "/" ]]; do _awg_clean="${_awg_clean%/}"; done
-                if [[ -n "$_awg_clean" && "$_awg_clean" != "/" && "$_awg_clean" != */.. && "$_awg_clean" != */../* \
+                if [[ ! -L "$AWG_DIR" && -n "$_awg_clean" && "$_awg_clean" != "/" && "$_awg_clean" != */.. && "$_awg_clean" != */../* \
                         && ( "$_awg_clean" =~ ^/[^/]+/[^/]+ || "$_awg_clean" =~ ^[A-Za-z]:[/\\][^/\\]+[/\\].+ ) ]]; then
                     rm -rf "$AWG_DIR"
                 else
