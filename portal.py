@@ -1140,7 +1140,7 @@ def _hy2_runtime_identity():
     proc = subprocess.run(
         ['systemctl', 'show', 'hysteria-server', '--property=ActiveState',
          '--property=MainPID', '--property=ExecMainStartTimestamp'],
-        capture_output=True, text=True, timeout=8)
+        capture_output=True, text=True, errors='replace', timeout=8)
     values = {}
     for line in proc.stdout.splitlines():
         if '=' in line:
@@ -6816,7 +6816,7 @@ def generate_vless_encryption_pair(binary='/usr/local/bin/xray'):
             or any(ord(c) < 32 or ord(c) == 127 for c in binary)):
         raise RuntimeError('xray 二进制路径不合法，无法生成 VLESS Encryption 密钥')
     try:
-        out = subprocess.run([binary, 'vlessenc'], capture_output=True, text=True, timeout=10)
+        out = subprocess.run([binary, 'vlessenc'], capture_output=True, text=True, errors='replace', timeout=10)
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError('xray vlessenc 执行异常，无法生成 VLESS Encryption 密钥: %s' % type(exc).__name__) from exc
     if out.returncode != 0:
@@ -7541,7 +7541,7 @@ def _nft_input_chain():
     """
     try:
         out = subprocess.run(['nft', 'list', 'ruleset'], capture_output=True, text=True,
-                             timeout=5).stdout
+                             errors='replace', timeout=5).stdout
     except Exception:
         return None
     table = ''
@@ -11396,7 +11396,7 @@ if __name__ == '__main__':
                 p = None
                 try:
                     p = subprocess.run(['/usr/local/bin/xray', 'x25519'],
-                                       capture_output=True, text=True, timeout=5)
+                                       capture_output=True, text=True, errors='replace', timeout=5)
                     for line in p.stdout.splitlines():
                         if 'PrivateKey:' in line:
                             priv_key = line.split('PrivateKey:', 1)[1].strip()
@@ -14174,7 +14174,7 @@ if __name__ == '__main__':
                             except (OSError, subprocess.SubprocessError):
                                 pass
                         proc = subprocess.run(['systemctl', action, AWG_SVC_NAME],
-                                              capture_output=True, text=True, timeout=30)
+                                              capture_output=True, text=True, errors='replace', timeout=30)
                     if proc.returncode != 0:
                         return self.reply_json(500, {'ok': False, 'error': '服务' + label + '失败：' + (proc.stderr or '').strip()[-400:]})
                     return self.reply_json(200, {'ok': True, 'message': '服务已' + label})
@@ -14434,7 +14434,7 @@ if __name__ == '__main__':
                         write_xray_unit()
                         enable_result = subprocess.run(
                             ['systemctl', 'enable', 'xray'], capture_output=True,
-                            text=True, timeout=30)
+                            text=True, errors='replace', timeout=30)
                         if enable_result.returncode != 0:
                             return self.reply_json(500, {'ok': False, 'error':
                                 'Xray 已安装，但开机自启设置失败：%s' %
@@ -14452,10 +14452,10 @@ if __name__ == '__main__':
                 # 否则用户只会看到"安装成功"却怎么都用不了，且不知道该查什么。
                 time.sleep(2)
                 xr_state = subprocess.run(['systemctl', 'is-active', 'xray'],
-                                          capture_output=True, text=True, timeout=5).stdout.strip()
+                                          capture_output=True, text=True, errors='replace', timeout=5).stdout.strip()
                 if xr_state != 'active':
                     xr_log = subprocess.run(['journalctl', '-u', 'xray', '-n', '8', '--no-pager'],
-                                            capture_output=True, text=True, timeout=5).stdout
+                                            capture_output=True, text=True, errors='replace', timeout=5).stdout
                     return self.reply_json(500, {'ok': False, 'error':
                         'Xray 已安装但服务未能启动（当前状态 %s）。'
                             '最常见原因是 TCP 443 已被其他服务（如 Caddy / Nginx）占用。'
@@ -15117,7 +15117,7 @@ if __name__ == '__main__':
                 if not Path(binary).exists():
                     return ''
                 try:
-                    out = subprocess.run([binary] + args, capture_output=True, text=True, timeout=5)
+                    out = subprocess.run([binary] + args, capture_output=True, text=True, errors='replace', timeout=5)
                     m = re.search(pattern, (out.stdout or '') + (out.stderr or ''))
                     return m.group(1) if m else '已安装'
                 except Exception:
@@ -15564,6 +15564,10 @@ if __name__ == '__main__':
                                                  'message': 'AnyTLS 本来就没有启用'})
                 with core_operation_lock, core_operation_file_lock(), anytls_apply_lock:
                     cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
+                    if cfg_path.is_symlink():
+                        return self.reply_json(500, {'ok': False, 'error': 'anytls.json 不允许为符号链接，未做任何修改'})
+                    if cfg_path.exists() and cfg_path.lstat().st_size > 4 * 1024 * 1024:
+                        return self.reply_json(500, {'ok': False, 'error': 'anytls.json 超过 4 MiB 上限，未做任何修改'})
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                     try:
@@ -15718,10 +15722,22 @@ if __name__ == '__main__':
                     users = tuic_users(data)
                 try:
                     unit_path = Path('/etc/systemd/system/%s.service' % TUIC_SERVICE)
+                    _u_sym = getattr(unit_path, 'is_symlink', None)
+                    if callable(_u_sym) and _u_sym():
+                        raise RuntimeError('TUIC 服务单元不允许为符号链接')
+                    _u_lstat = getattr(unit_path, 'lstat', None)
+                    if unit_path.exists() and callable(_u_lstat) and _u_lstat().st_size > 1024 * 1024:
+                        raise RuntimeError('TUIC 服务单元超过 1 MiB 上限')
                     previous_unit = unit_path.read_bytes() if unit_path.exists() else None
                     unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                     unit_changed = previous_unit != TUIC_UNIT_CONTENT.encode('utf-8')
                     cfg_path = portal_path.parent / TUIC_CONFIG_NAME
+                    _c_sym = getattr(cfg_path, 'is_symlink', None)
+                    if callable(_c_sym) and _c_sym():
+                        raise RuntimeError('tuic.json 不允许为符号链接')
+                    _c_lstat = getattr(cfg_path, 'lstat', None)
+                    if cfg_path.exists() and callable(_c_lstat) and _c_lstat().st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('tuic.json 超过 4 MiB 上限')
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
                     if unit_changed:
@@ -15834,6 +15850,10 @@ if __name__ == '__main__':
                                                  'message': 'TUIC 本来就没有启用'})
                 with core_operation_lock, core_operation_file_lock(), tuic_apply_lock:
                     cfg_path = portal_path.parent / TUIC_CONFIG_NAME
+                    if cfg_path.is_symlink():
+                        return self.reply_json(500, {'ok': False, 'error': 'tuic.json 不允许为符号链接，未做任何修改'})
+                    if cfg_path.exists() and cfg_path.lstat().st_size > 4 * 1024 * 1024:
+                        return self.reply_json(500, {'ok': False, 'error': 'tuic.json 超过 4 MiB 上限，未做任何修改'})
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
                     try:
@@ -16150,7 +16170,7 @@ if __name__ == '__main__':
                 except (OSError, subprocess.SubprocessError):
                     pass
                 available = subprocess.run(['sysctl', '-n', 'net.ipv4.tcp_available_congestion_control'],
-                                           capture_output=True, text=True, timeout=3)
+                                           capture_output=True, text=True, errors='replace', timeout=3)
                 if available.returncode != 0:
                     return self.reply_json(500, {'ok': False, 'error': '无法读取内核可用拥塞算法'})
                 if target not in available.stdout.split():
@@ -16166,7 +16186,7 @@ if __name__ == '__main__':
                 # 直接不写；必需的两项读不到才拒绝。
                 required = ('net.core.default_qdisc', 'net.ipv4.tcp_congestion_control')
                 for key in list(settings):
-                    result = subprocess.run(['sysctl', '-n', key], capture_output=True, text=True, timeout=3)
+                    result = subprocess.run(['sysctl', '-n', key], capture_output=True, text=True, errors='replace', timeout=3)
                     if result.returncode != 0 or not result.stdout.strip():
                         if key in required:
                             return self.reply_json(500, {'ok': False, 'error': '读取 sysctl 失败，未修改配置'})
@@ -16174,9 +16194,20 @@ if __name__ == '__main__':
                         continue
                     runtime[key] = result.stdout.strip()
                 paths = [Path('/etc/modules-load.d/bbr.conf'), Path('/etc/sysctl.d/99-bbr.conf')]
-                originals = {path: path.read_bytes() if path.exists() else None for path in paths}
+                originals = {}
+                for path in paths:
+                    if path.is_symlink():
+                        return self.reply_json(500, {'ok': False, 'error': '%s 不允许为符号链接，未修改 BBR 配置' % path.name})
+                    if path.exists():
+                        if path.lstat().st_size > 1024 * 1024:
+                            return self.reply_json(500, {'ok': False, 'error': '%s 超过 1 MiB 上限，未修改 BBR 配置' % path.name})
+                        originals[path] = path.read_bytes()
+                    else:
+                        originals[path] = None
 
                 def _write_bbr_file(target_path, raw_bytes):
+                    if target_path.is_symlink():
+                        raise OSError('%s 不允许为符号链接' % target_path.name)
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp_path = target_path.with_name(target_path.name + '.tmp.' + secrets.token_hex(4))
                     try:
@@ -16197,7 +16228,10 @@ if __name__ == '__main__':
                         except OSError:
                             pass
                     except BaseException:
-                        tmp_path.unlink(missing_ok=True)
+                        try:
+                            tmp_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                         raise
 
                 def _rollback_bbr_files_and_runtime():
@@ -16225,11 +16259,11 @@ if __name__ == '__main__':
                         (BBR_FILE_MARKER + '\n'
                          + '\n'.join('%s = %s' % item for item in settings.items()) + '\n').encode('utf-8'),
                     )
-                    applied = subprocess.run(['sysctl', '-p', str(paths[1])], capture_output=True, text=True, timeout=5)
+                    applied = subprocess.run(['sysctl', '-p', str(paths[1])], capture_output=True, text=True, errors='replace', timeout=5)
                     if applied.returncode != 0:
                         raise RuntimeError('sysctl 应用失败')
                     for key in ('net.ipv4.tcp_congestion_control', 'net.core.default_qdisc'):
-                        actual = subprocess.run(['sysctl', '-n', key], capture_output=True, text=True, timeout=3)
+                        actual = subprocess.run(['sysctl', '-n', key], capture_output=True, text=True, errors='replace', timeout=3)
                         if actual.returncode != 0 or actual.stdout.strip() != settings[key]:
                             raise RuntimeError('sysctl 读回与目标不一致')
                 except Exception:
@@ -17012,7 +17046,7 @@ systemctl daemon-reload
 systemctl enable --now hy2-warp-watchdog.timer >/dev/null 2>&1 || true
 log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 '''
-                res = subprocess.run(['bash', '-c', install_warp_sh], capture_output=True, text=True, timeout=180)
+                res = subprocess.run(['bash', '-c', install_warp_sh], capture_output=True, text=True, errors='replace', timeout=180)
                 if res.returncode != 0:
                     err_detail = (res.stderr or res.stdout or '').strip()
                     # 🔴 2026-10-28 修：裸 bash -c 脚本失败时 stderr 常为空
@@ -18061,7 +18095,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     _core_ver_cache['t'] = 0.0
             core_curr, core_latest, core_has_update = '未知', '', False
             try:
-                out = subprocess.run(['/usr/local/bin/hysteria', 'version'], capture_output=True, text=True, timeout=3).stdout
+                out = subprocess.run(['/usr/local/bin/hysteria', 'version'], capture_output=True, text=True, errors='replace', timeout=3).stdout
                 for line in out.splitlines():
                     if line.strip().startswith('Version:'):
                         core_curr = line.split(':', 1)[1].strip().removeprefix('v')
