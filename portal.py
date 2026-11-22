@@ -8016,15 +8016,18 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     单用户的 rcfg 里存的是**旧版单账号**的 uuid —— 这里忽略它，
     改用该 user_id 派生出的 UUID（reality_uuid_for_user）。
     """
-    # 同 VMess / VLESS-Encryption：非 dict 配置在订阅路径上直接抛
-    # AttributeError，用户拿不到任何节点。
+    # 同 VMess / VLESS-Encryption：非 dict 配置或非法 user_id 在订阅路径上直接抛异常，
+    # 拒绝后至少不影响其它节点下发。
     params = reality_client_params(rcfg)
     clean_ip = _clean_host_scalar(public_ip)
-    if params is None or not clean_ip:
+    if (params is None or not clean_ip or not isinstance(user_id, str)
+            or not user_id.strip() or any(ord(c) < 0x20 or ord(c) == 0x7f for c in user_id)):
         return ''
     port, dest_sni, pub_key, short_id = params
     uid_uuid = reality_uuid_for_user(user_id)
-    tag = label if isinstance(label, str) and label else ('VLESS-Reality-' + str(user_id))
+    clean_label = (''.join(c for c in label if ord(c) >= 32 and ord(c) != 127)
+                   if isinstance(label, str) else '')
+    tag = clean_label if clean_label else ('VLESS-Reality-' + user_id)
     return (f"vless://{uid_uuid}@{_host_for_url(clean_ip)}:{port}"
             f"?security=reality&encryption=none&pbk={pub_key}"
             f"&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision"
@@ -8046,7 +8049,7 @@ def _valid_port(value):
             return 0
     if isinstance(value, str):
         s = value.strip()
-        if not (s.isascii() and s.isdigit()):
+        if not (s.isascii() and s.isdigit()) or len(s) > 16:
             return 0
         value = s
     try:
@@ -8173,18 +8176,23 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
         proxy.update({'obfs': 'salamander', 'obfs-password': obfs_password})
         sing['obfs'] = dict(type='salamander', password=obfs_password)
 
+    # ---- 备用协议共用用户标识清洗 ----
+    # user_id 被调用方错传为数字/列表或含控制字符时跳过备用协议节点，避免 uuid5/hmac 抛异常打崩整份订阅。
+    clean_uid = (user_id if isinstance(user_id, str) and user_id.strip()
+                 and not any(ord(c) < 0x20 or ord(c) == 0x7f for c in user_id) else '')
+
     # ---- Reality 备用通道（可选）----
     #
     # 目标是「一条订阅里既有 UDP 的 Hy2、又有 TCP 的 Reality」，
     # 客户端用 url-test 自动择优：UDP 通走 Hy2，UDP 被 QoS/阻断时自动切 Reality。
-    # ⚠️ 只有 reality + user_id 同时给出时才追加 —— 单机管理员视角（user_id=None）
+    # ⚠️ 只有 reality + 合法 user_id 同时给出时才追加 —— 单机管理员视角（user_id=None）
     # 仍只出一条 Hy2，避免给自己输出一个用不上的节点。
     reality_proxy = None
     reality_sing = None
-    if reality and user_id:
-        ruri = reality_uri_for_user(reality, user_id, public_ip,
+    if reality and clean_uid:
+        ruri = reality_uri_for_user(reality, clean_uid, public_ip,
                                     label=(name + '-Reality'))
-        r_uuid = reality_uuid_for_user(user_id)
+        r_uuid = reality_uuid_for_user(clean_uid)
         _rp = reality_client_params(reality)
         r_port, r_sni, r_pbk, r_sid = _rp if _rp else (0, '', '', '')
         if ruri and _rp:
@@ -8216,7 +8224,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 握手，VMess 必须真的出示证书。因此只在启用且拿到域名时才追加。
     vmess_proxy = None
     vmess_sing = None
-    if isinstance(vmess, dict) and user_id:
+    if isinstance(vmess, dict) and clean_uid:
         v_host = _clean_host_scalar(vmess.get('domain'))
         v_port = _valid_port(vmess.get('port'))
         raw_v_path = vmess.get('ws_path')
@@ -8229,7 +8237,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
             v_path = ''
         if v_host and v_port and v_path:
             v_name = name + '-VMess'
-            v_uuid = vmess_uuid_for_user(user_id)
+            v_uuid = vmess_uuid_for_user(clean_uid)
             v_sni = _clean_host_scalar(vmess.get('sni')) or v_host
             vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
                                port=v_port, uuid=v_uuid, alterId=0,
@@ -8249,13 +8257,13 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 同样是 TCP + 自有证书，但比 VMess 多了后量子密钥交换。
     vlessenc_proxy = None
     vlessenc_sing = None
-    if isinstance(vlessenc, dict) and user_id:
+    if isinstance(vlessenc, dict) and clean_uid:
         e_host = _clean_host_scalar(vlessenc.get('domain'))
         e_port = _valid_port(vlessenc.get('port'))
         e_enc = _clean_host_scalar(vlessenc.get('encryption'))
         if e_host and e_port and e_enc:
             e_name = name + '-VLESS-Enc'
-            e_uuid = reality_uuid_for_user(user_id)
+            e_uuid = reality_uuid_for_user(clean_uid)
             e_sni = _clean_host_scalar(vlessenc.get('sni')) or e_host
             vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
                                   port=e_port, uuid=e_uuid, udp=True,
@@ -8272,14 +8280,15 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
     anytls_proxy = None
     anytls_sing = None
-    if isinstance(anytls, dict) and user_id:
+    if isinstance(anytls, dict) and clean_uid:
         a_host = _clean_host_scalar(anytls.get('domain'))
         a_port = _valid_port(anytls.get('port'))
         a_secret = anytls.get('secret')
-        if a_host and a_port and isinstance(a_secret, str) and a_secret:
+        if (a_host and a_port and isinstance(a_secret, str) and a_secret.strip()
+                and not any(ord(c) < 0x20 or ord(c) == 0x7f for c in a_secret)):
             a_name = name + '-AnyTLS'
             a_sni = _clean_host_scalar(anytls.get('sni')) or a_host
-            a_pwd = anytls_password_for_user(a_secret, user_id)
+            a_pwd = anytls_password_for_user(a_secret, clean_uid)
             anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
                                 port=a_port, password=a_pwd, udp=True,
                                 sni=a_sni, **{'client-fingerprint': 'chrome'})
@@ -8292,14 +8301,15 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # QUIC（UDP）+ 自有证书，由 sing-box 承载。
     tuic_proxy = None
     tuic_sing = None
-    if isinstance(tuic, dict) and user_id:
+    if isinstance(tuic, dict) and clean_uid:
         t_host = _clean_host_scalar(tuic.get('domain'))
         t_port = _valid_port(tuic.get('port'))
         t_secret = tuic.get('secret')
-        if t_host and t_port and isinstance(t_secret, str) and t_secret:
+        if (t_host and t_port and isinstance(t_secret, str) and t_secret.strip()
+                and not any(ord(c) < 0x20 or ord(c) == 0x7f for c in t_secret)):
             t_name = name + '-TUIC'
             t_sni = _clean_host_scalar(tuic.get('sni')) or t_host
-            t_uuid, t_pwd = tuic_credentials_for_user(t_secret, user_id)
+            t_uuid, t_pwd = tuic_credentials_for_user(t_secret, clean_uid)
             tuic_proxy = dict(name=t_name, type='tuic', server=t_host, port=t_port,
                               uuid=t_uuid, password=t_pwd, alpn=['h3'], sni=t_sni,
                               udp=True, **{'congestion-controller': 'bbr',
@@ -8517,6 +8527,11 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     if not isinstance(data, dict):
         raise ValueError('portal.json 顶层必须是 JSON 对象')
     original_data = copy.deepcopy(data)
+    # 缺失或损坏的门户路径令牌先自愈，防止下方拼接订阅地址时报 KeyError 或产出非法 URL。
+    raw_token = data.get('token')
+    if (not isinstance(raw_token, str) or not raw_token.strip() or '/' in raw_token
+            or not raw_token.isascii() or any(ord(ch) <= 32 or ord(ch) == 127 for ch in raw_token)):
+        data['token'] = secrets.token_urlsafe(18)
     # 凭据文件缺失/损坏时重建（保 token、API Key、用户），而不是让
     # 「刷新页面」「证书自愈」这类日常操作直接抛异常（2026-10-30 修）。
     access, _rebuilt = ensure_portal_access(root, m, data)
@@ -8525,9 +8540,11 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     subscription = (f"https://{access['username']}:{access['password']}@"
                     f"{_host_for_url(host)}:{resolve_subscription_port(m)[0]}/{data['token']}/clash.yaml")
     
-    # 空串 / null 也要重新生成：session_secret 是分享链接 k 的 HMAC 密钥，
-    # 空串等于「任何人都能算出任意用户的 k」（`in` 判断只看键在不在）。
-    if not isinstance(data.get('session_secret'), str) or not data['session_secret']:
+    # 空串 / 纯空白 / 含控制字符 / null 也要重新生成：session_secret 是分享链接 k 的 HMAC 密钥，
+    # 脏值或空串等于「任何人都能算出任意用户的 k」（`in` 判断只看键在不在）。
+    raw_secret = data.get('session_secret')
+    if (not isinstance(raw_secret, str) or not raw_secret.strip()
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_secret)):
         data['session_secret'] = secrets.token_hex(32)
     if not isinstance(data.get('api_key'), str) or not data['api_key'].strip():
         access_key = access.get('api_key')
@@ -8537,7 +8554,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
         # 与其他路径一致：portal-access.json 含用户名/密码/api_key，
         # write_text 会先按 umask 建出 0644 再补权限（2026-10-29 修）。
         atomic_write_private(root / 'portal-access.json',
-                             json.dumps(access, ensure_ascii=False).encode('utf-8'))
+                             json.dumps(access, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     if not isinstance(data.get('users'), dict):
         data['users'] = {
             MASTER_USER_ID: {
@@ -8586,7 +8603,7 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
             for key in ('clash', 'sing', 'qr', 'page_digest'):
                 if key in data:
                     latest[key] = data[key]
-            for key in ('api_key', 'auth_hash', 'session_secret', 'port'):
+            for key in ('token', 'api_key', 'auth_hash', 'session_secret', 'port'):
                 if data.get(key) != original_data.get(key):
                     latest[key] = data[key]
             if _rebuilt:
@@ -8615,8 +8632,8 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
             pass
     if access.get('url') != access_url:
         access['url'] = access_url
-        atomic_write_private(_access_file, json.dumps(access, ensure_ascii=False).encode('utf-8'))
-    atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(_access_file, json.dumps(access, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+    atomic_write_private(path, json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     # 需要在锁外补生成二维码的 uri（锁内 uri 才变化时）；None 表示已是最新。
     return stale_qr_uri
 
@@ -8659,7 +8676,7 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
                     latest = json.loads(portal_file.read_text(encoding='utf-8'))
                     if isinstance(latest, dict):
                         latest['qr'] = qr
-                        atomic_write_private(portal_file, json.dumps(latest, ensure_ascii=False).encode('utf-8'))
+                        atomic_write_private(portal_file, json.dumps(latest, ensure_ascii=False, allow_nan=False).encode('utf-8'))
                 except (OSError, ValueError) as exc:
                     _log_ignored('refresh_qr_late', exc)
 
@@ -8686,11 +8703,16 @@ def merge_cli_owned_state(data, disk):
                 continue
             data[key] = valid_p
         elif key in ('auth_hash', 'session_secret', 'api_key'):
-            if not isinstance(val, str) or not val:
+            if (not isinstance(val, str) or not val.strip()
+                    or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in val)):
                 continue
             data[key] = val
         elif key == 'session_epoch':
             if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                continue
+            data[key] = val
+        elif key in ('clash', 'sing', 'qr', 'page_digest'):
+            if not isinstance(val, str) or not val:
                 continue
             data[key] = val
         else:
@@ -8703,9 +8725,14 @@ def merge_cli_owned_state(data, disk):
         if not isinstance(master, dict):
             users[MASTER_USER_ID] = dict(disk_master)
         else:
-            for key in ('password', 'expires_at'):
-                if key in disk_master:
-                    master[key] = disk_master[key]
+            if isinstance(disk_master.get('password'), str):
+                master['password'] = disk_master['password']
+            if 'expires_at' in disk_master:
+                exp = disk_master['expires_at']
+                if isinstance(exp, str) or (
+                    isinstance(exp, (int, float)) and not isinstance(exp, bool) and 0 <= exp < float('inf')
+                ):
+                    master['expires_at'] = exp
 
 
 def ensure_portal_access(root, meta, data):
@@ -10846,22 +10873,23 @@ if __name__ == '__main__':
             pub_key = '' if force else rcfg_old.get('public_key', '')
             if not (priv_key and pub_key):
                 # 生成失败就停止，不能让不同节点共用硬编码私钥。
+                p = None
                 try:
                     p = subprocess.run(['/usr/local/bin/xray', 'x25519'],
                                        capture_output=True, text=True, timeout=5)
                     for line in p.stdout.splitlines():
                         if 'PrivateKey:' in line:
-                            priv_key = line.split('PrivateKey:')[1].strip()
+                            priv_key = line.split('PrivateKey:', 1)[1].strip()
                         elif 'Password (PublicKey):' in line or 'PublicKey:' in line:
-                            pub_key = line.split(':')[1].strip()
+                            pub_key = line.split(':', 1)[1].strip()
                 except Exception:
                     priv_key = pub_key = ''
-                if not priv_key or not pub_key or p.returncode != 0:
+                if not priv_key or not pub_key or p is None or p.returncode != 0:
                     raise RuntimeError('X25519 密钥生成失败，原密钥和配置未修改')
 
             short_id = (secrets.token_hex(4) if force
                         else (rcfg_old.get('short_id') or secrets.token_hex(4)))
-            dest_sni = rcfg_old.get('dest_sni') or 'www.apple.com'
+            dest_sni = _clean_host_scalar(rcfg_old.get('dest_sni')) or 'www.apple.com'
 
             # ---- 端口：自动避让，绝不硬塞（2026-10-04 加）----
             #
@@ -10877,14 +10905,10 @@ if __name__ == '__main__':
             # 本文件 gost 段记着血泪：「不再用 socket bind 做端口探测(在某些环境会卡住)」。
             m = read_meta_file(meta_path)
             _avoid = set()
-            try:
-                _avoid.add(int(m.get('listen_port') or 0))
-            except Exception:
-                pass
-            try:
-                _avoid.add(int(m.get('subscription_port') or 0))
-            except Exception:
-                pass
+            for _k in ('listen_port', 'subscription_port'):
+                _p = _valid_port(m.get(_k))
+                if _p:
+                    _avoid.add(_p)
 
             # 避开所有托管协议已占用的端口，而不只是 hy2 / 订阅端口。
             try:
