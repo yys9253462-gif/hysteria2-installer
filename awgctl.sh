@@ -1003,12 +1003,12 @@ cmd_peer_add() {
 
     tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers.XXXXXX")"
     # 同 peer-del：jq 失败时空输出不能盖掉原有客户端（2026-11-04 修）；
-    # 同时归一化 .peers 数组并过滤非对象脏项，防止损坏结构导致无法新增。
+    # 若 .peers 顶层非数组则报错保持原文件完整，若为数组则过滤其中非对象脏项。
     if ! jq --arg n "$name" --arg ip "$addr" --arg priv "$priv" \
        --arg pub "$pub" --arg psk "$psk" --arg ep "$endpoint" \
        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-       '.peers = (((.peers // []) | if type=="array" then map(select(type=="object")) else [] end) + [{name:$n, address:$ip, private_key:$priv, public_key:$pub,
-                    preshared_key:$psk, endpoint:$ep, created_at:$ts, enabled:true}])' \
+       'if (.peers | type) == "array" then .peers = ((.peers | map(select(type=="object"))) + [{name:$n, address:$ip, private_key:$priv, public_key:$pub,
+                    preshared_key:$psk, endpoint:$ep, created_at:$ts, enabled:true}]) else error("peers not array") end' \
        "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
         rm -f "$tmp" "$peers_backup" "$config_backup"
         die "客户端列表无法解析，未做任何修改：${AWG_PEERS_FILE}"
@@ -1056,8 +1056,8 @@ cmd_peer_del() {
 
     tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers.XXXXXX")"
     # jq 失败（peers.json 结构被改坏）时不能拿空输出覆盖原文件（2026-11-04 修）：
-    # 那会一次删光全部客户端；同时过滤非对象脏项，防止单个 null/数字导致删除彻底失败。
-    if ! jq --arg n "$name" '.peers = ((.peers // []) | if type=="array" then map(select(type=="object" and .name != $n)) else [] end)' "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
+    # 那会一次删光全部客户端；.peers 顶层非数组时报失败保原文件，为数组时过滤非对象脏项。
+    if ! jq --arg n "$name" 'if (.peers | type) == "array" then .peers |= map(select(type=="object" and .name != $n)) else error("peers not array") end' "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
         rm -f "$tmp" "$peers_backup" "$config_backup"
         die "客户端列表无法解析，未做任何修改：${AWG_PEERS_FILE}"
     fi

@@ -45,8 +45,9 @@ class AwgPeerDelCorruptIpv6EndpointAndKeygenGuardsTests(unittest.TestCase):
         inst = _extract_fn('cmd_install')
         self.assertIn('select(type=="object" and .name==$n)', pdel)
         self.assertIn('select(type=="object" and .name != $n)', pdel)
+        self.assertIn('if (.peers | type) == "array"', pdel)
         self.assertIn('[[ -n "$priv" && -n "$pub" && -n "$psk" ]]', padd)
-        self.assertIn('if type=="array"', padd)
+        self.assertIn('if (.peers | type) == "array"', padd)
         self.assertIn('first(', cconf)
         self.assertIn('[[ -n "$priv" && -n "$pub" ]]', inst)
 

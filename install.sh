@@ -6570,7 +6570,8 @@ flow_update_core() {
     require_installed || return 1
     # 与门户终端升级共享同一锁，串行保护备份、替换、重启和回滚整个事务。
     local update_lock_fd="" rollback_file=""
-    trap 'trap - RETURN; [[ -n "${rollback_file:-}" ]] && rm -f "$rollback_file"; [[ -n "${update_lock_fd:-}" ]] && exec {update_lock_fd}>&- 2>/dev/null || true' RETURN
+    local _core_trap='trap - RETURN; [[ -n "${rollback_file:-}" ]] && rm -f "$rollback_file"; [[ -n "${update_lock_fd:-}" ]] && exec {update_lock_fd}>&- 2>/dev/null || true'
+    trap "$_core_trap" RETURN
     exec {update_lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
         update_lock_fd=""
         log_err "无法创建核心升级锁。"; return 1; }
@@ -6595,7 +6596,11 @@ flow_update_core() {
         log_err "备份核心失败，已放弃更新，现有二进制未改动。"
         return 1
     fi
-    if ! install_binary; then
+    # install_binary 内部会覆盖并清空全局 RETURN 陷阱，调用结束后必须立刻重挂本函数清理陷阱。
+    local _install_rc=0
+    install_binary || _install_rc=$?
+    trap "$_core_trap" RETURN
+    if [[ "$_install_rc" -ne 0 ]]; then
         return 1
     fi
     if traffic_suspended; then
