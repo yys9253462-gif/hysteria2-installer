@@ -797,8 +797,12 @@ const btnResetWarpRules = document.getElementById('btn-reset-warp-rules');
 
 function renderWarpRules(rules, active = false) {
   if (!warpTagsCloud) return;
-  const domains = (rules || []).map(r => typeof r === 'string'
-    ? {domain:r, outbound:'warp_socks'} : r).filter(r => r && ['warp','warp_socks'].includes(r.outbound)).map(r => r.domain);
+  const list = Array.isArray(rules) ? rules : [];
+  const domains = list
+    .map(r => (typeof r === 'string' ? { domain: r, outbound: 'warp_socks' } : r))
+    .filter(r => r && typeof r === 'object' && ['warp', 'warp_socks'].includes(r.outbound)
+      && typeof r.domain === 'string' && r.domain.trim())
+    .map(r => r.domain.trim());
   if (warpRulesCount) warpRulesCount.textContent = domains.length + (active ? ' 个生效中' : ' 个已配置');
   if (!domains.length) {
     warpTagsCloud.innerHTML = '<span style="font-size:12px;color:var(--muted)">暂无 WARP 分流域名</span>';
@@ -820,8 +824,10 @@ if (warpTagsCloud) {
   });
 }
 
+let warpRuleBusy = false;
 async function addWarpRule(domain) {
-  if (!domain) return;
+  if (!domain || warpRuleBusy) return;
+  warpRuleBusy = true;
   try {
     const res = await fetch(location.pathname + 'manage-warp', {
       method: 'POST',
@@ -829,21 +835,25 @@ async function addWarpRule(domain) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'action=add_rule&domain=' + encodeURIComponent(domain)
     });
-    const json = await res.json();
-    if (json.ok) {
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (res.ok !== false && json && json.ok) {
       if (inputWarpDomain) inputWarpDomain.value = '';
       if (Array.isArray(json.rules)) renderWarpRules(json.rules);
       // 与删除路径一致：新增后也要刷新状态，「N 个生效中」与徽章才会更新。
       await checkWarpStatus();
     } else {
-      alert(json.error || '添加失败');
+      alert((json && json.error) || ('添加失败（HTTP ' + res.status + '）'));
     }
   } catch (e) {
-    alert('请求异常: ' + e.message);
+    alert('请求异常: ' + (e && e.message ? e.message : e));
+  } finally {
+    warpRuleBusy = false;
   }
 }
 
 async function delWarpRule(domain) {
+  if (!domain || warpRuleBusy) return;
   const confirmed = await showConfirm({
     title: '移除分流域名',
     text: '确定将 ' + domain + ' 从 WARP 分流列表中移除吗？',
@@ -851,7 +861,8 @@ async function delWarpRule(domain) {
     confirmText: '移除',
     isDanger: true
   });
-  if (!confirmed) return;
+  if (!confirmed || warpRuleBusy) return;
+  warpRuleBusy = true;
   try {
     const res = await fetch(location.pathname + 'manage-warp', {
       method: 'POST',
@@ -859,12 +870,15 @@ async function delWarpRule(domain) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'action=del_rule&domain=' + encodeURIComponent(domain)
     });
-    const json = await res.json();
-    if (!res.ok || !json.ok) throw new Error(json.error || '分流规则应用失败');
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('分流规则应用失败（HTTP ' + res.status + '）'));
     if (Array.isArray(json.rules)) renderWarpRules(json.rules);
     await checkWarpStatus();
   } catch (e) {
-    alert('请求异常: ' + e.message);
+    alert('请求异常: ' + (e && e.message ? e.message : e));
+  } finally {
+    warpRuleBusy = false;
   }
 }
 
@@ -2451,11 +2465,15 @@ function markBbrFailed(detail) {
 
 async function checkBbrStatus() {
   if (!bbrBadge) return;
+  const seq = (checkBbrStatus._seq = (checkBbrStatus._seq || 0) + 1);
   try {
     const res = await fetch(location.pathname + 'bbr-status', { credentials: 'same-origin' });
+    if (seq !== checkBbrStatus._seq) return;
     if (!res.ok) { markBbrFailed(); return; }
-    const json = await res.json();
-    if (!json.ok) { markBbrFailed(json.error); return; }
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (seq !== checkBbrStatus._seq) return;
+    if (!json || typeof json !== 'object' || !json.ok) { markBbrFailed(json && json.error); return; }
 
     if (Array.isArray(json.available)) document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
       const algo = {v1:'bbr',v2:'bbr2',v3:'bbr3'}[btn.dataset.version];
@@ -2497,7 +2515,7 @@ async function checkBbrStatus() {
         btnRebootServer.style.display = 'none';
       }
     }
-  } catch (_) { markBbrFailed(); }
+  } catch (_) { if (seq === checkBbrStatus._seq) markBbrFailed(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -2526,6 +2544,7 @@ function certShortIssuer(issuer) {
 
 async function checkCertStatus() {
   if (!certBadge) return;
+  const seq = (checkCertStatus._seq = (checkCertStatus._seq || 0) + 1);
   let json = null;
   // 取不到状态也要在卡片上说出来（2026-11-04 修）：旧实现静默 return，卡片一直停在
   // 「检测中…」—— 而这张卡片的用途正是把证书故障摆到眼前。
@@ -2538,13 +2557,14 @@ async function checkCertStatus() {
   try {
     const res = await fetch(location.pathname + 'cert-status', { credentials: 'same-origin' });
     try { json = await res.json(); } catch (_) { json = null; }
+    if (seq !== checkCertStatus._seq) return;
     // HTTP 失败 = 状态取不到；HTTP 200 + ok:false 是「证书不可读」，交给下面正常渲染。
-    if (res.ok === false || !json) {
+    if (res.ok === false || !json || typeof json !== 'object') {
       showFetchError((json && json.error) || ('服务器返回 ' + res.status));
       return;
     }
   } catch (e) {
-    showFetchError('请求异常：' + (e && e.message ? e.message : e));
+    if (seq === checkCertStatus._seq) showFetchError('请求异常：' + (e && e.message ? e.message : e));
     return;
   }
 
@@ -2552,7 +2572,7 @@ async function checkCertStatus() {
   // 后端正常返回数组，但数据被改坏/版本不一致时可能是字符串或 null。
   // 直接 .join 会抛 TypeError，把整张证书卡片（含到期告警）一起废掉，
   // 而这张卡片恰恰是排查「证书过期」的唯一入口（2026-10-30 修）。
-  const sansList = Array.isArray(json.sans) ? json.sans
+  const sansList = Array.isArray(json.sans) ? json.sans.filter(x => typeof x === 'string' && x)
                  : (typeof json.sans === 'string' && json.sans ? [json.sans] : []);
   certSetField('cert-sans', sansList.length ? sansList.join(', ') : '--');
   certSetField('cert-issuer', certShortIssuer(json.issuer));
@@ -2573,7 +2593,8 @@ async function checkCertStatus() {
   certSetField('cert-pin', json.is_insecure ? (json.pin_sha256 ? String(json.pin_sha256).slice(0, 16) + '…' : '未设置') : '不需要（可信链）');
 
   const days = json.expires_in_days;
-  certSetField('cert-daysleft', (days === null || days === undefined) ? '--' : days);
+  const hasValidDays = (typeof days === 'number' && Number.isFinite(days));
+  certSetField('cert-daysleft', hasValidDays ? days : '--');
 
   // 到期倒计时徽章
   if (!json.ok) {
@@ -2581,18 +2602,18 @@ async function checkCertStatus() {
     certBadge.style.background = '#fff1f0';
     certBadge.style.color = '#a8071a';
   } else if (json.expired) {
-    certBadge.textContent = '🔴 已过期 ' + Math.abs(days) + ' 天';
+    certBadge.textContent = hasValidDays ? ('🔴 已过期 ' + Math.abs(days) + ' 天') : '🔴 证书已过期';
     certBadge.style.background = '#fff1f0';
     certBadge.style.color = '#a8071a';
-  } else if (json.warn_level === 'critical') {
+  } else if (json.warn_level === 'critical' && hasValidDays) {
     certBadge.textContent = '🔴 仅剩 ' + days + ' 天到期';
     certBadge.style.background = '#fff1f0';
     certBadge.style.color = '#a8071a';
-  } else if (json.warn_level === 'warn') {
+  } else if (json.warn_level === 'warn' && hasValidDays) {
     certBadge.textContent = '🟡 ' + days + ' 天后到期';
     certBadge.style.background = '#fffbe6';
     certBadge.style.color = '#ad6800';
-  } else if (json.warn_level === 'unknown' || days === null || days === undefined) {
+  } else if (json.warn_level === 'unknown' || !hasValidDays) {
     // ⚠️ 必须单列一支：判级 unknown = 到期时间**读不出来**。
     // 若让它落进下面的 else，会显示成「● 正常 · null 天后到期」——
     // 一块绿色的安慰性假象，恰好毁掉这张卡片唯一的存在理由。
@@ -2614,14 +2635,14 @@ async function checkCertStatus() {
       msg = '🔴 无法读取证书（' + (json.cert_path || '未知路径') + '）。请检查证书文件是否被误删或权限异常。';
     } else if (json.expired) {
       certAlert.classList.add('critical');
-      msg = '🔴 证书已于 ' + json.not_after + ' 过期，客户端会直接握手失败。请立即续期（ACME 会自动续；自签名需重跑安装生成）。';
-    } else if (json.warn_level === 'critical') {
+      msg = '🔴 证书已于 ' + (json.not_after || '未知时间') + ' 过期，客户端会直接握手失败。请立即续期（ACME 会自动续；自签名需重跑安装生成）。';
+    } else if (json.warn_level === 'critical' && hasValidDays) {
       certAlert.classList.add('critical');
-      msg = '🔴 证书只剩 ' + days + ' 天到期（' + json.not_after + '）。请立刻确认续期链路是否正常，避免随时掉线。';
-    } else if (json.warn_level === 'warn') {
+      msg = '🔴 证书只剩 ' + days + ' 天到期（' + (json.not_after || '--') + '）。请立刻确认续期链路是否正常，避免随时掉线。';
+    } else if (json.warn_level === 'warn' && hasValidDays) {
       certAlert.classList.add('warn');
-      msg = '🟡 证书将在 ' + days + ' 天后到期（' + json.not_after + '）。若使用的是外部签发工具（Caddy / acme.sh），请确认其续期定时任务正常。';
-    } else if (json.warn_level === 'unknown' || days === null || days === undefined) {
+      msg = '🟡 证书将在 ' + days + ' 天后到期（' + (json.not_after || '--') + '）。若使用的是外部签发工具（Caddy / acme.sh），请确认其续期定时任务正常。';
+    } else if (json.warn_level === 'unknown' || !hasValidDays) {
       certAlert.classList.add('warn');
       msg = '⚠️ 证书到期时间读不出来（解析失败），无法判断临期风险。请手动执行：openssl x509 -enddate -noout -in ' + (json.cert_path || '/etc/hysteria/cert/fullchain.pem') + ' 核对到期时刻。';
     } else if (json.meta_matches_cert === false) {
@@ -2636,11 +2657,13 @@ async function checkCertStatus() {
   // 上次自动对齐时间：让「静默发生过什么」变可见
   const healNote = document.getElementById('cert-heal-note');
   if (healNote) {
-    if (json.healed_at) {
-      const t = new Date((json.healed_at || 0) * 1000);
+    const healedTs = (typeof json.healed_at === 'number') ? json.healed_at : Number(json.healed_at);
+    if (json.healed_at && Number.isFinite(healedTs) && healedTs > 0) {
+      const t = new Date(healedTs * 1000);
       const p = n => String(n).padStart(2, '0');
+      const healCount = (typeof json.heal_count === 'number' && Number.isFinite(json.heal_count)) ? json.heal_count : 0;
       healNote.textContent = '最近一次自动对齐：' + t.getFullYear() + '-' + p(t.getMonth() + 1) + '-' + p(t.getDate()) +
-        ' ' + p(t.getHours()) + ':' + p(t.getMinutes()) + '（累计 ' + (json.heal_count || 0) + ' 次）';
+        ' ' + p(t.getHours()) + ':' + p(t.getMinutes()) + '（累计 ' + healCount + ' 次）';
       healNote.style.display = 'block';
     } else {
       healNote.textContent = '尚未发生过自动对齐（证书与节点记录始终一致）';
@@ -3055,11 +3078,15 @@ function markVersionsUnknown() {
 
 async function checkVersions(force = false) {
   if (!coreVerDisplay || !portalVerDisplay) return;
+  const seq = (checkVersions._seq = (checkVersions._seq || 0) + 1);
   try {
     const res = await fetch(location.pathname + 'check-version' + (force ? '?force=1' : ''), { credentials: 'same-origin' });
+    if (seq !== checkVersions._seq) return false;
     if (!res.ok) { markVersionsUnknown(); return false; }
-    const json = await res.json();
-    if (!json.ok) { markVersionsUnknown(); return false; }
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (seq !== checkVersions._seq) return false;
+    if (!json || typeof json !== 'object' || !json.ok) { markVersionsUnknown(); return false; }
 
     // 核心展示
     coreVerDisplay.textContent = fmtVer(json.core_current, json.core_latest, json.core_has_update, true);
@@ -3086,7 +3113,7 @@ async function checkVersions(force = false) {
       }
     }
     return true;
-  } catch (_) { markVersionsUnknown(); return false; }
+  } catch (_) { if (seq === checkVersions._seq) markVersionsUnknown(); return false; }
 }
 
 async function waitForCoreUpgrade() {

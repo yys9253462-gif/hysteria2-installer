@@ -42,6 +42,7 @@
     3  节点没有对外可达的 API 通道（没有 masquerade.listenHTTPS），需要人工处理
 """
 import argparse
+import ipaddress
 import json
 import os
 import re
@@ -62,6 +63,13 @@ def _safe_host(value):
     host = value.strip()
     if not host or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() or ch in "/\\@?#" for ch in host):
         return ""
+    if ":" in host:
+        inner = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+        try:
+            ip = ipaddress.ip_address(inner)
+        except ValueError:
+            return ""
+        return str(ip) if ip.version == 6 else ""
     return host
 
 
@@ -214,9 +222,14 @@ def main():
 
     raw_api_key = meta.get("api_key")
     api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in api_key):
-        print("portal.json 中的 api_key 包含非法控制字符，请检查配置文件。", file=sys.stderr)
+    if any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in api_key):
+        print("portal.json 中的 api_key 包含非法空白或控制字符，请检查配置文件。", file=sys.stderr)
         return 2
+    if args.name is not None:
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in args.name):
+            print("--name 不能包含换行或控制字符", file=sys.stderr)
+            return 2
+        args.name = args.name.strip()
     raw_portal_port = meta.get("port")
     if isinstance(raw_portal_port, int) and not isinstance(raw_portal_port, bool) and 1 <= raw_portal_port <= 65535:
         portal_port = raw_portal_port
@@ -239,12 +252,24 @@ def main():
 
     # 对外可达端口 = masquerade.listenHTTPS
     # 可能写成 `:8443` 或 `0.0.0.0:8443`：只取最后一个冒号后的数字（2026-11-04 修），
-    # 旧实现拼出 https://a.com:0.0.0.0:8443 还返回 0。
+    # 旧实现拼出 https://a.com:0.0.0.0:8443 还返回 0；且只读取 masquerade 段内，绝不跨段误抓。
     https_port = (masq.get("listenHTTPS") or "").rpartition(":")[2].strip()
     if not (https_port.isascii() and https_port.isdigit()):
-        # 锚定行首且只匹配冒号后纯数字：被注释掉的 `# listenHTTPS: :1111` 与 `":abc8443"` 均不得误抽。
-        m2 = re.search(r"^\s*listenHTTPS:\s*[\"']?(?:[^\s#\"']*:)?([0-9]+)[\"']?\s*(?:#.*)?$", cfg_text, re.M)
-        https_port = m2.group(1) if m2 else ""
+        # 回退解析同样限定在顶层 masquerade: 块内，且只匹配冒号后纯数字。
+        in_masq = False
+        https_port = ""
+        for raw_line in cfg_text.splitlines():
+            s_line = raw_line.strip()
+            if not s_line or s_line.startswith("#"):
+                continue
+            if len(raw_line) - len(raw_line.lstrip()) == 0:
+                in_masq = bool(re.match(r"^masquerade:\s*(?:#.*)?$", s_line))
+                continue
+            if in_masq:
+                m2 = re.match(r"^listenHTTPS:\s*[\"']?(?:[^\s#\"']*:)?([0-9]+)[\"']?\s*(?:#.*)?$", s_line)
+                if m2:
+                    https_port = m2.group(1)
+                    break
     # 端口 0 / 越界拼出的地址永远连不上，旧实现照样输出并返回 0（2026-11-12 修）；
     # 同时去掉十进制前导零（如 08443 -> 8443），避免严格 URL 解析器拒绝。
     if https_port.isascii() and https_port.isdigit() and 1 <= int(https_port) <= 65535:

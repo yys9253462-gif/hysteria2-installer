@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.64'
+PORTAL_VERSION = '2.65'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -10125,19 +10125,46 @@ if __name__ == '__main__':
         line = str(meta.get('line', '3') or '3')
         if line not in ('2', '3'):
             line = '3'
+        _clean_scalar = lambda v: (
+            v.strip()
+            if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+            else ''
+        )
+        _clean_created = lambda v: (
+            v.strip()
+            if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+            else (v if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and (v - v == 0) else '')
+        )
+        _raw_port = meta.get('port')
+        _port_val = 0
+        if isinstance(_raw_port, int) and not isinstance(_raw_port, bool) and 1 <= _raw_port <= 65535:
+            _port_val = _raw_port
+        elif isinstance(_raw_port, str):
+            _ps = _raw_port.strip()
+            if _ps.isascii() and _ps.isdigit() and not _ps.startswith('0') and 1 <= int(_ps) <= 65535:
+                _port_val = int(_ps)
+        clean_peers = []
+        for p in peers_raw:
+            _pname = _clean_scalar(p.get('name'))
+            if not _pname:
+                continue
+            clean_peers.append({
+                'name': _pname,
+                'address': _clean_scalar(p.get('address')),
+                'endpoint': _clean_scalar(p.get('endpoint')),
+                'created_at': _clean_created(p.get('created_at')),
+            })
         return {
             'ok': True,
             'installed': awg_installed(),
             'active': awg_active(),
             'line': line,
-            'port': str(meta.get('port', '') or ''),
-            'endpoint': str(meta.get('endpoint', '') or ''),
-            'peer_count': len(peers_raw),
+            'port': str(_port_val) if _port_val else '',
+            'endpoint': _clean_scalar(meta.get('endpoint')),
+            'peer_count': len(clean_peers),
             'ctl': Path(AWG_CTL).exists(),
             # 注意：只回传非敏感字段，私钥与预共享密钥绝不下发到前端
-            'peers': [{'name': p.get('name', ''), 'address': p.get('address', ''),
-                       'endpoint': p.get('endpoint', ''),
-                       'created_at': p.get('created_at', '')} for p in peers_raw],
+            'peers': clean_peers,
         }
 
     def _active_reality_config():
@@ -10698,7 +10725,18 @@ if __name__ == '__main__':
             return verify_session(self.headers.get('Cookie', ''))
 
         def reply_json(self, code, payload):
-            body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            try:
+                body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8')
+            except ValueError:
+                def _scrub(obj):
+                    if isinstance(obj, float):
+                        return obj if math.isfinite(obj) else None
+                    if isinstance(obj, dict):
+                        return {k: _scrub(v) for k, v in obj.items()}
+                    if isinstance(obj, (list, tuple)):
+                        return [_scrub(v) for v in obj]
+                    return obj
+                body = json.dumps(_scrub(payload), ensure_ascii=False, allow_nan=False).encode('utf-8')
             self.send_response(code)
             self._responded = True
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -11533,6 +11571,8 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     password_changed = False
+                    status_disabled = False
+                    result = None
                     with data_lock:
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
@@ -11545,6 +11585,7 @@ if __name__ == '__main__':
                             previous = copy.deepcopy(u)
                             u.update(changes)
                             password_changed = previous.get('password') != u.get('password')
+                            status_disabled = u.get('status') == 'disabled'
                             rotate_user_view_key_on_change(previous, u)
                             try:
                                 save_data()
@@ -11553,10 +11594,11 @@ if __name__ == '__main__':
                             except OSError:
                                 data['users'][user_id] = previous
                                 conflict = (503, 'User update save failed; disk state may require verification')
-                            result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
-                            # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
-                            result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
-                            result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
+                            if conflict is None:
+                                result = {k: copy.deepcopy(v) for k, v in u.items() if k not in ('password', 'view_nonce')}
+                                # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
+                                result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
+                                result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
@@ -11565,7 +11607,7 @@ if __name__ == '__main__':
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
-                    if password_changed:
+                    if (password_changed or status_disabled) and hasattr(self, '_kick_old_password_sessions'):
                         self._kick_old_password_sessions(user_id)
                     if durability_uncertain:
                         return self.reply_json(503, {'ok': False,
@@ -11868,6 +11910,8 @@ if __name__ == '__main__':
                     # 每次都重启会撞 systemd 的 start-limit（10-03 踩过）。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if want != 'active' and hasattr(self, '_kick_old_password_sessions'):
+                        self._kick_old_password_sessions(user_id)
                     if durability_uncertain:
                         return self.reply_json(503, {'ok': False,
                             'error': 'User status saved but durability uncertain; verify and retry'})
@@ -11951,7 +11995,8 @@ if __name__ == '__main__':
             # 3. Web 网页版管理通道 (用户管理 / WARP 开关 / 触发升级)
             with data_lock:
                 _portal_tok = data.get('token')
-            if not isinstance(_portal_tok, str) or not _portal_tok:
+            if (not isinstance(_portal_tok, str) or not _portal_tok
+                    or any(ord(c) < 32 or ord(c) == 127 or c in '/\\' for c in _portal_tok)):
                 return self.reply(503, b'Portal token unavailable')
             prefix = '/' + _portal_tok + '/'
             if self.path == prefix + 'do-upgrade':
@@ -12486,16 +12531,17 @@ if __name__ == '__main__':
                         return 400, {'ok': False, 'error': 'HTTP Basic 认证用户名不能包含冒号'}
                     if ptype == 'socks5' and (len(username.encode('utf-8')) > 255 or len(password.encode('utf-8')) > 255):
                         return 400, {'ok': False, 'error': 'SOCKS5 账号或密码不能超过 255 字节'}
+                    _clean_note = ''.join(ch for ch in (raw_note_in or '') if ord(ch) >= 0x20 and ord(ch) != 0x7f).strip()[:200]
                     entry = {'id': 'proxy_' + secrets.token_hex(6), 'type': ptype, 'port': port,
                              'username': username, 'password': password, 'created_at': int(time.time()),
-                             'note': (raw_note_in or '').strip()[:200]}
+                             'note': _clean_note}
                     with data_lock:
                         data['proxy_services'] = working + [entry]
                 else:
                     proxy_id = str(params.get('id') or '').strip()
                     if not proxy_id:
                         return 400, {'ok': False, 'error': '请求缺少代理编号，请刷新页面后重试'}
-                    remaining = [item for item in working if item.get('id') != proxy_id]
+                    remaining = [item for item in working if isinstance(item, dict) and item.get('id') != proxy_id]
                     if len(remaining) == len(working):
                         return 404, {'ok': False, 'error': '这个代理服务已经不存在（可能已被删除），请刷新页面'}
                     with data_lock:
@@ -12503,7 +12549,12 @@ if __name__ == '__main__':
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
-                    raise
+                    if action == 'delete':
+                        try:
+                            reload_gost()
+                        except Exception as rel_exc:
+                            _log_ignored('proxy_durability_reload', rel_exc)
+                    return 503, {'ok': False, 'error': '代理配置已替换但目录刷盘状态不确定，请刷新确认后重试'}
                 except OSError:
                     with data_lock:
                         data['proxy_services'] = previous
@@ -12561,7 +12612,7 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
@@ -13484,8 +13535,11 @@ if __name__ == '__main__':
                             self._generate_and_apply_reality(True)
                         if not Path('/usr/local/bin/xray').exists():
                             return self.reply_json(500, {'ok': False, 'error': 'Xray 未安装'})
-                        actual = subprocess.run(['systemctl', 'is-active', 'xray'],
-                                                capture_output=True, text=True, timeout=3).stdout.strip()
+                        try:
+                            actual = subprocess.run(['systemctl', 'is-active', 'xray'],
+                                                    capture_output=True, text=True, timeout=3).stdout.strip()
+                        except (OSError, subprocess.SubprocessError):
+                            actual = ''
                         if actual != 'active':
                             return self.reply_json(500, {'ok': False, 'error': 'Reality 尚未运行，不能报告已开启'})
                         new_active = True
@@ -13498,7 +13552,7 @@ if __name__ == '__main__':
                     try:
                         cfg_now = (json.loads(xray_path.read_text(encoding='utf-8'))
                                    if xray_path.exists() else None)
-                    except ValueError:
+                    except (OSError, ValueError):
                         cfg_now = None
                     if not (isinstance(cfg_now, dict) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
                         return self.reply_json(409, {'ok': False, 'error':
@@ -13515,6 +13569,8 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'message': '已重置密钥并重启生效'})
 
                 return self.reply_json(400, {'ok': False, 'error': '未知的 Reality 操作类型，请刷新页面后重试'})
+            except AtomicWriteDurabilityError as e:
+                return self.reply_json(503, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
@@ -13554,7 +13610,7 @@ if __name__ == '__main__':
                 raise RuntimeError('无法解析证书生效时间，%s 不能启用' % protocol)
             if not_before > time.time():
                 raise RuntimeError('证书尚未生效，%s 不能启用' % protocol)
-            names = set(sans or []) | ({cn} if cn else set())
+            names = {n for n in (sans or []) if isinstance(n, str) and n} | ({cn} if isinstance(cn, str) and cn else set())
             if not certificate_covers_domain(domain, sans, cn):
                 raise RuntimeError('证书不包含域名 %s（现有: %s）' % (
                     domain, ', '.join(sorted(names)) or '无'))
@@ -13921,6 +13977,8 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'active': False,
                         'error': 'VMess 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
+            except AtomicWriteDurabilityError as exc:
+                return self.reply_json(503, {'ok': False, 'error': str(exc)})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
@@ -13943,28 +14001,33 @@ if __name__ == '__main__':
                 # 整个 /vmess-status 500，协议卡片整块空白。
                 _v = data.get('vmess_config')
                 vcfg = dict(_v) if isinstance(_v, dict) else {}
+            _clean_text = lambda v: (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else ''
+            )
             qr_svg = ''
-            _uri = vcfg.get('uri')
-            if active and isinstance(_uri, str) and _uri:
+            _uri = _clean_text(vcfg.get('uri'))
+            if active and _uri:
                 try:
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                                         input=_uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vmess_qr', exc)
             return self.reply_json(200, {
                 'ok': True, 'installed': installed, 'active': active,
                 'config': {
-                    'uri': vcfg.get('uri', '') if active else '',
-                    'uuid': vcfg.get('uuid', '') if active else '',
-                    'domain': vcfg.get('domain', ''),
-                    'sni': vcfg.get('sni', ''),
-                    'ws_path': vcfg.get('ws_path', ''),
-                    'port': vcfg.get('port', 0) if active else 0,
+                    'uri': _uri if active else '',
+                    'uuid': _clean_text(vcfg.get('uuid')) if active else '',
+                    'domain': _clean_text(vcfg.get('domain')),
+                    'sni': _clean_text(vcfg.get('sni')),
+                    'ws_path': _clean_text(vcfg.get('ws_path')),
+                    'port': (_valid_port(vcfg.get('port')) or 0) if active else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -14452,6 +14515,8 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'active': False,
                         'error': 'AnyTLS 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
+            except AtomicWriteDurabilityError as exc:
+                return self.reply_json(503, {'ok': False, 'error': str(exc)})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
@@ -14460,11 +14525,24 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             self._extend_deadline(30)
+            _clean_text = lambda v: (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else ''
+            )
             acfg = _active_anytls_config() or {}
+            if not isinstance(acfg, dict):
+                acfg = {}
             running = bool(acfg) and _systemd_state(ANYTLS_SERVICE) == 'active'
             version = _singbox_version()
-            uri = anytls_uri_for_user(acfg, MASTER_USER_ID,
-                                      label='AnyTLS-' + str(acfg.get('domain', ''))) if acfg else ''
+            _adomain = _clean_text(acfg.get('domain'))
+            try:
+                uri = _clean_text(anytls_uri_for_user(
+                    acfg, MASTER_USER_ID, label='AnyTLS-' + _adomain
+                )) if acfg else ''
+            except Exception as exc:
+                _log_ignored('anytls_status_uri', exc)
+                uri = ''
             qr_svg = ''
             if running and uri:
                 try:
@@ -14472,7 +14550,7 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('anytls_qr', exc)
@@ -14484,9 +14562,9 @@ if __name__ == '__main__':
                 'active': running,
                 'config': {
                     'uri': uri if running else '',
-                    'domain': acfg.get('domain', ''),
-                    'sni': acfg.get('sni', ''),
-                    'port': acfg.get('port', 0) if running else 0,
+                    'domain': _adomain,
+                    'sni': _clean_text(acfg.get('sni')),
+                    'port': (_valid_port(acfg.get('port')) or 0) if running else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -14698,6 +14776,8 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'active': False,
                         'error': 'TUIC 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
+            except AtomicWriteDurabilityError as exc:
+                return self.reply_json(503, {'ok': False, 'error': str(exc)})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
@@ -14706,11 +14786,24 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             self._extend_deadline(30)
+            _clean_text = lambda v: (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else ''
+            )
             tcfg = _active_tuic_config() or {}
+            if not isinstance(tcfg, dict):
+                tcfg = {}
             running = bool(tcfg) and _systemd_state(TUIC_SERVICE) == 'active'
             version = _singbox_version()
-            uri = tuic_uri_for_user(tcfg, MASTER_USER_ID,
-                                    label='TUIC-' + str(tcfg.get('domain', ''))) if tcfg else ''
+            _tdomain = _clean_text(tcfg.get('domain'))
+            try:
+                uri = _clean_text(tuic_uri_for_user(
+                    tcfg, MASTER_USER_ID, label='TUIC-' + _tdomain
+                )) if tcfg else ''
+            except Exception as exc:
+                _log_ignored('tuic_status_uri', exc)
+                uri = ''
             qr_svg = ''
             if running and uri:
                 try:
@@ -14718,7 +14811,7 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('tuic_qr', exc)
@@ -14730,9 +14823,9 @@ if __name__ == '__main__':
                 'active': running,
                 'config': {
                     'uri': uri if running else '',
-                    'domain': tcfg.get('domain', ''),
-                    'sni': tcfg.get('sni', ''),
-                    'port': tcfg.get('port', 0) if running else 0,
+                    'domain': _tdomain,
+                    'sni': _clean_text(tcfg.get('sni')),
+                    'port': (_valid_port(tcfg.get('port')) or 0) if running else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -14841,6 +14934,8 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'active': False,
                         'error': 'VLESS Encryption 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
+            except AtomicWriteDurabilityError as exc:
+                return self.reply_json(503, {'ok': False, 'error': str(exc)})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
@@ -14863,27 +14958,32 @@ if __name__ == '__main__':
                 # 同 /vmess-status：非 dict 配置会让 dict() 抛异常。
                 _e = data.get('vlessenc_config')
                 ecfg = dict(_e) if isinstance(_e, dict) else {}
+            _clean_text = lambda v: (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else ''
+            )
             qr_svg = ''
-            _euri = ecfg.get('uri')
-            if active and isinstance(_euri, str) and _euri:
+            _euri = _clean_text(ecfg.get('uri'))
+            if active and _euri:
                 try:
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                                         input=_euri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vlessenc_qr', exc)
             return self.reply_json(200, {
                 'ok': True, 'installed': installed, 'active': active,
                 'config': {
-                    'uri': ecfg.get('uri', '') if active else '',
+                    'uri': _euri if active else '',
                     'uuid': reality_uuid_for_user(MASTER_USER_ID) if active else '',
-                    'domain': ecfg.get('domain', ''),
-                    'sni': ecfg.get('sni', ''),
-                    'port': ecfg.get('port', 0) if active else 0,
+                    'domain': _clean_text(ecfg.get('domain')),
+                    'sni': _clean_text(ecfg.get('sni')),
+                    'port': (_valid_port(ecfg.get('port')) or 0) if active else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -15844,6 +15944,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self._reply_with_warp_apply({
                     'message': 'WARP 通道安装完成，正在应用分流配置。',
                 })
+            except AtomicWriteDurabilityError as e:
+                return self.reply_json(503, {'ok': False, 'error': f'状态落盘不确定: {str(e)}'})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
             finally:
@@ -16200,7 +16302,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                                  'measurement_sources': node_sources})
                 if sub == 'proxy-services/list':
                     with data_lock:
-                        items = proxy_services(data)
+                        items = [dict(s) for s in proxy_services(data) if isinstance(s, dict)]
                     # 面板只看这条 API: 补齐 host 与 gost 运行状态,
                     # 否则列表显示不出主机名, 也无法区分"服务真的可用"和"条目存在".
                     m = read_meta_file(meta_path)
@@ -16220,7 +16322,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             with data_lock:
                 _portal_tok = data.get('token')
-            if not isinstance(_portal_tok, str) or not _portal_tok:
+            if (not isinstance(_portal_tok, str) or not _portal_tok
+                    or any(ord(c) < 32 or ord(c) == 127 or c in '/\\' for c in _portal_tok)):
                 return self.reply(503, b'Portal token unavailable')
             prefix = '/' + _portal_tok + '/'
             if not self.path.startswith(prefix):
@@ -16787,7 +16890,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
-                services = proxy_services(data)
+                services = [dict(s) for s in proxy_services(data) if isinstance(s, dict)]
             m = read_meta_file(meta_path)
             host = meta_display_host(m)
             return self.reply_json(200, {
@@ -16804,6 +16907,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """GET /check-version 的处理逻辑（从 do_GET 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(45)
             query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
             if query.get('force', ['0'])[0] == '1':
                 try:
@@ -16923,15 +17028,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             with data_lock:
                 rcfg = dict(config_section(data, 'reality_config'))
 
+            _clean_text = lambda v, default='': (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else default
+            )
             qr_svg = ''
-            _ruri = rcfg.get('uri')
-            if is_active and isinstance(_ruri, str) and _ruri:
+            _ruri = _clean_text(rcfg.get('uri'))
+            if is_active and _ruri:
                 try:
                     qr_res = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                                             input=_ruri.encode('utf-8'), capture_output=True, timeout=3)
                     if qr_res.returncode == 0:
                         qr_svg = qr_res.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception:
                     qr_svg = ''
@@ -16943,12 +17053,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 'config': {
                     # 停用后不再下发 URI（与 VMess / VLESS Encryption 对齐）：
                     # 前端虽已隐藏内容区，但接口仍返回可用链接会误导脚本调用方。
-                    'uri': rcfg.get('uri', '') if is_active else '',
-                    'uuid': rcfg.get('uuid', ''),
-                    'pub_key': rcfg.get('public_key', ''),
-                    'short_id': rcfg.get('short_id', ''),
+                    'uri': _ruri if is_active else '',
+                    'uuid': _clean_text(rcfg.get('uuid')),
+                    'pub_key': _clean_text(rcfg.get('public_key')),
+                    'short_id': _clean_text(rcfg.get('short_id')),
                     'flow': 'xtls-rprx-vision',
-                    'sni': rcfg.get('dest_sni', 'www.apple.com'),
+                    'sni': _clean_text(rcfg.get('dest_sni'), 'www.apple.com') or 'www.apple.com',
                     'port': (_valid_port(rcfg.get('port')) or 443) if is_active else 0,
                     'qr_svg': qr_svg if is_active else ''
                 }
@@ -17438,6 +17548,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """GET /warp-status 的处理逻辑（从 do_GET 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(30)
             with data_lock:
                 state = routing_state(data)
                 enabled = state['warp_enabled']
@@ -17473,7 +17585,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             except Exception:
                 applied = False
             with data_lock:
-                apply_error = data.get('egress_apply_error') or data.get('warp_apply_error', '')
+                _raw_err = data.get('egress_apply_error') or data.get('warp_apply_error', '')
+                apply_error = (
+                    _raw_err.strip()
+                    if isinstance(_raw_err, str) and not any(ord(c) < 32 or ord(c) == 127 for c in _raw_err)
+                    else ''
+                )
                 applying = bool(data.get('egress_applying') or data.get('warp_applying'))
             return self.reply_json(200, {
                 'ok': True,
@@ -17497,6 +17614,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(30)
             try:
                 meta = read_meta_file(meta_path)
             except Exception:
@@ -17511,7 +17630,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             # 与门户实际下发给客户端的 sni 对照：不一致说明又发生了漂移
             # （自愈单元没装 / 装的是旧版 / 证书刚换还没跑到）。
             live_sn = ''
-            meta_sn = str(info.get('server_name') or '')
+            _raw_meta_sn = info.get('server_name')
+            meta_sn = _raw_meta_sn.strip() if isinstance(_raw_meta_sn, str) else ''
             _raw_sans = info.get('sans')
             _clean_sans = [s for s in (_raw_sans if isinstance(_raw_sans, (list, tuple)) else [])
                            if isinstance(s, str)]
@@ -17547,7 +17667,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(len(body)))
             for _name, _value in extra_headers:
-                self.send_header(_name, _value)
+                if not isinstance(_name, str) or not _name or any(ch in _name for ch in ('\r', '\n', '\x00', ':')):
+                    continue
+                _safe_val = str(_value).replace('\r', '').replace('\n', '').replace('\x00', '')
+                self.send_header(_name, _safe_val)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')

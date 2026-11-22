@@ -194,7 +194,7 @@ awg_atomic_copy_file() {
 awg_atomic_install_bin() {
     local src="$1" dst="$2" tmp
     mkdir -p "$(dirname "$dst")" || return 1
-    tmp="$(mktemp "${dst}.new.XXXXXX")" || return 1
+    tmp="$(umask 077 && mktemp "${dst}.new.XXXXXX")" || return 1
     if ! install -m 0755 "$src" "$tmp"; then
         rm -f "$tmp"
         return 1
@@ -424,7 +424,7 @@ download_binaries() {
     log_info "来源: ${url}"
 
     tmpd="$(umask 077 && mktemp -d)"
-    trap 'rm -rf "${tmpd:-}" "${bakd:-}" 2>/dev/null || true' RETURN
+    trap 'trap - RETURN; rm -rf "${tmpd:-}" "${bakd:-}" 2>/dev/null || true' RETURN
     # --max-time 与 `9>&-`（2026-11-03 修）：门户 420 秒超时只杀 bash，不杀 curl；
     # curl 又继承了持锁的 fd 9。下载卡住时孤儿 curl 一直占着锁，之后每个改 AWG
     # 的命令都等 300 秒再失败，EXIT 回滚也不会执行。两次下载 + 校验必须在 420 秒内完。
@@ -657,7 +657,8 @@ render_server_config() {
     mtu=$(( 1420 - 10#$s4v ))
     (( mtu < 1280 )) && mtu=1280
 
-    local tmp
+    local tmp=""
+    trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
     tmp="$(umask 077 && mktemp "${AWG_DIR}/.conf.XXXXXX")"
     if ! {
         echo "# ============================================================"
@@ -713,9 +714,9 @@ render_server_config() {
         if [[ -s "$AWG_PEERS_FILE" ]]; then
             jq -r '
                 (.peers // []) | if type=="array" then .[] else empty end |
-                select(type=="object" and (.public_key | type=="string" and length>0) and (.address | type=="string" and length>0)) |
-                "\n[Peer]\n# \(.name // "peer")\nPublicKey = \(.public_key)" +
-                (if (.preshared_key | type=="string" and length>0) then "\nPresharedKey = \(.preshared_key)" else "" end) +
+                select(type=="object" and (.public_key | type=="string" and length>0 and (test("[\r\n\t\u0000-\u001f\u007f ]") | not)) and (.address | type=="string" and test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"))) |
+                "\n[Peer]\n# \((.name | if type=="string" then gsub("[\r\n\t\u0000-\u001f\u007f]"; "") else "peer" end) | if length>0 then . else "peer" end)\nPublicKey = \(.public_key)" +
+                (if (.preshared_key | type=="string" and length>0 and (test("[\r\n\t\u0000-\u001f\u007f ]") | not)) then "\nPresharedKey = \(.preshared_key)" else "" end) +
                 "\nAllowedIPs = \(.address)/32"
             ' "$AWG_PEERS_FILE"
         fi
@@ -755,6 +756,13 @@ render_client_config() {
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
     [[ -n "$priv" && -n "$addr" ]] || die "找不到客户端或客户端记录损坏: ${name}"
+    [[ -n "$pub" ]] || die "meta 中缺少 server_public_key，无法生成客户端配置"
+    if [[ "$priv" == *$'\n'* || "$priv" == *$'\r'* || "$pub" == *$'\n'* || "$pub" == *$'\r'* || "$addr" == *$'\n'* || "$addr" == *$'\r'* ]]; then
+        die "客户端密钥或地址包含非法换行字符，已中止渲染: ${name}"
+    fi
+    if [[ -n "$psk" && ( "$psk" == *$'\n'* || "$psk" == *$'\r'* ) ]]; then
+        die "客户端预共享密钥包含非法换行字符，已中止渲染: ${name}"
+    fi
     if ! endpoint_has_port "$endpoint"; then
         [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || die "AWG 服务端端口配置无效: ${port}"
     fi
@@ -783,7 +791,9 @@ render_client_config() {
     echo ""
     echo "[Peer]"
     echo "PublicKey = ${pub}"
-    echo "PresharedKey = ${psk}"
+    if [[ -n "$psk" ]]; then
+        echo "PresharedKey = ${psk}"
+    fi
     # endpoint 允许自带端口（validate_endpoint 接受 host:port）；
     # 无脑再拼一次会得到 host:51820:54321，客户端直接握手失败（2026-10-29 修）。
     if endpoint_has_port "$endpoint"; then
@@ -807,7 +817,7 @@ render_client_config() {
 
 write_service() {
     local svc_dir tmp=""
-    trap 'rm -f "${tmp:-}"' RETURN
+    trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
     svc_dir="$(dirname "$AWG_SERVICE")"
     mkdir -p "$svc_dir"
     tmp="$(umask 077 && mktemp "${svc_dir}/.awg-service.XXXXXX")"
@@ -923,7 +933,7 @@ peer_apply_live_add() {
     local pub="$1" psk="$2" addr="$3"
     service_active || return 0
     local pskf=""
-    trap 'rm -f "${pskf:-}"' RETURN
+    trap 'trap - RETURN; rm -f "${pskf:-}"' RETURN
     pskf="$(umask 077 && mktemp)"
     chmod 600 "$pskf"
     printf '%s\n' "$psk" > "$pskf"
@@ -985,7 +995,7 @@ cmd_peer_add() {
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
     local priv pub psk addr tmp="" peers_backup="" config_backup="" had_config=0
-    trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"' RETURN
+    trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; trap - RETURN' RETURN
     # 先生成密钥、分配地址，再做备份（2026-11-03 修）：地址池满 / genkey 失败时
     # 旧实现在备份之后 die，每次都留下一份带全部客户端私钥的备份文件。
     priv="$(genkey)"
@@ -1044,7 +1054,7 @@ cmd_peer_del() {
     peer_exists "$name" || die "客户端不存在: ${name}"
 
     local pub tmp="" peers_backup="" config_backup="" had_config=0
-    trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"' RETURN
+    trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; trap - RETURN' RETURN
     pub="$(jq -r --arg n "$name" 'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.public_key | if type=="string" then . else empty end)) // empty' "$AWG_PEERS_FILE")"
     peers_backup="$(umask 077 && mktemp "${AWG_DIR}/.peers-backup.XXXXXX")" || die "无法创建客户端列表备份临时文件"
     config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || die "无法创建服务端配置备份临时文件"
@@ -1564,7 +1574,10 @@ cmd_update() {
             fi
         fi
         if [[ "$line" == "3" && -z "$(meta_get HeaderProtectionKey)" ]]; then
-            meta_set HeaderProtectionKey "$(genkey)"
+            local _hp_key
+            _hp_key="$(genkey)"
+            [[ -n "$_hp_key" ]] || die "生成 3.x 头部保护密钥失败"
+            meta_set HeaderProtectionKey "$_hp_key"
         fi
         render_server_config
         log_warn "⚠️ 请立即为所有客户端重新导出配置（旧配置已全部失效）:"
