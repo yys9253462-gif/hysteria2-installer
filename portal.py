@@ -8871,8 +8871,13 @@ def sync_download_artifacts(data, uri, clash, sing, qr=_QR_UNSET):
 
 
 def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', precomputed_qr=None):
-    root = Path(meta_path).parent
-    m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    meta_file = Path(meta_path)
+    if meta_file.is_symlink():
+        raise OSError('client_meta.json 不得为符号链接')
+    if meta_file.lstat().st_size > 1024 * 1024:
+        raise ValueError('client_meta.json 体积过大（超过 1 MiB）')
+    root = meta_file.parent
+    m = json.loads(meta_file.read_bytes().decode('utf-8', errors='replace'))
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     # 证书可能已被带外替换（Caddy 续期 / 手工换证），先修信任模型再对齐 pin。
@@ -8882,7 +8887,11 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     sync_pin(m, root, meta_path)
 
     path = root / 'portal.json'
-    data = json.loads(path.read_text(encoding='utf-8'))
+    if path.is_symlink():
+        raise OSError('portal.json 不得为符号链接')
+    if path.lstat().st_size > 16 * 1024 * 1024:
+        raise ValueError('portal.json 体积过大（超过 16 MiB）')
+    data = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
     if not isinstance(data, dict):
         raise ValueError('portal.json 顶层必须是 JSON 对象')
     original_data = copy.deepcopy(data)
@@ -8957,7 +8966,10 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     # that ensure_portal_access may have repaired in this refresh snapshot.
     # This preserves user, usage and service writes from the portal process.
     try:
-        latest = json.loads(path.read_text(encoding='utf-8'))
+        if not path.is_symlink() and path.is_file() and path.lstat().st_size <= 16 * 1024 * 1024:
+            latest = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
+        else:
+            latest = None
         if isinstance(latest, dict):
             for key in ('clash', 'sing', 'qr', 'page_digest'):
                 if key in data:
@@ -8982,11 +8994,12 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
     except (OSError, ValueError):
         pass
     _access_file = root / 'portal-access.json'
-    if _access_file.exists():
+    if _access_file.exists() and not _access_file.is_symlink():
         try:
-            latest_access = json.loads(_access_file.read_text(encoding='utf-8'))
-            if isinstance(latest_access, dict):
-                access = latest_access
+            if _access_file.is_file() and _access_file.lstat().st_size <= 1024 * 1024:
+                latest_access = json.loads(_access_file.read_bytes().decode('utf-8', errors='replace'))
+                if isinstance(latest_access, dict):
+                    access = latest_access
         except (OSError, ValueError):
             pass
     if access.get('url') != access_url:
@@ -8999,28 +9012,42 @@ def _refresh_portal_state(meta_path, config_path='/etc/hysteria/config.yaml', pr
 
 def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
     """Refresh derived portal state without racing live persistence writers."""
-    root = Path(meta_path).parent
+    meta_file = Path(meta_path)
+    root = meta_file.parent
     portal_file = root / 'portal.json'
     access_file = root / 'portal-access.json'
+    if meta_file.is_symlink() or portal_file.is_symlink() or access_file.is_symlink():
+        raise OSError('门户状态文件不得为符号链接，已拒绝刷新')
     # qrencode 最长 20 秒，先在状态锁外跑：运行中门户的 save_data 持 data_lock 等这把锁，
     # 锁内跑子进程会让所有 /auth 跟着卡住（2026-11-04 修）。
     precomputed_qr = None
     try:
-        _uri = artifacts(json.loads(Path(meta_path).read_text(encoding='utf-8')))[0]
-        precomputed_qr = (_uri, qr_svg_for(_uri))
+        if meta_file.is_file() and meta_file.lstat().st_size <= 1024 * 1024:
+            _uri = artifacts(json.loads(meta_file.read_bytes().decode('utf-8', errors='replace')))[0]
+            precomputed_qr = (_uri, qr_svg_for(_uri))
     except Exception as exc:
         _log_ignored('refresh_qr_precompute', exc)
     stale_uri = None
     with portal_state_file_lock(root):
+        if portal_file.is_symlink() or access_file.is_symlink():
+            raise OSError('门户状态文件不得为符号链接，已拒绝刷新')
+        if portal_file.lstat().st_size > 16 * 1024 * 1024:
+            raise ValueError('portal.json 体积过大（超过 16 MiB）')
         old_portal = portal_file.read_bytes()
-        old_access = access_file.read_bytes() if access_file.exists() else None
+        if access_file.exists():
+            if access_file.lstat().st_size > 1024 * 1024:
+                raise ValueError('portal-access.json 体积过大（超过 1 MiB）')
+            old_access = access_file.read_bytes()
+        else:
+            old_access = None
         try:
             stale_uri = _refresh_portal_state(meta_path, config_path, precomputed_qr)
         except Exception:
             try:
                 atomic_write_private(portal_file, old_portal)
                 if old_access is None:
-                    access_file.unlink(missing_ok=True)
+                    if not access_file.is_symlink():
+                        access_file.unlink(missing_ok=True)
                 else:
                     atomic_write_private(access_file, old_access)
             except OSError as rollback_error:
@@ -9032,10 +9059,11 @@ def refresh(meta_path, config_path='/etc/hysteria/config.yaml'):
         if isinstance(qr, str) and qr:
             with portal_state_file_lock(root):
                 try:
-                    latest = json.loads(portal_file.read_text(encoding='utf-8'))
-                    if isinstance(latest, dict):
-                        latest['qr'] = qr
-                        atomic_write_private(portal_file, json.dumps(latest, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+                    if not portal_file.is_symlink() and portal_file.lstat().st_size <= 16 * 1024 * 1024:
+                        latest = json.loads(portal_file.read_bytes().decode('utf-8', errors='replace'))
+                        if isinstance(latest, dict):
+                            latest['qr'] = qr
+                            atomic_write_private(portal_file, json.dumps(latest, ensure_ascii=False, allow_nan=False).encode('utf-8'))
                 except (OSError, ValueError) as exc:
                     _log_ignored('refresh_qr_late', exc)
 
@@ -13623,12 +13651,16 @@ if __name__ == '__main__':
                 gost_binary = Path('/usr/local/bin/gost')
                 gost_unit = Path('/etc/systemd/system/gost.service')
                 gost_owner = Path('/etc/hysteria/.hy2-gost-owned')
+                if gost_binary.is_symlink() or gost_unit.is_symlink() or gost_owner.is_symlink():
+                    return self.reply_json(409, {'ok': False, 'error':
+                        '检测到 GOST 相关路径为符号链接，已拒绝安装以防覆写宿主文件'})
                 if gost_binary.exists() or gost_unit.exists():
                     managed_unit = False
                     try:
-                        managed_unit = (gost_unit.is_file() and
-                            'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
-                            in gost_unit.read_text(encoding='utf-8'))
+                        managed_unit = (gost_unit.is_file() and not gost_unit.is_symlink()
+                            and gost_unit.lstat().st_size <= 1024 * 1024
+                            and 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
+                            in gost_unit.read_bytes().decode('utf-8', errors='replace'))
                     except (OSError, UnicodeDecodeError):
                         pass
                     if not (gost_owner.is_file() and managed_unit):
@@ -13699,7 +13731,7 @@ if __name__ == '__main__':
                 try:
                     old_gost_enabled = subprocess.run(
                         ['systemctl', 'is-enabled', 'gost'], capture_output=True,
-                        text=True, timeout=5).stdout.strip() == 'enabled'
+                        text=True, encoding='utf-8', errors='replace', timeout=5).stdout.strip() == 'enabled'
                 except Exception:
                     old_gost_enabled = False
                 with data_lock:
@@ -13708,6 +13740,9 @@ if __name__ == '__main__':
                 old_assets = {}
                 for asset_path in (gost_binary, gost_unit_path, gost_check_path,
                                    owner_marker_path, gost_config_path, *cert_files):
+                    if asset_path.is_symlink():
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '检测到 GOST 资产路径为符号链接，已拒绝安装：%s' % asset_path})
                     old_assets[asset_path] = (asset_path.read_bytes(),
                         asset_path.stat().st_mode & 0o777) if asset_path.exists() else None
                 with tempfile.TemporaryDirectory() as tmpdir:
@@ -13727,18 +13762,21 @@ if __name__ == '__main__':
                                 continue
                             src_bin = Path(tmpdir) / 'gost'
                             with tarfile.open(str(archive_path), 'r:gz') as tar:
-                                # 全量校验成员路径并拦截符号/硬链接，再只接受唯一精确同名的常规成员
+                                # 全量校验成员路径并拦截符号/硬链接与特殊设备节点，再只接受唯一精确同名的常规成员
                                 all_members = tar.getmembers()
                                 regular_names = []
                                 for m in all_members:
                                     mname = m.name or ''
-                                    clean = mname[2:] if mname.startswith('./') else mname
-                                    if (mname.startswith('/') or clean.startswith('/')
-                                            or '\\' in mname or '\x00' in mname
+                                    clean = mname
+                                    while clean.startswith('./'):
+                                        clean = clean[2:]
+                                    if (not clean or mname.startswith('/') or clean.startswith('/')
+                                            or '\\' in mname or ':' in clean
+                                            or any(ord(ch) < 32 or ord(ch) == 127 for ch in mname)
                                             or '..' in clean.split('/')):
                                         raise ValueError('tar 包内含不安全路径成员: %s' % mname)
-                                    if m.issym() or m.islnk():
-                                        raise ValueError('tar 包内含不允许的链接成员: %s' % mname)
+                                    if m.issym() or m.islnk() or m.isfifo() or m.ischr() or m.isblk() or m.isdev():
+                                        raise ValueError('tar 包内含不允许的链接或特殊设备成员: %s' % mname)
                                     if m.isfile():
                                         regular_names.append(mname)
                                 member_name = safe_tar_members(regular_names, 'gost')
@@ -13752,8 +13790,12 @@ if __name__ == '__main__':
                             if src_bin.exists():
                                 staged = Path('/usr/local/bin/gost.new.%s' % os.urandom(6).hex())
                                 replaced = False
+                                _sfd = None
                                 try:
-                                    with open(src_bin, 'rb') as src_f, open(staged, 'wb') as dst_f:
+                                    _sflags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+                                    _sfd = os.open(str(staged), _sflags, 0o755)
+                                    with open(src_bin, 'rb') as src_f, os.fdopen(_sfd, 'wb') as dst_f:
+                                        _sfd = None
                                         shutil.copyfileobj(src_f, dst_f)
                                         dst_f.flush()
                                         os.fsync(dst_f.fileno())
@@ -13763,7 +13805,7 @@ if __name__ == '__main__':
                                     # 旧实现直接覆盖正在用的 gost，所有代理随下次重启全部失效。
                                     try:
                                         probe = subprocess.run([str(staged), '-V'], capture_output=True,
-                                                               text=True, timeout=10)
+                                                               text=True, encoding='utf-8', errors='replace', timeout=10)
                                         runs = probe.returncode == 0 and 'gost' in (probe.stdout + probe.stderr).lower()
                                     except (OSError, subprocess.SubprocessError):
                                         runs = False
@@ -13776,8 +13818,16 @@ if __name__ == '__main__':
                                     installed = True
                                     break
                                 finally:
+                                    if _sfd is not None:
+                                        try:
+                                            os.close(_sfd)
+                                        except OSError:
+                                            pass
                                     if not replaced:
-                                        staged.unlink(missing_ok=True)
+                                        try:
+                                            staged.unlink(missing_ok=True)
+                                        except OSError:
+                                            pass
                             errors.append('%s: 包内没有 gost 可执行文件' % host)
                         except Exception as e:
                             errors.append('%s: %s: %s' % (host, type(e).__name__, e))
