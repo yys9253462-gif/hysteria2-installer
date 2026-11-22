@@ -27,7 +27,12 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     if active_users is not None:
         if isinstance(active_users, (str, bytes)) or not hasattr(active_users, '__iter__'):
             raise ValueError('invalid active_users')
-        active_users = set(active_users)
+        normalized_active = set()
+        for item in active_users:
+            if not isinstance(item, str) or not item:
+                raise ValueError('invalid active_users')
+            normalized_active.add(item)
+        active_users = normalized_active
     clean = {}
     for uid, pair in counters.items():
         if not isinstance(uid, str) or not isinstance(pair, dict):
@@ -181,7 +186,11 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     if first_sample:
         sources[source]['baseline_at'] = sampled_at
     elif 'baseline_at' in previous:
-        sources[source]['baseline_at'] = previous['baseline_at']
+        prev_bl = previous['baseline_at']
+        if ((isinstance(prev_bl, str) and bool(prev_bl.strip()))
+                or (isinstance(prev_bl, (int, float)) and not isinstance(prev_bl, bool)
+                    and math.isfinite(prev_bl))):
+            sources[source]['baseline_at'] = prev_bl
     gaps = new.setdefault('gaps', [])
     if new_epoch:
         gaps.append({'source': source, 'at': sampled_at,

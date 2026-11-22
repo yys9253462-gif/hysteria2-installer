@@ -49,9 +49,20 @@ def _validate_loopback_xray_addr(address):
     if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
         raise ValueError('xray endpoint must be loopback')
     port_text = address[len('127.0.0.1:'):]
-    if not (port_text.isascii() and port_text.isdigit()) or not (1 <= int(port_text) <= 65535):
+    if (not (port_text.isascii() and port_text.isdigit())
+            or port_text.startswith('0')
+            or not (1 <= int(port_text) <= 65535)):
         raise ValueError('xray endpoint must be loopback')
     return address
+
+
+def _valid_binary_path(binary):
+    if not isinstance(binary, str):
+        return False
+    s = binary.strip()
+    if not s or s.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in binary):
+        return False
+    return True
 
 
 def read_hysteria(url, secret):
@@ -104,7 +115,7 @@ def parse_xray(raw):
 
 
 def read_xray(binary, address):
-    if not isinstance(binary, str) or not binary.strip() or '\x00' in binary:
+    if not _valid_binary_path(binary):
         raise ValueError('invalid xray binary')
     address = _validate_loopback_xray_addr(address)
     r=subprocess.run([binary,'api','statsquery','--server='+address,'-pattern','user>>>','-reset=false'],
@@ -151,14 +162,23 @@ def _addr_ip(addr):
             if not rest.startswith(':'):
                 raise ValueError('invalid_bracketed_addr')
             port_text=rest[1:]
-            if not (port_text.isascii() and port_text.isdigit()) or not (1<=int(port_text)<=65535):
+            if (not (port_text.isascii() and port_text.isdigit())
+                    or port_text.startswith('0')
+                    or not (1<=int(port_text)<=65535)):
                 raise ValueError('invalid_bracketed_port')
         ip=ipaddress.ip_address(text[1:end])
     else:
         try:
             ip=ipaddress.ip_address(text)
         except ValueError:
-            ip=ipaddress.ip_address(text.rsplit(':',1)[0])
+            if ':' not in text:
+                raise ValueError('invalid_addr') from None
+            host_part, port_text = text.rsplit(':', 1)
+            if (not (port_text.isascii() and port_text.isdigit())
+                    or port_text.startswith('0')
+                    or not (1 <= int(port_text) <= 65535)):
+                raise ValueError('invalid_addr_port')
+            ip=ipaddress.ip_address(host_part)
     # 双栈监听时 IPv4 客户端报成 ::ffff:a.b.c.d：还原成 IPv4（2026-11-06 修），否则控制台的
     # 跨节点在线 IP 与拦截名单（纯 IPv4）对不上，同一设备在不同节点上像是两个。
     if ip.version==6 and ip.ipv4_mapped:
@@ -321,7 +341,13 @@ def read_live_connections():
     # 避免每 15 秒报「Reality在线IP读取失败」。未启用时明确说明，不用历史 access 日志猜。
     rcfg=cfg.get('reality') if isinstance(cfg.get('reality'),dict) else {}
     binary=rcfg.get('binary','') if isinstance(rcfg.get('binary'),str) else ''
-    if binary and pathlib.Path(binary).is_file() and service_running('xray'):
+    _bin_ok = False
+    if _valid_binary_path(binary):
+        try:
+            _bin_ok = pathlib.Path(binary).is_file()
+        except (OSError, ValueError):
+            _bin_ok = False
+    if _bin_ok and service_running('xray'):
         try:
             xcfg=json.loads(pathlib.Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
             policy=xcfg.get('policy') if isinstance(xcfg,dict) else None
@@ -330,7 +356,9 @@ def read_live_connections():
             enabled=level0.get('statsUserOnline',False) if isinstance(level0,dict) else False
             if not enabled:raise ValueError('online_statistics_not_enabled')
             address=_validate_loopback_xray_addr(rcfg.get('address'))
-            allusers=json.loads(cmd([binary,'api','statsgetallonlineusers','--server='+address]))
+            raw_allusers=cmd([binary,'api','statsgetallonlineusers','--server='+address])
+            if len(raw_allusers)>8*1024*1024:raise ValueError('online_users_response_too_large')
+            allusers=json.loads(raw_allusers)
             # Go 序列化空切片或空映射时常返回 null，仅把 None 视为缺省空集合，其它非法类型仍拒绝。
             names=([] if allusers.get('users') is None else allusers.get('users')) if isinstance(allusers,dict) else allusers
             if not isinstance(names,list):raise ValueError('invalid_online_users')
@@ -339,7 +367,11 @@ def read_live_connections():
             for uid,out in output['users'].items():
                 out['reality_ok']=True
                 if uid not in names:continue
-                result=json.loads(cmd([binary,'api','statsonlineiplist','--server='+address,'--email='+uid]))
+                if not isinstance(uid,str) or any(ord(c)<32 or ord(c)==127 for c in uid):
+                    raise ValueError('invalid_online_user_name')
+                raw_iplist=cmd([binary,'api','statsonlineiplist','--server='+address,'--email='+uid])
+                if len(raw_iplist)>8*1024*1024:raise ValueError('online_ips_response_too_large')
+                result=json.loads(raw_iplist)
                 if not isinstance(result,dict):raise ValueError('invalid_online_ips')
                 ips={} if result.get('ips') is None else result.get('ips')
                 if not isinstance(ips,dict):raise ValueError('invalid_online_ips')
