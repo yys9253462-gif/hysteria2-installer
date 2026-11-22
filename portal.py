@@ -6596,10 +6596,15 @@ class AuthLimiter:
 
     @staticmethod
     def _prune(items, now, window):
-        while items and now - items[0] >= window:
+        while items and (now - items[0] >= window or now < items[0]):
             items.popleft()
 
     def limited(self, key, now):
+        if (isinstance(now, bool) or not isinstance(now, (int, float))
+                or now != now or now == float('inf') or now == float('-inf')):
+            return False
+        if not isinstance(key, str):
+            key = str(key)[:64]
         self._prune(self.global_requests, now, 1)
         if len(self.global_requests) >= self.global_rate:
             return True
@@ -6618,6 +6623,11 @@ class AuthLimiter:
         return too_fast
 
     def record_failure(self, key, now):
+        if (isinstance(now, bool) or not isinstance(now, (int, float))
+                or now != now or now == float('inf') or now == float('-inf')):
+            return
+        if not isinstance(key, str):
+            key = str(key)[:64]
         self._bucket(key)[1].append(now)
 
 
@@ -6629,7 +6639,7 @@ def active_ip_deny(table, uid, now):
     异常穿透 do_POST → 连接被掐断，客户端只会无限重试（表现为「突然全节点
     连不上」）。损坏项按「无拦截」处理并清掉，绝不能让鉴权路径抛异常。
     """
-    if not isinstance(table, dict):
+    if not isinstance(table, dict) or not isinstance(uid, str):
         return set()
     row = table.get(uid)
     if not isinstance(row, dict):
@@ -6637,7 +6647,9 @@ def active_ip_deny(table, uid, now):
             table.pop(uid, None)
         return set()
     for ip in [ip for ip, until in row.items()
-               if not isinstance(until, (int, float)) or isinstance(until, bool)
+               if not isinstance(ip, str) or not ip
+               or not isinstance(until, (int, float)) or isinstance(until, bool)
+               or until != until or until == float('inf') or until == float('-inf')
                or until <= now]:
         row.pop(ip)
     if not row:
@@ -6676,9 +6688,15 @@ def kick_hy2_users(root, uids):
     secret = hc.get('secret')
     url = hc.get('url')
     url = url.rstrip('/') if isinstance(url, str) else ''
-    if not uids or not _valid_stats_secret(secret) or not _valid_loopback_stats_url(url):
+    if isinstance(uids, (str, bytes)) or not uids:
         return False
-    req = urllib.request.Request(url + '/kick', data=json.dumps(sorted(uids)).encode(),
+    try:
+        clean_uids = sorted({u for u in uids if isinstance(u, str) and u})
+    except TypeError:
+        return False
+    if not clean_uids or not _valid_stats_secret(secret) or not _valid_loopback_stats_url(url):
+        return False
+    req = urllib.request.Request(url + '/kick', data=json.dumps(clean_uids).encode(),
                                  headers={'Authorization': secret, 'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=4):
         pass
@@ -6727,7 +6745,8 @@ def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
         # 否则该用户的所有设备都不再受上限约束。
         for ip in list(admitted):
             last = admitted[ip]
-            if not isinstance(last, (int, float)) or isinstance(last, bool):
+            if (not isinstance(last, (int, float)) or isinstance(last, bool)
+                    or last != last or last == float('inf') or last == float('-inf')):
                 admitted.pop(ip)
             elif ip in seen:
                 admitted[ip] = now
@@ -6737,12 +6756,13 @@ def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
             span = blocked[ip]
             if (not isinstance(span, (list, tuple)) or len(span) != 2
                     or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                               and v == v and v != float('inf') and v != float('-inf')
                                for v in span)):
                 blocked.pop(ip)
                 continue
             if ip in seen:
-                blocked[ip][1] = now
-            elif now - blocked[ip][1] >= release_after:
+                blocked[ip] = [span[0], now]
+            elif now - span[1] >= release_after:
                 blocked.pop(ip)
         # 上限被调低时收回多出来的 Reality 名额（2026-11-03 修）：旧实现只评估
         # 尚未放行的 IP，已放行的每轮刷新时间戳，ip_limit 从 3 改成 1 后三台设备
@@ -6779,14 +6799,18 @@ def reality_iplimit_rules(blocked):
     """{uid: ips} -> {ruleTag: rule}。tag 由用户和 IP 集合派生：内容变了 tag 就变，
     同步时只比对 tag 即可，不需要依赖 lsrules 回显规则内容（它不回显）。"""
     rules = {}
+    if not isinstance(blocked, dict):
+        return rules
     for uid, ips in blocked.items():
-        if not ips:
+        if not isinstance(uid, str) or not uid or not ips or isinstance(ips, (str, bytes)):
             continue
-        ips = sorted(ips)
-        digest = hashlib.sha256((uid + '|' + ','.join(ips)).encode()).hexdigest()
+        clean_ips = sorted({ip for ip in ips if isinstance(ip, str) and ip})
+        if not clean_ips:
+            continue
+        digest = hashlib.sha256((uid + '|' + ','.join(clean_ips)).encode()).hexdigest()
         tag = '%s%s-%s' % (REALITY_IPLIMIT_TAG_PREFIX,
                            hashlib.sha256(uid.encode()).hexdigest()[:12], digest[:12])
-        rules[tag] = {'ruleTag': tag, 'type': 'field', 'user': [uid], 'source': ips,
+        rules[tag] = {'ruleTag': tag, 'type': 'field', 'user': [uid], 'source': clean_ips,
                       'outboundTag': 'iplimit-block'}
     return rules
 
@@ -8873,8 +8897,20 @@ def persist_interrupted_core_job(portal_path, data):
     else:
         changed = False
     if changed:
+        try:
+            payload = json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        except ValueError:
+            def _scrub_finite(obj):
+                if isinstance(obj, float):
+                    return obj if (obj == obj and obj != float('inf') and obj != float('-inf')) else None
+                if isinstance(obj, dict):
+                    return {k: _scrub_finite(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_scrub_finite(v) for v in obj]
+                return obj
+            payload = json.dumps(_scrub_finite(data), ensure_ascii=False, allow_nan=False).encode('utf-8')
         with portal_state_file_lock(Path(portal_path).parent):
-            atomic_write_private(portal_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+            atomic_write_private(portal_path, payload)
     return changed
 
 
@@ -8907,7 +8943,7 @@ def serve(path):
                 _bind_port = _cand_p if 1 <= _cand_p <= 65535 else 0
         elif isinstance(_raw_port, str):
             _ps = _raw_port.strip()
-            if _ps.isascii() and _ps.isdigit():
+            if _ps.isascii() and _ps.isdigit() and not (len(_ps) > 1 and _ps.startswith('0')):
                 _cand_p = int(_ps)
                 _bind_port = _cand_p if 1 <= _cand_p <= 65535 else 0
     if not _bind_port:
@@ -8939,7 +8975,10 @@ def serve(path):
     # api_key 与 session_secret 同理：空串会让 Bearer 校验退化成常量比较。
     # 重新生成后要**落盘**（portal.json 与 portal-access.json 两处），
     # 否则每次重启都换一个新 key，控制台永远对不上。
-    if not isinstance(data.get('api_key'), str) or not data['api_key']:
+    _stored_api_key = data.get('api_key')
+    if (not isinstance(_stored_api_key, str) or not _stored_api_key
+            or not _stored_api_key.isascii()
+            or any(ord(ch) <= 32 or ord(ch) == 127 for ch in _stored_api_key)):
         repair_missing_api_key(portal_path, data)
     meta_path = portal_path.parent / 'client_meta.json'
 
