@@ -126,7 +126,7 @@ CONF="$(render_client_config "alice" "")"
 echo "$CONF" | grep -q "PrivateKey = ALICE_PRIV"
 echo "$CONF" | grep -q "Endpoint = vpn.example.com:51888"
 echo "CONF_OK=1"
-if render_client_config "broken_no_priv" "" >/dev/null 2>&1; then
+if ( render_client_config "broken_no_priv" "" ) >/dev/null 2>&1; then
   echo "BROKEN_SHOULD_FAIL"
   exit 1
 fi

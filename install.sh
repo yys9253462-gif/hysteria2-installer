@@ -2616,23 +2616,24 @@ if len(sys.argv) > 2:
     except (OSError, ValueError):
         _data = {}
     if isinstance(_data, dict):
+        def _add_avoid(_p):
+            if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
+                avoid.add(_p)
+            elif isinstance(_p, str):
+                _s = _p.strip()
+                if _s.isascii() and _s.isdigit():
+                    _pi = int(_s)
+                    if 1 <= _pi <= 65535:
+                        avoid.add(_pi)
         for _key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config', 'tuic_config'):
             _sec = _data.get(_key)
             if isinstance(_sec, dict):
-                _p = _sec.get('port')
-                if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
-                    avoid.add(_p)
-                elif isinstance(_p, str) and _p.strip().isascii() and _p.strip().isdigit():
-                    avoid.add(int(_p.strip()))
+                _add_avoid(_sec.get('port'))
         _proxies = _data.get('proxy_services')
         if isinstance(_proxies, list):
             for _item in _proxies:
                 if isinstance(_item, dict):
-                    _p = _item.get('port')
-                    if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
-                        avoid.add(_p)
-                    elif isinstance(_p, str) and _p.strip().isascii() and _p.strip().isdigit():
-                        avoid.add(int(_p.strip()))
+                    _add_avoid(_item.get('port'))
 for _ in range(100):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))

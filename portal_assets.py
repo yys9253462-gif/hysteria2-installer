@@ -2753,6 +2753,7 @@ if (btnRebootServer) {
             back = false;
           }
           if (back) {
+            btnRebootServer.disabled = false;
             location.reload();
             return;
           }
