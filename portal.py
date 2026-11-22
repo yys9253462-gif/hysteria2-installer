@@ -9339,8 +9339,13 @@ def serve(path):
         # 排在本轮之后，用新快照重新生效。
         nonlocal last_enforced_blocked, last_enforce_error
         with access_apply_lock:
+            clean_force = (
+                {uid for uid in force_ids if isinstance(uid, str) and USER_ID_RE.match(uid)}
+                if isinstance(force_ids, (list, tuple, set, frozenset))
+                else set()
+            )
             with data_lock:
-                pending=pending_revocations(data) | set(force_ids)
+                pending=pending_revocations(data) | clean_force
                 snapshot=copy.deepcopy(data)
                 blocked=blocked_user_ids()
             acquired_core_lock = False
@@ -9517,12 +9522,11 @@ def serve(path):
                     cols = rest.split()
                     if len(cols) < 9:
                         continue
-                    try:
-                        rx_val, tx_val = int(cols[0]), int(cols[8])
-                    except ValueError:
+                    rx_raw, tx_raw = cols[0], cols[8]
+                    if not (rx_raw.isascii() and rx_raw.isdigit() and len(rx_raw) <= 24
+                            and tx_raw.isascii() and tx_raw.isdigit() and len(tx_raw) <= 24):
                         continue
-                    if rx_val < 0 or tx_val < 0:
-                        continue
+                    rx_val, tx_val = int(rx_raw), int(tx_raw)
                     rx += rx_val
                     tx += tx_val
                     seen.append(name)
@@ -9541,9 +9545,14 @@ def serve(path):
                              TUIC_SERVICE)
 
     def _unit_active(unit):
+        if not isinstance(unit, str) or not unit or unit.startswith('-'):
+            return False
+        if any(ord(ch) <= 32 or ord(ch) == 127 for ch in unit):
+            return False
         try:
             return subprocess.run(['systemctl', 'is-active', unit], capture_output=True,
-                                  text=True, timeout=5).stdout.strip() == 'active'
+                                  text=True, encoding='utf-8', errors='replace',
+                                  timeout=5).stdout.strip() == 'active'
         except Exception:
             return False
 
@@ -9676,7 +9685,7 @@ def serve(path):
         now = time.monotonic()
         # Persist the first sample immediately after start/reboot so a quick portal
         # restart cannot lose the new counter baseline or its accumulated usage.
-        if _meter_last_save[0] is not None and now - _meter_last_save[0] < METER_SAVE_INTERVAL:
+        if _meter_last_save[0] is not None and 0 <= now - _meter_last_save[0] < METER_SAVE_INTERVAL:
             return
         save_data()
         _meter_last_save[0] = now
@@ -9936,6 +9945,7 @@ def serve(path):
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
         gost_cfg_path = portal_path.parent / 'gost.yml'
         services = []
+        seen_ports = set()
         with data_lock:
             # 单条代理记录被改坏（null / 字符串 / 端口非数字）时跳过它：
             # 旧写法在这里抛异常，reload_gost 一律返回 False，
@@ -9955,11 +9965,12 @@ def serve(path):
                             port = cand_p if 1 <= cand_p <= 65535 else 0
                     elif isinstance(raw_port, str):
                         ps = raw_port.strip()
-                        if ps.isascii() and ps.isdigit() and not (len(ps) > 1 and ps.startswith('0')):
+                        if ps.isascii() and ps.isdigit() and len(ps) <= 16 and not (len(ps) > 1 and ps.startswith('0')):
                             cand_p = int(ps)
                             port = cand_p if 1 <= cand_p <= 65535 else 0
-                if not port:
+                if not port or port in seen_ports:
                     continue
+                seen_ports.add(port)
                 raw_user = svc.get('username', '')
                 raw_pass = svc.get('password', '')
                 safe_user = ''.join(ch for ch in raw_user if ord(ch) >= 32 and ord(ch) != 127) if isinstance(raw_user, str) else ''
@@ -10080,7 +10091,7 @@ def serve(path):
             cached_t = _ver_cache['t']
             cached_data = _ver_cache['data']
         ttl = 300 if cached_data is not None else 60
-        if cached_t and now - cached_t < ttl:
+        if cached_t and 0 <= now - cached_t < ttl:
             return dict(cached_data) if isinstance(cached_data, dict) else cached_data
         try:
             req = urllib.request.Request(
@@ -10098,7 +10109,11 @@ def serve(path):
             # GitHub 在限流/出错时返回的是对象（{"message": ...}），不是列表；
             # 旧写法 `for it in items` 直接抛 TypeError，虽然被下面 except 兜住，
             # 但每次都白跑一遍请求且永远拿不到缓存。
-            shas = ({it['name']: (it.get('sha') if isinstance(it.get('sha'), str) else '')
+            def _valid_blob_sha(val):
+                if isinstance(val, str) and 7 <= len(val) <= 64 and all(c in '0123456789abcdefABCDEF' for c in val):
+                    return val.lower()
+                return ''
+            shas = ({it['name']: _valid_blob_sha(it.get('sha'))
                      for it in items
                      if isinstance(it, dict) and isinstance(it.get('name'), str) and it['name']}
                     if isinstance(items, list) else {})
@@ -10142,7 +10157,9 @@ def serve(path):
     def gost_status():
         """检测 gost 服务运行状态。"""
         try:
-            out = subprocess.run(['systemctl', 'is-active', 'gost'], capture_output=True, text=True, timeout=3).stdout.strip()
+            out = subprocess.run(['systemctl', 'is-active', 'gost'], capture_output=True,
+                                 text=True, encoding='utf-8', errors='replace',
+                                 timeout=3).stdout.strip()
             return out == 'active'
         except Exception:
             return False
@@ -10165,8 +10182,13 @@ def serve(path):
             try:
                 with os.fdopen(fd, 'wb') as fh:
                     fh.write(GOST_SELFCHECK_SCRIPT.encode('utf-8'))
+                    fh.flush()
+                    os.fsync(fh.fileno())
             except BaseException:
-                tmp_path.unlink(missing_ok=True)
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 raise
             os.chmod(str(tmp_path), 0o755)
             os.replace(str(tmp_path), str(GOST_SELFCHECK_PATH))
@@ -10174,7 +10196,10 @@ def serve(path):
             return True
         except OSError as exc:
             if tmp_path is not None:
-                tmp_path.unlink(missing_ok=True)
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             _log_ignored('gost_selfcheck_write', exc)
             return False
 
