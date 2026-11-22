@@ -2758,10 +2758,17 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
               username="", password=""):
     def field(identifier, value, kind="link", label=None):
         # 读屏念的是 aria-label（2026-11-13 修）：旧实现直接用元素 id，念出来是「hy2-link」这类代码名。
+        text = value if isinstance(value, str) else ""
         return (f'<textarea id="{identifier}" class="{kind}" aria-label="{html.escape(label or identifier)}" '
-                f'readonly spellcheck="false">{html.escape(value)}</textarea>')
+                f'readonly spellcheck="false">{html.escape(text)}</textarea>')
     def copy(identifier):
         return f'<button class="button primary" type="button" data-copy="{identifier}" data-orig="复制">复制</button>'
+
+    token_str = token if isinstance(token, str) else ""
+    token_attr = html.escape(token_str, quote=True)
+    username_str = username if isinstance(username, str) else ""
+    password_str = password if isinstance(password, str) else ""
+    api_key_str = api_key if isinstance(api_key, str) else ""
     
     # meta 字段先清洗再用（2026-11-06 修）：server_name / public_ip 为数字、列表或 null 时
     # 下面的 html.escape 抛 AttributeError，整个管理页 500；is_insecure 写成字符串 "false"
@@ -2801,7 +2808,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     # 单条记录不是 dict（手工编辑 / 截断写入）时跳过该行；`users` 整体不是
     # dict 时按空表渲染 —— 页面是 /auth 与所有管理操作的必经路径，
     # 这里抛异常等于整个控制台白屏，而两个服务仍然 active。
-    rows = [(uid, u) for uid, u in users.items() if isinstance(u, dict)]
+    rows = [(uid, u) for uid, u in users.items() if isinstance(uid, str) and isinstance(u, dict)]
     for uid, u in sorted(rows, key=lambda x: _safe_int(x[1].get("created_at") or 0),
                          reverse=True):
         used_bytes = _safe_int(u.get("used_bytes") or 0)
@@ -2852,8 +2859,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
           <td>{expires_str}</td>
           <td><code style="font-size:11px">{html.escape(password_hint(u.get("password")))}</code></td>
           <td>
-            {'' if uid == MASTER_USER_ID else f'''<button class="button primary btn-user-connect" style="padding:4px 10px;font-size:11px;margin-right:6px" type="button" data-uid="{html.escape(uid)}" data-token="{token}" data-key="{user_key}">专属连接</button>'''}
-            {'' if uid == MASTER_USER_ID else f'''<form method="POST" action="/{token}/manage-user" style="display:inline" class="js-confirm-delete" data-confirm="确定注销此用户？此操作不可撤销。">
+            {'' if uid == MASTER_USER_ID else f'''<button class="button primary btn-user-connect" style="padding:4px 10px;font-size:11px;margin-right:6px" type="button" data-uid="{html.escape(uid)}" data-token="{token_attr}" data-key="{html.escape(user_key, quote=True)}">专属连接</button>'''}
+            {'' if uid == MASTER_USER_ID else f'''<form method="POST" action="/{token_attr}/manage-user" style="display:inline" class="js-confirm-delete" data-confirm="确定注销此用户？此操作不可撤销。">
               <input type="hidden" name="action" value="delete">
               <input type="hidden" name="user_id" value="{html.escape(uid)}">
               <button class="button danger" style="padding:4px 10px;font-size:11px" type="submit">删除</button>
@@ -2883,9 +2890,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     #
     # 反过来，绝不能把这份负载挂到 /api/v1/ 的 Bearer 链路上去：api_key 的权限
     # 明确低于 Basic（前者够不着门户网页端），用低权限凭据换高权限凭据就是提权。
-    access_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
+    access_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/"
     access_json = json.dumps(
-        portal_access_payload(access_url, username, password, api_key or ""),
+        portal_access_payload(access_url, username_str, password_str, api_key_str),
         ensure_ascii=False)
     field_access_json = (
         f'<textarea id="teyir-access-json" class="config" aria-label="TEYIR 接入凭据（JSON）" '
@@ -2894,9 +2901,10 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     def _access_row(identifier, label, value):
         """克隆既有 api-box 的结构，保持与「API 基础地址」一行完全一致的观感。"""
+        val_text = value if isinstance(value, str) else ""
         return (f'<div class="api-box"><div><div style="font-size:11px;color:var(--muted);'
                 f'font-weight:700">{label}</div>'
-                f'<div class="api-key-code" id="{identifier}">{html.escape(value)}</div></div>'
+                f'<div class="api-key-code" id="{identifier}">{html.escape(val_text)}</div></div>'
                 f'<button class="button" type="button" data-copy="{identifier}" '
                 f'data-orig="复制">复制</button></div>')
 
@@ -2919,9 +2927,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <summary class="hint" style="cursor:pointer">或按字段单独复制（控制台里手工填写时才需要）</summary>
     <div style="display:grid;gap:10px;margin-top:12px">
       {_access_row("teyir-url-val", "门户地址 url", access_url)}
-      {_access_row("teyir-user-val", "门户用户名 username", username)}
-      {_access_row("teyir-pass-val", "门户密码 password", password)}
-      {_access_row("teyir-key-val", "api_key（Bearer 鉴权）", api_key or "")}
+      {_access_row("teyir-user-val", "门户用户名 username", username_str)}
+      {_access_row("teyir-pass-val", "门户密码 password", password_str)}
+      {_access_row("teyir-key-val", "api_key（Bearer 鉴权）", api_key_str)}
     </div>
   </details>
 
@@ -2939,7 +2947,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HY2 · 节点与集群中心</title><style>{STYLE}</style></head><body><main>
 <nav class="topbar" aria-label="页面标识"><div class="brand"><span class="logo">H₂</span> HYSTERIA <span> / 控制中心</span></div><span class="private">● 集群运行中</span></nav>
 <header class="hero"><div class="eyebrow">HYSTERIA 2 NODE DASHBOARD</div><h1>{html.escape(host)}</h1><p>官方核心驱动 · 极速 QUIC 代理 · 多用户开户与流量/IP限制{fake_sni_hint}</p>
-<form method="POST" action="/{token}/logout" style="margin-top:10px"><button class="button" type="submit" style="padding:6px 14px;font-size:12px">退出登录</button></form></header>
+<form method="POST" action="/{token_attr}/logout" style="margin-top:10px"><button class="button" type="submit" style="padding:6px 14px;font-size:12px">退出登录</button></form></header>
 
 <!-- 顶部 Tab 导航栏 -->
 <div class="tab-bar">
@@ -3014,7 +3022,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     <details style="margin-bottom:18px">
       <summary class="button" style="margin-bottom:12px;list-style:none">＋ 手动添加/开通新用户</summary>
-      <form class="modal-form js-user-form" method="POST" action="/{token}/manage-user">
+      <form class="modal-form js-user-form" method="POST" action="/{token_attr}/manage-user">
         <input type="hidden" name="action" value="create">
         
         <div class="form-field">
@@ -3873,7 +3881,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <div class="api-box">
       <div>
         <div style="font-size:11px;color:var(--muted);font-weight:700">通信鉴权密钥 (Bearer API Key)</div>
-        <div class="api-key-code" id="api-key-val">{html.escape(api_key or "")}</div>
+        <div class="api-key-code" id="api-key-val">{html.escape(api_key_str)}</div>
       </div>
       <button class="button primary" type="button" data-copy="api-key-val" data-orig="复制 Key">复制 Key</button>
     </div>
@@ -4216,6 +4224,18 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # 数据被改坏时（非字典或字符串用量、非法到期时间）不能让客户页面 500：
     # 这几个值直接来自 portal.json（2026-10-30 修）。
     uinfo = uinfo if isinstance(uinfo, dict) else {}
+    host = host if isinstance(host, str) else ""
+    uid = uid if isinstance(uid, str) else ""
+    uri = uri if isinstance(uri, str) else ""
+    clash = clash if isinstance(clash, str) else ""
+    sing = sing if isinstance(sing, str) else ""
+    obfs_badge = obfs_badge if isinstance(obfs_badge, str) else ""
+    token_str = token if isinstance(token, str) else ""
+    user_key_str = user_key if isinstance(user_key, str) else ""
+    token_attr = html.escape(token_str, quote=True)
+    user_key_attr = html.escape(user_key_str, quote=True)
+    uid_url = quote(uid, safe='')
+    uid_attr = html.escape(uid, quote=True)
     used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
     limit_bytes = _safe_int(uinfo.get("limit_bytes") or 0)
     # 与 user_access_allowed 同源：徽标直接取自 user_access_denial。
@@ -4243,12 +4263,17 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # **绝不兜底成伪造的 8443**（8443 在本项目里是被主动避开的黑名单端口）。
     if sub_port is None:
         sub_port = resolve_subscription_port({})[0]
-    clash_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/clash.yaml?k={user_key}"
+    clash_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/u/{uid_url}/clash.yaml?k={user_key_str}"
     # sing-box 也给订阅链接（2026-11-13 加）：SFA / SFI 用「远程配置」填链接即可自动更新，
     # 响应头本来就带更新间隔；旧页面只给整段 JSON 和下载，节点换端口后客户得重新导入。
-    sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/sing-box.json?k={user_key}"
-    # 生成不出二维码时说清楚（2026-11-13 修）：旧页面留一个空框，下面还写着「扫描即可直接接入」。
-    qr_block = (qr_svg if isinstance(qr_svg, str) and '<svg' in qr_svg
+    sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/u/{uid_url}/sing-box.json?k={user_key_str}"
+    # 生成不出二维码或含危险脚本/事件属性时说清楚（2026-11-13 修）：严禁内联不受信任的 SVG 脚本。
+    qr_safe = (
+        isinstance(qr_svg, str)
+        and re.match(r'^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b', qr_svg.strip(), re.I) is not None
+        and re.search(r'<script\b|<foreignObject\b|\bon[a-z]+\s*=', qr_svg, re.I) is None
+    )
+    qr_block = (qr_svg if qr_safe
                 else '<p class="hint">%s</p>' % html.escape(QR_UNAVAILABLE_TEXT))
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>个人专属连接 · {html.escape(uid)}</title><style>{STYLE}</style></head><body><main style="max-width:860px">
@@ -4276,7 +4301,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     <p class="hint">支持 v2rayNG / Shadowrocket / Nekobox</p>
     <div class="qr-frame" style="margin:16px 0">{qr_block}</div>
     <p class="hint">在客户端点击右上角扫描即可直接接入</p>
-    <div class="tags"><span class="tag">Hysteria 2</span><span class="tag">专属认证</span><span class="tag">{obfs_badge}</span></div>
+    <div class="tags"><span class="tag">Hysteria 2</span><span class="tag">专属认证</span><span class="tag">{html.escape(obfs_badge)}</span></div>
   </section>
 
   <!-- 直链与客户端配置 -->
@@ -4296,7 +4321,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
       <textarea id="u-clash-sub" class="link" aria-label="Clash 订阅链接" style="height:68px" readonly>{html.escape(clash_sub_url)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-clash-sub">复制订阅链接</button>
-        <a class="button" href="/{token}/u/{quote(uid)}/clash.yaml?k={user_key}" download="clash-{uid}.yaml">下载 clash.yaml ↓</a>
+        <a class="button" href="/{token_attr}/u/{uid_url}/clash.yaml?k={user_key_attr}" download="clash-{uid_attr}.yaml">下载 clash.yaml ↓</a>
       </div>
       <details style="margin-top:10px">
         <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
@@ -4310,7 +4335,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
       <textarea id="u-sing-sub" class="link" aria-label="Sing-box 订阅链接" style="height:68px" readonly>{html.escape(sing_sub_url)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-sing-sub">复制订阅链接</button>
-        <a class="button" href="/{token}/u/{quote(uid)}/sing-box.json?k={user_key}" download="sing-box-{uid}.json">下载 sing-box.json ↓</a>
+        <a class="button" href="/{token_attr}/u/{uid_url}/sing-box.json?k={user_key_attr}" download="sing-box-{uid_attr}.json">下载 sing-box.json ↓</a>
       </div>
       <details style="margin-top:10px">
         <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
