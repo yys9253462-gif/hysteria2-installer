@@ -634,15 +634,13 @@ def clean_outbounds(outbounds):
 
 
 def _renderable_outbounds(outbounds):
-    """在 clean_outbounds 基础上进一步筛选可安全渲染进 YAML 的出站条目。"""
+    """在 clean_outbounds 基础上进一步筛选可通过校验、可安全渲染进 YAML 的出站条目。"""
     result = []
     for ob in clean_outbounds(outbounds):
-        otype = ob['type']
-        if otype == 'socks5' and not _is_safe_outbound_str(ob.get('addr')):
+        ok, cleaned, _ = validate_outbound(ob)
+        if not ok or not cleaned or cleaned['name'] != ob['name']:
             continue
-        if otype == 'http' and not _is_safe_outbound_str(ob.get('url')):
-            continue
-        result.append(ob)
+        result.append(cleaned)
     return result
 
 
@@ -828,6 +826,8 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     # 传进损坏值：数字会让 `for ... in 7` 抛 TypeError，条目是字符串时
     # `.get` 抛 AttributeError —— 都在「应用配置」路径上。
     outbounds = clean_outbounds(outbounds)
+    if not isinstance(tail_outbound, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', tail_outbound):
+        tail_outbound = 'direct'
     names = [ob['name'] for ob in (outbounds or [])]
     existing = set(_existing_outbound_names() if existing_names is None else existing_names)
     available = set(names) | existing | {'direct', 'reject'}
@@ -843,16 +843,17 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     # 写时，先加的 google.com → warp 会吞掉后加的 mail.google.com → direct，后者永不生效。
     # sorted 是稳定排序，同层级的规则仍保持添加顺序。
     rules = sorted((r for r in rules if isinstance(r, dict)),
-                   key=lambda r: -str(r.get('domain') or '').strip('.').count('.'))
+                   key=lambda r: -(r.get('domain').strip('.').count('.') if isinstance(r.get('domain'), str) else 0))
     for r in rules:
         if not isinstance(r, dict):
             continue
         raw_dom = r.get('domain')
-        dom = raw_dom.strip().lower() if isinstance(raw_dom, str) else ''
-        if not dom:
+        dom = raw_dom.strip().lower().strip('.') if isinstance(raw_dom, str) else ''
+        if not _valid_route_domain(dom):
             continue
-        target = r.get('outbound') or ''
-        # 出站可能已被用户删除 —— 引用不存在的名字会让 Hysteria 起不来
+        raw_target = r.get('outbound')
+        target = raw_target if isinstance(raw_target, str) else ''
+        # 出站可能已被用户删除或被改坏 —— 引用不存在的名字会让 Hysteria 起不来
         if target not in available:
             target = 'warp_socks' if 'warp_socks' in existing else tail_outbound
         acl.append('    - %s(suffix:%s)' % (target, dom))
@@ -897,7 +898,7 @@ def _valid_route_domain(domain):
 
 def build_warp_acl_config(original, enabled, rules):
     """Render WARP domain ACL over the existing Hysteria config."""
-    text = strip_acl_block(original)
+    text = strip_acl_block(original if isinstance(original, str) else '')
     # rules 可能是数字（旧快照被改坏）：`for r in 7` 抛 TypeError，
     # 而这里是 WARP 开关/应用配置的必经路径。
     rows = rules if isinstance(rules, (list, tuple)) else ()
@@ -923,15 +924,19 @@ def build_warp_acl_config(original, enabled, rules):
         text = text.rstrip('\n') + '\n\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443\n  udpPorts: 443\n'
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
     lines = _acl_head()
+    allowed_targets = set(existing) | {'direct', 'reject'}
     _ordered = sorted(rows if enabled else custom_rules,
-                      key=lambda r: -str(r.get('domain', '') if isinstance(r, dict) else r).strip('.').count('.'))
+                      key=lambda r: -(r.get('domain').strip('.').count('.')
+                                      if isinstance(r, dict) and isinstance(r.get('domain'), str)
+                                      else (r.strip('.').count('.') if isinstance(r, str) else 0)))
     for rule in _ordered:  # 同 build_acl_block：具体域名在前
-        domain = rule.get('domain', '') if isinstance(rule, dict) else rule
-        target = rule.get('outbound') or warp_name if isinstance(rule, dict) else warp_name
-        if target not in set(existing) | {'direct', 'reject'}:
-            target = warp_name
-        domain = str(domain).strip().lower().strip('.')
-        if domain and re.fullmatch(r'[a-z0-9.-]+', domain):
+        raw_dom = rule.get('domain') if isinstance(rule, dict) else rule
+        if not isinstance(raw_dom, str):
+            continue
+        raw_target = rule.get('outbound') if isinstance(rule, dict) else warp_name
+        target = raw_target if isinstance(raw_target, str) and raw_target in allowed_targets else warp_name
+        domain = raw_dom.strip().lower().strip('.')
+        if _valid_route_domain(domain):
             lines.append('    - %s(suffix:%s)' % (target, domain))
     lines.append('    - %s(all)' % tail)
     return text.rstrip('\n') + '\n\n' + '\n'.join(lines) + '\n'
@@ -967,9 +972,15 @@ def normalize_route_rules(rules):
             item = {'domain': item, 'outbound': 'warp_socks'}
         if not isinstance(item, dict):
             continue
-        domain = str(item.get('domain') or '').strip().lower().strip('.')
-        if domain and re.fullmatch(r'[a-z0-9.-]+', domain):
-            result.append({'domain': domain, 'outbound': str(item.get('outbound') or 'warp_socks')})
+        raw_dom = item.get('domain')
+        if not isinstance(raw_dom, str):
+            continue
+        domain = raw_dom.strip().lower().strip('.')
+        if _valid_route_domain(domain):
+            raw_ob = item.get('outbound')
+            ob = (raw_ob.strip() if isinstance(raw_ob, str)
+                  and re.fullmatch(r'[A-Za-z0-9_-]+', raw_ob.strip()) else 'warp_socks')
+            result.append({'domain': domain, 'outbound': ob})
     return result
 
 
@@ -981,6 +992,8 @@ def routing_state(data):
     warp_rules 是数字时 normalize_route_rules 之前就会在 deepcopy 后炸，
     面板拿不到能力清单。
     """
+    if not isinstance(data, dict):
+        data = {}
     rules = data.get('warp_rules')
     if not isinstance(rules, (list, tuple)):
         rules = DEFAULT_WARP_DOMAINS if data.get('warp_enabled') else []
@@ -995,10 +1008,12 @@ def routing_state(data):
 
 
 def render_egress_config(original, state):
+    if not isinstance(state, dict):
+        state = {}
     enabled = bool(state.get('warp_enabled', False))
     # Ensure the WARP transport/sniffer, then render the one shared route table.
     base = strip_acl_block(build_warp_acl_config(original, enabled, []))
-    outs = clean_outbounds(state.get('custom_outbounds', []))
+    outs = _renderable_outbounds(state.get('custom_outbounds', []))
     base = upsert_outbound_block(base, outs)
     existing = outbound_names_in(base)
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
