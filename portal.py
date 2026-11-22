@@ -11105,8 +11105,22 @@ if __name__ == '__main__':
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized API key'})
 
                 try:
-                    length = int(self.headers.get('Content-Length', 0))
-                    if length < 0 or length > 1048576:
+                    _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                    if _cl_vals is not None:
+                        if len(_cl_vals) > 1:
+                            return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+                        _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                    else:
+                        _raw_cl = self.headers.get('Content-Length', '0')
+                    if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                        _raw_cl = str(_raw_cl)
+                    if not isinstance(_raw_cl, str):
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+                    _raw_cl_s = _raw_cl.strip()
+                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+                    length = int(_raw_cl_s)
+                    if length > 1048576:
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
                     body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '{}'
                     params = json.loads(body)
@@ -11224,7 +11238,8 @@ if __name__ == '__main__':
                     # active 同理：旧实现校验了却始终写 status=active，
                     # 控制台传 {"active": false} 开户会拿到 200 但用户照样能连。
                     want_active = params.get('active', True)
-                    note = str(params.get('note', '')).strip()[:200]
+                    _raw_note = params.get('note')
+                    note = ('' if _raw_note is None else re.sub(r'[\x00-\x1f\x7f]', ' ', str(_raw_note))).strip()[:200]
 
                     # 🔴 判定必须在锁内、回包必须在锁外：data_lock 是全局锁，
                     # /auth 每个新连接都要拿它；在锁内写 socket（慢客户端/缓冲区满
@@ -11273,10 +11288,14 @@ if __name__ == '__main__':
                                 # （2026-10-29 修：旧实现无条件保留旧 status/用量，
                                 # 控制台对账时传 active=false 或 limit_bytes 会被静默忽略）。
                                 if 'used_bytes' not in params:
-                                    try:
-                                        record['used_bytes'] = int(existing.get('used_bytes') or 0)
-                                    except (TypeError, ValueError):
+                                    _old_used = existing.get('used_bytes')
+                                    if isinstance(_old_used, bool):
                                         record['used_bytes'] = 0
+                                    else:
+                                        try:
+                                            record['used_bytes'] = max(0, int(_old_used or 0))
+                                        except (TypeError, ValueError, OverflowError):
+                                            record['used_bytes'] = 0
                                 record['created_at'] = existing.get('created_at', now_ts)
                                 if 'legacy_auth_value' in existing:
                                     record['legacy_auth_value'] = existing['legacy_auth_value']
@@ -11287,9 +11306,16 @@ if __name__ == '__main__':
                                     if ((param not in params and not (param == 'traffic_gb' and 'limit_bytes' in params))
                                             or (param == 'password' and not params.get(param))):
                                         record[field] = existing.get(field, record[field])
-                                # traffic_gb 与 limit_bytes 都没传时才沿用旧配额。
+                                # traffic_gb 与 limit_bytes 都没传时才沿用旧配额，损坏非数值时回退 0。
                                 if 'traffic_gb' not in params and 'limit_bytes' not in params:
-                                    record['limit_bytes'] = existing.get('limit_bytes', record['limit_bytes'])
+                                    _old_lim = existing.get('limit_bytes')
+                                    if isinstance(_old_lim, bool):
+                                        record['limit_bytes'] = 0
+                                    else:
+                                        try:
+                                            record['limit_bytes'] = max(0, int(_old_lim or 0))
+                                        except (TypeError, ValueError, OverflowError):
+                                            record['limit_bytes'] = 0
                                 if 'duration_days' not in params and 'expires_at' not in params:
                                     record['expires_at'] = existing.get('expires_at', record['expires_at'])
                             if existing is not None:
@@ -11539,7 +11565,7 @@ if __name__ == '__main__':
                             raise ValueError()
                         days = int(raw_days)
                         raw_traffic = params.get('add_traffic_gb', 0)
-                        if isinstance(raw_traffic, bool):
+                        if isinstance(raw_traffic, bool) or (isinstance(raw_traffic, str) and not raw_traffic.isascii()):
                             raise ValueError()
                         add_traffic_gb = float(raw_traffic)
                         if not 1 <= days <= 36500 or not math.isfinite(add_traffic_gb) or not 0 <= add_traffic_gb <= 1000000:
@@ -11704,10 +11730,12 @@ if __name__ == '__main__':
                             ip_tracker.pop(user_id, None)
                             speed_tracker.pop(user_id, None)
                             reality_registry(data)
+                    durability_uncertain = False
                     try:
                         save_data()
                     except AtomicWriteDurabilityError:
-                        raise
+                        # 文件已替换但目录 fsync 失败：仍须立即执行 apply_access 踢人撤权，并返回可重试 503。
+                        durability_uncertain = True
                     except OSError:
                         with data_lock:
                             if previous_had_user:
@@ -11751,9 +11779,13 @@ if __name__ == '__main__':
                         return self.reply_json(503, {'ok': False,
                             'error': 'User deletion was not saved; no access changes were applied'})
                     deleted = previous_had_user
-                    regenerate_page()
+                    if not durability_uncertain:
+                        regenerate_page()
                     if not apply_access([user_id]):
                         return self.reply_json(503, {'ok': False, 'error': 'Access revocation pending; retry required'})
+                    if durability_uncertain:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'User deletion saved but durability uncertain; verify and retry'})
                     return self.reply_json(200, {'ok': True, 'access_revoked': True, 'message': 'User deleted' if deleted else 'User already absent; revocation confirmed'})
 
                 elif sub == 'users/set_status':
