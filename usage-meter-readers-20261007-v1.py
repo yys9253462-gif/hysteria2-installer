@@ -1,8 +1,56 @@
 """节点计数器只读适配器；不 reset，不输出 secret。"""
 import json
+import pathlib
+import stat
 import subprocess
+import urllib.error
 import urllib.request
 from urllib.parse import urlparse
+
+_ORIG_URLOPEN = urllib.request.urlopen
+_ORIG_PATH_CLS = pathlib.Path
+_ORIG_PATH_READ_TEXT = pathlib.Path.read_text
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """禁止本地统计接口跟随 3xx 重定向，防止把 Authorization 密钥发往跳转目标。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f'redirect blocked ({msg})',
+            headers,
+            fp,
+        )
+
+
+def _open_no_redirect(req, timeout=4):
+    if urllib.request.urlopen is not _ORIG_URLOPEN:
+        return urllib.request.urlopen(req, timeout=timeout)
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    return opener.open(req, timeout=timeout)
+
+
+def _read_bounded_json(path, max_bytes=8 * 1024 * 1024):
+    """受限读取常规 JSON 配置文件：拒绝符号链接、非常规文件及超限体积，并兼容单测 Path/read_text 桩。"""
+    p = pathlib.Path(path)
+    if (not isinstance(p, _ORIG_PATH_CLS)
+            or getattr(type(p), 'read_text', None) is not _ORIG_PATH_READ_TEXT):
+        text = p.read_text(encoding='utf-8')
+        if len(text.encode('utf-8')) > max_bytes:
+            raise ValueError('config file too large')
+        return json.loads(text)
+    st = p.lstat()
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError('config path must be regular file')
+    if st.st_size > max_bytes:
+        raise ValueError('config file too large')
+    with open(p, 'rb') as fh:
+        raw = fh.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise ValueError('config file too large')
+    return json.loads(raw.decode('utf-8', errors='replace'))
 
 
 def service_epoch(service):
@@ -52,6 +100,7 @@ def _validate_loopback_xray_addr(address):
         raise ValueError('xray endpoint must be loopback')
     port_text = address[len('127.0.0.1:'):]
     if (not (port_text.isascii() and port_text.isdigit())
+            or len(port_text) > 5
             or port_text.startswith('0')
             or not (1 <= int(port_text) <= 65535)):
         raise ValueError('xray endpoint must be loopback')
@@ -70,12 +119,22 @@ def _valid_binary_path(binary):
 def read_hysteria(url, secret):
     base = _validate_loopback_http_base(url, secret)
     req = urllib.request.Request(base + '/traffic', headers={'Authorization': secret})
-    with urllib.request.urlopen(req, timeout=4) as response:
+    with _open_no_redirect(req, timeout=4) as response:
+        if 300 <= getattr(response, 'status', 200) < 400:
+            raise ValueError('unexpected redirect')
         raw=response.read(4*1024*1024+1)
     if len(raw)>4*1024*1024:
         raise ValueError('traffic response too large')
     result=json.loads(raw)
     if not isinstance(result,dict): raise ValueError('invalid traffic response')
+    for uid, counters in result.items():
+        if not isinstance(uid, str) or not uid or not isinstance(counters, dict):
+            raise ValueError('invalid traffic response')
+        for field in ('tx', 'rx'):
+            if field in counters:
+                val = counters[field]
+                if type(val) is not int or val < 0:
+                    raise ValueError('invalid traffic response')
     return result
 
 
@@ -99,6 +158,8 @@ def parse_xray(raw):
         parts=name.split('>>>')
         if len(parts)!=4 or parts[0]!='user' or parts[2]!='traffic': continue
         if parts[3] not in ('uplink','downlink'): continue
+        if not parts[1] or any(ord(c) < 32 or ord(c) == 127 for c in parts[1]):
+            raise ValueError('invalid xray user')
         value=row.get('value')
         if isinstance(value,str) and value.isascii() and value.isdigit() and len(value)<=30: value=int(value)
         if type(value) is not int or value<0: raise ValueError('invalid xray counter')
@@ -132,7 +193,9 @@ def read_xray(binary, address):
 def read_hysteria_online(url, secret):
     base = _validate_loopback_http_base(url, secret)
     req = urllib.request.Request(base + '/online', headers={'Authorization': secret})
-    with urllib.request.urlopen(req, timeout=4) as response:
+    with _open_no_redirect(req, timeout=4) as response:
+        if 300 <= getattr(response, 'status', 200) < 400:
+            raise ValueError('unexpected redirect')
         raw = response.read(4 * 1024 * 1024 + 1)
     if len(raw) > 4 * 1024 * 1024:
         raise ValueError('online response too large')
@@ -224,7 +287,9 @@ def parse_events(rows):
                     or not (s.isdigit() or (s.startswith('-') and s[1:].isdigit()))):
                 raise ValueError('invalid_connection_event')
             return int(s)
-        return int(raw_ts)
+        if type(raw_ts) is not int:
+            raise ValueError('invalid_connection_event')
+        return raw_ts
     try:
         rows=sorted(rows,key=_event_sort_ts)
     except (TypeError,ValueError,OverflowError):
@@ -250,7 +315,10 @@ def parse_events(rows):
         except (ValueError,TypeError):raise ValueError('invalid_connection_event') from None
         if event not in ('client connected','client disconnected'):continue
         uid,addr=fields.get('id'),fields.get('addr')
-        if not isinstance(uid,str) or not isinstance(addr,str):raise ValueError('missing_connection_identity')
+        if (not isinstance(uid,str) or not uid
+                or any(ord(c) < 32 or ord(c) == 127 for c in uid)
+                or not isinstance(addr,str)):
+            raise ValueError('missing_connection_identity')
         ip=_addr_ip(addr)
         key=(uid,ip)
         if event=='client connected':
@@ -281,12 +349,15 @@ def cmd(args):
     return subprocess.run(args,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=8,check=True).stdout
 
 def read_live_connections():
-    cfg=json.loads(pathlib.Path('/etc/hysteria/usage-meter-config.json').read_text(encoding='utf-8'))
+    cfg=_read_bounded_json('/etc/hysteria/usage-meter-config.json', max_bytes=4*1024*1024)
     if not isinstance(cfg,dict):raise ValueError('invalid_meter_config')
-    portal=json.loads(pathlib.Path('/etc/hysteria/portal.json').read_text(encoding='utf-8'))
+    portal=_read_bounded_json('/etc/hysteria/portal.json', max_bytes=16*1024*1024)
     users=portal.get('users') if isinstance(portal,dict) and isinstance(portal.get('users'),dict) else {}
     output={'users':{},'sampled_at':int(time.time())}
-    for uid in users:output['users'][uid]={'ips':[],'ok':False,'error':'Hy2 online IP unavailable','hysteria_ok':False,'reality_ok':False}
+    for uid in users:
+        if not isinstance(uid, str) or not uid or any(ord(c) < 32 or ord(c) == 127 for c in uid):
+            continue
+        output['users'][uid]={'ips':[],'ok':False,'error':'Hy2 online IP unavailable','hysteria_ok':False,'reality_ok':False}
     core_counts=None
     try:
         h=cfg.get('hysteria')
@@ -294,7 +365,9 @@ def read_live_connections():
         base=_validate_loopback_http_base(h.get('url'),h.get('secret'))
         live_req=urllib.request.Request(base+'/online/ips',headers={'Authorization':h['secret']})
         try:
-            with urllib.request.urlopen(live_req,timeout=4) as response:
+            with _open_no_redirect(live_req,timeout=4) as response:
+                if 300 <= getattr(response, 'status', 200) < 400:
+                    raise ValueError('unexpected_redirect')
                 raw=response.read(4*1024*1024+1)
             if len(raw)>4*1024*1024:raise ValueError('live_ips_response_too_large')
             live=json.loads(raw)
@@ -366,7 +439,7 @@ def read_live_connections():
             _bin_ok = False
     if _bin_ok and service_running('xray'):
         try:
-            xcfg=json.loads(pathlib.Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+            xcfg=_read_bounded_json('/etc/hysteria/xray.json', max_bytes=4*1024*1024)
             policy=xcfg.get('policy') if isinstance(xcfg,dict) else None
             levels=policy.get('levels') if isinstance(policy,dict) else None
             level0=levels.get('0') if isinstance(levels,dict) else None
@@ -380,10 +453,10 @@ def read_live_connections():
             names=([] if allusers.get('users') is None else allusers.get('users')) if isinstance(allusers,dict) else allusers
             if not isinstance(names,list):raise ValueError('invalid_online_users')
             if any(not isinstance(name,str) for name in names):raise ValueError('invalid_online_user_name')
-            names=[name.split('>>>')[1] if name.startswith('user>>>') and name.endswith('>>>online') and len(name.split('>>>'))==3 else name for name in names]
+            names_set={name.split('>>>')[1] if name.startswith('user>>>') and name.endswith('>>>online') and len(name.split('>>>'))==3 else name for name in names}
             for uid,out in output['users'].items():
                 out['reality_ok']=True
-                if uid not in names:continue
+                if uid not in names_set:continue
                 if not isinstance(uid,str) or any(ord(c)<32 or ord(c)==127 for c in uid):
                     raise ValueError('invalid_online_user_name')
                 raw_iplist=cmd([binary,'api','statsonlineiplist','--server='+address,'--email='+uid])

@@ -3242,7 +3242,8 @@ fi
 EOTW
     chmod +x "$HY2_DIR/toggle_warp.sh"
 
-    # 写入 do_upgrade.sh 供 Web 控制台在线升级官方核心或面板
+    # 写入 do_upgrade.sh 供 Web 控制台在线升级官方核心或面板（先防符号链接劫持）
+    [[ ! -L "$HY2_DIR/do_upgrade.sh" ]] || rm -f "$HY2_DIR/do_upgrade.sh"
     cat > "$HY2_DIR/do_upgrade.sh" <<'EOUG'
 #!/usr/bin/env bash
 # 与 install.sh 相同的 umask（2026-11-03 修）：本脚本由门户服务或手工 shell 调用，
@@ -3254,8 +3255,13 @@ HY2_DIR="/etc/hysteria"
 HY2_BIN="/usr/local/bin/hysteria"
 
 if [[ "$TARGET" == "core" ]]; then
-    # 菜单升级与门户终端升级共用锁，避免失败回滚覆盖另一入口成功的新核心。
-    exec 9>"${HY2_DIR}/.core-operation.lock"
+    # 菜单升级与门户终端升级共用锁，避免失败回滚覆盖另一入口成功的新核心；拒绝符号链接防截断劫持。
+    if [[ ! -L "${HY2_DIR}/.core-operation.lock" ]]; then
+        exec 9>>"${HY2_DIR}/.core-operation.lock"
+    else
+        echo "锁文件不能是符号链接，已放弃更新" >&2
+        exit 1
+    fi
     if ! flock -n 9; then
         echo "另一个核心升级正在运行，请稍后重试" >&2
         exit 1
@@ -3271,7 +3277,7 @@ if [[ "$TARGET" == "core" ]]; then
     ASSET="hysteria-linux-${HY_ARCH}"
 
     # 先定版本，再取该版本的官方 hashes.txt —— 绝不拿浮动 latest 的字节当依据。
-    TAG=$(curl -s --max-time 10 https://api.github.com/repos/apernet/hysteria/releases/latest \
+    TAG=$(curl -s --max-time 10 --max-filesize 2097152 https://api.github.com/repos/apernet/hysteria/releases/latest \
           | jq -r '.tag_name // empty' 2>/dev/null) || TAG=""
     if [[ -z "$TAG" || "$TAG" == "null" ]]; then
         _loc=$(curl -fsSIL --max-time 20 "https://download.hysteria.network/app/latest/${ASSET}" 2>/dev/null \
@@ -3281,22 +3287,28 @@ if [[ "$TARGET" == "core" ]]; then
             TAG="app/${BASH_REMATCH[1]}"
         fi
     fi
-    if [[ -z "$TAG" || "$TAG" == "null" ]]; then
-        echo "无法确定 Hysteria 版本，已放弃更新（不做无校验下载）" >&2
+    if [[ -z "$TAG" || "$TAG" == "null" || ! "$TAG" =~ ^(app/)?v[0-9A-Za-z._-]+$ || "$TAG" == *".."* ]]; then
+        echo "无法确定合法的 Hysteria 版本，已放弃更新（不做无校验下载）" >&2
         exit 1
     fi
 
     SUMDIR="$(mktemp -d)"
-    trap 'rm -rf "$SUMDIR"; rm -f "$TMP_FILE"' EXIT
-    if ! curl -fsSL --max-time 30 --retry 2 \
+    TMP_FILE=""
+    trap 'rm -rf "${SUMDIR:-}"; rm -f "${TMP_FILE:-}"' EXIT
+    if ! curl -fsSL --max-time 30 --max-filesize 2097152 --retry 2 \
             "https://github.com/apernet/hysteria/releases/download/${TAG}/hashes.txt" \
             -o "${SUMDIR}/hashes.txt" 2>/dev/null; then
         echo "取不到 ${TAG} 的官方 hashes.txt，已放弃更新，现有核心未改动" >&2
         exit 1
     fi
-    # 精确资产名解析唯一 SHA256；空/重复/畸形一律失败。
-    WANT="$(awk -v a="$ASSET" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==a || n ~ ("/" a "$")) print $1}' \
-            "${SUMDIR}/hashes.txt" | tr 'A-F' 'a-f' | sort -u)"
+    # 精确资产名解析唯一 SHA256；忽略注释行、要求严格双列且循环剥离多层 ./，空/重复/畸形一律失败。
+    WANT="$(awk -v a="$ASSET" '
+        /^[[:space:]]*(#|$)/ { next }
+        NF==2 {
+            n=$2; sub(/^\*/,"",n);
+            while (sub(/^\.\//,"",n)) {}
+            if (n==a || n ~ ("/" a "$")) print $1
+        }' "${SUMDIR}/hashes.txt" | tr 'A-F' 'a-f' | sort -u)"
     if [[ ! "$WANT" =~ ^[0-9a-f]{64}$ ]]; then
         echo "hashes.txt 中 ${ASSET} 的摘要缺失或不唯一（实际: [${WANT}]），已放弃更新" >&2
         exit 1
@@ -3304,7 +3316,7 @@ if [[ "$TARGET" == "core" ]]; then
 
     # mktemp 而不是固定的 /tmp/hy2_update_*：root 写可预测路径会被符号链接劫持。
     TMP_FILE="$(mktemp "${HY2_BIN}.update.XXXXXX")"
-    curl -fsSL --max-time 300 "https://github.com/apernet/hysteria/releases/download/${TAG}/${ASSET}" -o "$TMP_FILE" || {
+    curl -fsSL --max-time 300 --max-filesize 104857600 "https://github.com/apernet/hysteria/releases/download/${TAG}/${ASSET}" -o "$TMP_FILE" || {
         echo "下载失败，现有核心未改动" >&2; exit 1; }
     GOT="$(sha256sum "$TMP_FILE" | awk '{print $1}')"
     if [[ "$GOT" != "$WANT" ]]; then
@@ -3333,9 +3345,17 @@ if [[ "$TARGET" == "core" ]]; then
         exit 1
     fi
     # 老装机补上 masquerade.proxy.xForwarded（见安装模板的注释）。放在核心升级里做，
-    # 是因为这里本来就要重启 Hy2，不会为改配置额外断一次所有用户。
-    if [[ -f "$HY2_DIR/config.yaml" ]] && ! grep -qE '^[[:space:]]+xForwarded:' "$HY2_DIR/config.yaml"; then
-        sed -i -E 's/^([[:space:]]+)rewriteHost:(.*)$/&\n\1xForwarded: true/' "$HY2_DIR/config.yaml" || true
+    # 是因为这里本来就要重启 Hy2，不会为改配置额外断一次所有用户；同目录临时文件原子写入。
+    if [[ ! -L "$HY2_DIR/config.yaml" && -f "$HY2_DIR/config.yaml" ]] && ! grep -qE '^[[:space:]]+xForwarded:' "$HY2_DIR/config.yaml"; then
+        _xfwd_tmp="$(umask 077 && mktemp "${HY2_DIR}/.config.yaml.xfwd.XXXXXX" 2>/dev/null)" || _xfwd_tmp=""
+        if [[ -n "$_xfwd_tmp" ]]; then
+            if cp -p "$HY2_DIR/config.yaml" "$_xfwd_tmp" 2>/dev/null && sed -i -E 's/^([[:space:]]+)rewriteHost:(.*)$/&\n\1xForwarded: true/' "$_xfwd_tmp" 2>/dev/null && [[ -s "$_xfwd_tmp" ]]; then
+                chmod 600 "$_xfwd_tmp" 2>/dev/null || true
+                mv -f "$_xfwd_tmp" "$HY2_DIR/config.yaml" || rm -f "$_xfwd_tmp"
+            else
+                rm -f "$_xfwd_tmp"
+            fi
+        fi
     fi
     if [[ "$(jq -r '.traffic_suspend.suspended // false' "$HY2_DIR/portal.json" 2>/dev/null)" == "true" ]]; then
         rm -f "$ROLLBACK_FILE"
@@ -3376,10 +3396,12 @@ elif [[ "$TARGET" == "portal" ]]; then
     # 取文件并原子替换），这里保留是为了手工调用 do_upgrade.sh portal 的场景。
     REPO="yys9253462-gif/hysteria2-installer"
     # 固定一次提交后，所有回退源都读取相同快照。
-    _bundle_ref="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${REPO}/commits/main" |
+    _bundle_ref="$(curl -fsSL --max-time 15 --max-filesize 2097152 "https://api.github.com/repos/${REPO}/commits/main" |
         python3 -c 'import json,re,sys; s=json.load(sys.stdin).get("sha", ""); assert re.fullmatch("[0-9a-f]{40}", s); print(s)')" || exit 1
     [[ "$_bundle_ref" =~ ^[0-9a-f]{40}$ ]] || { echo "无法固定门户版本，保留全部旧文件" >&2; exit 1; }
     _bundle_dir="$(mktemp -d)"
+    _bundle_map=""
+    trap '_rc=$?; rm -f "${_bundle_map:-}"; [[ $_rc -ne 0 ]] && rm -rf "${_bundle_dir:-}"' EXIT
     _bundle_files="portal.py portal_assets.py usage-meter-core-20261007-v1.py usage-meter-readers-20261007-v1.py usage-meter-runtime-20261007-v1.py usage-meter-xray-config-20261007-v1.py"
     # 本脚本是独立生成的文件，不能依赖 install.sh 里的函数：内联 git blob 身份计算。
     # blob sha = sha1("blob <len>\0" + content)，与 GitHub contents API 的 sha 一致，
@@ -3394,7 +3416,7 @@ elif [[ "$TARGET" == "portal" ]]; then
     # 只有内容与该身份一致才算通过 —— 只校验 marker 挡不住 CDN 返回与所 pin
     # commit 不符的内容。
     _bundle_map="$(mktemp)"
-    if ! curl -fsSL --max-time 20 -H "Accept: application/vnd.github+json" \
+    if ! curl -fsSL --max-time 20 --max-filesize 2097152 -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/contents/?ref=${_bundle_ref}" -o "$_bundle_map" 2>/dev/null; then
         rm -rf "$_bundle_dir" "$_bundle_map"
         echo "无法取得 ${_bundle_ref:0:7} 的文件身份，保留全部旧文件" >&2
@@ -3431,7 +3453,7 @@ for it in items if isinstance(items, list) else []:
         for _url in "https://api.github.com/repos/${REPO}/contents/${_m}?ref=${_bundle_ref}" \
                     "https://cdn.jsdelivr.net/gh/${REPO}@${_bundle_ref}/${_m}" \
                     "https://raw.githubusercontent.com/${REPO}/${_bundle_ref}/${_m}"; do
-            if curl -fsSL --max-time 30 -H "Accept: application/vnd.github.raw" "$_url" -o "$_tmp_m" 2>/dev/null &&
+            if curl -fsSL --max-time 30 --max-filesize 10485760 -H "Accept: application/vnd.github.raw" "$_url" -o "$_tmp_m" 2>/dev/null &&
                grep -Fq "$_marker" "$_tmp_m" &&
                python3 -c 'import ast,sys; ast.parse(open(sys.argv[1],encoding="utf-8").read())' "$_tmp_m" 2>/dev/null &&
                [[ "$(_blob_sha "$_tmp_m")" == "$_want_sha" ]]; then
@@ -3634,7 +3656,9 @@ EOCS2
                     *)  _cwd="$(dirname "$HY2_DIR/$_cc")" ;;
                 esac
             fi
-            [[ -d "$_cwd" ]] || _cwd="$HY2_DIR/cert"
+            if [[ "$_cwd" == *$'\n'* || "$_cwd" == *$'\r'* || ! -d "$_cwd" ]]; then
+                _cwd="$HY2_DIR/cert"
+            fi
             printf '%s\n' \
               '[Unit]' \
               'Description=Watch certificate dir and self-heal trust model on change' \
@@ -5071,7 +5095,7 @@ install_warp_local_proxy() {
             log_err "wireproxy 包内没有 wireproxy 成员，已放弃安装。"
             return 1
         fi
-        TMP_EXTRACT="$(mktemp -d)"
+        TMP_EXTRACT="$(umask 077; mktemp -d)"
         # 只解出那一个确定成员，不再"取包内第一个可执行文件"当 root 二进制。
         if ! tar -xzf "${TMP_DIR}/${WP_ASSET}" -C "$TMP_EXTRACT" "$WP_MEMBER" 2>/dev/null; then
             rm -rf "$TMP_DIR" "$TMP_EXTRACT"
@@ -5153,6 +5177,10 @@ install_warp_local_proxy() {
     # 旧配置只写 IPv4，走 WARP 的域名一旦解析到 IPv6 就连不上（SE 上实测）。
     WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
     [[ -n "$WG_ADDR" ]] || WG_ADDR="172.16.0.2/32"
+    if [[ "$WG_PRIV" =~ [[:cntrl:]] || "$WG_PUB" =~ [[:cntrl:]] || "$WG_EP" =~ [[:cntrl:]] || "$WG_ADDR" =~ [[:cntrl:]] ]]; then
+        log_err "WireGuard 配置字段含非法控制字符，已中止写入。"
+        return 1
+    fi
     WG_ALLOWED="0.0.0.0/0"
     [[ "$WG_ADDR" == *:* ]] && WG_ALLOWED="0.0.0.0/0, ::/0"
     (
@@ -5207,8 +5235,11 @@ EOF
         log_err "写入 wireproxy.service 失败。"
         return 1
     fi
-    chmod 644 "$_wp_unit_tmp"
-    mv -f "$_wp_unit_tmp" /etc/systemd/system/wireproxy.service
+    if ! chmod 644 "$_wp_unit_tmp" || ! mv -f "$_wp_unit_tmp" /etc/systemd/system/wireproxy.service; then
+        rm -f "$_wp_unit_tmp"
+        log_err "落盘 wireproxy.service 失败。"
+        return 1
+    fi
     systemctl daemon-reload
     systemctl reset-failed wireproxy >/dev/null 2>&1 || true
     systemctl enable --now wireproxy >/dev/null 2>&1 || true
@@ -5234,7 +5265,7 @@ EOF
 #!/usr/bin/env bash
 set -u
 # 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
-probe() { curl --proxy socks5h://${WARP_SOCKS_ADDR} --silent --fail --max-time 6 "\$1" >/dev/null 2>&1; }
+probe() { curl --proxy socks5h://${WARP_SOCKS_ADDR} --silent --fail --max-time 6 --max-filesize 65536 "\$1" >/dev/null 2>&1; }
 if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
     systemctl reset-failed wireproxy >/dev/null 2>&1 || true
@@ -5271,8 +5302,11 @@ EOF
         log_err "写入 hy2-warp-watchdog.service 失败。"
         return 1
     fi
-    chmod 644 "$_wd_svc_tmp"
-    mv -f "$_wd_svc_tmp" /etc/systemd/system/hy2-warp-watchdog.service
+    if ! chmod 644 "$_wd_svc_tmp" || ! mv -f "$_wd_svc_tmp" /etc/systemd/system/hy2-warp-watchdog.service; then
+        rm -f "$_wd_svc_tmp"
+        log_err "落盘 hy2-warp-watchdog.service 失败。"
+        return 1
+    fi
 
     _wd_tmr_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.timer.XXXXXX")" || {
         log_err "无法创建 hy2-warp-watchdog.timer 临时文件。"
@@ -5295,8 +5329,11 @@ EOF
         log_err "写入 hy2-warp-watchdog.timer 失败。"
         return 1
     fi
-    chmod 644 "$_wd_tmr_tmp"
-    mv -f "$_wd_tmr_tmp" /etc/systemd/system/hy2-warp-watchdog.timer
+    if ! chmod 644 "$_wd_tmr_tmp" || ! mv -f "$_wd_tmr_tmp" /etc/systemd/system/hy2-warp-watchdog.timer; then
+        rm -f "$_wd_tmr_tmp"
+        log_err "落盘 hy2-warp-watchdog.timer 失败。"
+        return 1
+    fi
     systemctl daemon-reload
     systemctl enable --now hy2-warp-watchdog.timer >/dev/null 2>&1 || true
 
@@ -5543,6 +5580,7 @@ EOF
 而不是留下一个 "active 但无监听" 的假健康状态.
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -5552,38 +5590,58 @@ CFG = '/etc/hysteria/gost.yml'
 
 def listening(port):
     for fam, addr in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')):
-        s = socket.socket(fam, socket.SOCK_STREAM)
+        s = None
         try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
             s.settimeout(1)
             if s.connect_ex((addr, port)) == 0:
                 return True
         except OSError:
             pass
         finally:
-            s.close()
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
     return False
 
 
 def main():
     try:
-        with open(CFG, encoding='utf-8') as fh:
-            svc = json.load(fh).get('services') or []
+        if os.path.islink(CFG):
+            raise OSError('配置文件不允许为符号链接')
+        try:
+            if os.lstat(CFG).st_size > 4 * 1024 * 1024:
+                raise ValueError('配置文件超过 4 MiB 上限')
+        except FileNotFoundError:
+            pass
+        with open(CFG, encoding='utf-8', errors='replace') as fh:
+            data = json.load(fh)
+        svc = data.get('services') if isinstance(data, dict) else []
+        if not isinstance(svc, list):
+            svc = []
     except Exception as exc:                     # 配置读不了 -> 交给 gost 自己报错
         print('selfcheck: 无法读取配置: %s' % exc, file=sys.stderr)
         return 0
 
     ports = []
     for s in svc:
+        if not isinstance(s, dict):
+            continue
         addr = str(s.get('addr') or '')
         tail = addr.rsplit(':', 1)[-1]
-        if tail.isdigit():
-            ports.append(int(tail))
+        if tail.isascii() and tail.isdigit() and len(tail) <= 5:
+            port = int(tail)
+            if 1 <= port <= 65535:
+                ports.append(port)
     ports = sorted(set(ports))
     if not ports:
         return 0                                  # 尚无代理, 合法
 
-    deadline = time.time() + 5
-    while time.time() < deadline:
+    deadline = time.monotonic() + 5
+    missing = list(ports)
+    while time.monotonic() < deadline:
         missing = [p for p in ports if not listening(p)]
         if not missing:
             return 0

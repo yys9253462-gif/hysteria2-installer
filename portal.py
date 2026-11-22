@@ -252,7 +252,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.69'
+PORTAL_VERSION = '2.70'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -4553,6 +4553,9 @@ def _openssl_sha256_hex(cert_file, timeout=8):
     先用 `openssl x509 -outform DER` 输出到临时文件（带超时），再用
     `openssl dgst -sha256 -binary` 读取（带超时），全链路可控。
     """
+    cert_str = str(cert_file) if isinstance(cert_file, (str, os.PathLike)) else ''
+    if not cert_str or cert_str.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in cert_str):
+        return ''
     tmp = None
     out_fh = None
     try:
@@ -4562,7 +4565,7 @@ def _openssl_sha256_hex(cert_file, timeout=8):
         # 且永不关闭，而本函数在页面刷新路径上被反复调用 —— 句柄耗尽后
         # 门户会开始报 "Too many open files"，整片接口 500。
         out_fh = open(tmp, 'wb')
-        conv = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-outform', 'DER'],
+        conv = subprocess.run(['openssl', 'x509', '-in', cert_str, '-outform', 'DER'],
                               stdout=out_fh, stderr=subprocess.PIPE, timeout=timeout)
         out_fh.close()
         out_fh = None
@@ -4572,7 +4575,10 @@ def _openssl_sha256_hex(cert_file, timeout=8):
                              capture_output=True, timeout=timeout)
         if dig.returncode != 0:
             return ''
-        hexval = (dig.stdout or b'').decode('utf-8', 'replace').split()[0].strip().lower()
+        parts = (dig.stdout or b'').decode('utf-8', 'replace').split()
+        if not parts:
+            return ''
+        hexval = parts[0].strip().lower()
         return hexval if len(hexval) == 64 and all(c in '0123456789abcdef' for c in hexval) else ''
     except Exception as exc:
         _log_ignored('openssl_sha256', exc)
@@ -4606,8 +4612,11 @@ def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
     self-signed server.crt.
     """
     try:
-        text = Path(config_path).read_text(encoding='utf-8')
-    except (OSError, UnicodeDecodeError):
+        cp = Path(config_path)
+        if cp.stat().st_size > 4 * 1024 * 1024:
+            return ''
+        text = cp.read_bytes().decode('utf-8', errors='replace')
+    except OSError:
         return ''
     in_tls = False
     for raw in text.split('\n'):
@@ -4820,24 +4829,34 @@ def _cert_key_candidates(cert_file):
 
 def cert_key_matches(cert_file, key_file):
     """证书与私钥是否成对：比较二者的公钥指纹。"""
+    cert_str = str(cert_file) if isinstance(cert_file, (str, os.PathLike)) else ''
+    key_str = str(key_file) if isinstance(key_file, (str, os.PathLike)) else ''
+    for item in (cert_str, key_str):
+        if not item or item.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in item):
+            return False
     try:
-        pub = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout', '-pubkey'],
+        pub = subprocess.run(['openssl', 'x509', '-in', cert_str, '-noout', '-pubkey'],
                              capture_output=True, timeout=5)
-        if pub.returncode != 0:
+        if pub.returncode != 0 or not (pub.stdout or b'').strip():
             return False
         pub_digest = subprocess.run(['openssl', 'sha256'], input=pub.stdout,
                                     capture_output=True, timeout=5)
-        prv = subprocess.run(['openssl', 'pkey', '-in', str(key_file), '-pubout'],
+        if pub_digest.returncode != 0:
+            return False
+        prv = subprocess.run(['openssl', 'pkey', '-in', key_str, '-pubout'],
                              capture_output=True, timeout=5)
-        if prv.returncode != 0:
+        if prv.returncode != 0 or not (prv.stdout or b'').strip():
             return False
         prv_digest = subprocess.run(['openssl', 'sha256'], input=prv.stdout,
                                     capture_output=True, timeout=5)
+        if prv_digest.returncode != 0:
+            return False
     except Exception:
         return False
-    a = pub_digest.stdout.split()[-1] if pub_digest.stdout.split() else b''
-    b = prv_digest.stdout.split()[-1] if prv_digest.stdout.split() else b''
-    return bool(a) and a == b
+    a = pub_digest.stdout.split()[-1].lower() if pub_digest.stdout.split() else b''
+    b = prv_digest.stdout.split()[-1].lower() if prv_digest.stdout.split() else b''
+    _empty_sha = b'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    return bool(a) and a != _empty_sha and a == b
 
 
 def _find_cert_key(cert_file, cfg_dir):
@@ -4848,8 +4867,12 @@ def _find_cert_key(cert_file, cfg_dir):
     cfg_dir = Path(cfg_dir)
     candidates = []
     try:
-        text = (cfg_dir / 'config.yaml').read_text(encoding='utf-8')
-    except (OSError, UnicodeDecodeError):
+        cfg_file = cfg_dir / 'config.yaml'
+        if cfg_file.stat().st_size <= 4 * 1024 * 1024:
+            text = cfg_file.read_bytes().decode('utf-8', errors='replace')
+        else:
+            text = ''
+    except OSError:
         text = ''
     in_tls = False
     for raw in text.splitlines():
@@ -5027,6 +5050,17 @@ def _cert_summary(root, meta, config_path='/etc/hysteria/config.yaml'):
         return {'ok': False}
 
 
+def _scrub_nonfinite_json(obj):
+    """递归将非有限浮点（NaN/Infinity）替换为 None，确保严格 JSON 序列化不抛 ValueError。"""
+    if isinstance(obj, float):
+        return obj if (obj == obj and obj != float('inf') and obj != float('-inf')) else None
+    if isinstance(obj, dict):
+        return {k: _scrub_nonfinite_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_scrub_nonfinite_json(v) for v in obj]
+    return obj
+
+
 def sync_cert_runtime(root, cert_file, state_path=None):
     """Reload active TLS listeners after the certificate file actually changes.
 
@@ -5039,10 +5073,10 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         return False
     try:
         cert_file = Path(cert_file)
-        if not cert_file.is_file():
+        if not cert_file.is_file() or cert_file.stat().st_size > 4 * 1024 * 1024:
             return False
         raw_cert = cert_file.read_bytes()
-        if not raw_cert:
+        if not raw_cert or len(raw_cert) > 4 * 1024 * 1024:
             return False
         digest = hashlib.sha256(raw_cert).hexdigest()
     except (OSError, TypeError, ValueError):
@@ -5050,9 +5084,10 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     state = {}
     if state_path.exists():
         try:
-            loaded = json.loads(state_path.read_text(encoding='utf-8'))
-            if isinstance(loaded, dict):
-                state = loaded
+            if not state_path.is_symlink() and state_path.is_file() and state_path.lstat().st_size <= 1024 * 1024:
+                loaded = json.loads(state_path.read_bytes().decode('utf-8', errors='replace'))
+                if isinstance(loaded, dict):
+                    state = loaded
         except (OSError, ValueError):
             state = {}
     previous = state.get('loaded_cert_sha256')
@@ -5079,10 +5114,7 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         return False
     # Record the bytes confirmed by the successful reload attempt. If no service
     # was active, this establishes the baseline for the next certificate update.
-    clean_state = {
-        k: v for k, v in state.items()
-        if not (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf')))
-    }
+    clean_state = _scrub_nonfinite_json(state)
     clean_state['loaded_cert_sha256'] = digest
     try:
         atomic_write_private(
@@ -5109,12 +5141,12 @@ def record_cert_heal(root, state, before, after):
         previous = {}
         if state_path.exists():
             try:
-                loaded = json.loads(state_path.read_text(encoding='utf-8'))
+                if not state_path.is_symlink() and state_path.is_file() and state_path.lstat().st_size <= 1024 * 1024:
+                    loaded = json.loads(state_path.read_bytes().decode('utf-8', errors='replace'))
+                else:
+                    loaded = None
                 if isinstance(loaded, dict):
-                    previous = {
-                        k: v for k, v in loaded.items()
-                        if not (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf')))
-                    }
+                    previous = _scrub_nonfinite_json(loaded)
                 raw_count = previous.get('heal_count')
                 if isinstance(raw_count, bool):
                     prev_count = 0
@@ -5122,7 +5154,8 @@ def record_cert_heal(root, state, before, after):
                     prev_count = raw_count
                 elif isinstance(raw_count, float) and raw_count.is_integer() and raw_count >= 0:
                     prev_count = int(raw_count)
-                elif isinstance(raw_count, str) and raw_count.strip().isascii() and raw_count.strip().isdigit():
+                elif (isinstance(raw_count, str) and raw_count.strip().isascii()
+                      and raw_count.strip().isdigit() and len(raw_count.strip()) <= 16):
                     prev_count = int(raw_count.strip())
                 else:
                     prev_count = 0
@@ -8523,9 +8556,9 @@ def prepare(meta_path, port, node_api_key=None):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                             capture_output=True, timeout=20)
-        low_qr = qr.stdout.lower() if qr.returncode == 0 and qr.stdout else b''
-        qr_svg = (qr.stdout if (b'<svg' in low_qr and b'<script' not in low_qr
-                                and b'<foreignobject' not in low_qr) else b'')
+        qr_svg = (qr.stdout if (qr.returncode == 0 and qr.stdout
+                                and b'<script' not in qr.stdout.lower()
+                                and _is_safe_svg_payload(qr.stdout)) else b'')
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
@@ -8579,7 +8612,7 @@ def qr_svg_for(uri, timeout=20):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                             input=str(uri).encode(), capture_output=True, timeout=timeout)
-        if qr.returncode == 0 and qr.stdout and b'<svg' in qr.stdout:
+        if qr.returncode == 0 and qr.stdout and _is_safe_svg_payload(qr.stdout):
             return qr.stdout.decode('utf-8', 'replace')
     except Exception as exc:
         _log_ignored('qr_refresh', exc)  # 保留旧图，别把框清空
@@ -9011,7 +9044,9 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     if not meta_file.is_file():
         return False
     try:
-        m = json.loads(meta_file.read_text(encoding='utf-8'))
+        if meta_file.stat().st_size > 4 * 1024 * 1024:
+            return False
+        m = json.loads(meta_file.read_bytes().decode('utf-8', errors='replace'))
     except (OSError, ValueError):
         return False
     # 合法 JSON 但不是对象（[] / "x" / null）时同样当作「读不到」（2026-11-03 修）：
@@ -10349,6 +10384,7 @@ def serve(path):
 而不是留下一个 "active 但无监听" 的假健康状态.
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -10358,38 +10394,58 @@ CFG = '/etc/hysteria/gost.yml'
 
 def listening(port):
     for fam, addr in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')):
-        s = socket.socket(fam, socket.SOCK_STREAM)
+        s = None
         try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
             s.settimeout(1)
             if s.connect_ex((addr, port)) == 0:
                 return True
         except OSError:
             pass
         finally:
-            s.close()
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
     return False
 
 
 def main():
     try:
-        with open(CFG, encoding='utf-8') as fh:
-            svc = json.load(fh).get('services') or []
+        if os.path.islink(CFG):
+            raise OSError('配置文件不允许为符号链接')
+        try:
+            if os.lstat(CFG).st_size > 4 * 1024 * 1024:
+                raise ValueError('配置文件超过 4 MiB 上限')
+        except FileNotFoundError:
+            pass
+        with open(CFG, encoding='utf-8', errors='replace') as fh:
+            data = json.load(fh)
+        svc = data.get('services') if isinstance(data, dict) else []
+        if not isinstance(svc, list):
+            svc = []
     except Exception as exc:                     # 配置读不了 -> 交给 gost 自己报错
         print('selfcheck: 无法读取配置: %s' % exc, file=sys.stderr)
         return 0
 
     ports = []
     for s in svc:
+        if not isinstance(s, dict):
+            continue
         addr = str(s.get('addr') or '')
         tail = addr.rsplit(':', 1)[-1]
-        if tail.isdigit():
-            ports.append(int(tail))
+        if tail.isascii() and tail.isdigit() and len(tail) <= 5:
+            port = int(tail)
+            if 1 <= port <= 65535:
+                ports.append(port)
     ports = sorted(set(ports))
     if not ports:
         return 0                                  # 尚无代理, 合法
 
-    deadline = time.time() + 5
-    while time.time() < deadline:
+    deadline = time.monotonic() + 5
+    missing = list(ports)
+    while time.monotonic() < deadline:
         missing = [p for p in ports if not listening(p)]
         if not missing:
             return 0
@@ -11046,8 +11102,12 @@ if __name__ == '__main__':
 
             # 避开所有托管协议已占用的端口，而不只是 hy2 / 订阅端口。
             try:
-                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                            if Path('/etc/hysteria/xray.json').exists() else None)
+                _xp_cfg = Path('/etc/hysteria/xray.json')
+                if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
+                    _parsed_xcfg = json.loads(_xp_cfg.read_bytes().decode('utf-8', errors='replace'))
+                    _cfg_now = _parsed_xcfg if isinstance(_parsed_xcfg, dict) else None
+                else:
+                    _cfg_now = None
             except (OSError, ValueError):
                 _cfg_now = None
             with data_lock:
@@ -11546,7 +11606,7 @@ if __name__ == '__main__':
                     if not isinstance(_raw_cl, str):
                         raise ValueError('invalid auth content-length')
                     _raw_cl_s = _raw_cl.strip()
-                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit() or len(_raw_cl_s) > 10:
                         raise ValueError('invalid auth content-length')
                     length = int(_raw_cl_s)
                     if length > 65536:
@@ -11581,6 +11641,7 @@ if __name__ == '__main__':
                                     raise ValueError('invalid bracket addr suffix')
                                 _port_s = _suffix[1:]
                                 if (not _port_s or not _port_s.isascii() or not _port_s.isdigit()
+                                        or len(_port_s) > 5
                                         or (len(_port_s) > 1 and _port_s.startswith('0'))
                                         or not (1 <= int(_port_s) <= 65535)):
                                     raise ValueError('invalid bracket addr port')
@@ -11702,7 +11763,7 @@ if __name__ == '__main__':
                     if not isinstance(_raw_cl, str):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
                     _raw_cl_s = _raw_cl.strip()
-                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit() or len(_raw_cl_s) > 10:
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
                     length = int(_raw_cl_s)
                     if length > 1048576:
@@ -11729,11 +11790,11 @@ if __name__ == '__main__':
                         for key in ('duration_days', 'ip_limit', 'expires_at', 'limit_bytes', 'used_bytes'):
                             if key in params:
                                 value = params[key]
-                                if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+                                if isinstance(value, bool) or (isinstance(value, float) and (not math.isfinite(value) or not value.is_integer())):
                                     raise ValueError()
                                 if isinstance(value, str):
                                     sval = value.strip()
-                                    if not (sval.isascii() and sval.isdigit()):
+                                    if not (sval.isascii() and sval.isdigit()) or len(sval) > 24:
                                         raise ValueError()
                                     value = sval
                                 params[key] = int(value)
@@ -12182,6 +12243,10 @@ if __name__ == '__main__':
                                 raw_expiry = u.get('expires_at')
                                 if isinstance(raw_expiry, bool):
                                     raise ValueError()
+                                if isinstance(raw_expiry, float) and (not math.isfinite(raw_expiry) or not raw_expiry.is_integer()):
+                                    raise ValueError()
+                                if isinstance(raw_expiry, str) and (not raw_expiry.strip().isascii() or len(raw_expiry.strip()) > 24):
+                                    raise ValueError()
                                 if raw_expiry is None:
                                     new_expiry = None
                                 else:
@@ -12191,6 +12256,10 @@ if __name__ == '__main__':
                                 # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
                                 raw_limit = u.get('limit_bytes')
                                 if isinstance(raw_limit, bool):
+                                    raise ValueError()
+                                if isinstance(raw_limit, float) and (not math.isfinite(raw_limit) or not raw_limit.is_integer()):
+                                    raise ValueError()
+                                if isinstance(raw_limit, str) and (not raw_limit.strip().isascii() or len(raw_limit.strip()) > 24):
                                     raise ValueError()
                                 old_limit = int(raw_limit or 0)
                                 new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
@@ -12248,6 +12317,13 @@ if __name__ == '__main__':
                         if len(global_ip_deny) > 4096:
                             for _stale_uid in list(global_ip_deny):
                                 active_ip_deny(global_ip_deny, _stale_uid, now_ts)
+                            while len(global_ip_deny) > 4096:
+                                oldest_uid = min(
+                                    global_ip_deny,
+                                    key=lambda u: max(global_ip_deny[u].values(), default=0.0)
+                                    if isinstance(global_ip_deny.get(u), dict) else 0.0,
+                                )
+                                global_ip_deny.pop(oldest_uid, None)
                         _raw_tracker = ip_tracker.get(user_id)
                         recent = ({
                             ip for ip, t in _raw_tracker.items()
@@ -12481,7 +12557,7 @@ if __name__ == '__main__':
 
                 elif sub == 'proxy-services/list':
                     with data_lock:
-                        items = proxy_services(data)
+                        items = [dict(s) for s in proxy_services(data) if isinstance(s, dict)]
                     m = read_meta_file(meta_path)
                     host = meta_display_host(m)
                     # 不脱敏 password, 调用方是受信 API key
@@ -12507,7 +12583,17 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'suspended must be a boolean'})
                     # 停用或恢复涉及多个 systemd 单元启停，续期死线避免撞上默认 30 秒超时。
                     self._extend_deadline(120)
-                    state, results = set_traffic_suspension(params['suspended'])
+                    try:
+                        state, results = set_traffic_suspension(params['suspended'])
+                    except AtomicWriteDurabilityError:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'Traffic suspension state written but durability uncertain; verify and retry'})
+                    except OSError as exc:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'Traffic suspension save failed; changes rolled back: ' + api_error_text(exc)})
+                    except Exception as exc:
+                        return self.reply_json(500, {'ok': False,
+                            'error': 'Traffic suspension failed: ' + api_error_text(exc)})
                     failed = [u for u, ok in results.items() if not ok]
                     return self.reply_json(200 if not failed else 500, {
                         'ok': not failed, 'suspended': state.get('suspended', False),
@@ -12668,6 +12754,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -13142,9 +13230,17 @@ if __name__ == '__main__':
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
                 return 200, dict(entry, ok=True, applied=True, host=host, url=uri, qr=qr_svg,
@@ -13168,6 +13264,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -13509,6 +13607,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -13599,6 +13699,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -13801,6 +13903,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -13979,6 +14083,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14192,8 +14298,12 @@ if __name__ == '__main__':
             # 必须显式避开 Reality 的端口：它可能刚写进配置、尚未重启，
             # 监听表里还看不到，只靠 ss 探测会让两者撞同一个端口。
             try:
-                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                            if Path('/etc/hysteria/xray.json').exists() else None)
+                _xp_cfg = Path('/etc/hysteria/xray.json')
+                if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
+                    _parsed_xcfg = json.loads(_xp_cfg.read_bytes().decode('utf-8', errors='replace'))
+                    _cfg_now = _parsed_xcfg if isinstance(_parsed_xcfg, dict) else None
+                else:
+                    _cfg_now = None
             except (OSError, ValueError):
                 _cfg_now = None
             with data_lock:
@@ -14308,8 +14418,12 @@ if __name__ == '__main__':
                     config_section(data, 'vmess_config').get('port'),
                 }
             try:
-                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                            if Path('/etc/hysteria/xray.json').exists() else None)
+                _xp_cfg = Path('/etc/hysteria/xray.json')
+                if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
+                    _parsed_xcfg = json.loads(_xp_cfg.read_bytes().decode('utf-8', errors='replace'))
+                    _cfg_now = _parsed_xcfg if isinstance(_parsed_xcfg, dict) else None
+                else:
+                    _cfg_now = None
             except (OSError, ValueError):
                 _cfg_now = None
             with data_lock:
@@ -14425,6 +14539,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14545,9 +14661,17 @@ if __name__ == '__main__':
                                         input=_uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vmess_qr', exc)
             return self.reply_json(200, {
@@ -14648,6 +14772,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14693,7 +14819,13 @@ if __name__ == '__main__':
                 return [label for label, cfg in (('AnyTLS', _active_anytls_config()),
                                                  ('TUIC', _active_tuic_config())) if cfg]
             try:
-                cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                xp = Path('/etc/hysteria/xray.json')
+                xst = xp.lstat()
+                if xp.is_symlink() or not xp.is_file() or xst.st_size > 4 * 1024 * 1024:
+                    raise ValueError('xray.json 非法或过大')
+                cfg = json.loads(xp.read_bytes().decode('utf-8', errors='replace'))
+                if not isinstance(cfg, dict):
+                    raise ValueError('xray.json 顶层非对象')
             except FileNotFoundError:
                 # 没有配置文件 = 确实没有任何 Xray 协议在用，可以卸载。
                 return []
@@ -14730,6 +14862,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14764,7 +14898,7 @@ if __name__ == '__main__':
                             try:
                                 is_en = subprocess.run(
                                     ['systemctl', 'is-enabled', unit], capture_output=True,
-                                    text=True, timeout=5)
+                                    text=True, encoding='utf-8', errors='replace', timeout=5)
                                 enabled_state = is_en.stdout.strip()
                                 is_en_rc = is_en.returncode
                             except (OSError, subprocess.SubprocessError):
@@ -14855,8 +14989,12 @@ if __name__ == '__main__':
                 old = dict(config_section(data, 'anytls_config'))
                 _data_now = dict(data)
             try:
-                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                            if Path('/etc/hysteria/xray.json').exists() else None)
+                _xp_cfg = Path('/etc/hysteria/xray.json')
+                if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
+                    _parsed_xcfg = json.loads(_xp_cfg.read_bytes().decode('utf-8', errors='replace'))
+                    _cfg_now = _parsed_xcfg if isinstance(_parsed_xcfg, dict) else None
+                else:
+                    _cfg_now = None
             except (OSError, ValueError):
                 _cfg_now = None
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config', keep_disabled=True)
@@ -14959,6 +15097,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -15080,9 +15220,17 @@ if __name__ == '__main__':
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('anytls_qr', exc)
             return self.reply_json(200, {
@@ -15119,10 +15267,9 @@ if __name__ == '__main__':
             # UDP 端口只会和其它 UDP 服务撞：Hy2 监听端口与跳跃区间、AWG（监听表里能看到）。
             blocked = set()
             for value in (m.get('listen_port'),):
-                try:
-                    blocked.add(int(value))
-                except (TypeError, ValueError):
-                    pass
+                _vp = _valid_port(value)
+                if _vp is not None:
+                    blocked.add(_vp)
             with tuic_apply_lock:
                 # 在服务锁内读取最新用户并完成启用提交。撤销线程要么先完成并反映在
                 # 此快照中，要么随后取得锁并从新启用的配置中移除该用户。
@@ -15221,6 +15368,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -15341,9 +15490,17 @@ if __name__ == '__main__':
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('tuic_qr', exc)
             return self.reply_json(200, {
@@ -15384,6 +15541,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -15502,9 +15661,17 @@ if __name__ == '__main__':
                                         input=_euri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
-                        qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vlessenc_qr', exc)
             return self.reply_json(200, {
@@ -15548,6 +15715,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -15726,6 +15895,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                if len(_raw_cl_s) > 10:
+                    return self.reply(413, '请求体过大'.encode('utf-8'))
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply(400, '请求体长度不合法'.encode('utf-8'))
@@ -15775,9 +15946,9 @@ if __name__ == '__main__':
                         _raw_days = (form.get('duration_days', ['30'])[0] or '30').strip()
                         _raw_ipl = (form.get('ip_limit', ['0'])[0] or '0').strip()
                         _raw_tgb = (form.get('traffic_gb', ['0'])[0] or '0').strip()
-                        if (not _raw_days.isascii() or not _raw_days.isdigit()
-                                or not _raw_ipl.isascii() or not _raw_ipl.isdigit()
-                                or not _raw_tgb.isascii()):
+                        if (not _raw_days.isascii() or not _raw_days.isdigit() or len(_raw_days) > 24
+                                or not _raw_ipl.isascii() or not _raw_ipl.isdigit() or len(_raw_ipl) > 24
+                                or not _raw_tgb.isascii() or len(_raw_tgb) > 24):
                             raise ValueError()
                         days = int(_raw_days)
                         ip_limit = int(_raw_ipl)
@@ -16015,6 +16186,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply(400, b'Bad request')
+                if len(_raw_cl_s) > 10:
+                    return self.reply(413, b'Payload too large')
                 length = int(_raw_cl_s)
                 if length > 4096:
                     return self.reply(400, b'Bad request')
@@ -17076,9 +17249,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
+                _svg_ok = globals().get('_is_safe_svg_payload')
                 if '<svg' not in qr_svg:
                     qr_svg = ""
-                elif '<script' in qr_svg.lower():
+                elif _svg_ok is not None:
+                    if not _svg_ok(qr_svg):
+                        qr_svg = ""
+                elif ('<script' in qr_svg.lower() or '<foreignobject' in qr_svg.lower()
+                        or 'javascript:' in qr_svg.lower() or 'onload=' in qr_svg.lower()
+                        or 'onerror=' in qr_svg.lower()):
                     qr_svg = ""
 
                 denial = user_access_denial(u_copy)
@@ -17582,9 +17761,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     qr_res = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                                             input=_ruri.encode('utf-8'), capture_output=True, timeout=3)
                     if qr_res.returncode == 0:
-                        qr_svg = qr_res.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
-                            qr_svg = ''
+                        qr_svg = qr_res.stdout.decode('utf-8', errors='replace')
+                        _svg_ok = globals().get('_is_safe_svg_payload')
+                        if _svg_ok is not None:
+                            if not _svg_ok(qr_svg):
+                                qr_svg = ''
+                        else:
+                            _low_qr = qr_svg.lower()
+                            if (len(qr_svg) > 2 * 1024 * 1024 or '<svg' not in _low_qr
+                                    or '<script' in _low_qr or '<foreignobject' in _low_qr
+                                    or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
+                                qr_svg = ''
                 except Exception:
                     qr_svg = ''
 
@@ -17906,6 +18093,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '探测请求过大，请刷新页面后重试'})
                 length = int(_raw_cl_s)
                 if length > 8192:
                     return self.reply_json(413, {'ok': False, 'error': '探测请求过大，请刷新页面后重试'})
@@ -17947,6 +18136,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -18084,7 +18275,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': rule_error})
             else:
-                return self.reply_json(400, {'ok': False, 'error': '未知的操作类型：' + action})
+                safe_action = ''.join(ch for ch in action if ord(ch) >= 32 and ord(ch) != 127)[:64]
+                return self.reply_json(400, {'ok': False, 'error': '未知的操作类型：' + safe_action})
 
             try:
                 save_data()
@@ -18125,7 +18317,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 with _warp_probe_lock:
                     cached = _warp_probe_cache.get('value')
                     cached_at = _warp_probe_cache.get('at', 0)
-                if cached and time.monotonic() - cached_at < 30:
+                now_mono = time.monotonic()
+                if cached and 0 <= now_mono - cached_at < 30:
                     outbound_ip, connected = cached
                 else:
                     for warp_addr in ('127.0.0.1:19898', '127.0.0.1:40000'):
@@ -18137,7 +18330,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         _warp_probe_cache['value'] = (outbound_ip, connected)
                         _warp_probe_cache['at'] = time.monotonic()
             try:
-                cfg_text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
+                _wcfg_p = Path('/etc/hysteria/config.yaml')
+                _wcfg_st = _wcfg_p.lstat()
+                if _wcfg_p.is_symlink() or not _wcfg_p.is_file() or _wcfg_st.st_size > 4 * 1024 * 1024:
+                    raise ValueError('config.yaml 非法或过大')
+                cfg_text = _wcfg_p.read_bytes().decode('utf-8', errors='replace')
                 applied = cfg_text == render_egress_config(cfg_text, state)
                 applied = applied and _hy2_config_loaded('/etc/hysteria/config.yaml')
             except Exception:

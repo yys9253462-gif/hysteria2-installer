@@ -938,10 +938,11 @@ async function checkWarpStatus() {
   const seq = ++warpStatusSeq;
   try {
     const res = await fetch(location.pathname + 'warp-status', { credentials: 'same-origin' });
+    if (res.status === 401) { portalSessionExpired = true; if (seq === warpStatusSeq) { markStatusUnknown(warpBadge, '登录已过期'); markWarpRulesFailed(); } return; }
     if (!res.ok) { if (seq === warpStatusSeq) { markStatusUnknown(warpBadge); markWarpRulesFailed(); } return; }
-    const json = await res.json();
+    const json = await res.json().catch(() => null);
     if (seq !== warpStatusSeq) return;
-    if (!json.ok) { markStatusUnknown(warpBadge, json.error); markWarpRulesFailed(); return; }
+    if (!json || !json.ok) { markStatusUnknown(warpBadge, json && json.error); markWarpRulesFailed(); return; }
 
     // 分流名单与 WARP 装没装无关（门户里一直有默认名单，未安装时也能增删）：先渲染。
     // 旧实现在「未安装」分支提前 return，数量与列表永远停在「加载中…」（2026-11-12 修）。
@@ -995,6 +996,7 @@ async function checkWarpStatus() {
 
 if (btnToggleWarp) {
   btnToggleWarp.addEventListener('click', async () => {
+    if (btnToggleWarp.disabled) return;
     // 按卡片显示的状态发送明确的 enable / disable（2026-11-13 修，同协议开关）；开关要等状态查询
     // 成功才显示，旧页面一加载就显示「切换中...」且可点，查询失败时点下去是盲翻。
     const action = btnToggleWarp.classList.contains('on') ? 'disable' : 'enable';
@@ -1007,8 +1009,13 @@ if (btnToggleWarp) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=' + action
       });
-      const json = await res.json();
-      if (!json.ok) alert(json.error || '切换失败');
+      if (res.status === 401) {
+        portalSessionExpired = true;
+        alert('登录已过期，请刷新页面重新登录');
+        return;
+      }
+      const json = await res.json().catch(() => null);
+      if (!res.ok || !json || !json.ok) alert((json && json.error) || ('切换失败 (HTTP ' + res.status + ')'));
     } catch (e) {
       alert('操作失败: ' + e.message);
     } finally {
@@ -1020,13 +1027,14 @@ if (btnToggleWarp) {
 
 if (btnInstallWarp) {
   btnInstallWarp.addEventListener('click', async () => {
+    if (btnInstallWarp.disabled) return;
     const confirmed = await showConfirm({
       title: '部署 Cloudflare WARP',
       text: '确定要在服务器上一键部署 Cloudflare WARP 本地出口吗？将自动安装 wgcf + wireproxy，并启用 127.0.0.1:19898 的 socks5 出口。',
       icon: '☁️',
       confirmText: '开始部署'
     });
-    if (!confirmed) return;
+    if (!confirmed || btnInstallWarp.disabled) return;
     btnInstallWarp.disabled = true;
     const origText = btnInstallWarp.textContent;
     let installedOk = false;
@@ -1037,15 +1045,20 @@ if (btnInstallWarp) {
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
+      if (res.status === 401) {
+        portalSessionExpired = true;
+        showToast('登录已过期，请刷新页面重新登录', 'error');
+        return;
+      }
       // 失败回包按 JSON 读出原因（2026-11-12 修）：旧实现把整段响应原文拼进提示，用户看到的是
       // {"ok": false, "error": ...} 一串；会话过期或反代回 502 时是整页 HTML。
-      const json = await res.json();
-      if (res.ok && json.ok) {
+      const json = await res.json().catch(() => null);
+      if (res.ok && json && json.ok) {
         installedOk = true;
         showToast(json.message || 'Cloudflare WARP 安装成功！服务已自动就绪。', 'success');
         await checkWarpStatus();
       } else {
-        showToast(json.error || ('安装失败（HTTP ' + res.status + '），请检查网络'), 'error');
+        showToast((json && json.error) || ('安装失败（HTTP ' + res.status + '），请检查网络'), 'error');
       }
     } catch (e) {
       showToast('安装请求异常: ' + e.message, 'error');
@@ -1072,6 +1085,7 @@ document.querySelectorAll('.preset-rule').forEach(el => {
 
 if (btnResetWarpRules) {
   btnResetWarpRules.addEventListener('click', async () => {
+    if (btnResetWarpRules.disabled) return;
     const confirmed = await showConfirm({
       title: '重置分流规则',
       text: '确定重置为系统默认推荐的 AI 域名规则列表吗？手动添加的 WARP 分流域名会被清掉，走其它出站的规则不受影响。',
@@ -1079,7 +1093,7 @@ if (btnResetWarpRules) {
       confirmText: '重置',
       isDanger: true
     });
-    if (!confirmed) return;
+    if (!confirmed || btnResetWarpRules.disabled) return;
     btnResetWarpRules.disabled = true;
     try {
       const res = await fetch(location.pathname + 'manage-warp', {
@@ -1088,10 +1102,14 @@ if (btnResetWarpRules) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'action=reset_rules'
       });
+      if (res.status === 401) {
+        portalSessionExpired = true;
+        throw new Error('登录已过期，请刷新页面重新登录');
+      }
       // 失败要说出来（2026-11-12 修）：旧实现只处理成功，保存 / 应用失败回 ok:false 时
       // 点了「重置」毫无反应；也没刷新状态，WARP 生效中仍显示「N 个已配置」。
       const json = await res.json().catch(() => ({}));
-      if (!res.ok || !json.ok) throw new Error(json.error || ('HTTP ' + res.status));
+      if (!res.ok || !json || !json.ok) throw new Error((json && json.error) || ('HTTP ' + res.status));
       if (Array.isArray(json.rules)) renderWarpRules(json.rules);
       await checkWarpStatus();
     } catch (e) {
@@ -2731,14 +2749,15 @@ document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
   btn.addEventListener('click', async () => {
     if (btn.disabled) return;
     const ver = btn.getAttribute('data-version') || 'v1';
-    const label = { v1: 'BBR V1 (经典官方)', v2: 'BBR V2 (低丢包)', v3: 'BBR V3 (极限吞吐)' }[ver];
+    const bbrLabels = { v1: 'BBR V1 (经典官方)', v2: 'BBR V2 (低丢包)', v3: 'BBR V3 (极限吞吐)' };
+    const label = Object.prototype.hasOwnProperty.call(bbrLabels, ver) ? bbrLabels[ver] : 'BBR';
     const confirmed = await showConfirm({
       title: '开启 ' + label + ' 加速引擎',
       text: '系统将自动将拥塞控制与排队规则写入 Linux 内核持久化配置（/etc/sysctl.d/99-bbr.conf）。配置后可能需要安全重启服务器以完成生效。',
       icon: '🚀',
       confirmText: '立即开启 ' + ver.toUpperCase()
     });
-    if (!confirmed) return;
+    if (!confirmed || btn.disabled) return;
 
     btn.disabled = true;
     const orig = btn.textContent;
@@ -2750,6 +2769,11 @@ document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'version=' + encodeURIComponent(ver)
       });
+      if (res.status === 401) {
+        portalSessionExpired = true;
+        showToast('登录已过期，请刷新页面重新登录', 'error');
+        return;
+      }
       let json = null;
       try { json = await res.json(); } catch (_) { json = null; }
       if (res.ok !== false && json && json.ok) {
@@ -3146,6 +3170,7 @@ async function checkVersions(force = false) {
   try {
     const res = await fetch(location.pathname + 'check-version' + (force ? '?force=1' : ''), { credentials: 'same-origin' });
     if (seq !== checkVersions._seq) return false;
+    if (res.status === 401) { portalSessionExpired = true; markVersionsUnknown(); return false; }
     if (!res.ok) { markVersionsUnknown(); return false; }
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
@@ -3188,7 +3213,10 @@ async function waitForCoreUpgrade() {
     try {
       const res = await fetch(location.pathname + 'upgrade-status', {credentials:'same-origin'});
       // 会话过期不再空等 5 分钟（2026-11-06 修）
-      if (res.status === 401 || portalSessionExpired) throw new Error('登录已失效，请刷新页面重新登录后查看更新结果');
+      if (res.status === 401 || portalSessionExpired) {
+        portalSessionExpired = true;
+        throw new Error('登录已失效，请刷新页面重新登录后查看更新结果');
+      }
       if (!res.ok) continue;
       const payload = await res.json();
       if (!payload || typeof payload !== 'object') continue;
@@ -3232,6 +3260,14 @@ async function doUpgrade(target) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'target=' + encodeURIComponent(target) + (custom ? '&allow_custom=1' : '')
     });
+    if (res.status === 401) {
+      portalSessionExpired = true;
+      const expMsg = '登录已过期，请刷新页面重新登录后再升级';
+      alert(expMsg);
+      if (updateStatusMsg) updateStatusMsg.textContent = expMsg;
+      if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
+      return;
+    }
     const json = await res.json().catch(() => null);
     if (res.ok !== false && json && json.ok) {
       if (target === 'core' && json.applying) {
@@ -3537,6 +3573,12 @@ async function loadProxyServices() {
   try {
     const res = await fetch(location.pathname + 'proxy-services', { credentials: 'same-origin' });
     if (seq !== loadProxyServices._seq) return;
+    if (res.status === 401) {
+      portalSessionExpired = true;
+      markStatusUnknown(gostBadge, '登录已过期');
+      markLoadFailed(proxyTbody, '登录已过期，请刷新页面重新登录');
+      return;
+    }
     if (!res.ok) {
       markStatusUnknown(gostBadge);
       markLoadFailed(proxyTbody, '代理服务列表加载失败（HTTP ' + res.status + '），请刷新页面重试');
@@ -3582,7 +3624,7 @@ async function loadProxyServices() {
       proxyTbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">暂无代理服务，点击上方「添加代理服务」创建</td></tr>';
       return;
     }
-    if (json.host) curProxyServerHost = json.host;
+    if (typeof json.host === 'string' && json.host.trim()) curProxyServerHost = json.host.trim();
     const rawHost = String(curProxyServerHost || '');
     const proxyHostPart = (rawHost.includes(':') && !rawHost.startsWith('[')) ? ('[' + rawHost + ']') : rawHost;
     const typeLabel = { socks5: 'SOCKS5', http: 'HTTP', https: 'HTTPS' };

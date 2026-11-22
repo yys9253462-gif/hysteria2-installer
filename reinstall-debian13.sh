@@ -168,8 +168,8 @@ password_ok() {
 # 先解开符号链接（/dev/disk/by-id/... 指向的是整块磁盘时也要认）。用法：is_whole_disk <设备>
 is_whole_disk() {
     [ -n "${1:-}" ] || return 1
-    _wd_resolved="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
-    _wd_name="$(basename "$_wd_resolved" 2>/dev/null || printf '')"
+    _wd_resolved="$(readlink -f -- "$1" 2>/dev/null || printf '%s' "$1")"
+    _wd_name="$(basename -- "$_wd_resolved" 2>/dev/null || printf '')"
     case "$_wd_name" in
         ''|.|..|*/*) return 1 ;;
     esac
@@ -314,7 +314,7 @@ case "$MIRROR" in
     *) die "镜像地址必须以 http:// 或 https:// 开头：$MIRROR" ;;
 esac
 case "$MIRROR" in
-    *[!A-Za-z0-9._~:/?#%+-]*) die "镜像地址含非法字符：$MIRROR" ;;
+    *[!A-Za-z0-9._~:/%+-]*) die "镜像地址含非法字符：$MIRROR" ;;
 esac
 
 if [ -n "$PASSWORD" ] && ! password_ok "$PASSWORD"; then
@@ -684,11 +684,12 @@ IN_FILE="$WORKDIR/InstallNET.sh"
 # 拿到的必须像个脚本：够大且以 #! 开头。被劫持或拿到报错网页时
 # 可能也有几十 KB，只看大小会把一个网页当成脚本以 root 执行。
 installnet_looks_valid() {
+    [ ! -L "$IN_FILE" ] && [ -f "$IN_FILE" ] || return 1
     _got="$(wc -c < "$IN_FILE" 2>/dev/null | tr -d '[:space:]')"
     case "$_got" in
         ''|*[!0-9]*) return 1 ;;
     esac
-    [ "$_got" -ge 50000 ] && [ "$_got" -le 2097152 ] && head -n 1 "$IN_FILE" 2>/dev/null | grep -q '^#!'
+    [ "${#_got}" -le 8 ] && [ "$_got" -ge 50000 ] && [ "$_got" -le 2097152 ] && head -n 1 "$IN_FILE" 2>/dev/null | grep -q '^#!'
 }
 
 download_installnet() {
