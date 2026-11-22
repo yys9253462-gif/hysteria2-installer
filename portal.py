@@ -11564,6 +11564,8 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     password_changed = False
+                    status_disabled = False
+                    result = None
                     with data_lock:
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
@@ -11576,6 +11578,7 @@ if __name__ == '__main__':
                             previous = copy.deepcopy(u)
                             u.update(changes)
                             password_changed = previous.get('password') != u.get('password')
+                            status_disabled = u.get('status') == 'disabled'
                             rotate_user_view_key_on_change(previous, u)
                             try:
                                 save_data()
@@ -11584,10 +11587,11 @@ if __name__ == '__main__':
                             except OSError:
                                 data['users'][user_id] = previous
                                 conflict = (503, 'User update save failed; disk state may require verification')
-                            result = {k: v for k, v in u.items() if k not in ('password', 'view_nonce')}
-                            # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
-                            result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
-                            result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
+                            if conflict is None:
+                                result = {k: copy.deepcopy(v) for k, v in u.items() if k not in ('password', 'view_nonce')}
+                                # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
+                                result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
+                                result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
@@ -11596,7 +11600,7 @@ if __name__ == '__main__':
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
-                    if password_changed:
+                    if (password_changed or status_disabled) and hasattr(self, '_kick_old_password_sessions'):
                         self._kick_old_password_sessions(user_id)
                     if durability_uncertain:
                         return self.reply_json(503, {'ok': False,
@@ -11899,6 +11903,8 @@ if __name__ == '__main__':
                     # 每次都重启会撞 systemd 的 start-limit（10-03 踩过）。
                     if not self._sync_reality_clients():
                         return self.reply_json(503, {'ok': False, 'error': 'Reality sync failed; retry required'})
+                    if want != 'active' and hasattr(self, '_kick_old_password_sessions'):
+                        self._kick_old_password_sessions(user_id)
                     if durability_uncertain:
                         return self.reply_json(503, {'ok': False,
                             'error': 'User status saved but durability uncertain; verify and retry'})
@@ -11982,7 +11988,8 @@ if __name__ == '__main__':
             # 3. Web 网页版管理通道 (用户管理 / WARP 开关 / 触发升级)
             with data_lock:
                 _portal_tok = data.get('token')
-            if not isinstance(_portal_tok, str) or not _portal_tok:
+            if (not isinstance(_portal_tok, str) or not _portal_tok
+                    or any(ord(c) < 32 or ord(c) == 127 or c in '/\\' for c in _portal_tok)):
                 return self.reply(503, b'Portal token unavailable')
             prefix = '/' + _portal_tok + '/'
             if self.path == prefix + 'do-upgrade':
@@ -16288,7 +16295,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                                  'measurement_sources': node_sources})
                 if sub == 'proxy-services/list':
                     with data_lock:
-                        items = proxy_services(data)
+                        items = [dict(s) for s in proxy_services(data) if isinstance(s, dict)]
                     # 面板只看这条 API: 补齐 host 与 gost 运行状态,
                     # 否则列表显示不出主机名, 也无法区分"服务真的可用"和"条目存在".
                     m = read_meta_file(meta_path)
@@ -16308,7 +16315,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
 
             with data_lock:
                 _portal_tok = data.get('token')
-            if not isinstance(_portal_tok, str) or not _portal_tok:
+            if (not isinstance(_portal_tok, str) or not _portal_tok
+                    or any(ord(c) < 32 or ord(c) == 127 or c in '/\\' for c in _portal_tok)):
                 return self.reply(503, b'Portal token unavailable')
             prefix = '/' + _portal_tok + '/'
             if not self.path.startswith(prefix):
