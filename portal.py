@@ -10969,8 +10969,22 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': False, 'msg': 'Forbidden'})
                 # 先解析出客户端地址再限流：限流按来源分桶（H4，2026-11-02）。
                 try:
-                    length = int(self.headers.get('Content-Length', 0))
-                    if length < 0 or length > 65536:
+                    _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                    if _cl_vals is not None:
+                        if len(_cl_vals) > 1:
+                            raise ValueError('duplicate auth content-length')
+                        _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                    else:
+                        _raw_cl = self.headers.get('Content-Length', '0')
+                    if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                        _raw_cl = str(_raw_cl)
+                    if not isinstance(_raw_cl, str):
+                        raise ValueError('invalid auth content-length')
+                    _raw_cl_s = _raw_cl.strip()
+                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                        raise ValueError('invalid auth content-length')
+                    length = int(_raw_cl_s)
+                    if length > 65536:
                         raise ValueError('invalid auth content-length')
                     body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                     req_data = json.loads(body)
@@ -12067,11 +12081,22 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             update_lock_fd = None
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -12547,11 +12572,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '')
                 params = {key: values[0] for key, values in form.items()}
@@ -12877,11 +12913,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -12956,11 +13003,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -13325,11 +13383,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -13755,11 +13824,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -13960,11 +14040,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
@@ -14031,11 +14122,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
@@ -14249,11 +14351,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
@@ -14485,11 +14598,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
@@ -14622,11 +14746,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -15235,8 +15370,22 @@ if __name__ == '__main__':
         def _h_post_login(self, prefix):
             """POST /login 的处理逻辑（从 do_POST 机械搬移而来）。"""
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                if length < 0 or length > 4096:
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply(400, b'Bad request')
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
+                    return self.reply(400, b'Bad request')
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply(400, b'Bad request')
+                length = int(_raw_cl_s)
+                if length > 4096:
                     return self.reply(400, b'Bad request')
                 body = self.rfile.read(length).decode('utf-8', errors='ignore') if length > 0 else ''
                 params = parse_qs(body)
