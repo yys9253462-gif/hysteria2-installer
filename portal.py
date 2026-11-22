@@ -7808,7 +7808,11 @@ def apply_xray_config_with_meter(config, config_path, meter_cfg_path, portal_dir
     """
     config_path = Path(config_path)
     if meter_cfg_path.exists():
-        raw_meter = json.loads(meter_cfg_path.read_text(encoding='utf-8'))
+        if meter_cfg_path.is_symlink():
+            raise ValueError('计量配置文件不允许为符号链接')
+        if meter_cfg_path.lstat().st_size > 1024 * 1024:
+            raise ValueError('计量配置文件超过 1 MiB 上限')
+        raw_meter = json.loads(meter_cfg_path.read_bytes().decode('utf-8', errors='replace'))
         meter = raw_meter.get('reality') if isinstance(raw_meter, dict) else None
         meter = meter if isinstance(meter, dict) else {}
         address = meter.get('address', '')
@@ -7816,7 +7820,8 @@ def apply_xray_config_with_meter(config, config_path, meter_cfg_path, portal_dir
             if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
                 raise ValueError('统计接口必须为回环地址')
             port_text = address.rsplit(':', 1)[1]
-            if not (port_text.isascii() and port_text.isdigit()):
+            if not (port_text.isascii() and port_text.isdigit() and 1 <= len(port_text) <= 5
+                    and not port_text.startswith('0')):
                 raise ValueError('统计接口端口非法')
             stats_port = int(port_text)
             if not 1 <= stats_port <= 65535:
@@ -14275,14 +14280,17 @@ if __name__ == '__main__':
                 raise RuntimeError('找不到可用 TLS 证书，%s 需要先配置证书' % protocol)
             if self_signed:
                 raise RuntimeError('当前为自签证书，%s 客户端无法校验；请先配置域名证书' % protocol)
-            validity = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout',
+            cert_path_str = str(cert_file)
+            if cert_path_str.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in cert_path_str):
+                raise RuntimeError('证书路径不合法，%s 不能启用' % protocol)
+            validity = subprocess.run(['openssl', 'x509', '-in', cert_path_str, '-noout',
                                        '-checkend', '0'], capture_output=True,
-                                      text=True, timeout=5)
+                                      text=True, encoding='utf-8', errors='replace', timeout=5)
             if validity.returncode != 0:
                 raise RuntimeError('证书已过期或无效，%s 不能启用' % protocol)
-            starts = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout',
+            starts = subprocess.run(['openssl', 'x509', '-in', cert_path_str, '-noout',
                                      '-startdate'], capture_output=True,
-                                    text=True, timeout=5)
+                                    text=True, encoding='utf-8', errors='replace', timeout=5)
             if starts.returncode != 0 or not starts.stdout.startswith('notBefore='):
                 raise RuntimeError('无法读取证书生效时间，%s 不能启用' % protocol)
             try:
@@ -14307,10 +14315,14 @@ if __name__ == '__main__':
             # 只给叶证书时握手会报 x509: certificate signed by unknown authority。
             # 安装器 _accept_cert_pair 有同样的判据，门户这边此前漏了。
             try:
-                pem_text = Path(cert_file).read_text(encoding='utf-8', errors='ignore')
+                _cf_obj = Path(cert_file)
+                if _cf_obj.stat().st_size > 4 * 1024 * 1024:
+                    raise RuntimeError('证书 %s 体积超过 4 MiB 上限，%s 不能启用' % (cert_file, protocol))
+                pem_text = _cf_obj.read_bytes().decode('utf-8', errors='ignore')
             except OSError:
                 pem_text = ''
-            if pem_text.count('BEGIN CERTIFICATE') < 2:
+            _cert_blocks = sum(1 for _ln in pem_text.splitlines() if _ln.strip() == '-----BEGIN CERTIFICATE-----')
+            if _cert_blocks < 2:
                 raise RuntimeError(
                     '证书 %s 只有叶证书、缺少中间证书链；客户端会报 unknown authority。'
                     '请使用 fullchain 或包含完整链的证书文件' % cert_file)
@@ -14355,7 +14367,9 @@ if __name__ == '__main__':
             with data_lock:
                 _data_now = dict(data)
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config', keep_disabled=True)
-            blocked.add(reality_port)
+            _rp_valid = _valid_port(reality_port)
+            if _rp_valid:
+                blocked.add(_rp_valid)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2087,
                 extra_blocked=blocked,
@@ -14391,8 +14405,16 @@ if __name__ == '__main__':
                 was_active = _systemd_state('xray') == 'active'
                 with data_lock:
                     inbound['settings']['clients'] = vmess_clients(data)
-                original_config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                                   if xray_path.exists() else None)
+                if xray_path.is_symlink():
+                    raise RuntimeError('xray.json 不允许为符号链接')
+                if xray_path.exists():
+                    if xray_path.lstat().st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('xray.json 超过 4 MiB 上限')
+                    original_config = json.loads(xray_path.read_bytes().decode('utf-8', errors='replace'))
+                    if not isinstance(original_config, dict):
+                        raise ValueError('xray.json 顶层必须为 JSON 对象')
+                else:
+                    original_config = None
                 config = (copy.deepcopy(original_config) if original_config is not None else
                           {'log': {'loglevel': 'warning'},
                            'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]})
@@ -14456,13 +14478,16 @@ if __name__ == '__main__':
             cert_file, key_file, sni = self._vmess_certificate(domain, 'VLESS Encryption')
             with data_lock:
                 old = dict(config_section(data, 'vlessenc_config'))
-                blocked_ports = {
-                    m.get('listen_port'), m.get('subscription_port'),
-                    # config_section 清洗（2026-11-06 修）：配置段被改成字符串 / 列表时旧写法
-                    # 抛 AttributeError，VLESS Encryption 每次启用都失败。
+                blocked_ports = set()
+                for _cand_p in (
+                    m.get('listen_port'),
+                    m.get('subscription_port'),
                     config_section(data, 'reality_config').get('port'),
                     config_section(data, 'vmess_config').get('port'),
-                }
+                ):
+                    _vp = _valid_port(_cand_p)
+                    if _vp:
+                        blocked_ports.add(_vp)
             try:
                 _xp_cfg = Path('/etc/hysteria/xray.json')
                 if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
@@ -14482,7 +14507,8 @@ if __name__ == '__main__':
                 raise RuntimeError(reason)
             decryption = old.get('decryption', '')
             encryption = old.get('encryption', '')
-            if not (decryption and encryption):
+            if not (isinstance(decryption, str) and decryption and not any(ord(c) < 32 or ord(c) == 127 for c in decryption)
+                    and isinstance(encryption, str) and encryption and not any(ord(c) < 32 or ord(c) == 127 for c in encryption)):
                 decryption, encryption = generate_vless_encryption_pair()
             with data_lock:
                 clients = vlessenc_clients(data)
@@ -14511,8 +14537,16 @@ if __name__ == '__main__':
                 was_active = _systemd_state('xray') == 'active'
                 with data_lock:
                     inbound['settings']['clients'] = vlessenc_clients(data)
-                original_config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                                   if xray_path.exists() else None)
+                if xray_path.is_symlink():
+                    raise RuntimeError('xray.json 不允许为符号链接')
+                if xray_path.exists():
+                    if xray_path.lstat().st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('xray.json 超过 4 MiB 上限')
+                    original_config = json.loads(xray_path.read_bytes().decode('utf-8', errors='replace'))
+                    if not isinstance(original_config, dict):
+                        raise ValueError('xray.json 顶层必须为 JSON 对象')
+                else:
+                    original_config = None
                 config = (copy.deepcopy(original_config) if original_config is not None else
                           {'log': {'loglevel': 'warning'},
                            'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]})
@@ -15049,8 +15083,12 @@ if __name__ == '__main__':
                 own_active=_systemd_state(ANYTLS_SERVICE) == 'active')
             if not listen_port:
                 raise RuntimeError(reason)
+            _old_secret = old.get('secret') if (
+                isinstance(old.get('secret'), str) and old.get('secret').strip()
+                and not any(ord(c) < 32 or ord(c) == 127 for c in old.get('secret'))
+            ) else ''
             new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
-                       'secret': old.get('secret') or secrets.token_hex(32)}
+                       'secret': _old_secret or secrets.token_hex(32)}
             unit_path = Path('/etc/systemd/system/%s.service' % ANYTLS_SERVICE)
             with anytls_apply_lock:
                 # 用户表在协议锁内取（2026-11-04 修）：旧实现在锁外取，期间撤销流程同步完
@@ -15060,10 +15098,16 @@ if __name__ == '__main__':
                     preview = dict(data)
                     preview['anytls_config'] = new_cfg
                     users = anytls_users(preview)
-                previous_unit = unit_path.read_bytes() if unit_path.exists() else None
+                if unit_path.is_symlink():
+                    raise RuntimeError('AnyTLS 服务单元不允许为符号链接')
+                previous_unit = unit_path.read_bytes() if (unit_path.exists() and unit_path.lstat().st_size <= 1024 * 1024) else None
                 unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                 unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
                 cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
+                if cfg_path.is_symlink():
+                    raise RuntimeError('anytls.json 不允许为符号链接')
+                if cfg_path.exists() and cfg_path.lstat().st_size > 4 * 1024 * 1024:
+                    raise RuntimeError('anytls.json 超过 4 MiB 上限')
                 previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                 try:
