@@ -3315,13 +3315,14 @@ function showProxyResult(data) {
   if (!proxyModal) return;
   const host = String(data.host || curProxyServerHost || '');
   const hostPart = (host.includes(':') && !host.startsWith('[')) ? ('[' + host + ']') : host;
-  const ptype = data.type || 'socks5';
-  const url = data.url || (ptype + '://' + encodeURIComponent(data.username) + ':' + encodeURIComponent(data.password) + '@' + hostPart + ':' + data.port);
-  const fmt = data.format || (host + ':' + data.port + ':' + data.username + ':' + data.password);
+  const ptype = String(data.type || 'socks5');
+  const safePtype = (ptype === 'socks5' || ptype === 'http' || ptype === 'https') ? ptype : '';
+  const url = data.url || (ptype + '://' + encodeURIComponent(data.username || '') + ':' + encodeURIComponent(data.password || '') + '@' + hostPart + ':' + data.port);
+  const fmt = data.format || (host + ':' + data.port + ':' + (data.username || '') + ':' + (data.password || ''));
 
   if (resPTypeBadge) {
     resPTypeBadge.textContent = ptype.toUpperCase();
-    resPTypeBadge.className = 'proxy-type ' + ptype;
+    resPTypeBadge.className = safePtype ? ('proxy-type ' + safePtype) : 'proxy-type';
   }
   if (resPHost) resPHost.textContent = host;
   if (resPPort) resPPort.textContent = data.port;
@@ -3331,8 +3332,8 @@ function showProxyResult(data) {
   if (resPFmt) resPFmt.value = fmt;
 
   if (resPQr) {
-    // 没生成出二维码或返回值不是 SVG 时必须覆盖掉初始「生成中...」或旧二维码，避免扫码连错代理或注入非 SVG 内容。
-    resPQr.innerHTML = (typeof data.qr === 'string' && data.qr.includes('<svg'))
+    // 没生成出二维码、非 SVG 或含 script 标签时必须覆盖掉初始「生成中...」或旧二维码，避免扫码连错代理或脚本注入。
+    resPQr.innerHTML = (typeof data.qr === 'string' && data.qr.includes('<svg') && !/<script/i.test(data.qr))
       ? data.qr
       : '<p style="color:var(--muted);font-size:12px;margin:0;text-align:center">二维码生成失败（服务器可能未安装 qrencode），请复制右侧代理链接导入</p>';
   }
@@ -3477,7 +3478,7 @@ async function loadProxyServices() {
       }
     }
 
-    const services = Array.isArray(json.services) ? json.services : [];
+    const services = (Array.isArray(json.services) ? json.services : []).filter(s => s && typeof s === 'object');
     if (services.length === 0) {
       proxyTbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">暂无代理服务，点击上方「添加代理服务」创建</td></tr>';
       return;
@@ -3488,10 +3489,11 @@ async function loadProxyServices() {
     const typeLabel = { socks5: 'SOCKS5', http: 'HTTP', https: 'HTTPS' };
     proxyTbody.innerHTML = services.map(s => {
       const safeTypeClass = Object.prototype.hasOwnProperty.call(typeLabel, s.type) ? s.type : '';
+      const displayType = safeTypeClass ? typeLabel[safeTypeClass] : String(s.type || '');
       const fullUrl = `${s.type || ''}://${encodeURIComponent(s.username || '')}:${encodeURIComponent(s.password || '')}@${proxyHostPart}:${s.port}`;
       return `
       <tr>
-        <td><span class="proxy-type ${safeTypeClass}">${obEsc(typeLabel[s.type] || s.type)}</span></td>
+        <td><span class="proxy-type ${safeTypeClass}">${obEsc(displayType)}</span></td>
         <td><code style="font-size:12px;font-weight:700;color:var(--accent)">:${obEsc(s.port)}</code></td>
         <td><code style="font-size:12px">${obEsc(s.username)}</code></td>
         <td><code style="font-size:12px">${obEsc(s.password)}</code></td>
@@ -3510,6 +3512,7 @@ async function loadProxyServices() {
     });
     proxyTbody.querySelectorAll('[data-proxy-del]').forEach(btn => {
       btn.addEventListener('click', async () => {
+        if (btn.disabled) return;
         const confirmed = await showConfirm({
           title: '删除代理服务',
           text: '确定删除该代理服务？',
@@ -3517,7 +3520,7 @@ async function loadProxyServices() {
           confirmText: '删除',
           isDanger: true
         });
-        if (!confirmed) return;
+        if (!confirmed || btn.disabled) return;
         btn.disabled = true;
         try {
           const res = await fetch(location.pathname + 'manage-proxy', {
@@ -3606,12 +3609,12 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       // 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）：UDP 不通的客户要靠 Reality / VMess
       // 等 TCP 协议兜底，旧弹窗只有 Hy2 一条，管理员只能另开分享页去找。
       const extraLinksHtml = (Array.isArray(json.extra_links) ? json.extra_links : [])
-        .filter(x => x && typeof x.uri === 'string' && x.uri)
+        .filter(x => x && typeof x === 'object' && typeof x.uri === 'string' && x.uri)
         .map((x, i) => `
             <div>
-              <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">${obEsc(x.label)} 直链（UDP 不通时用）:</div>
-              <textarea id="um-extra-${i}" class="link" aria-label="${obEsc(x.label)} 直链" style="height:52px;font-size:11px" readonly>${obEsc(x.uri)}</textarea>
-              <div style="margin-top:6px"><button class="button" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-extra-${i}">复制 ${obEsc(x.label)} 直链</button></div>
+              <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">${obEsc(x.label || '备用协议')} 直链（UDP 不通时用）:</div>
+              <textarea id="um-extra-${i}" class="link" aria-label="${obEsc(x.label || '备用协议')} 直链" style="height:52px;font-size:11px" readonly>${obEsc(x.uri)}</textarea>
+              <div style="margin-top:6px"><button class="button" style="padding:6px 14px;font-size:11px" type="button" data-modal-copy="um-extra-${i}">复制 ${obEsc(x.label || '备用协议')} 直链</button></div>
             </div>`).join('');
       
       // 统一用 fmtBytes：旧写法把已用强制成 MB、配额强制成 GB，
@@ -3649,7 +3652,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div class="user-connect-grid">
           <div style="text-align:center;background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px">
             <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:8px">专属二维码扫码导入</div>
-            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg')) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
+            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg') && !/<script/i.test(json.qr_svg)) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
             <div style="font-size:11px;color:var(--muted);margin-top:8px">Shadowrocket / v2rayNG / Nekobox</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:12px">
@@ -3810,7 +3813,7 @@ function fmtAwgCreated(value) {
 
 function renderAwgPeers(peers) {
   if (!awgPeerTbody) return;
-  const safePeers = (Array.isArray(peers) ? peers : []).filter(p => p && typeof p === 'object');
+  const safePeers = (Array.isArray(peers) ? peers : []).filter(p => p && typeof p === 'object' && typeof p.name === 'string' && p.name);
   if (!safePeers.length) {
     awgPeerTbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:20px">暂无客户端，用上方表单新增</td></tr>';
     return;
@@ -3847,6 +3850,7 @@ function renderAwgPeers(peers) {
   });
   awgPeerTbody.querySelectorAll('[data-awg-del]').forEach(b => {
     b.addEventListener('click', async () => {
+      if (b.disabled) return;
       const n = decodeURIComponent(b.getAttribute('data-awg-del'));
       const confirmed = await showConfirm({
         title: '删除 AWG 客户端',
@@ -3855,7 +3859,7 @@ function renderAwgPeers(peers) {
         confirmText: '删除',
         isDanger: true
       });
-      if (!confirmed) return;
+      if (!confirmed || b.disabled) return;
       // 请求期间禁用按钮（2026-11-04 修）：连点两次第二次必然报「不存在」。
       b.disabled = true;
       try {
