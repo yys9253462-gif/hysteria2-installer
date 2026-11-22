@@ -852,6 +852,11 @@ async function addWarpRule(domain) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'action=add_rule&domain=' + encodeURIComponent(domain)
     });
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      alert('登录已过期，请刷新页面重新登录');
+      return;
+    }
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
     if (res.ok !== false && json && json.ok) {
@@ -887,6 +892,10 @@ async function delWarpRule(domain) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'action=del_rule&domain=' + encodeURIComponent(domain)
     });
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      throw new Error('登录已过期，请刷新页面重新登录');
+    }
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
     if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('分流规则应用失败（HTTP ' + res.status + '）'));
@@ -2640,6 +2649,11 @@ async function checkCertStatus() {
   };
   try {
     const res = await fetch(location.pathname + 'cert-status', { credentials: 'same-origin' });
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      if (seq === checkCertStatus._seq) showFetchError('登录已过期，请刷新页面重新登录');
+      return;
+    }
     try { json = await res.json(); } catch (_) { json = null; }
     if (seq !== checkCertStatus._seq) return;
     // HTTP 失败 = 状态取不到；HTTP 200 + ok:false 是「证书不可读」，交给下面正常渲染。
@@ -2844,6 +2858,13 @@ if (btnRebootServer) {
         method: 'POST',
         credentials: 'same-origin'
       });
+      if (res.status === 401) {
+        if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+        alert('登录已过期，请刷新页面重新登录');
+        btnRebootServer.disabled = false;
+        btnRebootServer.textContent = '🔄 立即重启服务器生效';
+        return;
+      }
       // 看服务器怎么答（2026-11-04 修）：有重型任务在跑时回 409、会话过期回 401，
       // 旧实现一律倒计时 25 秒再刷新，机器其实从未重启。
       let json = null;
@@ -3066,6 +3087,11 @@ async function installCore(core, btn) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'name=' + encodeURIComponent(core.id)
     });
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      alert('登录已过期，请刷新页面重新登录');
+      return;
+    }
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
     if (res.ok !== false && json && json.ok) showToast(json.message || '安装完成', 'success');
@@ -3099,6 +3125,11 @@ async function uninstallCore(core, btn) {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: 'name=' + encodeURIComponent(core.id)
     });
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      alert('登录已过期，请刷新页面重新登录');
+      return;
+    }
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
     if (res.ok !== false && json && json.ok) showToast(json.message || '已卸载', 'success');
@@ -3475,8 +3506,8 @@ function showProxyResult(data) {
   if (resPFmt) resPFmt.value = fmt;
 
   if (resPQr) {
-    // 没生成出二维码、非 SVG 或含 script 标签时必须覆盖掉初始「生成中...」或旧二维码，避免扫码连错代理或脚本注入。
-    resPQr.innerHTML = (typeof data.qr === 'string' && data.qr.includes('<svg') && !/<script/i.test(data.qr))
+    // 没生成出二维码、非 SVG 或含 script/foreignObject/事件/javascript: 时必须覆盖掉初始「生成中...」或旧二维码，避免扫码连错代理或脚本注入。
+    resPQr.innerHTML = (typeof data.qr === 'string' && data.qr.includes('<svg') && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(data.qr.trim()) && !/<script/i.test(data.qr) && !/<foreignObject\b/i.test(data.qr) && !/\bon[a-z]+\s*=/i.test(data.qr) && !/javascript\s*:/i.test(data.qr))
       ? data.qr
       : '<p style="color:var(--muted);font-size:12px;margin:0;text-align:center">二维码生成失败（服务器可能未安装 qrencode），请复制右侧代理链接导入</p>';
   }
@@ -3524,6 +3555,11 @@ document.querySelectorAll('.btn-quick-proxy').forEach(btn => {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: body
       });
+      if (res.status === 401) {
+        if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+        alert('登录已过期，请刷新页面重新登录');
+        return;
+      }
       const json = await res.json().catch(() => null);
       if (res.ok !== false && json && json.ok) {
         if (cPortEl) cPortEl.value = '';
@@ -3561,6 +3597,11 @@ if (btnInstallGost) {
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
       });
+      if (res.status === 401) {
+        if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+        alert('登录已过期，请刷新页面重新登录');
+        return;
+      }
       const json = await res.json().catch(() => null);
       if (res.ok !== false && json && json.ok) {
         installedOk = true;
@@ -3680,6 +3721,10 @@ async function loadProxyServices() {
             headers: {'Content-Type':'application/x-www-form-urlencoded'},
             body: 'action=delete&id=' + encodeURIComponent(btn.dataset.proxyDel)
           });
+          if (res.status === 401) {
+            if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+            throw new Error('登录已过期，请刷新页面重新登录');
+          }
           const json = await res.json().catch(() => null);
           if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('删除代理失败 (HTTP ' + res.status + ')'));
           await loadProxyServices();
@@ -3820,7 +3865,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div class="user-connect-grid">
           <div style="text-align:center;background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px">
             <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:8px">专属二维码扫码导入</div>
-            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg') && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(json.qr_svg.trim()) && !/<script/i.test(json.qr_svg) && !/<foreignObject\b/i.test(json.qr_svg) && !/\bon[a-z]+\s*=/i.test(json.qr_svg)) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
+            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg') && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(json.qr_svg.trim()) && !/<script/i.test(json.qr_svg) && !/<foreignObject\b/i.test(json.qr_svg) && !/\bon[a-z]+\s*=/i.test(json.qr_svg) && !/javascript\s*:/i.test(json.qr_svg)) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
             <div style="font-size:11px;color:var(--muted);margin-top:8px">Shadowrocket / v2rayNG / Nekobox</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:12px">
@@ -3937,6 +3982,11 @@ async function loadAwgState() {
   try {
     const res = await fetch(location.pathname + 'awg-state', { credentials: 'same-origin' });
     if (seq !== loadAwgState._seq) return;
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      markStatusUnknown(awgBadge, '登录已过期');
+      return;
+    }
     if (!res.ok) { markStatusUnknown(awgBadge); return; }
     const json = await res.json();
     if (seq !== loadAwgState._seq) return;
