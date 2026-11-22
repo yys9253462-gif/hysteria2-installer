@@ -9009,8 +9009,8 @@ def serve(path):
         port_match = re.search(r':([0-9]+)$', endpoint)
         if port_match:
             raw_port = port_match.group(1)
-            if len(raw_port) > 5 or raw_port.startswith('0'):
-                return '连接地址中的端口必须是 1-65535（不含前导零）'
+            if len(raw_port) > 5:
+                return '连接地址中的端口必须是 1-65535'
             port = int(raw_port, 10)
             if not 1 <= port <= 65535:
                 return '连接地址中的端口必须是 1-65535'

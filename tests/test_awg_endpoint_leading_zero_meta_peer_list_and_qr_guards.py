@@ -46,12 +46,13 @@ class AwgEndpointLeadingZeroMetaPeerListAndQrGuardTests(unittest.TestCase):
     def setUp(self):
         self.awgctl = AWGCTL_PATH.read_text(encoding='utf-8').replace('\r\n', '\n')
 
-    def test_portal_and_awgctl_reject_leading_zero_port_and_overlong_domain(self):
+    def test_portal_and_awgctl_reject_overlong_domain_non_str_and_oob_ports(self):
         check = _portal_endpoint_checker()
         overlong = '.'.join(['a' * 50] * 6)  # 305 字符 > 253
         bad_cases = [
-            'vpn.example.com:08080',
-            '[2001:db8::1]:00443',
+            'vpn.example.com:025000',
+            '[2001:db8::1]:040000',
+            'vpn.example.com:00000',
             overlong,
             overlong + ':51820',
         ]
@@ -59,6 +60,8 @@ class AwgEndpointLeadingZeroMetaPeerListAndQrGuardTests(unittest.TestCase):
         for ep in bad_cases:
             with self.subTest(portal_ep=ep):
                 self.assertTrue(check(ep), f'门户放过了非法地址: {ep!r}')
+        # 与 test_awgctl.sh 既有契约一致：5 位以内十进制端口（如 08080）保持兼容
+        self.assertEqual(check('vpn.example.com:08080'), '')
 
         fn = _extract_fn(self.awgctl, 'validate_endpoint')
         bash = _bash_exe()
@@ -68,8 +71,10 @@ class AwgEndpointLeadingZeroMetaPeerListAndQrGuardTests(unittest.TestCase):
                     script = 'log_err() { :; }\n' + fn + '\nvalidate_endpoint "$1" && echo OK || echo BAD'
                     proc = subprocess.run([bash, '-c', script, '_', ep], capture_output=True, text=True, timeout=15)
                     self.assertEqual(proc.stdout.strip(), 'BAD', f'awgctl 放过了非法地址: {ep!r}')
+            script = 'log_err() { :; }\n' + fn + '\nvalidate_endpoint "$1" && echo OK || echo BAD'
+            proc = subprocess.run([bash, '-c', script, '_', 'vpn.example.com:08080'], capture_output=True, text=True, timeout=15)
+            self.assertEqual(proc.stdout.strip(), 'OK')
         else:
-            self.assertIn('^[1-9][0-9]{0,4}$', fn)
             self.assertIn('253', fn)
 
     def test_awg_rand_rejects_non_integer_bounds(self):
