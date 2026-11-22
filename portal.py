@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.66'
+PORTAL_VERSION = '2.67'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1881,15 +1881,20 @@ def git_blob_sha(data):
 def safe_tar_members(names, wanted):
     """校验 tar 成员名，并返回与 wanted 同名的**包内实际成员名**。
 
-    拒绝绝对路径、反斜杠、空字节与含 `..` 的成员（防以 root 写出临时目录），
+    拒绝绝对路径、反斜杠、空字节、控制字符、冒号盘符与含 `..` 的成员（防以 root 写出临时目录），
     且只接受一个精确同名的常规文件（不做"第一个可执行文件"兜底）。
     """
+    if not isinstance(wanted, str) or not wanted:
+        raise ValueError('tar 目标成员名无效')
     hits = []
     for name in names:
-        if not isinstance(name, str) or '\\' in name or '\x00' in name:
+        if (not isinstance(name, str) or not name or '\\' in name or ':' in name
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
             raise ValueError('tar 包内含不安全路径成员: %r' % (name,))
-        clean = name[2:] if name.startswith('./') else name
-        if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
+        clean = name
+        while clean.startswith('./'):
+            clean = clean[2:]
+        if not clean or name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
             raise ValueError('tar 包内含不安全路径成员: %s' % name)
         if clean == wanted or clean.rsplit('/', 1)[-1] == wanted:
             hits.append(name)
@@ -1900,12 +1905,17 @@ def safe_tar_members(names, wanted):
 
 def safe_zip_members(names, wanted):
     """校验 zip 成员名并返回唯一精确匹配的成员名。"""
+    if not isinstance(wanted, str) or not wanted:
+        raise ValueError('zip 目标成员名无效')
     hits = []
     for name in names:
-        if not isinstance(name, str) or '\\' in name or '\x00' in name:
+        if (not isinstance(name, str) or not name or '\\' in name or ':' in name
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
             raise ValueError('zip 包内含不安全路径成员: %r' % (name,))
-        clean = name[2:] if name.startswith('./') else name
-        if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
+        clean = name
+        while clean.startswith('./'):
+            clean = clean[2:]
+        if not clean or name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
             raise ValueError('zip 包内含不安全路径成员: %s' % name)
         if clean == wanted or clean.rsplit('/', 1)[-1] == wanted:
             hits.append(name)
@@ -1920,9 +1930,13 @@ HYSTERIA_ARCH_ASSET = {'amd64': 'amd64', 'arm64': 'arm64', 'armv7': 'arm'}
 
 
 def hysteria_asset_arch(machine=None):
-    machine = (machine or platform.machine()).lower()
+    if machine is None:
+        machine = platform.machine()
+    if not isinstance(machine, str):
+        return None
+    machine = machine.lower()
     arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64',
-            'arm64': 'arm64', 'armv7l': 'armv7', 'armv7': 'armv7'}.get(machine)
+            'arm64': 'arm64', 'armv7l': 'armv7', 'armv7': 'armv7', 'armhf': 'armv7'}.get(machine)
     return HYSTERIA_ARCH_ASSET.get(arch) if arch else None
 
 
@@ -1934,14 +1948,21 @@ def _prune_core_backups(directory, keep=3):
     旧实现从不清理：小盘 VPS 上历经几次升级就可能写满根分区，
     而 portal.json 的原子写入失败会连带影响用户数据（2026-10-29 加）。
     """
+    keep = max(1, keep) if isinstance(keep, int) and not isinstance(keep, bool) else 3
     directory = Path(directory)
+    entries = []
     try:
-        items = sorted((p for p in directory.iterdir()
-                        if p.is_file() and p.name.startswith(('hysteria-', 'xray-'))),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in directory.iterdir():
+            try:
+                if p.is_symlink() or not p.is_file() or not p.name.startswith(('hysteria-', 'xray-')):
+                    continue
+                entries.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
     except OSError:
         return
-    for old in items[keep:]:
+    entries.sort(key=lambda item: item[0], reverse=True)
+    for _, old in entries[keep:]:
         try:
             old.unlink()
         except OSError:
@@ -5260,9 +5281,20 @@ def suspend_state(data):
         return {}
     clean = dict(state)
     units = clean.get('units')
-    clean['units'] = ([u for u in units
-                       if isinstance(u, str) and TRAFFIC_SUSPEND_UNIT_RE.match(u)]
-                      if isinstance(units, list) else [])
+    deduped_units = []
+    seen_units = set()
+    if isinstance(units, list):
+        for u in units:
+            if isinstance(u, str) and TRAFFIC_SUSPEND_UNIT_RE.match(u) and u not in seen_units:
+                seen_units.add(u)
+                deduped_units.append(u)
+    clean['units'] = deduped_units
+    raw_since = clean.get('since')
+    if (isinstance(raw_since, bool) or not isinstance(raw_since, (int, float))
+            or not (0 <= raw_since < float('inf'))):
+        clean.pop('since', None)
+    else:
+        clean['since'] = int(raw_since)
     return clean
 
 
@@ -6596,10 +6628,15 @@ class AuthLimiter:
 
     @staticmethod
     def _prune(items, now, window):
-        while items and now - items[0] >= window:
+        while items and (now - items[0] >= window or now < items[0]):
             items.popleft()
 
     def limited(self, key, now):
+        if (isinstance(now, bool) or not isinstance(now, (int, float))
+                or now != now or now == float('inf') or now == float('-inf')):
+            return False
+        if not isinstance(key, str):
+            key = str(key)[:64]
         self._prune(self.global_requests, now, 1)
         if len(self.global_requests) >= self.global_rate:
             return True
@@ -6618,6 +6655,11 @@ class AuthLimiter:
         return too_fast
 
     def record_failure(self, key, now):
+        if (isinstance(now, bool) or not isinstance(now, (int, float))
+                or now != now or now == float('inf') or now == float('-inf')):
+            return
+        if not isinstance(key, str):
+            key = str(key)[:64]
         self._bucket(key)[1].append(now)
 
 
@@ -6629,7 +6671,7 @@ def active_ip_deny(table, uid, now):
     异常穿透 do_POST → 连接被掐断，客户端只会无限重试（表现为「突然全节点
     连不上」）。损坏项按「无拦截」处理并清掉，绝不能让鉴权路径抛异常。
     """
-    if not isinstance(table, dict):
+    if not isinstance(table, dict) or not isinstance(uid, str):
         return set()
     row = table.get(uid)
     if not isinstance(row, dict):
@@ -6637,7 +6679,9 @@ def active_ip_deny(table, uid, now):
             table.pop(uid, None)
         return set()
     for ip in [ip for ip, until in row.items()
-               if not isinstance(until, (int, float)) or isinstance(until, bool)
+               if not isinstance(ip, str) or not ip
+               or not isinstance(until, (int, float)) or isinstance(until, bool)
+               or until != until or until == float('inf') or until == float('-inf')
                or until <= now]:
         row.pop(ip)
     if not row:
@@ -6676,9 +6720,15 @@ def kick_hy2_users(root, uids):
     secret = hc.get('secret')
     url = hc.get('url')
     url = url.rstrip('/') if isinstance(url, str) else ''
-    if not uids or not _valid_stats_secret(secret) or not _valid_loopback_stats_url(url):
+    if isinstance(uids, (str, bytes)) or not uids:
         return False
-    req = urllib.request.Request(url + '/kick', data=json.dumps(sorted(uids)).encode(),
+    try:
+        clean_uids = sorted({u for u in uids if isinstance(u, str) and u})
+    except TypeError:
+        return False
+    if not clean_uids or not _valid_stats_secret(secret) or not _valid_loopback_stats_url(url):
+        return False
+    req = urllib.request.Request(url + '/kick', data=json.dumps(clean_uids).encode(),
                                  headers={'Authorization': secret, 'Content-Type': 'application/json'})
     with urllib.request.urlopen(req, timeout=4):
         pass
@@ -6727,7 +6777,8 @@ def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
         # 否则该用户的所有设备都不再受上限约束。
         for ip in list(admitted):
             last = admitted[ip]
-            if not isinstance(last, (int, float)) or isinstance(last, bool):
+            if (not isinstance(last, (int, float)) or isinstance(last, bool)
+                    or last != last or last == float('inf') or last == float('-inf')):
                 admitted.pop(ip)
             elif ip in seen:
                 admitted[ip] = now
@@ -6737,12 +6788,13 @@ def plan_reality_iplimit(limits, reality_ips, hy2_ips, state, now,
             span = blocked[ip]
             if (not isinstance(span, (list, tuple)) or len(span) != 2
                     or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                               and v == v and v != float('inf') and v != float('-inf')
                                for v in span)):
                 blocked.pop(ip)
                 continue
             if ip in seen:
-                blocked[ip][1] = now
-            elif now - blocked[ip][1] >= release_after:
+                blocked[ip] = [span[0], now]
+            elif now - span[1] >= release_after:
                 blocked.pop(ip)
         # 上限被调低时收回多出来的 Reality 名额（2026-11-03 修）：旧实现只评估
         # 尚未放行的 IP，已放行的每轮刷新时间戳，ip_limit 从 3 改成 1 后三台设备
@@ -6779,14 +6831,18 @@ def reality_iplimit_rules(blocked):
     """{uid: ips} -> {ruleTag: rule}。tag 由用户和 IP 集合派生：内容变了 tag 就变，
     同步时只比对 tag 即可，不需要依赖 lsrules 回显规则内容（它不回显）。"""
     rules = {}
+    if not isinstance(blocked, dict):
+        return rules
     for uid, ips in blocked.items():
-        if not ips:
+        if not isinstance(uid, str) or not uid or not ips or isinstance(ips, (str, bytes)):
             continue
-        ips = sorted(ips)
-        digest = hashlib.sha256((uid + '|' + ','.join(ips)).encode()).hexdigest()
+        clean_ips = sorted({ip for ip in ips if isinstance(ip, str) and ip})
+        if not clean_ips:
+            continue
+        digest = hashlib.sha256((uid + '|' + ','.join(clean_ips)).encode()).hexdigest()
         tag = '%s%s-%s' % (REALITY_IPLIMIT_TAG_PREFIX,
                            hashlib.sha256(uid.encode()).hexdigest()[:12], digest[:12])
-        rules[tag] = {'ruleTag': tag, 'type': 'field', 'user': [uid], 'source': ips,
+        rules[tag] = {'ruleTag': tag, 'type': 'field', 'user': [uid], 'source': clean_ips,
                       'outboundTag': 'iplimit-block'}
     return rules
 
@@ -6915,6 +6971,11 @@ def _systemd_service_snapshot(unit):
 
 def _restore_systemd_service_state(unit, snapshot):
     """Restore and verify the active and enabled states from a snapshot."""
+    if (not isinstance(unit, str) or not unit or unit.startswith('-')
+            or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in unit)):
+        return False
+    if not isinstance(snapshot, dict):
+        return False
     active = snapshot.get('active')
     enabled = snapshot.get('enabled')
     if active not in ('active', 'inactive', 'failed') or enabled not in (
@@ -6936,8 +6997,12 @@ def _restore_systemd_service_state(unit, snapshot):
                 # 回滚恢复运行态前先清理失败计数并执行 restart（而非 start）：
                 # 1) 刚因新配置崩溃撞上 StartLimitBurst 时，直接 start 会被 systemd 拒绝；
                 # 2) 服务若正跑着新配置（同为 active），start 会静默空操作而不会重新加载刚回滚的旧配置。
-                subprocess.run(['systemctl', 'reset-failed', unit],
-                               capture_output=True, timeout=15)
+                # reset-failed 单独隔离超时，避免因清理计数超时跳过后面的 restart。
+                try:
+                    subprocess.run(['systemctl', 'reset-failed', unit],
+                                   capture_output=True, timeout=15)
+                except (OSError, subprocess.SubprocessError) as rf_exc:
+                    _log_ignored('restore_service_reset_failed', rf_exc)
                 results.append(subprocess.run(
                     ['systemctl', 'restart', unit], capture_output=True, timeout=30))
             else:
@@ -6948,8 +7013,12 @@ def _restore_systemd_service_state(unit, snapshot):
     if any(result.returncode != 0 for result in results):
         return False
     restored = _systemd_service_snapshot(unit)
-    active_ok = (restored['active'] == ('active' if active == 'active' else 'inactive')
-                 if enabled != 'not-found' else restored['active'] in ('', 'inactive'))
+    if enabled == 'not-found':
+        active_ok = restored['active'] in ('', 'inactive')
+    elif active == 'active':
+        active_ok = restored['active'] == 'active'
+    else:
+        active_ok = restored['active'] in ('inactive', 'failed')
     return active_ok and restored['enabled'] == enabled
 
 
@@ -7008,13 +7077,30 @@ def _nft_port_rule(proto, port):
     """匹配本模块写入的 accept 规则（用于幂等判断与删除）。"""
     return re.compile(r'\b%s\s+dport\s+%d\s+accept\b' % (re.escape(proto), int(port)))
 
+def _strict_port(value):
+    """严格解析 1..65535 端口；拒绝布尔、非整数浮点、非有限值、前导零与超长字符串。"""
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, float):
+        if not (float('-inf') < value < float('inf')) or not value.is_integer():
+            return 0
+        port = int(value)
+    elif isinstance(value, int):
+        port = value
+    elif isinstance(value, str):
+        s = value.strip()
+        if not (s.isascii() and s.isdigit() and 1 <= len(s) <= 5 and not s.startswith('0')):
+            return 0
+        port = int(s)
+    else:
+        return 0
+    return port if 1 <= port <= 65535 else 0
+
+
 def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
     """Whether another configured protocol still needs an open firewall port."""
-    if isinstance(port, bool):
-        return False
-    try:
-        port = int(port)
-    except (TypeError, ValueError):
+    port = _strict_port(port)
+    if not port:
         return False
     data = data if isinstance(data, dict) else {}
     keys = ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config', 'tuic_config')
@@ -7026,28 +7112,20 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
         if isinstance(section, dict) and section.get('enabled') is False:
             continue
         if isinstance(section, dict) and (key not in ('anytls_config', 'tuic_config') or section.get('enabled')):
-            try:
-                raw_p = section.get('port')
-                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
-                    return True
-            except (TypeError, ValueError):
-                pass
+            if _strict_port(section.get('port')) == port:
+                return True
     tags = {REALITY_INBOUND_TAG, VMESS_INBOUND_TAG, VLESSENC_INBOUND_TAG}
     if isinstance(xray_config, dict):
         inbounds = xray_config.get('inbounds')
         for inbound in (inbounds if isinstance(inbounds, list) else []):
             if not isinstance(inbound, dict) or inbound.get('tag') not in tags:
                 continue
-            try:
-                raw_p = inbound.get('port')
-                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
-                    section_key = {REALITY_INBOUND_TAG: 'reality_config',
-                                   VMESS_INBOUND_TAG: 'vmess_config',
-                                   VLESSENC_INBOUND_TAG: 'vlessenc_config'}[inbound['tag']]
-                    if section_key != exclude_key:
-                        return True
-            except (TypeError, ValueError):
-                continue
+            if _strict_port(inbound.get('port')) == port:
+                section_key = {REALITY_INBOUND_TAG: 'reality_config',
+                               VMESS_INBOUND_TAG: 'vmess_config',
+                               VLESSENC_INBOUND_TAG: 'vlessenc_config'}[inbound['tag']]
+                if section_key != exclude_key:
+                    return True
     for service, cfg_key in ((ANYTLS_SERVICE, 'anytls_config'), (TUIC_SERVICE, 'tuic_config')):
         if exclude_key == cfg_key:
             continue
@@ -7057,21 +7135,17 @@ def protocol_port_in_use(port, proto, data, xray_config=None, exclude_key=None):
                 config = json.loads(config_path.read_text(encoding='utf-8'))
                 listeners = config.get('inbounds', []) if isinstance(config, dict) else []
                 if isinstance(listeners, list) and any(
-                        not isinstance(item.get('listen_port'), bool) and int(item.get('listen_port') or 0) == port
+                        _strict_port(item.get('listen_port')) == port
                         for item in listeners if isinstance(item, dict)):
                     return True
-            except (OSError, ValueError, TypeError):
+            except (OSError, ValueError, TypeError, OverflowError):
                 return True
     if proto == 'tcp' and exclude_key != 'proxy_services':
         for item in data.get('proxy_services', []) if isinstance(data.get('proxy_services'), list) else []:
             if not isinstance(item, dict):
                 continue
-            try:
-                raw_p = item.get('port')
-                if not isinstance(raw_p, bool) and int(raw_p or 0) == port:
-                    return True
-            except (TypeError, ValueError):
-                pass
+            if _strict_port(item.get('port')) == port:
+                return True
     return False
 
 
@@ -7082,13 +7156,8 @@ def firewall_port(port, proto='tcp', open_=True):
     Hy2 与 AWG 的端口由安装脚本放行；门户自己装的 Reality 和 GOST 代理端口要在这里处理，
     否则开着防火墙的系统上本机探测一切正常，外网却连不上。
     """
-    if isinstance(port, bool):
-        return False
-    try:
-        port = int(port)
-    except (TypeError, ValueError):
-        return False
-    if not 1 <= port <= 65535 or proto not in ('tcp', 'udp'):
+    port = _strict_port(port)
+    if not port or proto not in ('tcp', 'udp'):
         return False
     spec = '%d/%s' % (port, proto)
     try:
@@ -7157,11 +7226,14 @@ def password_taken(users, pwd, owner_uid):
     /auth 按密码找用户、命中第一个就停：两人同密码时，后者的流量、限额、
     到期都会算到前者头上；撞上机主密码则直接拿到不限量的永久账号。
     """
-    if not isinstance(users, dict):
+    if not isinstance(users, dict) or not isinstance(pwd, str) or not pwd:
         return False
-    return any(uid != owner_uid and isinstance(u, dict)
-               and str(u.get('password', '')) == str(pwd)
-               for uid, u in users.items())
+    return any(
+        uid != owner_uid and isinstance(u, dict)
+        and isinstance(u.get('password'), str) and u['password']
+        and hmac.compare_digest(u['password'], pwd)
+        for uid, u in users.items()
+    )
 
 def enforce_node_access(root, snapshot, force_ids=(), apply_lock=None,
                          skip_anytls=False, skip_tuic=False):
@@ -8549,9 +8621,12 @@ def ensure_portal_access(root, meta, data):
     if path.exists():
         try:
             access = json.loads(path.read_text(encoding='utf-8'))
-            if (isinstance(access, dict)
-                    and isinstance(access.get('username'), str) and access['username']
-                    and isinstance(access.get('password'), str) and access['password']):
+            uname = access.get('username') if isinstance(access, dict) else None
+            upwd = access.get('password') if isinstance(access, dict) else None
+            if (isinstance(uname, str) and uname and ':' not in uname
+                    and not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in uname)
+                    and isinstance(upwd, str) and upwd
+                    and not any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in upwd)):
                 return access, False
         except (OSError, ValueError):
             pass
@@ -8562,9 +8637,11 @@ def ensure_portal_access(root, meta, data):
     data['auth_hash'] = hashlib.sha256(auth).hexdigest()
     host = meta_display_host(meta)
     sub_port, _src = resolve_subscription_port(meta)
-    url = f"https://{_host_for_url(host)}:{sub_port}/{data.get('token', '')}/"
-    access = portal_access_payload(url, username, password, data.get('api_key', ''))
-    atomic_write_private(path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
+    token_str = data.get('token') if isinstance(data.get('token'), str) else ''
+    api_key_str = data.get('api_key') if isinstance(data.get('api_key'), str) else ''
+    url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/"
+    access = portal_access_payload(url, username, password, api_key_str)
+    atomic_write_private(path, json.dumps(access, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     print('[portal] portal-access.json 缺失或损坏，已重建访问凭据'
           '（token / API Key / 用户保留）', file=sys.stderr)
     return access, True
@@ -8873,8 +8950,20 @@ def persist_interrupted_core_job(portal_path, data):
     else:
         changed = False
     if changed:
+        try:
+            payload = json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        except ValueError:
+            def _scrub_finite(obj):
+                if isinstance(obj, float):
+                    return obj if (obj == obj and obj != float('inf') and obj != float('-inf')) else None
+                if isinstance(obj, dict):
+                    return {k: _scrub_finite(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_scrub_finite(v) for v in obj]
+                return obj
+            payload = json.dumps(_scrub_finite(data), ensure_ascii=False, allow_nan=False).encode('utf-8')
         with portal_state_file_lock(Path(portal_path).parent):
-            atomic_write_private(portal_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+            atomic_write_private(portal_path, payload)
     return changed
 
 
@@ -8907,7 +8996,7 @@ def serve(path):
                 _bind_port = _cand_p if 1 <= _cand_p <= 65535 else 0
         elif isinstance(_raw_port, str):
             _ps = _raw_port.strip()
-            if _ps.isascii() and _ps.isdigit():
+            if _ps.isascii() and _ps.isdigit() and not (len(_ps) > 1 and _ps.startswith('0')):
                 _cand_p = int(_ps)
                 _bind_port = _cand_p if 1 <= _cand_p <= 65535 else 0
     if not _bind_port:
@@ -8939,7 +9028,10 @@ def serve(path):
     # api_key 与 session_secret 同理：空串会让 Bearer 校验退化成常量比较。
     # 重新生成后要**落盘**（portal.json 与 portal-access.json 两处），
     # 否则每次重启都换一个新 key，控制台永远对不上。
-    if not isinstance(data.get('api_key'), str) or not data['api_key']:
+    _stored_api_key = data.get('api_key')
+    if (not isinstance(_stored_api_key, str) or not _stored_api_key
+            or not _stored_api_key.isascii()
+            or any(ord(ch) <= 32 or ord(ch) == 127 for ch in _stored_api_key)):
         repair_missing_api_key(portal_path, data)
     meta_path = portal_path.parent / 'client_meta.json'
 
@@ -9277,17 +9369,22 @@ def serve(path):
             state = suspend_state(data)
         results = {}
         _retired = set()
+        _active_before_stop = set()
         if suspend:
             units = state.get('units') if state.get('suspended') else None
             if units is None:
                 units = [u for u in TRAFFIC_SUSPEND_UNITS if _unit_active(u)]
+                _active_before_stop = set(units)
             else:
                 # 已处于停用状态时也要复核一遍：停用期间有人手动
                 # systemctl start 起来的服务，必须重新停掉，否则整机超额
-                # 状态形同虚设（2026-10-29 修）。
+                # 状态形同虚设（2026-10-29 修）。同时只记下原本确实运行的服务，
+                # 防止后续落盘失败补偿分支把原本早已停用的服务误重新拉起。
+                _active_before_stop = {u for u in units if _unit_active(u)}
                 for _u in TRAFFIC_SUSPEND_UNITS:
                     if _u not in units and _unit_active(_u):
                         units.append(_u)
+                        _active_before_stop.add(_u)
             for u in units:
                 try:
                     r = subprocess.run(['systemctl', 'stop', u], capture_output=True, timeout=20)
@@ -9344,6 +9441,8 @@ def serve(path):
                     data.pop('traffic_suspend', None)
             for unit, succeeded in results.items():
                 if not succeeded or (not suspend and unit in _retired):
+                    continue
+                if suspend and unit not in _active_before_stop:
                     continue
                 compensate = 'start' if suspend else 'stop'
                 if compensate == 'start':
@@ -10523,12 +10622,15 @@ if __name__ == '__main__':
         with data_lock:
             expected_token = data.get('token')
             epoch = session_epoch()
-        if not isinstance(expected_token, str) or not expected_token or not expected_token.isascii():
+        if (not isinstance(expected_token, str) or not expected_token
+                or not expected_token.isascii() or '/' in expected_token
+                or any(ord(ch) <= 32 or ord(ch) == 127 for ch in expected_token)):
             return False
         now = time.time()
         for value in candidates:
             parts = value.split('.')
             if (len(parts) != 3 or not (parts[1].isascii() and parts[1].isdigit())
+                    or len(parts[1]) > 12 or (len(parts[1]) > 1 and parts[1].startswith('0'))
                     or not parts[0].isascii() or not parts[2].isascii()):
                 continue
             t, issued_at, sig = parts
@@ -11110,9 +11212,13 @@ if __name__ == '__main__':
             except (BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
             except Exception as exc:
+                raw_cmd = str(getattr(self, 'command', '?'))
+                raw_path = str(getattr(self, 'path', '?')).split('?', 1)[0]
+                safe_cmd = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' ' for ch in raw_cmd)[:32]
+                safe_path = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' ' for ch in raw_path)[:200]
+                safe_err = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' ' for ch in str(exc))[:200]
                 print('[portal] unhandled error on %s %s: %s: %s'
-                      % (getattr(self, 'command', '?'), getattr(self, 'path', '?'),
-                         type(exc).__name__, str(exc)[:200]), file=sys.stderr)
+                      % (safe_cmd, safe_path, type(exc).__name__, safe_err), file=sys.stderr)
                 # 已经发过响应头就不能再发第二个（会把 HTTP 流写坏）。
                 if getattr(self, '_responded', False):
                     self.close_connection = True
@@ -11138,6 +11244,8 @@ if __name__ == '__main__':
             _raw_cl_s = _raw_cl.strip()
             if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+            if len(_raw_cl_s) > 10:
+                return self.reply_json(413, {'ok': False, 'error': 'Request body exceeds 1 MiB'})
             body_length = int(_raw_cl_s)
             if body_length > 1024 * 1024:
                 return self.reply_json(413, {'ok': False, 'error': 'Request body exceeds 1 MiB'})

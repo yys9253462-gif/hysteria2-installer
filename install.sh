@@ -971,7 +971,7 @@ install_binary() {
         # 可能已经切换版本，导致摘要与资产对不上（或更糟：对上了另一个版本）。
         local resolved
         resolved="$(curl -fsSIL --max-time 20 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
-            awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)"
+            awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)" || resolved=""
         if [[ "$resolved" =~ /app/(v[0-9][^/]*)/${asset}$ ]]; then
             # 下载站只给出裸版本号（v2.13.0），而 GitHub 的 release tag 是
             # `app/v2.13.0`。用裸版本号拼 GitHub URL 实测 404（hashes.txt 与资产
@@ -1059,16 +1059,56 @@ reuse_existing_cert_config() {
     mt="$(jq -r '.cert_type // empty' "$HY2_META_FILE" 2>/dev/null || true)"
     insecure="$(jq -r '.is_insecure // empty' "$HY2_META_FILE" 2>/dev/null || true)"
 
-    if grep -q '^acme:' <<<"$txt"; then
-        dom="$(awk '/^acme:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*-[[:space:]]/{sub(/^[[:space:]]*-[[:space:]]*/,"");gsub(/"/,"");print;exit}' <<<"$txt")"
-        email="$(awk '/^[[:space:]]*email:/{sub(/^[[:space:]]*email:[[:space:]]*/,"");gsub(/"/,"");print;exit}' <<<"$txt")"
+    if grep -qE '^acme:[[:space:]]*(#.*)?$' <<<"$txt"; then
+        dom="$(awk '
+            /^acme:[[:space:]]*(#.*)?$/ { f=1; next }
+            /^[^[:space:]#]/ { f=0 }
+            f && /^[[:space:]]*-[[:space:]]+/ {
+                v = $0
+                sub(/^[[:space:]]*-[[:space:]]+/, "", v)
+                if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+                else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+                else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+                print v; exit
+            }' <<<"$txt")"
+        email="$(awk '
+            /^acme:[[:space:]]*(#.*)?$/ { f=1; next }
+            /^[^[:space:]#]/ { f=0 }
+            f && /^[[:space:]]+email:[[:space:]]*/ {
+                v = $0
+                sub(/^[[:space:]]+email:[[:space:]]*/, "", v)
+                if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+                else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+                else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+                print v; exit
+            }' <<<"$txt")"
         CERT_TYPE="acme"
         SERVER_NAME="${SERVER_NAME:-$dom}"
         ACME_EMAIL="${ACME_EMAIL:-$email}"
         IS_INSECURE="false"
     else
-        cert="$(awk '/^tls:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*cert:/{sub(/^[[:space:]]*cert:[[:space:]]*/,"");gsub(/^"|"$/,"");print;exit}' <<<"$txt")"
-        key="$(awk '/^tls:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*key:/{sub(/^[[:space:]]*key:[[:space:]]*/,"");gsub(/^"|"$/,"");print;exit}' <<<"$txt")"
+        cert="$(awk '
+            /^tls:[[:space:]]*(#.*)?$/ { f=1; next }
+            /^[^[:space:]#]/ { f=0 }
+            f && /^[[:space:]]+cert:[[:space:]]*/ {
+                v = $0
+                sub(/^[[:space:]]+cert:[[:space:]]*/, "", v)
+                if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+                else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+                else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+                print v; exit
+            }' <<<"$txt")"
+        key="$(awk '
+            /^tls:[[:space:]]*(#.*)?$/ { f=1; next }
+            /^[^[:space:]#]/ { f=0 }
+            f && /^[[:space:]]+key:[[:space:]]*/ {
+                v = $0
+                sub(/^[[:space:]]+key:[[:space:]]*/, "", v)
+                if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+                else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+                else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+                print v; exit
+            }' <<<"$txt")"
         [[ -n "$cert" && -n "$key" && -f "$cert" && -f "$key" ]] || return 1
         CERT_FILE="$cert"
         KEY_FILE="$key"
@@ -1508,8 +1548,15 @@ scrub_caddy_identity() {
 setup_cert_via_existing_caddy() {
     local domain="$1"
     local certdir="/var/lib/caddy/.local/share/caddy/certificates"
+    local cf="/etc/caddy/Caddyfile" bak="" cand="" rb_tmp=""
+    trap 'trap - RETURN; rm -f "${cand:-}" "${rb_tmp:-}" 2>/dev/null || true' RETURN
     command -v caddy >/dev/null 2>&1 || { log_err "未找到 caddy 命令。"; return 1; }
-    if [[ -z "$domain" || "$domain" == *..* || ! "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    local domain_lc
+    domain_lc="$(printf '%s' "$domain" | tr 'A-Z' 'a-z')"
+    # 零外部函数依赖的内联域名校验（独立摘出本函数测试时无需依赖 is_valid_domain）
+    if [[ -z "$domain_lc" || ${#domain_lc} -gt 253 || "$domain_lc" == *..* \
+        || "${domain_lc##*.}" =~ ^[0-9]+$ \
+        || ! "$domain_lc" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
         log_err "域名格式不合法，已拒绝写入 Caddyfile: ${domain}"
         return 1
     fi
@@ -1522,16 +1569,15 @@ setup_cert_via_existing_caddy() {
     fi
 
     # 备份后在同目录候选文件上构造并校验，校验通过才原子替换生产 Caddyfile
-    local cf="/etc/caddy/Caddyfile" bak cand rb_tmp
     [[ -f "$cf" ]] || { log_err "找不到 /etc/caddy/Caddyfile。"; return 1; }
-    bak="${cf}.bak-hy2-$(date +%Y%m%d-%H%M%S)"
+    bak="${cf}.bak-hy2-$(date +%Y%m%d-%H%M%S).$$"
     cp -a "$cf" "$bak" || { log_err "备份 Caddyfile 失败。"; return 1; }
     log_info "已备份 Caddyfile -> ${bak}"
 
     # 幂等：已存在该域名块就不重复追加
     local appended=0
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
-        cand="$(mktemp "${cf}.hy2-tmp.XXXXXX")" || { log_err "创建 Caddyfile 候选临时文件失败。"; return 1; }
+        cand="$(umask 077 && mktemp "${cf}.hy2-tmp.XXXXXX")" || { log_err "创建 Caddyfile 候选临时文件失败。"; return 1; }
         if ! cp -p "$cf" "$cand" || ! cat >> "$cand" <<CEOF
 
 # 证书签发站点（由 install.sh 自动追加）
@@ -1579,7 +1625,7 @@ CEOF
         sleep 5
     done
     if [[ "$appended" == 1 ]]; then
-        rb_tmp="$(mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
+        rb_tmp="$(umask 077 && mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
         if [[ -n "$rb_tmp" ]] && cp -p "$bak" "$rb_tmp" 2>/dev/null && mv -f "$rb_tmp" "$cf" 2>/dev/null; then
             :
         else
@@ -1628,17 +1674,30 @@ hy2_acme_ensure() {
 # 有 crontab 且上游已写入计划任务时不重复安装。
 hy2_acme_ensure_renew_timer() {
     local home="$1" unit_dir="${HY2_SYSTEMD_DIR:-/etc/systemd/system}"
+    local svc_tmp="" tmr_tmp=""
+    trap 'trap - RETURN; rm -f "${svc_tmp:-}" "${tmr_tmp:-}" 2>/dev/null || true' RETURN
+    if [[ -z "$home" || "$home" =~ [[:space:][:cntrl:]\"\'\`\;] ]]; then
+        return 1
+    fi
     if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF 'acme.sh --cron'; then
         return 0
     fi
     command -v systemctl >/dev/null 2>&1 || return 1
+    svc_tmp="$(umask 077 && mktemp "${unit_dir}/.hy2-acme-renew.service.XXXXXX")" || return 1
     printf '%s\n' '[Unit]' 'Description=acme.sh certificate renewal (hysteria2-installer)' '' \
         '[Service]' 'Type=oneshot' "ExecStart=${home}/acme.sh --cron --home ${home}" \
-        > "${unit_dir}/hy2-acme-renew.service" || return 1
+        > "$svc_tmp" || return 1
+    chmod 0644 "$svc_tmp" 2>/dev/null || true
+    mv -f "$svc_tmp" "${unit_dir}/hy2-acme-renew.service" || return 1
+    svc_tmp=""
+    tmr_tmp="$(umask 077 && mktemp "${unit_dir}/.hy2-acme-renew.timer.XXXXXX")" || return 1
     printf '%s\n' '[Unit]' 'Description=Daily acme.sh renewal (hysteria2-installer)' '' \
         '[Timer]' 'OnCalendar=daily' 'RandomizedDelaySec=3600' 'Persistent=true' '' \
         '[Install]' 'WantedBy=timers.target' \
-        > "${unit_dir}/hy2-acme-renew.timer" || return 1
+        > "$tmr_tmp" || return 1
+    chmod 0644 "$tmr_tmp" 2>/dev/null || true
+    mv -f "$tmr_tmp" "${unit_dir}/hy2-acme-renew.timer" || return 1
+    tmr_tmp=""
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now hy2-acme-renew.timer >/dev/null 2>&1
 }
@@ -2749,7 +2808,7 @@ setup_iptables_port_hopping() {
     local e_port="$3"
     local hop_skip=""
 
-    if [[ ! "$l_port" =~ ^[0-9]+$ || ! "$s_port" =~ ^[0-9]+$ || ! "$e_port" =~ ^[0-9]+$ ]] \
+    if [[ ! "$l_port" =~ ^[1-9][0-9]{0,4}$ || ! "$s_port" =~ ^[1-9][0-9]{0,4}$ || ! "$e_port" =~ ^[1-9][0-9]{0,4}$ ]] \
             || (( 10#$l_port < 1 || 10#$l_port > 65535 || 10#$s_port < 1 || 10#$s_port > 65535 || 10#$e_port < 1 || 10#$e_port > 65535 || 10#$s_port > 10#$e_port )); then
         log_err "端口跳跃参数非法（监听=${l_port}，区间=${s_port}-${e_port}），拒绝配置。"
         return 1
@@ -2816,6 +2875,7 @@ setup_iptables_port_hopping() {
     # 兜底部署 systemd 端口跳跃自愈守护服务（同目录临时文件原子落盘），保证开机/重启 100% 自动恢复规则
     local _ipt_unit="/etc/systemd/system/hy2-iptables.service"
     local _ipt_unit_tmp=""
+    trap 'rm -f "${_ipt_unit_tmp:-}"; trap - RETURN' RETURN
     _ipt_unit_tmp="$(umask 022; mktemp "${_ipt_unit}.XXXXXX")" || {
         log_err "无法为 ${_ipt_unit} 创建临时文件。"
         return 1
@@ -2899,6 +2959,7 @@ generate_server_config() {
     fi
 
     local _cfg_tmp=""
+    trap 'rm -f "${_cfg_tmp:-}"; trap - RETURN' RETURN
     _cfg_tmp="$(umask 077; mktemp "${HY2_CONFIG}.XXXXXX")" || {
         log_err "无法为 ${HY2_CONFIG} 创建临时文件，原配置未改动。"
         return 1
@@ -3002,11 +3063,14 @@ EOF
     fi
     if ! chmod 600 "$_cfg_tmp" || ! mv -f "$_cfg_tmp" "$HY2_CONFIG"; then
         rm -f "$_cfg_tmp"
+        _cfg_tmp=""
         log_err "原子写入 ${HY2_CONFIG} 失败。"
         return 1
     fi
+    _cfg_tmp=""
 
-    # 写入 toggle_warp.sh 控制脚本，供 portal.py 或命令行无感知调用
+    # 写入 toggle_warp.sh 控制脚本，供 portal.py 或命令行无感知调用（先防符号链接劫持）
+    [[ ! -L "$HY2_DIR/toggle_warp.sh" ]] || rm -f "$HY2_DIR/toggle_warp.sh"
     cat > "$HY2_DIR/toggle_warp.sh" <<'EOTW'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -4444,7 +4508,7 @@ sync_cert_meta() {
     [[ -f "$cert_file" ]] || return 0
 
     local cn sans subject issuer self_signed="false" acme_block="false"
-    cn="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -1 | sed 's/ *$//')"
+    cn="$(openssl x509 -in "$cert_file" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -1 | sed 's/[[:space:]]*$//')"
     # 收集**全部** SAN：一张证书常覆盖多个域名，只取第一个会把 server_name
     # 写成错的（客户端 SNI 对不上 → 握手失败）。具体选哪个在下面决定。
     sans="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | tr '\n' ' ')"
@@ -4472,7 +4536,9 @@ sync_cert_meta() {
     if [[ "$self_signed" == "true" ]]; then
         new_type="self_signed"; new_insecure="true"
         new_pin="$(openssl x509 -in "$cert_file" -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print $NF}' | tr 'A-F' 'a-f' || true)"
-        [[ "$new_pin" =~ ^[0-9a-f]{64}$ ]] || new_pin=""
+        if [[ ! "$new_pin" =~ ^[0-9a-f]{64}$ || "$new_pin" == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]]; then
+            new_pin=""
+        fi
     else
         [[ "$acme_block" == "true" ]] && new_type="acme" || new_type="custom"
         new_insecure="false"
@@ -4499,19 +4565,22 @@ sync_cert_meta() {
     if [[ "$new_pin" != "$cur_pin" ]]; then
         log_warn "  pin_sha256: ${cur_pin:-<空>} -> ${new_pin:-<清空>}"
     fi
-    local tmp_meta
+    local tmp_meta=""
+    trap 'rm -f "${tmp_meta:-}"; trap - RETURN' RETURN
     tmp_meta="$(umask 077 && mktemp "${HY2_META_FILE}.XXXXXX")" || {
         log_err "无法创建临时元数据文件，client_meta.json 保持不变。"
         return 1
     }
     if jq --arg t "$new_type" --argjson i "$new_insecure" --arg s "$new_sn" --arg p "$new_pin" \
-          '.cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p' \
+          'if type=="object" then .cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p else error("meta not object") end' \
           "$HY2_META_FILE" > "$tmp_meta" 2>/dev/null && [[ -s "$tmp_meta" ]]; then
         chmod 600 "$tmp_meta"
         mv -f "$tmp_meta" "$HY2_META_FILE"
+        tmp_meta=""
         log_info "证书信任模型已自愈。"
     else
         rm -f "$tmp_meta"
+        tmp_meta=""
         log_err "证书信任模型自愈写盘失败，client_meta.json 保持不变。"
         return 1
     fi
@@ -5857,7 +5926,12 @@ install_amneziawg() {
         if [[ "$has_peers" == "0" ]]; then
             echo ""
             read -rp "请为首个客户端命名 [默认: client1]: " client || true
+            client="${client// /}"
             client="${client:-client1}"
+            if [[ "$client" == "." || "$client" == ".." || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
+                log_err "客户端名称不合法（仅允许 1-32 位字母/数字/._-，且不能为 . 或 ..）。"
+                return 1
+            fi
         fi
     fi
 
@@ -5871,12 +5945,12 @@ install_amneziawg() {
         args+=(--endpoint "$endpoint")
     fi
 
-    # 已有客户端时不重复创建，避免报"客户端已存在"
+    # 已有客户端或未提供连接地址时不创建首个客户端，避免报"客户端已存在"或与上方提示矛盾
     local peer_count="0"
     if [[ -f "$AWG_PEERS_FILE" ]]; then
         peer_count="$(jq -r '[.peers[]?]|length' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
     fi
-    if [[ "$peer_count" == "0" ]]; then
+    if [[ -n "$endpoint" && "$peer_count" == "0" ]]; then
         args+=(--client "$client")
     fi
 
@@ -6580,8 +6654,14 @@ flow_install() {
     setup_certificates || _step_rc=$?
     trap "$_lock_trap" RETURN
     [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
-    setup_ports_and_obfs
-    generate_server_config
+    _step_rc=0
+    setup_ports_and_obfs || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
+    _step_rc=0
+    generate_server_config || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     _step_rc=0
     setup_systemd || _step_rc=$?
@@ -6689,8 +6769,14 @@ flow_reconfigure() {
     setup_certificates || _step_rc=$?
     trap "$_lock_trap" RETURN
     [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
-    setup_ports_and_obfs
-    generate_server_config
+    _step_rc=0
+    setup_ports_and_obfs || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
+    _step_rc=0
+    generate_server_config || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     close_replaced_ports "$_old_listen" "$_old_sub"
     _step_rc=0

@@ -601,8 +601,18 @@ async function submitUserForm(form) {
       location.reload();
       return;
     }
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      alert('登录已过期，请刷新页面重新登录');
+      return;
+    }
     const text = (await res.text()).trim();
-    alert(text || ('操作失败（HTTP ' + res.status + '）'));
+    let msg = '';
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && typeof parsed.error === 'string') msg = parsed.error;
+    } catch (_) {}
+    alert(msg || (text ? text.slice(0, 200) : ('操作失败（HTTP ' + res.status + '）')));
   } catch (e) {
     alert('请求异常: ' + e.message);
   } finally {
@@ -660,11 +670,12 @@ function panelVisible(paneId, subId) {
 
 // 顶层标签：默认打开组内第一个子页；也支持 #proxies/awg 这种直达写法。
 function switchTab(tabId, subId) {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  if (typeof tabId !== 'string' || !/^[a-z0-9_-]+$/i.test(tabId)) return;
   const btn = document.querySelector('[data-tab="' + tabId + '"]');
   const pane = document.getElementById('pane-' + tabId);
   if (!btn || !pane) return;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   btn.classList.add('active');
   pane.classList.add('active');
   // 窄屏菜单横滑时，把当前项滚进可见区域（只滚菜单本身，不动页面）。
@@ -674,10 +685,11 @@ function switchTab(tabId, subId) {
   }
   const subs = pane.querySelectorAll('.subtab-btn');
   if (subs.length) {
-    const wanted = subId && pane.querySelector('[data-subtab="' + subId + '"]');
+    const safeSub = (typeof subId === 'string' && /^[a-z0-9_-]+$/i.test(subId)) ? subId : '';
+    const wanted = safeSub && pane.querySelector('[data-subtab="' + safeSub + '"]');
     // 用实际生效的子页写哈希：传入的 subId 不存在时 switchSubtab 会回退到
     // 第一个子页，旧实现却把不存在的 id 写进 URL，刷新后显示与地址不一致。
-    const effective = wanted ? subId : subs[0].dataset.subtab;
+    const effective = wanted ? safeSub : subs[0].dataset.subtab;
     switchSubtab(tabId, effective);
     history.replaceState(null, null, '#' + tabId + '/' + effective);
   } else {
@@ -761,9 +773,14 @@ document.querySelectorAll('[data-copy]').forEach(button => {
       ta.style.position = 'fixed';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
-      ta.select();
-      try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
-      ta.remove();
+      try {
+        ta.select();
+        copied = document.execCommand('copy');
+      } catch (_) {
+        copied = false;
+      } finally {
+        ta.remove();
+      }
     }
     if (copied) {
       if (status) status.textContent = '已复制到剪贴板 ✓';
@@ -1335,8 +1352,15 @@ async function obApi(action, params) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body,
   });
+  if (res.status === 401) {
+    if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+    throw new Error('登录已失效，请刷新页面重新登录');
+  }
   let json = {};
-  try { json = await res.json(); } catch (_) {}
+  try {
+    const parsed = await res.json();
+    if (parsed && typeof parsed === 'object') json = parsed;
+  } catch (_) {}
   if (!res.ok || !json.ok) throw new Error(json.error || ('请求失败 HTTP ' + res.status));
   if (json.applying) json = Object.assign(json, await waitForEgressApply());
   return json;
@@ -1473,7 +1497,7 @@ function obParseLink(raw) {
   if (!s) return null;
   const okPort = (p) => {
     const n = Number(p);
-    return /^\d{1,5}$/.test(p) && n >= 1 && n <= 65535;
+    return /^[1-9]\d{0,4}$/.test(p) && n >= 1 && n <= 65535;
   };
   let m = s.match(/^(?:socks5h?|socks):\/\/(?:([^:@\/\s]*)(?::([^@\/\s]*))?@)?(\[[0-9a-fA-F:]+\]|[^\/:@\s[\]]+):(\d{1,5})\/?(?:[?#].*)?$/i);
   if (m && okPort(m[4])) {
@@ -1505,7 +1529,10 @@ function obSuggestName(type, host) {
   base = base.replace(/_+$/, '').slice(0, 32);
   const taken = new Set(Array.from(document.querySelectorAll('[data-ob-edit]')).map(b => b.dataset.obEdit));
   let name = base, n = 2;
-  while (taken.has(name)) name = base.slice(0, 29) + '_' + (n++);
+  while (taken.has(name)) {
+    const suffix = '_' + (n++);
+    name = base.slice(0, Math.max(1, 32 - suffix.length)) + suffix;
+  }
   return name;
 }
 
@@ -1515,7 +1542,7 @@ function obAutoName() {
   let host = '';
   if (t === 'socks5' && obEls.socksAddr) host = obEls.socksAddr.value.trim().replace(/:\d+$/, '');
   else if (t === 'http' && obEls.httpUrl) {
-    const m = obEls.httpUrl.value.trim().match(/^https?:\/\/(?:[^@\/\s]*@)?([^\/:@\s]+)/i);
+    const m = obEls.httpUrl.value.trim().match(/^https?:\/\/(?:[^@\/\s]*@)?(\[[0-9a-fA-F:]+\]|[^\/:@\s]+)/i);
     host = m ? m[1] : '';
   }
   obEls.name.value = t === 'direct' ? 'direct_local' : (host ? obSuggestName(t, host) : '');
@@ -1567,14 +1594,15 @@ async function obTestForm() {
   const t = obEls.type ? obEls.type.value : 'socks5';
   let kind = t, addr = '';
   if (t === 'socks5') {
-    const a = obEls.socksAddr.value.trim();
-    const am = a.match(/^(?:\[[0-9a-fA-F:]+\]|[^\s:[\]]+):(\d{1,5})$/);
+    const a = obEls.socksAddr ? obEls.socksAddr.value.trim() : '';
+    const am = a.match(/^(?:\[[0-9a-fA-F:]+\]|[^\s:[\]]+):([1-9]\d{0,4})$/);
     const port = am ? Number(am[1]) : 0;
-    if (!am || port < 1 || port > 65535) { obMsg('SOCKS5 地址格式应为 host:port（端口 1-65535）', 'err'); return; }
-    const u = obEls.socksUser.value.trim(), pw = obEls.socksPass.value.trim();
+    if (!am || port < 1 || port > 65535) { obMsg('SOCKS5 地址格式应为 host:port（端口 1-65535，不含前导零）', 'err'); return; }
+    const u = obEls.socksUser ? obEls.socksUser.value.trim() : '';
+    const pw = obEls.socksPass ? obEls.socksPass.value.trim() : '';
     addr = (u || pw) ? encodeURIComponent(u) + ':' + encodeURIComponent(pw) + '@' + a : a;
   } else if (t === 'http') {
-    addr = obEls.httpUrl.value.trim();
+    addr = obEls.httpUrl ? obEls.httpUrl.value.trim() : '';
     if (!/^https?:\/\/\S+$/i.test(addr)) { obMsg('HTTP 代理地址应以 http:// 或 https:// 开头', 'err'); return; }
   } else {
     kind = 'direct';
@@ -2004,6 +2032,8 @@ if (btnResetRealityKeys) {
 // 旧实现只有 .then 没有 .catch，失败时按钮毫无反应，看起来像点坏了。
 // 失败时退回「选中文本」并提示手动复制（与页面通用 [data-copy] 处理器一致）。
 function copyWithFeedback(text, button, doneText) {
+  if (!button) return;
+  const value = text == null ? '' : String(text);
   // 原文只记第一次（同用户页，2026-11-12 修）：恢复前再点一下会把「已复制 ✓」当成原文。
   const orig = button.dataset.orig || (button.dataset.orig = button.textContent);
   const ok = () => {
@@ -2013,19 +2043,24 @@ function copyWithFeedback(text, button, doneText) {
   };
   const fallback = () => {
     const ta = document.createElement('textarea');
-    ta.value = text;
+    ta.value = value;
     ta.style.position = 'fixed';
     ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
     let copied = false;
-    try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
-    ta.remove();
+    document.body.appendChild(ta);
+    try {
+      ta.select();
+      copied = document.execCommand('copy');
+    } catch (_) {
+      copied = false;
+    } finally {
+      ta.remove();
+    }
     if (copied) ok();
     else alert('复制失败，请手动选中后复制');
   };
   if (!navigator.clipboard || !navigator.clipboard.writeText) { fallback(); return; }
-  navigator.clipboard.writeText(text).then(ok).catch(fallback);
+  navigator.clipboard.writeText(value).then(ok).catch(fallback);
 }
 
 if (btnCopyRealityUri) {
@@ -2726,17 +2761,20 @@ document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
 // 无条件刷新；VPS 重启常要 30~90 秒，多半落在浏览器的「无法访问此网站」错误页。
 // 只认 2xx 或 401（会话随重启失效，刷新后重新登录即可）；反代先起来时回的 502 不算恢复。
 async function waitPortalBack(timeoutMs = 300000, intervalMs = 3000) {
+  const maxWait = (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0) ? timeoutMs : 300000;
+  const stepMs = (typeof intervalMs === 'number' && Number.isFinite(intervalMs) && intervalMs >= 200) ? intervalMs : 3000;
   const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const ctrl = new AbortController();
-    const abortTimer = setTimeout(() => ctrl.abort(), 5000);
+  while (Date.now() - started < maxWait) {
+    const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+    const abortTimer = ctrl ? setTimeout(() => ctrl.abort(), 5000) : null;
     try {
-      const res = await fetch(location.pathname + 'traffic-speed',
-        { credentials: 'same-origin', cache: 'no-store', signal: ctrl.signal });
+      const opts = { credentials: 'same-origin', cache: 'no-store' };
+      if (ctrl) opts.signal = ctrl.signal;
+      const res = await fetch(location.pathname + 'traffic-speed', opts);
       if (res.ok || res.status === 401) return true;
     } catch (_) {
-    } finally { clearTimeout(abortTimer); }
-    await new Promise(r => setTimeout(r, intervalMs));
+    } finally { if (abortTimer !== null) clearTimeout(abortTimer); }
+    await new Promise(r => setTimeout(r, stepMs));
   }
   return false;
 }
@@ -2786,8 +2824,7 @@ if (btnRebootServer) {
             back = false;
           }
           if (back) {
-            btnRebootServer.disabled = false;
-            location.reload();
+            try { location.reload(); } finally { btnRebootServer.disabled = false; }
             return;
           }
           btnRebootServer.disabled = false;
@@ -2820,7 +2857,7 @@ if (btnRebootServer) {
   function render() {
     const q = (search && search.value || '').trim().toLowerCase();
     const st = filter ? filter.value : 'all';
-    const matched = rows.filter(r => (st === 'all' || r.dataset.state === st) && (!q || r.dataset.search.includes(q)));
+    const matched = rows.filter(r => (st === 'all' || r.dataset.state === st) && (!q || (r.dataset.search || '').includes(q)));
     const pages = Math.max(1, Math.ceil(matched.length / PAGE_SIZE));
     if (page > pages) page = pages;
     const start = (page - 1) * PAGE_SIZE;
@@ -3154,12 +3191,13 @@ async function doUpgrade(target) {
   if (doUpgrade._busy) return;
   const names = { core: 'Hysteria 2 官方核心', portal: '控制面板自身', awg: 'AmneziaWG 引擎' };
   const btns = { core: btnUpdateCore, portal: btnUpdatePortal, awg: btnUpdateAwgEngine };
+  if (!Object.prototype.hasOwnProperty.call(names, target)) return;
   const btn = btns[target];
   const custom = target === 'core' && coreVerDisplay?.textContent.includes('+');
   // SCRIPT 是 Python 原始字符串：换行写 \n。写成 \\n 到 JS 里是字面的反斜杠加 n，弹窗上显示「\n」（2026-11-13 修）。
   const confirmed = await showConfirm({
-    title: '升级 ' + (names[target] || target),
-    text: '确定要升级 ' + (names[target] || target) + ' 吗？' + (custom ? '\n当前含定制补丁，升级官方核心会替换补丁。' : ''),
+    title: '升级 ' + names[target],
+    text: '确定要升级 ' + names[target] + ' 吗？' + (custom ? '\n当前含定制补丁，升级官方核心会替换补丁。' : ''),
     icon: '⬆️',
     confirmText: '开始升级',
     isDanger: custom,
@@ -3167,6 +3205,7 @@ async function doUpgrade(target) {
   });
   if (!confirmed || doUpgrade._busy) return;
   doUpgrade._busy = true;
+  let reloading = false;
   if (btn) { btn.disabled = true; btn.textContent = '升级中...'; }
   if (updateStatusMsg) updateStatusMsg.textContent = '正在下载并应用更新，请稍候...';
   try {
@@ -3196,8 +3235,9 @@ async function doUpgrade(target) {
         if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
         return;
       }
+      reloading = true;
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
-      setTimeout(() => location.reload(), 5000);
+      setTimeout(() => { try { location.reload(); } finally { doUpgrade._busy = false; } }, 5000);
     } else {
       const errMsg = (json && json.error) || ('升级失败 (HTTP ' + res.status + ')');
       alert(errMsg);
@@ -3210,7 +3250,7 @@ async function doUpgrade(target) {
     if (updateStatusMsg) updateStatusMsg.textContent = errMsg;
     if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
   } finally {
-    doUpgrade._busy = false;
+    if (!reloading) doUpgrade._busy = false;
   }
 }
 
@@ -4098,9 +4138,14 @@ document.querySelectorAll('[data-copy]').forEach(button => {
       ta.style.position = 'fixed';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
-      ta.select();
-      try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
-      ta.remove();
+      try {
+        ta.select();
+        copied = document.execCommand('copy');
+      } catch (_) {
+        copied = false;
+      } finally {
+        ta.remove();
+      }
     }
     if (copied) {
       button.textContent = '已复制 ✓';

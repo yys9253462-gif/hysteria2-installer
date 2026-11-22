@@ -28,9 +28,11 @@ def service_running(service):
 
 
 def _validate_loopback_http_base(url, secret):
-    if not isinstance(url, str) or any(ch in url for ch in ('\r', '\n', '\x00')):
+    if (not isinstance(url, str) or not url
+            or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in url)):
         raise ValueError('stats endpoint must be loopback HTTP base URL')
-    if not isinstance(secret, str) or any(ch in secret for ch in ('\r', '\n', '\x00')):
+    if (not isinstance(secret, str) or not secret.isascii()
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in secret)):
         raise ValueError('invalid stats secret')
     p = urlparse(url)
     try:
@@ -78,6 +80,8 @@ def read_hysteria(url, secret):
 
 
 def parse_xray(raw):
+    if not isinstance(raw, (str, bytes, bytearray)):
+        raise ValueError('invalid xray response')
     obj=json.loads(raw)
     if not isinstance(obj,dict): raise ValueError('invalid xray response')
     rows=obj.get('stat', obj.get('stats'))
@@ -96,7 +100,7 @@ def parse_xray(raw):
         if len(parts)!=4 or parts[0]!='user' or parts[2]!='traffic': continue
         if parts[3] not in ('uplink','downlink'): continue
         value=row.get('value')
-        if isinstance(value,str) and value.isascii() and value.isdigit(): value=int(value)
+        if isinstance(value,str) and value.isascii() and value.isdigit() and len(value)<=30: value=int(value)
         if type(value) is not int or value<0: raise ValueError('invalid xray counter')
         pair=out.setdefault(parts[1],{'tx':0,'rx':0})
         # 方向必须与 Hy2 的语义对齐（2026-10-29 修）：
@@ -143,7 +147,9 @@ import re,ipaddress,time,pathlib,urllib.error
 
 def _norm_ip(value):
     """规范化单个 IP：IPv4 映射地址还原成 IPv4（与 /auth、拦截名单同一写法）。"""
-    ip=ipaddress.ip_address(str(value).strip())
+    if not isinstance(value, str):
+        raise ValueError('invalid_ip')
+    ip=ipaddress.ip_address(value.strip())
     if ip.version==6 and ip.ipv4_mapped:
         ip=ip.ipv4_mapped
     return str(ip)
@@ -154,8 +160,12 @@ def _addr_ip(addr):
     旧写法 `rsplit(':',1)[0]` 把不带端口的 IPv6 截成 '2001:db8:'，ip_address 抛错，
     一条这样的日志让整台节点的在线 IP 快照失败。
     """
+    if not isinstance(addr, str):
+        raise ValueError('invalid_addr')
     text=addr.strip()
     if text.startswith('['):
+        if ']' not in text:
+            raise ValueError('invalid_bracketed_addr')
         end=text.index(']')
         rest=text[end+1:]
         if rest:
@@ -163,6 +173,7 @@ def _addr_ip(addr):
                 raise ValueError('invalid_bracketed_addr')
             port_text=rest[1:]
             if (not (port_text.isascii() and port_text.isdigit())
+                    or len(port_text) > 5
                     or port_text.startswith('0')
                     or not (1<=int(port_text)<=65535)):
                 raise ValueError('invalid_bracketed_port')
@@ -175,6 +186,7 @@ def _addr_ip(addr):
                 raise ValueError('invalid_addr') from None
             host_part, port_text = text.rsplit(':', 1)
             if (not (port_text.isascii() and port_text.isdigit())
+                    or len(port_text) > 5
                     or port_text.startswith('0')
                     or not (1 <= int(port_text) <= 65535)):
                 raise ValueError('invalid_addr_port')
@@ -196,7 +208,7 @@ def parse_events(rows):
     """
     active={}
     unmatched=set()
-    if any(not isinstance(row,dict) for row in rows):
+    if not isinstance(rows, (list, tuple)) or any(not isinstance(row,dict) for row in rows):
         raise ValueError('invalid_connection_event')
     def _event_sort_ts(row):
         raw_ts = row.get('__MONOTONIC_TIMESTAMP')
@@ -208,7 +220,8 @@ def parse_events(rows):
             raise ValueError('invalid_connection_event')
         if isinstance(raw_ts, str):
             s = raw_ts.strip()
-            if not (s.isascii() and (s.isdigit() or (s.startswith('-') and s[1:].isdigit()))):
+            if (not s or len(s) > 30 or not s.isascii()
+                    or not (s.isdigit() or (s.startswith('-') and s[1:].isdigit()))):
                 raise ValueError('invalid_connection_event')
             return int(s)
         return int(raw_ts)
@@ -254,6 +267,10 @@ def parse_events(rows):
     return active
 
 def confirmed_ips(connections,uid,count):
+    if not isinstance(connections, dict) or not isinstance(uid, str) or not uid:
+        return None
+    if type(count) is not int or count < 0:
+        return None
     if count==0:return []
     if (uid,None) in connections:return None
     known={ip:n for (user,ip),n in connections.items() if user==uid and ip is not None}
@@ -379,7 +396,7 @@ def read_live_connections():
                 # 否则同一设备同时测速 Hy2 与 Reality 时会被当成两个在线 IP，也对不上跨节点拦截名单。
                 merged={}
                 for ip,seen in ips.items():
-                    if isinstance(seen,str) and seen.isascii() and seen.isdigit():
+                    if isinstance(seen,str) and seen.isascii() and seen.isdigit() and len(seen)<=20:
                         ts=int(seen)
                     elif type(seen) is int and seen>=0:
                         ts=seen

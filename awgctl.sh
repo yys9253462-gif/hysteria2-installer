@@ -212,11 +212,12 @@ awg_atomic_install_bin() {
 }
 
 awg_transaction_restore() {
-    local index=0 path state_file active enabled unit_dir
+    local index=0 path state_file active enabled unit_dir dir_mode
     local -a paths=("$AWG_META_FILE" "$AWG_CONFIG" "$AWG_PEERS_FILE" "$AWG_SERVICE")
     local -a binaries=("$AWG_VERSION_FILE" "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN")
     [[ -n "${AWG_TRANSACTION_DIR:-}" && -d "$AWG_TRANSACTION_DIR" ]] || return 1
     state_file="$AWG_TRANSACTION_DIR/service-state"
+    [[ -f "$state_file" ]] || return 1
     active="$(sed -n '1p' "$state_file")"
     enabled="$(sed -n '2p' "$state_file")"
     if [[ "$enabled" == "not-found" ]]; then
@@ -233,7 +234,9 @@ awg_transaction_restore() {
     done
     if [[ -f "$AWG_TRANSACTION_DIR/original-dir.present" ]]; then
         mkdir -p "$AWG_DIR" || return 1
-        chmod "$AWG_TRANSACTION_DIR_MODE" "$AWG_DIR" || return 1
+        dir_mode="${AWG_TRANSACTION_DIR_MODE:-700}"
+        [[ "$dir_mode" =~ ^[0-7]{3,4}$ ]] || dir_mode="700"
+        chmod "$dir_mode" "$AWG_DIR" || return 1
     else
         rmdir "$AWG_DIR" 2>/dev/null || true
     fi
@@ -308,8 +311,14 @@ detect_wan_iface() {
     local wan
     wan="$(ip -4 route show default 2>/dev/null \
         | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-    if [[ -n "$wan" && -d "/sys/class/net/$wan" ]]; then
-        echo "$wan"; return 0
+    if [[ -n "$wan" ]]; then
+        if [[ "$wan" == "." || "$wan" == ".." || ! "$wan" =~ ^[A-Za-z0-9._:@-]{1,32}$ ]]; then
+            log_err "默认出口网卡名非法: ${wan}"
+            return 1
+        fi
+        if [[ -d "/sys/class/net/$wan" ]]; then
+            echo "$wan"; return 0
+        fi
     fi
     # 探测失败时**不能**静默回退到 eth0：现代发行版普遍是 ens3/enp0s3，
     # 那条 MASQUERADE 规则会静默不生效 —— 表现是客户端握手成功、
@@ -327,21 +336,28 @@ pick_port() {
     port="$(printf '%s
 ' "$listening" | python3 -I -c '
 import secrets, sys
-lo, hi, hy2 = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+raw_lo, raw_hi, hy2 = sys.argv[1], sys.argv[2], sys.argv[3]
+if not (raw_lo.isascii() and raw_lo.isdigit() and len(raw_lo) <= 5 and not raw_lo.startswith("0")):
+    raise SystemExit("bad-port-range")
+if not (raw_hi.isascii() and raw_hi.isdigit() and len(raw_hi) <= 5 and not raw_hi.startswith("0")):
+    raise SystemExit("bad-port-range")
+lo, hi = max(1, int(raw_lo)), min(65535, int(raw_hi))
+if lo > hi:
+    raise SystemExit("bad-port-range")
 used = set()
 for line in sys.stdin:
     parts = line.split()
     if len(parts) >= 4 and ":" in parts[3]:
         tail = parts[3].rsplit(":", 1)[1]
-        if tail.isascii() and tail.isdigit():
+        if tail.isascii() and tail.isdigit() and len(tail) <= 5 and not tail.startswith("0"):
             p = int(tail)
             if 1 <= p <= 65535:
                 used.add(p)
-if hy2.isascii() and hy2.isdigit():
+if hy2.isascii() and hy2.isdigit() and len(hy2) <= 5 and not hy2.startswith("0"):
     p = int(hy2)
     if 1 <= p <= 65535:
         used.add(p)
-free = [p for p in range(lo, hi + 1) if p not in used]
+free = [p for p in range(lo, hi + 1) if p not in used and not (20000 <= p <= 40000)]
 if not free:
     raise SystemExit("no-free-udp-port")
 print(free[secrets.randbelow(len(free))])
@@ -460,7 +476,7 @@ download_binaries() {
     fi
     # 精确资产名、唯一匹配、64 位十六进制，否则视为失败（不取"第一条"）。
     want="$(awk -v f="amneziawg-linux-${arch}-awg${line}.tar.gz" \
-            '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); if (n==f) print $1}' \
+            '$1 ~ /^#/ || NF < 2 { next } { n=$2; sub(/^\*/, "", n); while (sub(/^\.\//, "", n)) {} if (n==f) print $1 }' \
             "${tmpd}/SHA256SUMS" | tr 'A-F' 'a-f' | sort -u)"
     if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
         rm -rf "$tmpd"
@@ -479,14 +495,21 @@ download_binaries() {
     # ⚠️ 必须先把清单读出来并检查 tar 的返回码：旧写法用进程替换，
     # `tar -t` 失败时循环一次都不执行，检查被当成「通过」（fail-open，
     # 2026-10-29 修）。install.sh 的同名逻辑一直是 fail-closed。
-    local member listing verbose_listing vline
+    local member norm_member listing verbose_listing vline
     if ! listing="$(tar -tzf "${tmpd}/awg.tar.gz" 2>/dev/null)"; then
         rm -rf "$tmpd"; log_err "无法读取安装包清单（包可能已损坏），已放弃安装"; return 1
     fi
     [ -n "$listing" ] || { rm -rf "$tmpd"; log_err "安装包为空，已放弃安装"; return 1; }
     while IFS= read -r member; do
-        case "$member" in
-            /*|..|../*|*/../*|*/..|*\\*) rm -rf "$tmpd"; log_err "安装包内含不安全路径成员，已放弃安装"; return 1 ;;
+        if [[ -z "$member" || "$member" == *\\* || "$member" =~ [[:cntrl:]] ]]; then
+            rm -rf "$tmpd"; log_err "安装包内含不安全路径成员，已放弃安装"; return 1
+        fi
+        norm_member="$member"
+        while [[ "$norm_member" == ./* ]]; do
+            norm_member="${norm_member#./}"
+        done
+        case "$norm_member" in
+            /*|..|../*|*/../*|*/..) rm -rf "$tmpd"; log_err "安装包内含不安全路径成员，已放弃安装"; return 1 ;;
         esac
     done <<< "$listing"
     if ! verbose_listing="$(tar -tvzf "${tmpd}/awg.tar.gz" 2>/dev/null)"; then
@@ -1439,7 +1462,24 @@ cmd_uninstall() {
     # 旧实现卸载后 ufw / firewalld 里的 UDP 放行永久留着。
     local old_port
     old_port="$(meta_get port)"
-    [[ -n "$old_port" ]] && revoke_firewall "$old_port"
+    if [[ "$old_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$old_port >= 1 && 10#$old_port <= 65535 )); then
+        revoke_firewall "$old_port"
+    fi
+
+    # 防止异常环境变量将 AWG_DIR 指向根目录或顶层系统目录导致误删（同时兼容 Windows 单测盘符路径）。
+    local clean_awg_dir="${AWG_DIR%/}"
+    clean_awg_dir="${clean_awg_dir%\\}"
+    if [[ -z "$clean_awg_dir" \
+        || ( "$clean_awg_dir" != /*/* && ! "$clean_awg_dir" =~ ^[A-Za-z]:[/\\][^/\\]+[/\\].+ ) \
+        || "$clean_awg_dir" == *"/../"* || "$clean_awg_dir" == *"/.." \
+        || "$clean_awg_dir" == *"\\..\\"* || "$clean_awg_dir" == *"\\.." ]]; then
+        die "AWG_DIR 路径不安全（${AWG_DIR:-<empty>}），已拒绝删除目录。"
+    fi
+    case "$clean_awg_dir" in
+        /|/etc|/usr|/var|/root|/home|/bin|/sbin|/lib|/lib64|/tmp|/run|/opt|/srv|/boot|/dev|/proc|/sys)
+            die "AWG_DIR 指向系统受保护目录（${AWG_DIR}），已拒绝删除。"
+            ;;
+    esac
 
     rm -rf "$AWG_DIR"
     # 再清掉可能因此变空的厂商级父目录（/etc/amnezia）。
