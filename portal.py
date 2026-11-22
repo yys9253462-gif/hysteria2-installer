@@ -6432,11 +6432,11 @@ def parse_ip_deny(params, now):
 
 def auth_rate_key(client_ip):
     """/auth 限流的分桶键：IPv4 按单个地址，IPv6 按 /64（单台主机通常持有整段 /64，
-    按单地址分桶等于没限）；IPv4 映射地址还原成 IPv4。解析不了的原样截断。"""
+    按单地址分桶等于没限）；IPv4 映射地址还原成 IPv4。解析不了的剥除控制字符后截断，防止日志注入。"""
     try:
         ip = ipaddress.ip_address(client_ip)
-    except ValueError:
-        return str(client_ip)[:64]
+    except (ValueError, TypeError):
+        return re.sub(r'[\x00-\x1f\x7f]', '', str(client_ip))[:64]
     if ip.version == 6:
         if ip.ipv4_mapped:
             return str(ip.ipv4_mapped)
@@ -10912,11 +10912,22 @@ if __name__ == '__main__':
                     self.close_connection = True
 
         def do_POST(self):
-            try:
-                body_length = int(self.headers.get('Content-Length', 0))
-            except (ValueError, TypeError):
+            _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+            if _cl_vals is not None:
+                if len(_cl_vals) > 1:
+                    return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+                _raw_cl = _cl_vals[0] if _cl_vals else '0'
+            else:
+                _raw_cl = self.headers.get('Content-Length', '0')
+            if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                _raw_cl = str(_raw_cl)
+            if not isinstance(_raw_cl, str):
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
-            if not 0 <= body_length <= 1024 * 1024:
+            _raw_cl_s = _raw_cl.strip()
+            if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+            body_length = int(_raw_cl_s)
+            if body_length > 1024 * 1024:
                 return self.reply_json(413, {'ok': False, 'error': 'Request body exceeds 1 MiB'})
             # 1. Hysteria 2 本地 HTTP 动态鉴权、实时流量统计与 IP 限额拦截端点
             #
@@ -10959,8 +10970,20 @@ if __name__ == '__main__':
                     raw_addr = client_addr.strip()
                     client_ip = ''
                     if raw_addr:
-                        if raw_addr.startswith('[') and ']' in raw_addr:
-                            client_ip = raw_addr[1:raw_addr.index(']')]
+                        if raw_addr.startswith('['):
+                            if ']' not in raw_addr:
+                                raise ValueError('unclosed bracket addr')
+                            _close_idx = raw_addr.index(']')
+                            client_ip = raw_addr[1:_close_idx]
+                            _suffix = raw_addr[_close_idx + 1:]
+                            if _suffix:
+                                if not _suffix.startswith(':'):
+                                    raise ValueError('invalid bracket addr suffix')
+                                _port_s = _suffix[1:]
+                                if (not _port_s or not _port_s.isascii() or not _port_s.isdigit()
+                                        or (len(_port_s) > 1 and _port_s.startswith('0'))
+                                        or not (1 <= int(_port_s) <= 65535)):
+                                    raise ValueError('invalid bracket addr port')
                         else:
                             try:
                                 # 先直接解析裸 IPv4 / 裸 IPv6，避免 rsplit(':') 截断无端口 IPv6。
@@ -15622,6 +15645,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self._h_api_unlock_check()
                 if sub == 'capabilities':
                     # 节点能力总览（2026-10-04 加）。
+                    # 续期连接死线，避免多个 systemctl/sysctl/sing-box 子进程串行探测触顶超时。
+                    if hasattr(self, '_extend_deadline'):
+                        self._extend_deadline(45)
                     #
                     # 为什么需要：主面板要一眼知道「这台节点有什么、什么版本、
                     # 什么开着」。此前这些信息散在 /reality-status、/bbr-status、
@@ -15698,6 +15724,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     vlessenc_port = _valid_port(d_snap['vlessenc'].get('port'))
                     anytls_port = _valid_port(d_snap['anytls'].get('port'))
                     tuic_port = _valid_port(d_snap['tuic'].get('port'))
+                    vmess_domain = _clean_host_scalar(d_snap['vmess'].get('domain'))
+                    vmess_ws_path = _clean_host_scalar(d_snap['vmess'].get('ws_path'))
+                    vmess_sni = _clean_host_scalar(d_snap['vmess'].get('sni'))
+                    vlessenc_domain = _clean_host_scalar(d_snap['vlessenc'].get('domain'))
+                    vlessenc_sni = _clean_host_scalar(d_snap['vlessenc'].get('sni'))
+                    anytls_domain = _clean_host_scalar(d_snap['anytls'].get('domain'))
+                    anytls_sni = _clean_host_scalar(d_snap['anytls'].get('sni'))
+                    tuic_domain = _clean_host_scalar(d_snap['tuic'].get('domain'))
+                    tuic_sni = _clean_host_scalar(d_snap['tuic'].get('sni'))
+                    _hop_tuple = clean_hop_range(m.get('hop_port_range'))
+                    _hop_text = ('%d-%d' % _hop_tuple) if _hop_tuple else ''
 
                     # 节点门户自身版本：流式扫描 __file__ 命中 PORTAL_VERSION 即停，
                     # 避免旧版 [:80] 截断漏掉定义及整文件读入内存；不可读时回落模块常量。
@@ -15759,15 +15796,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 {
                                     'installed': _bin('xray'),
                                     'active': d_snap['vmess_inbound'],
-                                    'configured': bool(d_snap['vmess'].get('domain')),
+                                    'configured': bool(vmess_domain),
                                 },
                                 **({'port': vmess_port} if vmess_port else {}),
-                                **({'domain': d_snap['vmess']['domain']}
-                                   if d_snap['vmess'].get('domain') else {}),
-                                **({'ws_path': d_snap['vmess']['ws_path']}
-                                   if d_snap['vmess'].get('ws_path') else {}),
-                                **({'sni': d_snap['vmess']['sni']}
-                                   if d_snap['vmess'].get('sni') else {}),
+                                **({'domain': vmess_domain} if vmess_domain else {}),
+                                **({'ws_path': vmess_ws_path} if vmess_ws_path else {}),
+                                **({'sni': vmess_sni} if vmess_sni else {}),
                             ),
                             # VLESS Encryption：同样只暴露客户端需要的参数，
                             # decryption（服务端私钥）绝不出现在这里。
@@ -15775,13 +15809,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 {
                                     'installed': _bin('xray'),
                                     'active': d_snap['vlessenc_inbound'],
-                                    'configured': bool(d_snap['vlessenc'].get('domain')),
+                                    'configured': bool(vlessenc_domain),
                                 },
                                 **({'port': vlessenc_port} if vlessenc_port else {}),
-                                **({'domain': d_snap['vlessenc']['domain']}
-                                   if d_snap['vlessenc'].get('domain') else {}),
-                                **({'sni': d_snap['vlessenc']['sni']}
-                                   if d_snap['vlessenc'].get('sni') else {}),
+                                **({'domain': vlessenc_domain} if vlessenc_domain else {}),
+                                **({'sni': vlessenc_sni} if vlessenc_sni else {}),
                             ),
                             # AnyTLS（2026-10-29 补）：由独立的 sing-box 进程承载，
                             # 所以 installed 看 sing-box、active 看 hy2-anytls 服务。
@@ -15794,13 +15826,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     # 配置被删/损坏但进程还在时误报能力可用。
                                     'active': _active_anytls_config() is not None
                                               and _svc_active(ANYTLS_SERVICE),
-                                    'configured': bool(d_snap['anytls'].get('domain')),
+                                    'configured': bool(anytls_domain),
                                 },
                                 **({'port': anytls_port} if anytls_port else {}),
-                                **({'domain': d_snap['anytls']['domain']}
-                                   if d_snap['anytls'].get('domain') else {}),
-                                **({'sni': d_snap['anytls']['sni']}
-                                   if d_snap['anytls'].get('sni') else {}),
+                                **({'domain': anytls_domain} if anytls_domain else {}),
+                                **({'sni': anytls_sni} if anytls_sni else {}),
                             ),
                             # TUIC（2026-10-31 加）：同样由 sing-box 承载，端口为 UDP。
                             'tuic': dict(
@@ -15808,13 +15838,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'installed': singbox_installed,
                                     'active': _active_tuic_config() is not None
                                               and _svc_active(TUIC_SERVICE),
-                                    'configured': bool(d_snap['tuic'].get('domain')),
+                                    'configured': bool(tuic_domain),
                                 },
                                 **({'port': tuic_port} if tuic_port else {}),
-                                **({'domain': d_snap['tuic']['domain']}
-                                   if d_snap['tuic'].get('domain') else {}),
-                                **({'sni': d_snap['tuic']['sni']}
-                                   if d_snap['tuic'].get('sni') else {}),
+                                **({'domain': tuic_domain} if tuic_domain else {}),
+                                **({'sni': tuic_sni} if tuic_sni else {}),
                             ),
                         },
                         'extras': {
@@ -15836,10 +15864,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'cert': _cert_summary(meta_path.parent, m),
                         },
                         'node': {
-                            'public_ip': m.get('public_ip', ''),
-                            'server_name': m.get('server_name', ''),
+                            'public_ip': _clean_host_scalar(m.get('public_ip')),
+                            'server_name': _clean_host_scalar(m.get('server_name')),
                             'is_insecure': clean_node_identity(m)[0],
-                            'hop_port_range': m.get('hop_port_range', ''),
+                            'hop_port_range': _hop_text,
                             'users_count': d_snap['users_count'],
                         },
                     })
