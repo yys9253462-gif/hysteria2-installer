@@ -1609,16 +1609,23 @@ setup_cert_via_existing_caddy() {
     fi
 
     # 备份后在同目录候选文件上构造并校验，校验通过才原子替换生产 Caddyfile
+    if [[ -L "$cf" ]]; then
+        log_err "/etc/caddy/Caddyfile 为符号链接，已拒绝修改。"
+        return 1
+    fi
     [[ -f "$cf" ]] || { log_err "找不到 /etc/caddy/Caddyfile。"; return 1; }
     bak="${cf}.bak-hy2-$(date +%Y%m%d-%H%M%S).$$"
-    cp -a "$cf" "$bak" || { log_err "备份 Caddyfile 失败。"; return 1; }
+    if [[ -L "$bak" ]] || ! (umask 077 && cp -a -- "$cf" "$bak"); then
+        log_err "备份 Caddyfile 失败。"
+        return 1
+    fi
     log_info "已备份 Caddyfile -> ${bak}"
 
     # 幂等：已存在该域名块就不重复追加
     local appended=0
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
         cand="$(umask 077 && mktemp "${cf}.hy2-tmp.XXXXXX")" || { log_err "创建 Caddyfile 候选临时文件失败。"; return 1; }
-        if ! cp -p "$cf" "$cand" || ! cat >> "$cand" <<CEOF
+        if ! cp -p -- "$cf" "$cand" || ! cat >> "$cand" <<CEOF
 
 # 证书签发站点（由 install.sh 自动追加）
 # 用途：本机 80/443 已被 Caddy 占用，内置 ACME 无法自行签发，
@@ -1628,20 +1635,24 @@ $(caddy_decoy_directives "$domain")
 }
 CEOF
         then
-            rm -f "$cand"
+            rm -f -- "$cand"
+            cand=""
             log_err "写入 Caddyfile 候选配置失败，生产配置未改动。"
             return 1
         fi
         if ! caddy validate --config "$cand" --adapter caddyfile >/dev/null 2>&1; then
-            rm -f "$cand"
+            rm -f -- "$cand"
+            cand=""
             log_err "追加后的 Caddyfile 校验不通过，生产配置未改动。"
             return 1
         fi
-        if ! mv -f "$cand" "$cf"; then
-            rm -f "$cand"
+        if ! mv -f -- "$cand" "$cf"; then
+            rm -f -- "$cand"
+            cand=""
             log_err "原子替换 Caddyfile 失败，生产配置未改动。"
             return 1
         fi
+        cand=""
         appended=1
     elif ! caddy validate --config "$cf" --adapter caddyfile >/dev/null 2>&1; then
         log_err "现有 Caddyfile 校验不通过，已中止。"
@@ -1653,7 +1664,7 @@ CEOF
     fi
     sleep 3
     # 触发签发
-    curl -s -o /dev/null -m 15 "http://${domain}/" 2>/dev/null || true
+    curl -s -o /dev/null -m 15 --max-filesize 65536 "http://${domain}/" 2>/dev/null || true
 
     log_info "等待 Caddy 完成 ACME 签发（通常 5~30 秒）..."
     local i
@@ -1716,27 +1727,28 @@ hy2_acme_ensure_renew_timer() {
     local home="$1" unit_dir="${HY2_SYSTEMD_DIR:-/etc/systemd/system}"
     local svc_tmp="" tmr_tmp=""
     trap 'trap - RETURN; rm -f "${svc_tmp:-}" "${tmr_tmp:-}" 2>/dev/null || true' RETURN
-    if [[ -z "$home" || "$home" =~ [[:space:][:cntrl:]\"\'\`\;] ]]; then
+    if [[ -z "$home" || "$home" == -* || "$home" =~ [[:space:][:cntrl:]\"\'\`\;%\$] ]]; then
         return 1
     fi
     if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF 'acme.sh --cron'; then
         return 0
     fi
     command -v systemctl >/dev/null 2>&1 || return 1
+    if [[ -L "${unit_dir}" || -L "${unit_dir}/hy2-acme-renew.service" || -L "${unit_dir}/hy2-acme-renew.timer" ]]; then
+        return 1
+    fi
     svc_tmp="$(umask 077 && mktemp "${unit_dir}/.hy2-acme-renew.service.XXXXXX")" || return 1
     printf '%s\n' '[Unit]' 'Description=acme.sh certificate renewal (hysteria2-installer)' '' \
         '[Service]' 'Type=oneshot' "ExecStart=${home}/acme.sh --cron --home ${home}" \
         > "$svc_tmp" || return 1
-    chmod 0644 "$svc_tmp" 2>/dev/null || true
-    mv -f "$svc_tmp" "${unit_dir}/hy2-acme-renew.service" || return 1
+    chmod 0644 "$svc_tmp" && mv -f "$svc_tmp" "${unit_dir}/hy2-acme-renew.service" || return 1
     svc_tmp=""
     tmr_tmp="$(umask 077 && mktemp "${unit_dir}/.hy2-acme-renew.timer.XXXXXX")" || return 1
     printf '%s\n' '[Unit]' 'Description=Daily acme.sh renewal (hysteria2-installer)' '' \
         '[Timer]' 'OnCalendar=daily' 'RandomizedDelaySec=3600' 'Persistent=true' '' \
         '[Install]' 'WantedBy=timers.target' \
         > "$tmr_tmp" || return 1
-    chmod 0644 "$tmr_tmp" 2>/dev/null || true
-    mv -f "$tmr_tmp" "${unit_dir}/hy2-acme-renew.timer" || return 1
+    chmod 0644 "$tmr_tmp" && mv -f "$tmr_tmp" "${unit_dir}/hy2-acme-renew.timer" || return 1
     tmr_tmp=""
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now hy2-acme-renew.timer >/dev/null 2>&1
@@ -2281,31 +2293,43 @@ generate_self_signed_cert() {
     CERT_FILE="${HY2_CERT_DIR}/server.crt"
     KEY_FILE="${HY2_CERT_DIR}/server.key"
     IS_INSECURE="true"
+    local tmp_key="" tmp_cert="" _sn_re=""
+    _sn_re="$(printf '%s' "$SERVER_NAME" | sed 's/[.[\*^$()+?{}|]/\\&/g')"
+    trap 'trap - RETURN; [[ -n "${tmp_key:-}" ]] && rm -f -- "$tmp_key"; [[ -n "${tmp_cert:-}" ]] && rm -f -- "$tmp_cert"' RETURN
+
+    if [[ -L "$HY2_CERT_DIR" || -L "$CERT_FILE" || -L "$KEY_FILE" ]]; then
+        log_err "自签名证书目录或目标文件路径为符号链接，已拒绝写入。"
+        return 1
+    fi
 
     # 已有一对可用的自签证书就沿用（2026-11-04 修）：「重新修改配置」默认走这里，旧实现每次
     # 重新生成，pin 跟着变，已发放的自签链接（带 pinSHA256）全部握手失败。
     # 要强制换新证书：HY2_REGEN_SELF_SIGNED=1。
-    if [[ "${HY2_REGEN_SELF_SIGNED:-0}" != "1" && -s "$CERT_FILE" && -s "$KEY_FILE" ]]             && _cert_key_usable "$CERT_FILE" "$KEY_FILE"             && openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -q "CN *= *${SERVER_NAME}"; then
+    if [[ "${HY2_REGEN_SELF_SIGNED:-0}" != "1" && -s "$CERT_FILE" && -s "$KEY_FILE" ]] \
+            && _cert_key_usable "$CERT_FILE" "$KEY_FILE" \
+            && openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -qE "(^|[[:space:],/=])CN[[:space:]]*=[[:space:]]*${_sn_re}([[:space:],/]|$)"; then
         log_info "沿用现有自签名证书（pin 不变，已发放的客户端无需重新导入）。"
         return 0
     fi
     log_step "正在生成高拟真自签名 ECC 证书 (伪装 SNI: ${SERVER_NAME})..."
-    mkdir -p "$HY2_CERT_DIR"
-    local tmp_key tmp_cert
+    mkdir -p "$HY2_CERT_DIR" && chmod 700 "$HY2_CERT_DIR" || { log_err "无法准备自签名证书目录。"; return 1; }
     tmp_key="$(umask 077 && mktemp "${HY2_CERT_DIR}/.server.key.XXXXXX")" || { log_err "无法创建临时私钥文件。"; return 1; }
-    tmp_cert="$(umask 077 && mktemp "${HY2_CERT_DIR}/.server.crt.XXXXXX")" || { rm -f "$tmp_key"; log_err "无法创建临时证书文件。"; return 1; }
+    tmp_cert="$(umask 077 && mktemp "${HY2_CERT_DIR}/.server.crt.XXXXXX")" || { rm -f -- "$tmp_key"; tmp_key=""; log_err "无法创建临时证书文件。"; return 1; }
     if ! (umask 077; openssl ecparam -genkey -name prime256v1 -out "$tmp_key") \
             || ! openssl req -new -x509 -days 3650 -key "$tmp_key" -out "$tmp_cert" -subj "/CN=${SERVER_NAME}" >/dev/null 2>&1; then
-        rm -f "$tmp_key" "$tmp_cert"
+        rm -f -- "$tmp_key" "$tmp_cert"
+        tmp_key=""; tmp_cert=""
         log_err "自签名证书生成失败，未改动现有证书。"
         return 1
     fi
     chmod 600 "$tmp_key" && chmod 644 "$tmp_cert" \
-        && mv -f "$tmp_key" "$KEY_FILE" && mv -f "$tmp_cert" "$CERT_FILE" || {
-        rm -f "$tmp_key" "$tmp_cert"
+        && mv -f "$tmp_key" "$KEY_FILE" && { tmp_key=""; mv -f "$tmp_cert" "$CERT_FILE"; } || {
+        rm -f -- "${tmp_key:-}" "${tmp_cert:-}"
+        tmp_key=""; tmp_cert=""
         log_err "落盘自签名证书失败。"
         return 1
     }
+    tmp_cert=""
     log_info "自签名证书生成成功。"
 }
 
@@ -2851,7 +2875,7 @@ persist_hopping_rules() {
 
 _hy2_iptables_unit_owned() {
     local unit=/etc/systemd/system/hy2-iptables.service
-    [[ -f "$unit" ]] \
+    [[ ! -L "$unit" && -f "$unit" ]] \
         && grep -qF 'Description=Hysteria 2 Port Hopping iptables persistence' "$unit" \
         && grep -qF -- '--comment hy2-installer' "$unit"
 }
@@ -2860,7 +2884,7 @@ clear_all_hopping_rules() {
     # Commented rules prove current installer ownership. For older unmarked rules,
     # require both matching saved metadata and the legacy installer unit signature.
     local legacy_start='' legacy_end='' legacy_target='' saved_range=''
-    if [[ -f "$HY2_META_FILE" ]] && _hy2_iptables_unit_owned; then
+    if [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]] && _hy2_iptables_unit_owned; then
         saved_range="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
         legacy_target="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
         if [[ "$saved_range" =~ ^([0-9]{1,5})-([0-9]{1,5})$ ]]; then
@@ -2883,7 +2907,7 @@ clear_all_hopping_rules() {
     persist_hopping_rules || log_warn "端口跳跃规则持久化状态未能同步，重启后请检查 netfilter-persistent 配置。"
     if _hy2_iptables_unit_owned; then
         systemctl disable --now hy2-iptables.service >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
+        rm -f -- /etc/systemd/system/hy2-iptables.service >/dev/null 2>&1 || true
     fi
 }
 
@@ -2959,9 +2983,13 @@ setup_iptables_port_hopping() {
 
     # 兜底部署 systemd 端口跳跃自愈守护服务（同目录临时文件原子落盘），保证开机/重启 100% 自动恢复规则
     local _ipt_unit="/etc/systemd/system/hy2-iptables.service"
+    if [[ -L "$_ipt_unit" ]]; then
+        log_err "${_ipt_unit} 不允许为符号链接，拒绝写入。"
+        return 1
+    fi
     local _ipt_unit_tmp=""
-    trap 'rm -f "${_ipt_unit_tmp:-}"; trap - RETURN' RETURN
-    _ipt_unit_tmp="$(umask 022; mktemp "${_ipt_unit}.XXXXXX")" || {
+    trap 'rm -f -- "${_ipt_unit_tmp:-}"; trap - RETURN' RETURN
+    _ipt_unit_tmp="$(umask 077; mktemp "${_ipt_unit}.XXXXXX")" || {
         log_err "无法为 ${_ipt_unit} 创建临时文件。"
         return 1
     }
@@ -2983,12 +3011,12 @@ ExecStart=/bin/bash -c "command -v ip6tables >/dev/null 2>&1 || exit 0; ip6table
 WantedBy=multi-user.target
 EOF
     then
-        rm -f "$_ipt_unit_tmp"
+        rm -f -- "$_ipt_unit_tmp"
         log_err "写入 ${_ipt_unit} 失败。"
         return 1
     fi
-    if ! chmod 644 "$_ipt_unit_tmp" || ! mv -f "$_ipt_unit_tmp" "$_ipt_unit"; then
-        rm -f "$_ipt_unit_tmp"
+    if ! chmod 644 -- "$_ipt_unit_tmp" || ! mv -f -- "$_ipt_unit_tmp" "$_ipt_unit"; then
+        rm -f -- "$_ipt_unit_tmp"
         log_err "原子落盘 ${_ipt_unit} 失败。"
         return 1
     fi
@@ -4795,8 +4823,16 @@ setup_portal() {
             return 1
         fi
     fi
+    if [[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%\$] ]]; then
+        log_err "HY2_DIR 路径不安全（符号链接或含非法控制/占位字符），拒绝写入门户单元。"
+        return 1
+    fi
+    if [[ -L /etc/systemd/system/hysteria-portal.service ]]; then
+        log_err "/etc/systemd/system/hysteria-portal.service 不允许为符号链接，拒绝写入。"
+        return 1
+    fi
     local _portal_svc_tmp=""
-    trap 'trap - RETURN; rm -f "${_portal_svc_tmp:-}"' RETURN
+    trap 'trap - RETURN; rm -f -- "${_portal_svc_tmp:-}"' RETURN
     _portal_svc_tmp="$(umask 077; mktemp /etc/systemd/system/hysteria-portal.service.XXXXXX)" || return 1
     {
         cat > "$_portal_svc_tmp" <<EOF
@@ -4816,8 +4852,8 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
-    } && chmod 644 "$_portal_svc_tmp" && mv -f "$_portal_svc_tmp" /etc/systemd/system/hysteria-portal.service || {
-        rm -f "$_portal_svc_tmp"
+    } && chmod 644 -- "$_portal_svc_tmp" && mv -f -- "$_portal_svc_tmp" /etc/systemd/system/hysteria-portal.service || {
+        rm -f -- "$_portal_svc_tmp"
         return 1
     }
     # 目录 700：门户与所有配置只允许 root 访问。portal.py 本身是 644，
@@ -4846,8 +4882,19 @@ EOF
 #      续期是 rename 替换，PathChanged 必然命中），做到「换完即修」。
 # 执行体是一个只调 `portal.py selfheal` 的脚本：幂等，无漂移时零写入。
 setup_cert_selfheal() {
+    local _sh_target
+    for _sh_target in \
+        /usr/local/bin/hy2-cert-selfheal.sh \
+        /etc/systemd/system/hy2-cert-selfheal.service \
+        /etc/systemd/system/hy2-cert-selfheal.timer \
+        /etc/systemd/system/hy2-cert-selfheal.path; do
+        if [[ -L "$_sh_target" ]]; then
+            log_err "${_sh_target} 不允许为符号链接，拒绝写入证书自愈文件。"
+            return 1
+        fi
+    done
     local _sh_script_tmp="" _sh_svc_tmp="" _sh_tmr_tmp="" _sh_pth_tmp=""
-    trap 'trap - RETURN; rm -f "${_sh_script_tmp:-}" "${_sh_svc_tmp:-}" "${_sh_tmr_tmp:-}" "${_sh_pth_tmp:-}"' RETURN
+    trap 'trap - RETURN; rm -f -- "${_sh_script_tmp:-}" "${_sh_svc_tmp:-}" "${_sh_tmr_tmp:-}" "${_sh_pth_tmp:-}"' RETURN
     _sh_script_tmp="$(umask 077; mktemp /usr/local/bin/hy2-cert-selfheal.sh.XXXXXX)" || return 1
     {
         cat > "$_sh_script_tmp" <<'EOCS'
@@ -4877,7 +4924,7 @@ unset _out
 exit 0
 EOCS
     } && chmod 755 "$_sh_script_tmp" && mv -f "$_sh_script_tmp" /usr/local/bin/hy2-cert-selfheal.sh || {
-        rm -f "$_sh_script_tmp"
+        rm -f -- "$_sh_script_tmp"
         return 1
     }
 
@@ -4893,11 +4940,11 @@ Type=oneshot
 ExecStart=/usr/local/bin/hy2-cert-selfheal.sh
 EOCU
     } && chmod 644 "$_sh_svc_tmp" && mv -f "$_sh_svc_tmp" /etc/systemd/system/hy2-cert-selfheal.service || {
-        rm -f "$_sh_svc_tmp"
+        rm -f -- "$_sh_svc_tmp"
         return 1
     }
 
-    _sh_tmr_tmp="$(mktemp /etc/systemd/system/hy2-cert-selfheal.timer.XXXXXX)" || return 1
+    _sh_tmr_tmp="$(umask 077; mktemp /etc/systemd/system/hy2-cert-selfheal.timer.XXXXXX)" || return 1
     {
         cat > "$_sh_tmr_tmp" <<'EOCT'
 [Unit]
@@ -4912,7 +4959,7 @@ Unit=hy2-cert-selfheal.service
 WantedBy=timers.target
 EOCT
     } && chmod 644 "$_sh_tmr_tmp" && mv -f "$_sh_tmr_tmp" /etc/systemd/system/hy2-cert-selfheal.timer || {
-        rm -f "$_sh_tmr_tmp"
+        rm -f -- "$_sh_tmr_tmp"
         return 1
     }
 
@@ -4922,16 +4969,16 @@ EOCT
     local cert_watch_dir="$HY2_CERT_DIR"
     local _cc
     _cc="$(config_tls_cert "$HY2_CONFIG")"
-    if [[ -n "$_cc" && ! "$_cc" =~ [[:cntrl:]] ]]; then
+    if [[ -n "$_cc" && ! "$_cc" =~ [[:cntrl:]] && ! "$_cc" =~ [%\$] ]]; then
         if [[ "$_cc" != /* ]]; then
             cert_watch_dir="$(dirname "${HY2_DIR}/${_cc}")"
         else
             cert_watch_dir="$(dirname "$_cc")"
         fi
     fi
-    [[ -d "$cert_watch_dir" && ! "$cert_watch_dir" =~ [[:cntrl:]] ]] || cert_watch_dir="$HY2_CERT_DIR"
+    [[ -d "$cert_watch_dir" && ! -L "$cert_watch_dir" && ! "$cert_watch_dir" =~ [[:cntrl:]] && ! "$cert_watch_dir" =~ [%\$] ]] || cert_watch_dir="$HY2_CERT_DIR"
 
-    _sh_pth_tmp="$(mktemp /etc/systemd/system/hy2-cert-selfheal.path.XXXXXX)" || return 1
+    _sh_pth_tmp="$(umask 077; mktemp /etc/systemd/system/hy2-cert-selfheal.path.XXXXXX)" || return 1
     {
         cat > "$_sh_pth_tmp" <<EOCP
 [Unit]
@@ -4945,11 +4992,11 @@ Unit=hy2-cert-selfheal.service
 WantedBy=paths.target
 EOCP
     } && chmod 644 "$_sh_pth_tmp" && mv -f "$_sh_pth_tmp" /etc/systemd/system/hy2-cert-selfheal.path || {
-        rm -f "$_sh_pth_tmp"
+        rm -f -- "$_sh_pth_tmp"
         return 1
     }
 
-    systemctl daemon-reload
+    systemctl daemon-reload || return 1
     # 看结果再报（2026-11-12 修）：旧实现两条 enable 失败都吞掉、照报「已启用」并返回 0，
     # refresh_portal 里「证书自愈单元未能补齐」的提示永远不会出现。
     systemctl enable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || return 1
@@ -4962,10 +5009,20 @@ EOCP
 # 才改并重启 Hysteria（2026-11-13 修）：旧实现装 WARP 时无条件重启，新装机根本没有这一行，
 # 装一次 WARP 就把所有在线用户断开一次。
 warp_migrate_legacy_outbound() {
+    local new_addr="${1:-}"
+    if [[ -z "$new_addr" || "$new_addr" =~ [[:space:][:cntrl:]] ]]; then
+        log_err "WARP 目标代理地址不合法，拒绝迁移旧出站配置。"
+        return 1
+    fi
+    if [[ -L "$HY2_CONFIG" ]]; then
+        log_err "${HY2_CONFIG} 不允许为符号链接，拒绝迁移旧 WARP 出站。"
+        return 1
+    fi
     [[ -f "$HY2_CONFIG" ]] && grep -qF 'addr: 127.0.0.1:40000' "$HY2_CONFIG" || return 0
     local _wm_tmp=""
+    trap 'trap - RETURN; rm -f -- "${_wm_tmp:-}"' RETURN
     _wm_tmp="$(umask 077; mktemp "${HY2_CONFIG}.migrate.XXXXXX")" || return 1
-    NEW_ADDR="$1" awk '
+    NEW_ADDR="$new_addr" awk '
         {
             idx = index($0, "addr: 127.0.0.1:40000")
             while (idx > 0) {
@@ -4974,8 +5031,8 @@ warp_migrate_legacy_outbound() {
             }
             print
         }
-    ' "$HY2_CONFIG" > "$_wm_tmp" && chmod 600 "$_wm_tmp" && mv -f "$_wm_tmp" "$HY2_CONFIG" || {
-        rm -f "$_wm_tmp"
+    ' "$HY2_CONFIG" > "$_wm_tmp" && chmod 600 -- "$_wm_tmp" && mv -f -- "$_wm_tmp" "$HY2_CONFIG" || {
+        rm -f -- "$_wm_tmp"
         return 1
     }
     systemctl reset-failed hysteria-server 2>/dev/null || true
@@ -6829,13 +6886,25 @@ release_installer_core_lock() {
 }
 
 acquire_installer_core_lock() {
+    if [[ -L "$HY2_DIR" ]]; then
+        log_err "配置目录不得为符号链接: ${HY2_DIR}"
+        return 1
+    fi
     mkdir -p "$HY2_DIR" || return 1
     if [[ -n "${_INSTALLER_CORE_LOCK_FD:-}" ]]; then
         release_installer_core_lock
     fi
-    local lock_fd
-    exec {lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
+    local lock_fd _lock_file="${HY2_DIR}/.core-operation.lock" _old_umask=""
+    if [[ -L "$_lock_file" ]]; then
+        log_err "核心操作锁路径不得为符号链接: ${_lock_file}"
+        return 1
+    fi
+    _old_umask="$(umask)"
+    umask 077
+    exec {lock_fd}>>"$_lock_file" || {
+        umask "$_old_umask"
         log_err "无法创建核心操作锁。"; return 1; }
+    umask "$_old_umask"
     if ! flock -n "$lock_fd"; then
         exec {lock_fd}>&- 2>/dev/null || true
         log_err "门户正在修改节点核心，等待完成后重试。"

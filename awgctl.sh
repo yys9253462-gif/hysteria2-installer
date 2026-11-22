@@ -103,29 +103,32 @@ awg_rand() {
 # 读取 meta 字段
 meta_get() {
     local key="$1"
-    if [[ ! -f "$AWG_META_FILE" ]]; then
+    if [[ -L "$AWG_META_FILE" || ! -f "$AWG_META_FILE" ]]; then
         echo ""
         return 0
     fi
-    jq -r --arg k "$key" '.[$k] // empty' "$AWG_META_FILE" 2>/dev/null || echo ""
+    jq -r --arg k "$key" 'if type=="object" then .[$k] // empty else empty end' "$AWG_META_FILE" 2>/dev/null || echo ""
 }
 
 # 写入 meta 字段（原子替换）
 meta_set() {
     local key="$1" value="$2" tmp=""
-    trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
+    trap 'rm -f -- "${tmp:-}"; trap - RETURN' RETURN
+    if [[ -L "$AWG_DIR" || -L "$AWG_META_FILE" ]]; then
+        die "AWG 配置目录或 meta 文件为符号链接，已拒绝写入 (key=${key})"
+    fi
     mkdir -p "$AWG_DIR"
     chmod 700 "$AWG_DIR"
     [[ -f "$AWG_META_FILE" ]] || (umask 077; echo '{}' > "$AWG_META_FILE")
     tmp="$(umask 077; mktemp "${AWG_DIR}/.meta.XXXXXX")" || die "创建 meta 临时文件失败 (key=${key})"
     if jq --arg k "$key" --arg v "$value" \
         'if type=="object" then .[$k] = $v else error("meta not object") end' \
-        "$AWG_META_FILE" > "$tmp" 2>/dev/null; then
-        chmod 600 "$tmp"
-        mv -f "$tmp" "$AWG_META_FILE"
+        "$AWG_META_FILE" > "$tmp" 2>/dev/null \
+        && chmod 600 "$tmp" \
+        && mv -f "$tmp" "$AWG_META_FILE"; then
         tmp=""
     else
-        rm -f "$tmp"
+        rm -f -- "$tmp"
         tmp=""
         die "写入 meta 失败 (key=${key})"
     fi
@@ -443,13 +446,22 @@ validate_endpoint() {
 download_binaries() {
     local line="$1" arch="$2"
     local url tmpd="" bakd=""
+    if [[ "$line" != "2" && "$line" != "3" ]]; then
+        log_err "不支持的 AmneziaWG 协议线: ${line}"
+        return 1
+    fi
+    if [[ "$arch" != "amd64" && "$arch" != "arm64" && "$arch" != "armv7" ]]; then
+        log_err "不支持的目标架构: ${arch}"
+        return 1
+    fi
 
     url="https://github.com/${AWG_REPO}/releases/download/${AWG_RELEASE_TAG}/amneziawg-linux-${arch}-awg${line}.tar.gz"
     log_step "下载 AmneziaWG 二进制 (协议线 AWG ${line}.x / 架构 ${arch})"
     log_info "来源: ${url}"
 
     tmpd="$(umask 077 && mktemp -d)"
-    trap 'trap - RETURN; rm -rf "${tmpd:-}" "${bakd:-}" 2>/dev/null || true' RETURN
+    local _dl_trap='trap - RETURN; rm -rf "${tmpd:-}" "${bakd:-}" 2>/dev/null || true'
+    trap "$_dl_trap" RETURN
     # --max-time 与 `9>&-`（2026-11-03 修）：门户 420 秒超时只杀 bash，不杀 curl；
     # curl 又继承了持锁的 fd 9。下载卡住时孤儿 curl 一直占着锁，之后每个改 AWG
     # 的命令都等 300 秒再失败，EXIT 回滚也不会执行。两次下载 + 校验必须在 420 秒内完。
@@ -479,7 +491,7 @@ download_binaries() {
     fi
     # 精确资产名、唯一匹配、64 位十六进制，否则视为失败（不取"第一条"）。
     want="$(awk -v f="amneziawg-linux-${arch}-awg${line}.tar.gz" \
-            '$1 ~ /^#/ || NF < 2 { next } { n=$2; sub(/^\*/, "", n); while (sub(/^\.\//, "", n)) {} if (n==f) print $1 }' \
+            '$1 ~ /^#/ || NF != 2 { next } { n=$2; sub(/^\*/, "", n); while (sub(/^\.\//, "", n)) {} if (n==f) print $1 }' \
             "${tmpd}/SHA256SUMS" | tr 'A-F' 'a-f' | sort -u)"
     if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
         rm -rf "$tmpd"
@@ -545,12 +557,25 @@ download_binaries() {
         return 1
     fi
 
+    if [[ -L "$AWG_DIR" ]]; then
+        rm -rf "$tmpd"
+        log_err "配置目录不得为符号链接: ${AWG_DIR}"
+        return 1
+    fi
+    for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
+        if [[ -L "$f" ]]; then
+            rm -rf "$tmpd"
+            log_err "目标二进制路径不得为符号链接: ${f}"
+            return 1
+        fi
+    done
+
     mkdir -p "$AWG_DIR"
     # 覆盖现役二进制前先备份，并使用同目录临时文件原子替换，避免覆写运行中程序触发 ETXTBSY。
     local f
     bakd="$(umask 077; mktemp -d "${AWG_DIR}/.binbak.XXXXXX")"
     for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
-        [[ -e "$f" ]] && cp -a "$f" "$bakd/$(basename "$f")"
+        [[ -e "$f" ]] && cp -a -- "$f" "$bakd/$(basename "$f")"
     done
     _restore_bins() {
         for f in "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
@@ -560,20 +585,30 @@ download_binaries() {
                 rm -f "$f" || true
             fi
         done
-        rm -rf "$bakd"
+        rm -rf -- "$bakd"
     }
+    local _inst_rc=0
     if ! awg_atomic_install_bin "${tmpd}/amneziawg-go" "$AWG_GO_BIN" \
             || ! awg_atomic_install_bin "${tmpd}/awg" "$AWG_BIN" \
             || ! awg_atomic_install_bin "${tmpd}/awg-quick" "$AWG_QUICK_BIN"; then
-        _restore_bins; rm -rf "$tmpd"
+        _inst_rc=1
+    fi
+    trap "$_dl_trap" RETURN
+    if [[ "$_inst_rc" -ne 0 ]]; then
+        _restore_bins
+        trap "$_dl_trap" RETURN
+        unset -f _restore_bins
+        rm -rf -- "$tmpd"
         log_err "写入二进制失败，已恢复原有版本"
         return 1
     fi
     if [[ -f "${tmpd}/VERSION" && ! -L "${tmpd}/VERSION" ]]; then
         awg_atomic_copy_file "${tmpd}/VERSION" "$AWG_VERSION_FILE"
+        trap "$_dl_trap" RETURN
         chmod 600 "$AWG_VERSION_FILE"
     fi
-    rm -rf "$bakd" "$tmpd"
+    rm -rf -- "$bakd" "$tmpd"
+    bakd=""; tmpd=""
     unset -f _restore_bins
     log_info "已安装: ${AWG_GO_BIN} / ${AWG_BIN} / ${AWG_QUICK_BIN}"
 }
@@ -1534,11 +1569,11 @@ cmd_uninstall() {
         fi
         ip link delete dev "$AWG_LINK" 2>/dev/null || true
     fi
-    rm -f "$AWG_SERVICE"
+    rm -f -- "$AWG_SERVICE"
     systemctl daemon-reload 2>/dev/null || true
 
     if [[ "$keep_binaries" != "1" ]]; then
-        rm -f "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"
+        rm -f -- "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"
         log_info "已移除二进制"
     fi
 
@@ -1550,7 +1585,10 @@ cmd_uninstall() {
         revoke_firewall "$old_port"
     fi
 
-    # 防止异常环境变量将 AWG_DIR 指向根目录或顶层系统目录导致误删（同时兼容 Windows 单测盘符路径）。
+    # 防止异常环境变量将 AWG_DIR 指向根目录、顶层系统目录或符号链接导致误删（同时兼容 Windows 单测盘符路径）。
+    if [[ -L "$AWG_DIR" ]]; then
+        die "AWG_DIR 为符号链接（${AWG_DIR}），已拒绝递归删除。"
+    fi
     local clean_awg_dir="${AWG_DIR%/}"
     clean_awg_dir="${clean_awg_dir%\\}"
     if [[ -z "$clean_awg_dir" \
@@ -1565,7 +1603,7 @@ cmd_uninstall() {
             ;;
     esac
 
-    rm -rf "$AWG_DIR"
+    rm -rf -- "$AWG_DIR"
     # 再清掉可能因此变空的厂商级父目录（/etc/amnezia）。
     # 用 rmdir 而不是 rm -rf：只在它确实为空时删除，
     # 万一用户在该目录下还有别的东西（例如官方包的其他组件）不会被误删。
@@ -1749,6 +1787,7 @@ cmd_update() {
 
 # 依 meta 重新渲染服务端配置并热重载（不中断现有连接）
 cmd_resync() {
+    [[ $# -eq 0 ]] || die "resync 不接受多余参数: $1"
     require_root
     require_jq
     is_installed || die "AmneziaWG 尚未安装。"
@@ -1805,7 +1844,7 @@ parse_name_endpoint() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --endpoint)
-                if [[ $# -lt 2 ]]; then
+                if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
                     die "--endpoint 缺少取值（应形如 --endpoint vpn.example.com）"
                 fi
                 PARSED_ENDPOINT="$2"
