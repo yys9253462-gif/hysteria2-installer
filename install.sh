@@ -428,7 +428,7 @@ hy2_acme_install_verified() {
     fi
 
     work="$(umask 077 && mktemp -d)" || { log_err "无法创建临时目录，已放弃安装 acme.sh。"; return 1; }
-    trap 'rm -rf "${work:-}" 2>/dev/null || true' RETURN
+    trap 'trap - RETURN; rm -rf "${work:-}" 2>/dev/null || true' RETURN
 
     for path in $HY2_ACME_FILES; do
         if ! blob="$(hy2_acme_blob_for_path "$tree_json" "$path")"; then
@@ -534,7 +534,7 @@ hy2_acme_verify_existing() {
         return 1
     fi
     work="$(umask 077 && mktemp -d)" || { log_err "无法创建临时目录，无法校验已有 acme.sh。"; return 1; }
-    trap 'rm -rf "${work:-}" 2>/dev/null || true' RETURN
+    trap 'trap - RETURN; rm -rf "${work:-}" 2>/dev/null || true' RETURN
     # 优先对比本机记录的固定 commit（本项目装的 / 已核验过的安装）。
     # 记录存在时**绝不**回退到上游 master：对不上就是被改过，必须阻断。
     # 没有记录的旧安装（get.acme.sh 装的）只能对比当前 master，核验通过后再补记录。
@@ -955,7 +955,7 @@ install_binary() {
     LATEST_TAG=$(curl -s --max-time 10 --max-filesize=2097152 https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || LATEST_TAG=""
 
     local asset_arch asset tmpdir="" staged="" expected got
-    trap 'rm -rf "${tmpdir:-}" "${staged:-}"' RETURN
+    trap 'trap - RETURN; rm -rf "${tmpdir:-}" "${staged:-}"' RETURN
     if ! asset_arch="$(hy2_core_asset_arch "$HY2_ARCH")"; then
         log_err "Hysteria 2 不支持当前 CPU 架构: ${HY2_ARCH}"
         return 1
@@ -1667,7 +1667,6 @@ nginx_reload_checked() {
 setup_cert_via_nginx() {
     local domain="$1" email="$2"
     local _nginx_tmp=""
-    trap 'rm -f "${_nginx_tmp:-}"' RETURN
     # 调用方用 $(...) 取 "cert|key"：日志与 acme.sh 输出全部改走 stderr，
     # 只有最后那一行结果写到 fd 3（原 stdout）。
     exec 3>&1 1>&2
@@ -1683,6 +1682,8 @@ setup_cert_via_nginx() {
         return 1
     fi
     hy2_acme_ensure || return 1
+    # hy2_acme_ensure 内部可能使用 RETURN 陷阱，在它返回后再挂本函数清理陷阱防止被覆盖。
+    trap 'trap - RETURN; rm -f "${_nginx_tmp:-}"' RETURN
     local acct="${HOME}/.acme.sh/acme.sh" conf="" rc=0
     local created_owned_conf=0
     export SKIP_ACME_SH_UPGRADE=1
@@ -3640,7 +3641,7 @@ setup_systemd() {
         return 1
     fi
     local _sysctl_tmp="" _svc_tmp="" _dropin_tmp=""
-    trap 'rm -f "${_sysctl_tmp:-}" "${_svc_tmp:-}" "${_dropin_tmp:-}"' RETURN
+    trap 'trap - RETURN; rm -f "${_sysctl_tmp:-}" "${_svc_tmp:-}" "${_dropin_tmp:-}"' RETURN
     _sysctl_tmp="$(umask 077; mktemp /etc/sysctl.d/99-hysteria2.conf.XXXXXX)" || return 1
     if ! cat > "$_sysctl_tmp" <<EOF
 # Hysteria 2 内核网络与 UDP 缓冲调优 (由 hysteria2-installer 自动生成)
@@ -3973,7 +3974,7 @@ portal_fetch_files() {
 # 比逐文件请求省额度。取不到返回 1 —— 调用方必须 fail-closed。
 portal_remote_blob_shas() {
     local ref="${1:-}" json=""
-    trap 'rm -f "${json:-}"' RETURN
+    trap 'trap - RETURN; rm -f "${json:-}"' RETURN
     [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
     json="$(umask 077; mktemp)" || return 1
     if ! curl -fsSL --max-time 20 --max-filesize=4194304 -H "Accept: application/vnd.github+json" \
@@ -4112,7 +4113,8 @@ EOF
 portal_ensure_py() {
     local dest_dir="$HY2_DIR"
     local srcdir="" dir="" tmpdir="" stage="" m
-    trap 'trap - RETURN; [[ -n "${stage:-}" ]] && rm -rf "$stage"; [[ -n "${tmpdir:-}" ]] && rm -rf "$tmpdir"' RETURN
+    local _ensure_trap='trap - RETURN; [[ -n "${stage:-}" ]] && rm -rf "$stage"; [[ -n "${tmpdir:-}" ]] && rm -rf "$tmpdir"'
+    trap "$_ensure_trap" RETURN
 
     # 本地快路径：门户两个文件 + 计量模块都在脚本同目录才用。
     # 少任何一个都说明是残缺的本地树 —— 这种情况宁可走网络拉完整的，也不要写一半进去。
@@ -4131,7 +4133,11 @@ portal_ensure_py() {
 
     if [[ -z "$srcdir" ]]; then
         tmpdir="$(umask 077; mktemp -d)"
-        if portal_fetch_py "$tmpdir"; then
+        local _fetch_rc=0
+        portal_fetch_py "$tmpdir" || _fetch_rc=$?
+        # portal_fetch_py 会经 portal_remote_blob_shas 覆盖全局 RETURN 陷阱，返回后须立即重挂。
+        trap "$_ensure_trap" RETURN
+        if [[ "$_fetch_rc" -eq 0 ]]; then
             srcdir="$tmpdir"
         else
             rm -rf "$tmpdir"
@@ -4620,7 +4626,7 @@ EOF
 # 执行体是一个只调 `portal.py selfheal` 的脚本：幂等，无漂移时零写入。
 setup_cert_selfheal() {
     local _sh_script_tmp="" _sh_svc_tmp="" _sh_tmr_tmp="" _sh_pth_tmp=""
-    trap 'rm -f "${_sh_script_tmp:-}" "${_sh_svc_tmp:-}" "${_sh_tmr_tmp:-}" "${_sh_pth_tmp:-}"' RETURN
+    trap 'trap - RETURN; rm -f "${_sh_script_tmp:-}" "${_sh_svc_tmp:-}" "${_sh_tmr_tmp:-}" "${_sh_pth_tmp:-}"' RETURN
     _sh_script_tmp="$(umask 077; mktemp /usr/local/bin/hy2-cert-selfheal.sh.XXXXXX)" || return 1
     {
         cat > "$_sh_script_tmp" <<'EOCS'
@@ -5556,7 +5562,7 @@ EOF
 awg_fetch_ctl() {
     local out="$1"
     local ref expected blob tmp="" staged=""
-    trap 'rm -f "${tmp:-}" "${staged:-}"' RETURN
+    trap 'trap - RETURN; rm -f "${tmp:-}" "${staged:-}"' RETURN
 
     # 只解析一次，三个源都读同一快照；解析失败就放弃，绝不回退到浮动 main。
     ref="$(curl -fsSL --max-time 15 --max-filesize=2097152 "https://api.github.com/repos/${AWG_REPO}/commits/main" 2>/dev/null |
@@ -6248,7 +6254,8 @@ uninstall_all() {
 
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         acquire_installer_core_lock || return 1
-        trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi' RETURN
+        local _lock_trap='trap - RETURN; if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi'
+        trap "$_lock_trap" RETURN
         log_step "正在停止并删除系统服务..."
         systemctl stop hysteria-server 2>/dev/null || true
         systemctl disable hysteria-server 2>/dev/null || true
@@ -6427,6 +6434,7 @@ uninstall_all() {
         if [[ "$awg_confirm" =~ ^[Yy]$ ]]; then
             log_step "正在卸载 AmneziaWG..."
             awg_ensure_ctl 2>/dev/null || true
+            trap "$_lock_trap" RETURN
             # 控制工具卸载失败时（停不下来 / 禁用失败）它会刻意保留全部资产并退出非零。
             # 旧实现吞掉退出码、删掉控制工具、照报「已卸载」：AWG 实际还在跑，
             # 却没了管理它的工具（2026-11-03 修）。
@@ -6547,19 +6555,29 @@ flow_install() {
         ask_preserve_portal
     fi
     acquire_installer_core_lock || return 1
-    trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi' RETURN
+    local _lock_trap='trap - RETURN; if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi'
+    trap "$_lock_trap" RETURN
     if [[ -f "$HY2_CONFIG" ]]; then
         backup_state_before_reconfigure || return 1
     fi
     require_systemd_247 || return 1
     install_dependencies
     get_public_ip
-    install_binary
-    setup_certificates
+    local _step_rc=0
+    install_binary || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
+    _step_rc=0
+    setup_certificates || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
     setup_ports_and_obfs
     generate_server_config
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
-    setup_systemd
+    _step_rc=0
+    setup_systemd || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
     if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi
     show_client_configs
 }
@@ -6648,7 +6666,8 @@ flow_reconfigure() {
     fi
     ask_preserve_portal
     acquire_installer_core_lock || return 1
-    trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi' RETURN
+    local _lock_trap='trap - RETURN; if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi'
+    trap "$_lock_trap" RETURN
     backup_state_before_reconfigure || return 1
     # 先记下旧端口：setup_ports_and_obfs 会重写 meta，之后就拿不到了。
     local _old_listen _old_sub
@@ -6657,12 +6676,18 @@ flow_reconfigure() {
     require_systemd_247 || return 1
     install_dependencies
     get_public_ip
-    setup_certificates
+    local _step_rc=0
+    setup_certificates || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
     setup_ports_and_obfs
     generate_server_config
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     close_replaced_ports "$_old_listen" "$_old_sub"
-    setup_systemd
+    _step_rc=0
+    setup_systemd || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
     if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi
     show_client_configs
 }
