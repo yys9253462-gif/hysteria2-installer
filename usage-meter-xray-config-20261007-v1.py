@@ -5,14 +5,28 @@ import json
 import os
 import secrets
 import shutil
+import stat
 import subprocess
 import time
+
+_MAX_XRAY_CONFIG_BYTES = 4 * 1024 * 1024
+
+
+def _read_regular_config_bytes(path):
+    """安全读取常规 Xray 配置文件：拒绝符号链接、非常规文件与超过 4 MiB 的大文件。"""
+    st = path.lstat()
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        raise ValueError('xray config must be a regular file')
+    if st.st_size > _MAX_XRAY_CONFIG_BYTES:
+        raise ValueError('xray config too large')
+    return path.read_bytes(), (st.st_mode & 0o777) or 0o600
+
 
 def _validate_loopback_address(address):
     if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
         raise ValueError('stats endpoint must be loopback')
     port_text = address[len('127.0.0.1:'):]
-    if (not port_text.isascii() or not port_text.isdigit()
+    if (not port_text.isascii() or not port_text.isdigit() or len(port_text) > 5
             or port_text.startswith('0') or not (1 <= int(port_text) <= 65535)):
         raise ValueError('stats endpoint must be loopback')
 
@@ -32,7 +46,7 @@ def _client_level_key(raw_level):
         return str(raw_level) if raw_level >= 0 else None
     if isinstance(raw_level, str):
         cleaned = raw_level.strip()
-        if cleaned and cleaned.isascii() and cleaned.isdigit():
+        if cleaned and len(cleaned) <= 6 and cleaned.isascii() and cleaned.isdigit():
             return str(int(cleaned))
     return None
 
@@ -51,11 +65,12 @@ def _inbound_uses_port(raw_port, target_port):
             if '-' in seg:
                 lo_s, _, hi_s = seg.partition('-')
                 lo_s, hi_s = lo_s.strip(), hi_s.strip()
-                if (lo_s.isascii() and lo_s.isdigit() and hi_s.isascii() and hi_s.isdigit()):
+                if (lo_s.isascii() and lo_s.isdigit() and len(lo_s) <= 5
+                        and hi_s.isascii() and hi_s.isdigit() and len(hi_s) <= 5):
                     lo, hi = int(lo_s), int(hi_s)
                     if lo <= target_port <= hi:
                         return True
-            elif seg.isascii() and seg.isdigit() and int(seg) == target_port:
+            elif seg.isascii() and seg.isdigit() and len(seg) <= 5 and int(seg) == target_port:
                 return True
     return False
 
@@ -189,6 +204,8 @@ def add_iplimit_routing(cfg):
     if 'RoutingService' not in services:services.append('RoutingService')
     api['services']=services
     outbounds=_ensure_list(cfg,'outbounds')
+    # 清理非 dict 脏元素，防止首位被脏对象占据导致 Xray 配置加载失败。
+    outbounds[:] = [o for o in outbounds if isinstance(o, dict)]
     if not outbounds:outbounds.append({'protocol':'freedom','tag':'direct'})
     if isinstance(outbounds[0], dict) and outbounds[0].get('tag')==IPLIMIT_OUTBOUND_TAG:
         # 保留原默认出口的行为，托管 tag 留给后面的黑洞。首个出站本身就是托管黑洞时
@@ -299,8 +316,7 @@ def enable_iplimit_routing(config_path, binary, address):
     _validate_binary(binary)
     _validate_loopback_address(address)
     path=pathlib.Path(config_path)
-    original=path.read_bytes()
-    orig_mode=(path.stat().st_mode & 0o777) or 0o600
+    original, orig_mode = _read_regular_config_bytes(path)
     config=json.loads(original)
     if not isinstance(config, dict):raise ValueError('invalid xray config')
     if iplimit_routing_ready(config):
@@ -362,8 +378,7 @@ def enable_reality_online(config_path, binary, address):
     _validate_binary(binary)
     _validate_loopback_address(address)
     path=pathlib.Path(config_path)
-    original=path.read_bytes()
-    orig_mode=(path.stat().st_mode & 0o777) or 0o600
+    original, orig_mode = _read_regular_config_bytes(path)
     config=json.loads(original)
     if not isinstance(config, dict):raise ValueError('invalid xray config')
     policy=_ensure_dict(config,'policy')

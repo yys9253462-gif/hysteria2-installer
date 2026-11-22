@@ -14,12 +14,13 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     if source not in ('hysteria', 'reality'):
         raise ValueError('unknown source')
     if (not isinstance(epoch, str) or not epoch.strip()
-            or any(ord(c) < 32 or ord(c) == 127 for c in epoch)):
+            or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in epoch)):
         raise ValueError('missing service epoch')
     if not isinstance(counters, dict):
         raise ValueError('counters must be a dict')
     valid_ts = (
-        (isinstance(sampled_at, str) and bool(sampled_at.strip()))
+        (isinstance(sampled_at, str) and bool(sampled_at.strip())
+         and not any(ord(c) < 32 or ord(c) == 127 for c in sampled_at))
         or (isinstance(sampled_at, (int, float)) and not isinstance(sampled_at, bool)
             and math.isfinite(sampled_at))
     )
@@ -36,7 +37,9 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
         active_users = normalized_active
     clean = {}
     for uid, pair in counters.items():
-        if not isinstance(uid, str) or not uid or not isinstance(pair, dict):
+        if (not isinstance(uid, str) or not uid
+                or any(ord(c) < 32 or ord(c) == 127 for c in uid)
+                or not isinstance(pair, dict)):
             raise ValueError('invalid counter entry')
         tx, rx = pair.get('tx'), pair.get('rx')
         if type(tx) is not int or type(rx) is not int or min(tx, rx) < 0:
@@ -96,6 +99,8 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     for uid in clean:
         total_bytes(new, uid)
     adjustments = new.get('adjustments')
+    if adjustments is not None and not isinstance(adjustments, dict):
+        raise ValueError('invalid adjustments')
     if isinstance(adjustments, dict):
         # 账户删除并清空 totals 时，必须一并清掉平级 adjustments[uid]；
         # 否则残留的负偏移会在同名重建后让 adjusted_bytes 算出负值，导致整机计量循环持续失败。
