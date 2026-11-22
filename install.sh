@@ -1323,6 +1323,7 @@ detect_webserver_squatting() {
 # 输出 "cert|key"（找到）或空串（没找到）。
 find_cert_in_webserver() {
     local domain="$1" c k
+    [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || return 1
     # 优先搜 Caddy 2.x：/var/lib/caddy/.local/share/caddy/certificates/<ca>/<domain>/
     # 🔴 CADDY_CERT_ROOT 可覆盖根路径：不同发行版/运行用户路径不同，
     #    同时留出测试注入点 —— 否则本函数无法被测试覆盖。
@@ -1344,7 +1345,8 @@ find_cert_in_webserver() {
 
     # 🔴 Nginx（certbot 签发）：布局完全不同，且路径由配置决定，不能硬编码。
     # Nginx 装机量远大于 Caddy，缺了这条会让大量用户仍退回自签。
-    for c in $(_nginx_cert_candidates); do
+    while IFS= read -r c; do
+        [[ -n "$c" ]] || continue
         # certbot 的私钥是同目录的 privkey.pem（2026-11-04 修）：旧写法
         # ${c%.fullchain.pem} 去不掉 "/fullchain.pem" 里的斜杠，拼出
         # fullchain.pem.privkey.pem，Nginx + certbot 的证书永远复用不上。
@@ -1357,7 +1359,7 @@ find_cert_in_webserver() {
         if _cert_matches_domain "$c" "$domain"; then
             echo "$c|$k"; return 0
         fi
-    done
+    done < <(_nginx_cert_candidates)
     return 1
 }
 
@@ -1390,10 +1392,13 @@ _accept_cert_pair() {
 # 过期检查（2026-11-04 补）：复用扫描、导入、本机扫描都曾收下过期证书并标成可信，
 # 客户端校验全部失败，而面板显示一切正常。
 _cert_key_usable() {
-    local c="$1" k="$2" pub prv
+    local c="$1" k="$2" pub_pem prv_pem pub prv
     openssl x509 -in "$c" -noout -checkend 86400 >/dev/null 2>&1 || return 1
-    pub="$(openssl x509 -in "$c" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}')"
-    prv="$(openssl pkey -in "$k" -pubout 2>/dev/null | openssl sha256 2>/dev/null | awk '{print $NF}')"
+    pub_pem="$(openssl x509 -in "$c" -noout -pubkey 2>/dev/null)" || return 1
+    prv_pem="$(openssl pkey -in "$k" -pubout 2>/dev/null)" || return 1
+    [[ -n "$pub_pem" && -n "$prv_pem" ]] || return 1
+    pub="$(printf '%s\n' "$pub_pem" | openssl sha256 2>/dev/null | awk '{print $NF}')"
+    prv="$(printf '%s\n' "$prv_pem" | openssl sha256 2>/dev/null | awk '{print $NF}')"
     [[ -n "$pub" && "$pub" == "$prv" ]] || return 1
     return 0
 }
@@ -2509,7 +2514,7 @@ backup_state_before_reconfigure() {
              "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
         _snaps=()
         for _old in "${f}".bak-*; do
-            [[ -f "$_old" ]] && _snaps+=("$_old")
+            [[ -f "$_old" && ! -L "$_old" ]] && _snaps+=("$_old")
         done
         if (( ${#_snaps[@]} > 5 )); then
             printf '%s\n' "${_snaps[@]}" | sort -r | tail -n +6 | while IFS= read -r _old; do
@@ -4106,7 +4111,8 @@ EOF
 # 而非真实文件，所以必须做存在性判断。
 portal_ensure_py() {
     local dest_dir="$HY2_DIR"
-    local srcdir="" dir="" tmpdir=""
+    local srcdir="" dir="" tmpdir="" stage="" m
+    trap 'trap - RETURN; [[ -n "${stage:-}" ]] && rm -rf "$stage"; [[ -n "${tmpdir:-}" ]] && rm -rf "$tmpdir"' RETURN
 
     # 本地快路径：门户两个文件 + 计量模块都在脚本同目录才用。
     # 少任何一个都说明是残缺的本地树 —— 这种情况宁可走网络拉完整的，也不要写一半进去。
@@ -4156,9 +4162,7 @@ portal_ensure_py() {
     fi
 
     # 先在目标文件系统暂存整包；srcdir == dest_dir 时也不会覆盖输入。
-    local stage m
-    if ! stage="$(mktemp -d "${dest_dir}/.portal-bundle-XXXXXX")"; then
-        [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
+    if ! stage="$(umask 077; mktemp -d "${dest_dir}/.portal-bundle-XXXXXX")"; then
         return 1
     fi
     for m in $PORTAL_FILES $METER_FILES; do
@@ -4200,6 +4204,14 @@ try:
     for f in files:
         os.replace(stage / f, dest / f)
         written.append(f)
+    try:
+        dir_fd = os.open(str(dest), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 except Exception:
     for f in reversed(written):
         try:
