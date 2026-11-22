@@ -971,7 +971,7 @@ install_binary() {
         # 可能已经切换版本，导致摘要与资产对不上（或更糟：对上了另一个版本）。
         local resolved
         resolved="$(curl -fsSIL --max-time 20 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
-            awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)"
+            awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)" || resolved=""
         if [[ "$resolved" =~ /app/(v[0-9][^/]*)/${asset}$ ]]; then
             # 下载站只给出裸版本号（v2.13.0），而 GitHub 的 release tag 是
             # `app/v2.13.0`。用裸版本号拼 GitHub URL 实测 404（hashes.txt 与资产
@@ -1059,16 +1059,56 @@ reuse_existing_cert_config() {
     mt="$(jq -r '.cert_type // empty' "$HY2_META_FILE" 2>/dev/null || true)"
     insecure="$(jq -r '.is_insecure // empty' "$HY2_META_FILE" 2>/dev/null || true)"
 
-    if grep -q '^acme:' <<<"$txt"; then
-        dom="$(awk '/^acme:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*-[[:space:]]/{sub(/^[[:space:]]*-[[:space:]]*/,"");gsub(/"/,"");print;exit}' <<<"$txt")"
-        email="$(awk '/^[[:space:]]*email:/{sub(/^[[:space:]]*email:[[:space:]]*/,"");gsub(/"/,"");print;exit}' <<<"$txt")"
+    if grep -qE '^acme:[[:space:]]*(#.*)?$' <<<"$txt"; then
+        dom="$(awk '
+            /^acme:[[:space:]]*(#.*)?$/ { f=1; next }
+            /^[^[:space:]#]/ { f=0 }
+            f && /^[[:space:]]*-[[:space:]]+/ {
+                v = $0
+                sub(/^[[:space:]]*-[[:space:]]+/, "", v)
+                if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+                else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+                else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+                print v; exit
+            }' <<<"$txt")"
+        email="$(awk '
+            /^acme:[[:space:]]*(#.*)?$/ { f=1; next }
+            /^[^[:space:]#]/ { f=0 }
+            f && /^[[:space:]]+email:[[:space:]]*/ {
+                v = $0
+                sub(/^[[:space:]]+email:[[:space:]]*/, "", v)
+                if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+                else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+                else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+                print v; exit
+            }' <<<"$txt")"
         CERT_TYPE="acme"
         SERVER_NAME="${SERVER_NAME:-$dom}"
         ACME_EMAIL="${ACME_EMAIL:-$email}"
         IS_INSECURE="false"
     else
-        cert="$(awk '/^tls:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*cert:/{sub(/^[[:space:]]*cert:[[:space:]]*/,"");gsub(/^"|"$/,"");print;exit}' <<<"$txt")"
-        key="$(awk '/^tls:/{f=1;next} /^[^ ]/{f=0} f&&/^[[:space:]]*key:/{sub(/^[[:space:]]*key:[[:space:]]*/,"");gsub(/^"|"$/,"");print;exit}' <<<"$txt")"
+        cert="$(awk '
+            /^tls:[[:space:]]*(#.*)?$/ { f=1; next }
+            /^[^[:space:]#]/ { f=0 }
+            f && /^[[:space:]]+cert:[[:space:]]*/ {
+                v = $0
+                sub(/^[[:space:]]+cert:[[:space:]]*/, "", v)
+                if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+                else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+                else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+                print v; exit
+            }' <<<"$txt")"
+        key="$(awk '
+            /^tls:[[:space:]]*(#.*)?$/ { f=1; next }
+            /^[^[:space:]#]/ { f=0 }
+            f && /^[[:space:]]+key:[[:space:]]*/ {
+                v = $0
+                sub(/^[[:space:]]+key:[[:space:]]*/, "", v)
+                if (v ~ /^"/) { sub(/^"/, "", v); sub(/".*$/, "", v) }
+                else if (v ~ /^\047/) { sub(/^\047/, "", v); sub(/\047.*$/, "", v) }
+                else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+                print v; exit
+            }' <<<"$txt")"
         [[ -n "$cert" && -n "$key" && -f "$cert" && -f "$key" ]] || return 1
         CERT_FILE="$cert"
         KEY_FILE="$key"
@@ -1508,8 +1548,12 @@ scrub_caddy_identity() {
 setup_cert_via_existing_caddy() {
     local domain="$1"
     local certdir="/var/lib/caddy/.local/share/caddy/certificates"
+    local cf="/etc/caddy/Caddyfile" bak="" cand="" rb_tmp=""
+    trap 'trap - RETURN; rm -f "${cand:-}" "${rb_tmp:-}" 2>/dev/null || true' RETURN
     command -v caddy >/dev/null 2>&1 || { log_err "未找到 caddy 命令。"; return 1; }
-    if [[ -z "$domain" || "$domain" == *..* || ! "$domain" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    local domain_lc
+    domain_lc="$(printf '%s' "$domain" | tr 'A-Z' 'a-z')"
+    if ! is_valid_domain "$domain_lc"; then
         log_err "域名格式不合法，已拒绝写入 Caddyfile: ${domain}"
         return 1
     fi
@@ -1522,16 +1566,15 @@ setup_cert_via_existing_caddy() {
     fi
 
     # 备份后在同目录候选文件上构造并校验，校验通过才原子替换生产 Caddyfile
-    local cf="/etc/caddy/Caddyfile" bak cand rb_tmp
     [[ -f "$cf" ]] || { log_err "找不到 /etc/caddy/Caddyfile。"; return 1; }
-    bak="${cf}.bak-hy2-$(date +%Y%m%d-%H%M%S)"
+    bak="${cf}.bak-hy2-$(date +%Y%m%d-%H%M%S).$$"
     cp -a "$cf" "$bak" || { log_err "备份 Caddyfile 失败。"; return 1; }
     log_info "已备份 Caddyfile -> ${bak}"
 
     # 幂等：已存在该域名块就不重复追加
     local appended=0
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
-        cand="$(mktemp "${cf}.hy2-tmp.XXXXXX")" || { log_err "创建 Caddyfile 候选临时文件失败。"; return 1; }
+        cand="$(umask 077 && mktemp "${cf}.hy2-tmp.XXXXXX")" || { log_err "创建 Caddyfile 候选临时文件失败。"; return 1; }
         if ! cp -p "$cf" "$cand" || ! cat >> "$cand" <<CEOF
 
 # 证书签发站点（由 install.sh 自动追加）
@@ -1579,7 +1622,7 @@ CEOF
         sleep 5
     done
     if [[ "$appended" == 1 ]]; then
-        rb_tmp="$(mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
+        rb_tmp="$(umask 077 && mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
         if [[ -n "$rb_tmp" ]] && cp -p "$bak" "$rb_tmp" 2>/dev/null && mv -f "$rb_tmp" "$cf" 2>/dev/null; then
             :
         else
@@ -1628,17 +1671,30 @@ hy2_acme_ensure() {
 # 有 crontab 且上游已写入计划任务时不重复安装。
 hy2_acme_ensure_renew_timer() {
     local home="$1" unit_dir="${HY2_SYSTEMD_DIR:-/etc/systemd/system}"
+    local svc_tmp="" tmr_tmp=""
+    trap 'trap - RETURN; rm -f "${svc_tmp:-}" "${tmr_tmp:-}" 2>/dev/null || true' RETURN
+    if [[ -z "$home" || "$home" =~ [[:space:][:cntrl:]\"\'\`\;] ]]; then
+        return 1
+    fi
     if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF 'acme.sh --cron'; then
         return 0
     fi
     command -v systemctl >/dev/null 2>&1 || return 1
+    svc_tmp="$(umask 077 && mktemp "${unit_dir}/.hy2-acme-renew.service.XXXXXX")" || return 1
     printf '%s\n' '[Unit]' 'Description=acme.sh certificate renewal (hysteria2-installer)' '' \
         '[Service]' 'Type=oneshot' "ExecStart=${home}/acme.sh --cron --home ${home}" \
-        > "${unit_dir}/hy2-acme-renew.service" || return 1
+        > "$svc_tmp" || return 1
+    chmod 0644 "$svc_tmp" 2>/dev/null || true
+    mv -f "$svc_tmp" "${unit_dir}/hy2-acme-renew.service" || return 1
+    svc_tmp=""
+    tmr_tmp="$(umask 077 && mktemp "${unit_dir}/.hy2-acme-renew.timer.XXXXXX")" || return 1
     printf '%s\n' '[Unit]' 'Description=Daily acme.sh renewal (hysteria2-installer)' '' \
         '[Timer]' 'OnCalendar=daily' 'RandomizedDelaySec=3600' 'Persistent=true' '' \
         '[Install]' 'WantedBy=timers.target' \
-        > "${unit_dir}/hy2-acme-renew.timer" || return 1
+        > "$tmr_tmp" || return 1
+    chmod 0644 "$tmr_tmp" 2>/dev/null || true
+    mv -f "$tmr_tmp" "${unit_dir}/hy2-acme-renew.timer" || return 1
+    tmr_tmp=""
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now hy2-acme-renew.timer >/dev/null 2>&1
 }
@@ -5867,7 +5923,12 @@ install_amneziawg() {
         if [[ "$has_peers" == "0" ]]; then
             echo ""
             read -rp "请为首个客户端命名 [默认: client1]: " client || true
+            client="${client// /}"
             client="${client:-client1}"
+            if [[ "$client" == "." || "$client" == ".." || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
+                log_err "客户端名称不合法（仅允许 1-32 位字母/数字/._-，且不能为 . 或 ..）。"
+                return 1
+            fi
         fi
     fi
 
@@ -5881,12 +5942,12 @@ install_amneziawg() {
         args+=(--endpoint "$endpoint")
     fi
 
-    # 已有客户端时不重复创建，避免报"客户端已存在"
+    # 已有客户端或未提供连接地址时不创建首个客户端，避免报"客户端已存在"或与上方提示矛盾
     local peer_count="0"
     if [[ -f "$AWG_PEERS_FILE" ]]; then
         peer_count="$(jq -r '[.peers[]?]|length' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
     fi
-    if [[ "$peer_count" == "0" ]]; then
+    if [[ -n "$endpoint" && "$peer_count" == "0" ]]; then
         args+=(--client "$client")
     fi
 
