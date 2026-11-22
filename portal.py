@@ -240,13 +240,15 @@ _UNLOCK_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 def _unlock_read(resp, limit):
     # 分块传输被对端提前断开时 read() 会抛 IncompleteRead —— 判据只看页面里
     # 的几个标记，拿到的部分内容已经够用，不能因此把整项判成「检测失败」。
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        return ''
     try:
         raw = resp.read(limit)
     except http.client.IncompleteRead as e:
-        raw = e.partial
+        raw = (e.partial or b'')[:limit]
     if not raw:
         return ''
-    return raw.decode('utf-8', 'replace')
+    return raw[:limit].decode('utf-8', 'replace')
 
 
 def _unlock_fetch(url, timeout=8, limit=400000):
@@ -10092,9 +10094,13 @@ if __name__ == '__main__':
         jsDelivr / raw 可能返回与所 pin commit 不符的内容（缓存污染或 CDN 侧篡改），
         只比对 marker 挡不住 —— 只要内容里含 marker 且语法合法就会被写盘。
         """
-        if ref != "main" and not re.fullmatch(r"[0-9a-f]{40}", ref):
+        if (not isinstance(filename, str)
+                or not re.fullmatch(r'[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*', filename)
+                or any(part in ('', '.', '..') for part in filename.split('/'))):
+            raise ValueError("invalid repo filename")
+        if not isinstance(ref, str) or (ref != "main" and not re.fullmatch(r"[0-9a-f]{40}", ref)):
             raise ValueError("invalid immutable ref")
-        if expect_blob is not None and not re.fullmatch(r"[0-9a-f]{40}", expect_blob):
+        if expect_blob is not None and (not isinstance(expect_blob, str) or not re.fullmatch(r"[0-9a-f]{40}", expect_blob)):
             raise ValueError("invalid expected blob sha")
         sources = [
             ('https://api.github.com/repos/' + AWG_REPO + '/contents/' + filename + '?ref=' + ref,
@@ -10145,6 +10151,12 @@ if __name__ == '__main__':
         现在 API 拿不到就返回 None，调用方必须 fail-closed（放弃更新）。
         marker 参数仅为兼容既有调用点保留，此处不再用于下载内容。
         """
+        if (not isinstance(filename, str)
+                or not re.fullmatch(r'[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*', filename)
+                or any(part in ('', '.', '..') for part in filename.split('/'))):
+            return None
+        if not isinstance(ref, str) or (ref != 'main' and not re.fullmatch(r'[0-9a-f]{40}', ref)):
+            return None
         try:
             url = ('https://api.github.com/repos/' + AWG_REPO + '/contents/'
                    + filename + '?ref=' + ref)
@@ -10202,6 +10214,7 @@ if __name__ == '__main__':
             replaced = False
             try:
                 with os.fdopen(fd, 'wb') as fh:
+                    fd = None
                     fh.write(content)
                     fh.flush()
                     os.fsync(fh.fileno())
@@ -10209,6 +10222,11 @@ if __name__ == '__main__':
                 os.replace(tmp_name, str(target_path))
                 replaced = True
             finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 if not replaced:
                     try:
                         os.unlink(tmp_name)
@@ -12302,6 +12320,9 @@ if __name__ == '__main__':
                         return self.reply_json(500, {'ok': False,
                             'error': 'usage-meter-config.json 缺少有效的 reality 配置（binary/address）'})
                     spec = importlib.util.spec_from_file_location('reality_online_config', Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py')
+                    if spec is None or spec.loader is None:
+                        return self.reply_json(500, {'ok': False,
+                            'error': '缺少计量配置模块 usage-meter-xray-config-20261007-v1.py'})
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
                     with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
@@ -17319,16 +17340,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             不锚定前缀名。只认一种会让精简镜像的节点永远"未测得"，
             而界面上看不出原因。
             """
+            if (not isinstance(host, str) or not host.strip()
+                    or host.strip().startswith('-')
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in host)):
+                return None, None
             try:
                 # ⚠️ LC_ALL=C 是必需的（2026-10-09 修）：下面两个正则只认英文输出
                 # （'% packet loss' / 小数点分隔的 `= a/b/c`）。在本地化 locale 下
                 # 解析会全面失效 —— 实测 zh_CN 下丢包率解析不到，
                 # de_DE 下连 avg 都解析不到（逗号当小数点），测速永远显示「未测得」。
-                # -n 则保证 host 不会被当成命令选项。
+                # -n 与 -- 保证 host 不会被当成命令选项。
                 # 10 个包（2026-11-01 由 3 包改）：3 包时丢包率只有 0/33/67/100%
                 # 四档，丢一个包就跳 33%。10 包间隔 1 秒约 11 秒，超时给 20 秒。
                 proc = subprocess.run(
-                    ['ping', '-n', '-c', '10', '-W', '2', host],
+                    ['ping', '-n', '-c', '10', '-W', '2', '--', host.strip()],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=20,
                     env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
             except Exception:
