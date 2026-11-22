@@ -196,8 +196,13 @@ def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
     systemd-sysctl 按文件名排序加载，99-sysctl.conf（指向 /etc/sysctl.conf）排在
     99-bbr.conf 之后，同一个键以它为准。
     """
+    if not isinstance(wanted, dict) or not wanted:
+        return []
     try:
-        text = Path(path).read_text(encoding='utf-8', errors='replace')
+        p = Path(path)
+        if not p.is_file() or p.stat().st_size > 2 * 1024 * 1024:
+            return []
+        text = p.read_bytes().decode('utf-8', errors='replace')
     except OSError:
         return []
     found = []
@@ -282,13 +287,37 @@ def _unlock_read(resp, limit):
     return raw[:limit].decode('utf-8', 'replace')
 
 
+class _UnlockHttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """仅允许重定向至 http/https 的安全重定向处理器，拦截 ftp/file 等非 HTTP 协议跳转。"""
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlsplit(str(newurl))
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+                or any(ord(c) < 32 or ord(c) == 127 for c in str(newurl))):
+            raise urllib.error.HTTPError(newurl, code, 'blocked non-http redirect', headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_ORIG_PORTAL_URLOPEN = urllib.request.urlopen
+_UNLOCK_HTTP_OPENER = urllib.request.build_opener(_UnlockHttpOnlyRedirectHandler())
+
+
 def _unlock_fetch(url, timeout=8, limit=400000):
     """返回 (status_code, final_url, body_text)。HTTP 错误码也正常返回，网络错误抛异常。"""
-    if not isinstance(url, str) or urlsplit(url).scheme not in ('http', 'https'):
+    if (not isinstance(url, str) or any(ord(c) < 32 or ord(c) == 127 for c in url)):
         raise ValueError('unsupported unlock url scheme')
+    parsed = urlsplit(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        raise ValueError('unsupported unlock url scheme')
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError('invalid unlock timeout')
     req = urllib.request.Request(url, headers={'User-Agent': _UNLOCK_UA, 'Accept-Language': 'en-US,en;q=0.9'})
+    _open_fn = (_UNLOCK_HTTP_OPENER.open if urllib.request.urlopen is _ORIG_PORTAL_URLOPEN
+                else urllib.request.urlopen)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open_fn(req, timeout=timeout) as resp:
             return resp.status, resp.geturl(), _unlock_read(resp, limit)
     except urllib.error.HTTPError as e:
         try:
@@ -12823,7 +12852,11 @@ if __name__ == '__main__':
                     self._extend_deadline(60)
                     cfg_path = portal_path.parent / 'usage-meter-config.json'
                     try:
-                        raw_meter_cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+                        if cfg_path.is_symlink():
+                            raise OSError('配置文件不允许为符号链接')
+                        if cfg_path.lstat().st_size > 1024 * 1024:
+                            raise ValueError('配置文件超过 1 MiB 上限')
+                        raw_meter_cfg = json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
                     except (OSError, ValueError) as exc:
                         return self.reply_json(500, {'ok': False,
                             'error': '读取 usage-meter-config.json 失败：%s' % exc})
@@ -12910,8 +12943,11 @@ if __name__ == '__main__':
                     created = []
                     changed = False
                     try:
+                        _nf_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
                         for fname, content in fetched:
                             dest = base_dir / fname
+                            if dest.is_symlink():
+                                raise OSError('目标门户文件不允许为符号链接: %s' % fname)
                             try:
                                 if dest.read_bytes() == content:
                                     continue          # 内容一致就不动它
@@ -12931,16 +12967,27 @@ if __name__ == '__main__':
                                 old_bytes = dest.read_bytes()
                                 old_mode = dest.stat().st_mode & 0o777
                                 bak_tmp = dest.with_name('%s.bak-tmp-%s' % (dest.name, os.urandom(4).hex()))
+                                _bfd = None
                                 try:
-                                    with open(bak_tmp, 'wb') as bfh:
+                                    _bfd = os.open(str(bak_tmp), _nf_flags, old_mode or 0o600)
+                                    with os.fdopen(_bfd, 'wb') as bfh:
+                                        _bfd = None
                                         bfh.write(old_bytes)
                                         bfh.flush()
                                         os.fsync(bfh.fileno())
                                     os.chmod(bak_tmp, old_mode)
                                     os.replace(bak_tmp, str(bak))
                                 finally:
-                                    if bak_tmp.exists():
-                                        bak_tmp.unlink(missing_ok=True)
+                                    if _bfd is not None:
+                                        try:
+                                            os.close(_bfd)
+                                        except OSError:
+                                            pass
+                                    try:
+                                        if bak_tmp.exists():
+                                            bak_tmp.unlink(missing_ok=True)
+                                    except OSError:
+                                        pass
                                 backups.append((dest, bak))
                             else:
                                 created.append(dest)
@@ -12948,18 +12995,37 @@ if __name__ == '__main__':
                             # （或一次更新 + 一次手工 cp）会互相写坏同一个文件，
                             # 随后 os.replace 把半截内容变成 root 运行的面板代码。
                             tmp = dest.with_name('%s.new-%s' % (dest.name, stamp))
+                            _tfd = None
                             try:
-                                with open(tmp, 'wb') as fh:
+                                _tfd = os.open(str(tmp), _nf_flags, 0o644)
+                                with os.fdopen(_tfd, 'wb') as fh:
+                                    _tfd = None
                                     fh.write(content)
                                     fh.flush()
                                     os.fsync(fh.fileno())
                                 os.chmod(tmp, 0o644)
                                 os.replace(tmp, str(dest))
                             finally:
-                                if tmp.exists():
-                                    tmp.unlink(missing_ok=True)
+                                if _tfd is not None:
+                                    try:
+                                        os.close(_tfd)
+                                    except OSError:
+                                        pass
+                                try:
+                                    if tmp.exists():
+                                        tmp.unlink(missing_ok=True)
+                                except OSError:
+                                    pass
                             changed = True
                         if changed:
+                            try:
+                                _dfd = os.open(str(base_dir), os.O_RDONLY)
+                                try:
+                                    os.fsync(_dfd)
+                                finally:
+                                    os.close(_dfd)
+                            except OSError:
+                                pass
                             # 只保留最近 3 **轮**更新留下的备份；本轮的必须护住
                             # （protected），否则回滚时找不到上一版。
                             _prune_portal_backups(base_dir,
@@ -12973,15 +13039,19 @@ if __name__ == '__main__':
                             portal_start_update(restart_prefix, restart_script, update_lock_fd)
                     except Exception as e:
                         # 出错就把已替换的经同目录临时文件原子恢复回去，绝不留下半新半旧或半截文件
+                        _rb_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
                         for dest, bak in backups:
                             rb_tmp = None
+                            _rfd = None
                             try:
                                 bak_path = Path(bak)
                                 bak_bytes = bak_path.read_bytes()
                                 bak_mode = bak_path.stat().st_mode & 0o777
                                 rb_tmp = Path(dest).with_name(
                                     '%s.rb-%s' % (Path(dest).name, os.urandom(4).hex()))
-                                with open(rb_tmp, 'wb') as rfh:
+                                _rfd = os.open(str(rb_tmp), _rb_flags, bak_mode or 0o600)
+                                with os.fdopen(_rfd, 'wb') as rfh:
+                                    _rfd = None
                                     rfh.write(bak_bytes)
                                     rfh.flush()
                                     os.fsync(rfh.fileno())
@@ -12989,8 +13059,16 @@ if __name__ == '__main__':
                                 os.replace(rb_tmp, str(dest))
                                 rb_tmp = None
                             except Exception as exc:
+                                if _rfd is not None:
+                                    try:
+                                        os.close(_rfd)
+                                    except OSError:
+                                        pass
                                 if rb_tmp is not None:
-                                    rb_tmp.unlink(missing_ok=True)
+                                    try:
+                                        rb_tmp.unlink(missing_ok=True)
+                                    except OSError:
+                                        pass
                                 _log_ignored('portal_update.rollback', exc)
                         for dest in created:
                             try:
@@ -18137,7 +18215,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 mode = state['outbound_mode']
                 rules = [r for r in state['warp_rules'] if isinstance(r, (str, dict))]
                 applying = bool(data.get('egress_applying'))
-                error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
+                _raw_err = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
+                error = (re.sub(r'[\x00-\x1f\x7f]', ' ', _raw_err).strip()[:300]
+                         if isinstance(_raw_err, str) else '')
             try:
                 _cfg_p = Path('/etc/hysteria/config.yaml')
                 _cfg_st = _cfg_p.lstat()
