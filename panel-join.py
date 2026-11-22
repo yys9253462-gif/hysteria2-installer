@@ -47,10 +47,33 @@ import json
 import os
 import re
 import shlex
+import stat
 import sys
 import urllib.parse
 import urllib.request
 import urllib.error
+
+_ORIG_URLOPEN = urllib.request.urlopen
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """禁止跟随 HTTP 3xx 重定向，防止把管理员 JWT 与节点密钥泄露给跳转目标。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"已拒绝跟随重定向({msg})",
+            headers,
+            fp,
+        )
+
+
+def _open_no_redirect(req, timeout=30):
+    if urllib.request.urlopen is not _ORIG_URLOPEN:
+        return urllib.request.urlopen(req, timeout=timeout)
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    return opener.open(req, timeout=timeout)
 
 CONFIG = "/etc/hysteria/config.yaml"
 PORTAL = "/etc/hysteria/portal.json"
@@ -103,7 +126,14 @@ def meta_host(meta_text):
 
 
 def read(path):
-    if not os.path.isfile(path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    if st.st_size > MAX_CONFIG_BYTES:
+        print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
         return None
     try:
         with open(path, "rb") as f:
@@ -134,10 +164,12 @@ def parse_simple_yaml(text):
     """只取需要的几个键，不引第三方依赖（节点上不一定装了 PyYAML）。
 
     hy2 的 config.yaml 结构很浅，缩进两级，按缩进扫一遍足够。
+    仅提取每个顶层段的一级子键，防止更深层嵌套同名子键覆盖顶层段键值。
     """
     out = {}
-    # 记录每个顶层键下面的子键值对
+    # 记录每个顶层键下面的子键值对及其一级子缩进宽度
     top = None
+    sub_indent = None
     for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip() or line.strip().startswith("#"):
@@ -145,12 +177,19 @@ def parse_simple_yaml(text):
         indent = len(line) - len(line.lstrip())
         body = line.strip()
         if indent == 0:
-            if ":" in body:
+            sub_indent = None
+            if ":" in body and not body.startswith("-"):
                 k, _, v = body.partition(":")
                 top = k.strip()
                 out[top] = {"__value__": yaml_scalar(v)}
+            else:
+                top = None
             continue
-        if ":" not in body or top is None:
+        if top is None:
+            continue
+        if sub_indent is None:
+            sub_indent = indent
+        if indent != sub_indent or ":" not in body or body.startswith("-"):
             continue
         k, _, v = body.partition(":")
         out[top][k.strip()] = yaml_scalar(v)
@@ -245,6 +284,9 @@ def main():
             print("--name 不能包含换行或控制字符", file=sys.stderr)
             return 2
         args.name = args.name.strip()
+        if len(args.name) > 256:
+            print("--name 长度不能超过 256 个字符", file=sys.stderr)
+            return 2
     raw_portal_port = meta.get("port")
     if isinstance(raw_portal_port, int) and not isinstance(raw_portal_port, bool) and 1 <= raw_portal_port <= 65535:
         portal_port = raw_portal_port
@@ -352,8 +394,11 @@ def main():
         if _panel_port is not None and not (1 <= _panel_port <= 65535):
             print("--panel 端口不合法（必须在 1-65535 之间）", file=sys.stderr)
             return 2
-        if _p.scheme != "https" or not _panel_host or _p.username is not None or _p.password is not None or _p.query or _p.fragment:
+        if _p.scheme != "https" or not _panel_host or not _safe_host(_panel_host) or _p.username is not None or _p.password is not None or _p.query or _p.fragment:
             print("--panel 必须是 https:// 开头的面板地址（不能包含凭据、? 或 #）", file=sys.stderr)
+            return 2
+        if any(seg == ".." for seg in (_p.path or "").split("/")):
+            print("--panel 路径不能包含上级目录穿越段（..）", file=sys.stderr)
             return 2
         panel = raw_panel.rstrip("/")
 
@@ -392,7 +437,10 @@ def main():
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + admin_token)
         try:
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with _open_no_redirect(req, timeout=30) as r:
+                if 300 <= getattr(r, "status", 200) < 400:
+                    print(f"登记失败：面板返回重定向 HTTP {r.status}，已拒绝跟随以防泄露令牌", file=sys.stderr)
+                    return 1
                 print(f"登记成功 HTTP {r.status}")
                 print(r.read(65536).decode("utf-8", errors="replace"))
             return 0

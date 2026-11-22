@@ -672,17 +672,37 @@ render_server_config() {
     hp="$(meta_get HeaderProtectionKey)"
     # 出口网卡只写进注释：NAT 规则按隧道网段匹配，不依赖网卡名（见下方 PostUp）。
     wan="$(detect_wan_iface 2>/dev/null)" || wan="（未探测到默认路由，按隧道网段 NAT）"
+    wan="$(printf '%s' "$wan" | tr -d '[:cntrl:]')"
 
     [[ -n "$port" ]] || die "meta 中缺少 port，无法渲染配置"
-    if [[ ! "$port" =~ ^[0-9]+$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
+    if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$port < 1 || 10#$port > 65535 )); then
         die "meta 中 port 非法: ${port}"
     fi
     [[ -n "$priv" ]] || die "meta 中缺少 server_private_key，无法渲染配置"
+    if [[ "$priv" =~ [[:space:][:cntrl:]] ]]; then
+        die "meta 中 server_private_key 含非法空白或控制字符"
+    fi
+    if [[ -n "$hp" && "$hp" =~ [[:space:][:cntrl:]] ]]; then
+        die "meta 中 HeaderProtectionKey 含非法空白或控制字符"
+    fi
+
+    local jc jmin jmax s1 s2 s3 h1 h2 h3 h4 _pk _pv
+    jc="$(meta_get Jc)"; jmin="$(meta_get Jmin)"; jmax="$(meta_get Jmax)"
+    s1="$(meta_get S1)"; s2="$(meta_get S2)"; s3="$(meta_get S3)"
+    h1="$(meta_get H1)"; h2="$(meta_get H2)"; h3="$(meta_get H3)"; h4="$(meta_get H4)"
+    for _pv in "$jc" "$jmin" "$jmax" "$s1" "$s2" "$s3" "$h1" "$h2" "$h3" "$h4"; do
+        if [[ -n "$_pv" && ! "$_pv" =~ ^[0-9]{1,12}$ ]]; then
+            die "meta 中混淆参数含非法值: ${_pv}"
+        fi
+    done
 
     # MTU 必须扣掉 S4：S4 是每个 Data 包的随机填充，不扣掉外层会分片。
     # 基准 1420 = 1500 - 20(IP) - 8(UDP) - 32(WG 数据包头+认证标签) - 20(预留)。
     s4v="$(meta_get S4)"
-    [[ "$s4v" =~ ^[0-9]+$ ]] || s4v=0
+    if [[ -n "$s4v" && ! "$s4v" =~ ^[0-9]{1,5}$ ]]; then
+        die "meta 中 S4 非法: ${s4v}"
+    fi
+    [[ "$s4v" =~ ^[0-9]{1,5}$ ]] || s4v=0
     mtu=$(( 1420 - 10#$s4v ))
     (( mtu < 1280 )) && mtu=1280
 
@@ -703,17 +723,17 @@ render_server_config() {
         echo "Address = ${AWG_SUBNET}.1/24"
         echo "ListenPort = ${port}"
         echo "MTU = ${mtu}"
-        echo "Jc = $(meta_get Jc)"
-        echo "Jmin = $(meta_get Jmin)"
-        echo "Jmax = $(meta_get Jmax)"
-        echo "S1 = $(meta_get S1)"
-        echo "S2 = $(meta_get S2)"
-        echo "S3 = $(meta_get S3)"
-        echo "S4 = $(meta_get S4)"
-        echo "H1 = $(meta_get H1)"
-        echo "H2 = $(meta_get H2)"
-        echo "H3 = $(meta_get H3)"
-        echo "H4 = $(meta_get H4)"
+        echo "Jc = ${jc}"
+        echo "Jmin = ${jmin}"
+        echo "Jmax = ${jmax}"
+        echo "S1 = ${s1}"
+        echo "S2 = ${s2}"
+        echo "S3 = ${s3}"
+        echo "S4 = ${s4v}"
+        echo "H1 = ${h1}"
+        echo "H2 = ${h2}"
+        echo "H3 = ${h3}"
+        echo "H4 = ${h4}"
         # HeaderProtectionKey 只有 3.x 支持
         if [[ "$line" == "3" && -n "$hp" ]]; then
             echo "HeaderProtectionKey = ${hp}"
@@ -743,7 +763,12 @@ render_server_config() {
         if [[ -s "$AWG_PEERS_FILE" ]]; then
             jq -r '
                 (.peers // []) | if type=="array" then .[] else empty end |
-                select(type=="object" and (.public_key | type=="string" and length>0 and (test("[\r\n\t\u0000-\u001f\u007f ]") | not)) and (.address | type=="string" and test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"))) |
+                select(type=="object"
+                    and (.public_key | type=="string" and length>0 and (test("[\r\n\t\u0000-\u001f\u007f ]") | not))
+                    and (.address | type=="string"
+                         and test("^(0|[1-9][0-9]{0,2})(\\.(0|[1-9][0-9]{0,2})){3}$")
+                         and (split(".") | all((tonumber) <= 255)))
+                ) |
                 "\n[Peer]\n# \((.name | if type=="string" then gsub("[\r\n\t\u0000-\u001f\u007f]"; "") else "peer" end) | if length>0 then . else "peer" end)\nPublicKey = \(.public_key)" +
                 (if (.preshared_key | type=="string" and length>0 and (test("[\r\n\t\u0000-\u001f\u007f ]") | not)) then "\nPresharedKey = \(.preshared_key)" else "" end) +
                 "\nAllowedIPs = \(.address)/32"
@@ -1012,7 +1037,7 @@ cmd_peer_add() {
     is_installed || die "AmneziaWG 尚未安装，请先执行: hy2-awgctl install"
 
     [[ -n "$name" ]] || die "用法: hy2-awgctl peer-add <名称> [--endpoint HOST]"
-    [[ "$name" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] || die "客户端名称只允许字母/数字/._- 且不超过 32 字符"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] || die "客户端名称须以字母/数字开头，仅允许字母/数字/._- 且不超过 32 字符"
     if [[ -n "$endpoint" ]]; then
         validate_endpoint "$endpoint" || die "连接地址非法"
     fi
@@ -1022,7 +1047,13 @@ cmd_peer_add() {
     fi
 
     peers_init
-    [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
+    if [[ -z "$endpoint" ]]; then
+        endpoint="$(meta_get endpoint)"
+        if [[ -n "$endpoint" ]] && ! validate_endpoint "$endpoint" >/dev/null 2>&1; then
+            log_warn "meta 中记录的默认连接地址格式异常，已忽略: ${endpoint}"
+            endpoint=""
+        fi
+    fi
 
     local priv pub psk addr tmp="" peers_backup="" config_backup="" had_config=0
     trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; trap - RETURN' RETURN
@@ -1528,8 +1559,8 @@ cmd_status() {
         peers_count="$(jq -r '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object")] | length' "$AWG_PEERS_FILE" 2>/dev/null || echo "")"
     fi
     if [[ -f "$AWG_VERSION_FILE" ]]; then
-        go_tag="$(awk -F= '/^amneziawg-go=/{print $2}' "$AWG_VERSION_FILE" 2>/dev/null || true)"
-        tools_tag="$(awk -F= '/^amneziawg-tools=/{print $2}' "$AWG_VERSION_FILE" 2>/dev/null || true)"
+        go_tag="$(awk -F= '/^amneziawg-go=/{print $2; exit}' "$AWG_VERSION_FILE" 2>/dev/null || true)"
+        tools_tag="$(awk -F= '/^amneziawg-tools=/{print $2; exit}' "$AWG_VERSION_FILE" 2>/dev/null || true)"
     fi
 
     if [[ "$installed" != "yes" ]]; then
@@ -1783,10 +1814,11 @@ EOF
 acquire_lock() {
     builtin command -v flock >/dev/null 2>&1 || die "缺少 flock，无法安全串行化 AWG 修改；请安装 util-linux 后重试"
     local lock_file="${AWG_LOCK_FILE:-/run/hy2-awgctl.lock}"
+    [[ ! -L "$lock_file" ]] || die "AWG 操作锁 ${lock_file} 为符号链接，拒绝执行"
     # 2>/dev/null 必须只作用于打开锁文件这一步（2026-11-03 修）：只有重定向的
     # `exec 9>f 2>/dev/null` 会把 fd 2 也永久改掉，之后所有 log_err / die 与
-    # journalctl 诊断都被吞掉，门户只看到「退出码 1」。
-    { exec 9>"$lock_file"; } 2>/dev/null || die "无法打开 AWG 操作锁 ${lock_file}，拒绝并发修改"
+    # journalctl 诊断都被吞掉，门户只看到「退出码 1」。使用追加模式打开避免截断。
+    { umask 077; exec 9>>"$lock_file"; } 2>/dev/null || die "无法打开 AWG 操作锁 ${lock_file}，拒绝并发修改"
     flock -w 300 9 || die "另一个 hy2-awgctl 操作仍在进行，请稍后重试"
 }
 

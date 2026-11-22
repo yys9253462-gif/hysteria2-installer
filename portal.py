@@ -157,6 +157,37 @@ QR_UNAVAILABLE_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="260" heigh
                       '<text x="130" y="118" text-anchor="middle" font-size="16" fill="#5f5e5a">二维码生成失败</text>'
                       '<text x="130" y="146" text-anchor="middle" font-size="12" fill="#5f5e5a">请复制节点直链导入</text>'
                       '</svg>')
+_SVG_EVENT_HANDLER_RE = re.compile(r'[\s/<]on[a-z]+\s*=', re.IGNORECASE)
+
+
+def _is_safe_svg_payload(raw, max_bytes=2 * 1024 * 1024):
+    """校验待输出或内嵌的 SVG 二维码负载，拦截脚本、外联对象、内联事件及超大体积。"""
+    if isinstance(raw, bytes):
+        if not raw or len(raw) > max_bytes:
+            return False
+        text = raw.decode('utf-8', errors='replace')
+    elif isinstance(raw, str):
+        if not raw or len(raw.encode('utf-8')) > max_bytes:
+            return False
+        text = raw
+    else:
+        return False
+    low = text.lower()
+    if '<svg' not in low:
+        return False
+    if '<script' in low or '<foreignobject' in low or 'javascript:' in low:
+        return False
+    if _SVG_EVENT_HANDLER_RE.search(text):
+        return False
+    return True
+
+
+def _safe_cookie_path_token(token):
+    """构造安全的 Cookie Path，剔除分号、空白与换行等注入字符。"""
+    if not isinstance(token, str):
+        return '/'
+    cleaned = re.sub(r'[^A-Za-z0-9._-]', '', token)
+    return f'/{cleaned}/' if cleaned else '/'
 
 
 def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
@@ -221,7 +252,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.68'
+PORTAL_VERSION = '2.69'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -723,22 +754,26 @@ def strip_managed_outbounds(cfg_text):
         return ''
     lines = cfg_text.split('\n')
     out = []
+    in_outbounds = False
     skipping = False
     for line in lines:
-        m = _OUTBOUND_NAME_LINE_RE.match(line)
-        if m:
-            name = _yaml_name_value(m.group(1))
-            # 内建出站：不跳过，继续保留
-            skipping = name not in builtin
-            if skipping:
-                continue
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#') and line[:1] not in (' ', '\t'):
+            in_outbounds = bool(re.match(r'^outbounds:\s*(?:\[\s*\]\s*)?(?:#.*)?$', line))
+            skipping = False
             out.append(line)
             continue
-        if skipping:
-            # 出站项的字段都是缩进的；遇到顶格行说明这一项结束了
-            if line.strip() and line[:1] not in (' ', '\t'):
-                skipping = False
-            else:
+        if in_outbounds:
+            m = _OUTBOUND_NAME_LINE_RE.match(line)
+            if m:
+                name = _yaml_name_value(m.group(1))
+                # 内建出站：不跳过，继续保留
+                skipping = name not in builtin
+                if skipping:
+                    continue
+                out.append(line)
+                continue
+            if skipping:
                 continue
         out.append(line)
     return '\n'.join(out)
@@ -777,12 +812,13 @@ def add_private_network_guard(config):
     outbounds = config.setdefault('outbounds', [])
     if not isinstance(outbounds, list):
         outbounds = config['outbounds'] = []
-    if not outbounds:
-        outbounds.append({'protocol': 'freedom', 'tag': 'direct'})
-    if not any(isinstance(o, dict) and o.get('tag') == XRAY_BLOCK_OUTBOUND_TAG
-               for o in outbounds):
-        # 黑洞必须排在 freedom 之后，否则会变成默认出站，把正常流量也吞掉。
-        outbounds.append({'protocol': 'blackhole', 'tag': XRAY_BLOCK_OUTBOUND_TAG})
+    # 过滤非 dict 脏出站并移除所有旧的 block-private，确保它绝不落在首位吞掉正常流量。
+    clean_outs = [o for o in outbounds
+                  if isinstance(o, dict) and o.get('tag') != XRAY_BLOCK_OUTBOUND_TAG]
+    if not clean_outs:
+        clean_outs.append({'protocol': 'freedom', 'tag': 'direct'})
+    clean_outs.append({'protocol': 'blackhole', 'tag': XRAY_BLOCK_OUTBOUND_TAG})
+    config['outbounds'] = clean_outs
     routing = config.setdefault('routing', {})
     if not isinstance(routing, dict):
         routing = config['routing'] = {}
@@ -807,7 +843,8 @@ def add_private_network_guard(config):
     api_section = config.get('api')
     api_tag = api_section.get('tag') if isinstance(api_section, dict) else None
     api_rules = [r for r in rules if isinstance(r, dict) and api_tag and r.get('outboundTag') == api_tag]
-    others = [r for r in rules if r != guard and r not in api_rules]
+    others = [r for r in rules
+              if r not in api_rules and not (isinstance(r, dict) and r.get('outboundTag') == XRAY_BLOCK_OUTBOUND_TAG)]
     routing['rules'] = api_rules + [guard] + others
     return config
 
@@ -1202,7 +1239,9 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
 
     proxy_url = ''
     if kind == 'socks5' and addr:
-        raw_addr = str(addr)
+        if not isinstance(addr, str):
+            return ''
+        raw_addr = addr
         if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_addr):
             return ''
         lower = raw_addr.lower()
@@ -1217,7 +1256,9 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
             return ''
         proxy_url = 'socks5h://' + raw_addr
     elif kind == 'http' and addr:
-        raw_addr = str(addr)
+        if not isinstance(addr, str):
+            return ''
+        raw_addr = addr
         if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_addr):
             return ''
         lower = raw_addr.lower()
@@ -1252,7 +1293,8 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
         if proxy_insecure:
             args.append('--proxy-insecure')
         args.append('https://api4.ipify.org?format=json')
-        run_kwargs = {'capture_output': True, 'text': True, 'timeout': seconds + 2}
+        run_kwargs = {'capture_output': True, 'text': True, 'encoding': 'utf-8',
+                      'errors': 'replace', 'timeout': seconds + 2}
         if stdin_cfg is not None:
             run_kwargs['input'] = stdin_cfg
         proc = subprocess.run(args, **run_kwargs)
@@ -1260,10 +1302,14 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
             return ''
         payload = proc.stdout.strip()
         try:
-            result = json.loads(payload).get('ip', '')
+            parsed = json.loads(payload)
+            result = parsed.get('ip', '') if isinstance(parsed, dict) else ''
         except (ValueError, AttributeError):
             result = payload
-        return str(ipaddress.ip_address(result))
+        # ipaddress.ip_address 会把整数（如 123）接受成 0.0.0.123，必须限定只收字符串。
+        if not isinstance(result, str) or not result.strip():
+            return ''
+        return str(ipaddress.ip_address(result.strip()))
     except Exception:
         return ''
 
@@ -1329,8 +1375,15 @@ def _unreachable_outbounds(outs, timeout=2):
     「应用出站配置」路径上 —— 一条坏条目会让整个保存动作失败，报错还只说
     「应用失败」。逐条跳过非 dict，和 clean_outbounds 保持同一口径。
     """
+    if not isinstance(outs, (list, tuple)):
+        return []
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not (0 < timeout < float('inf'))):
+        probe_timeout = 2.0
+    else:
+        probe_timeout = min(30.0, float(timeout))
     dead = []
-    for ob in outs or []:
+    for ob in outs:
         if not isinstance(ob, dict):
             continue
         name = ob.get('name')
@@ -1343,10 +1396,9 @@ def _unreachable_outbounds(outs, timeout=2):
                 raw_host, raw_port = target.rsplit(':', 1)
                 if raw_host.startswith('[') and raw_host.endswith(']'):
                     raw_host = raw_host[1:-1]
-                try:
-                    host, port = raw_host, int(raw_port)
-                except ValueError:
+                if not re.fullmatch(r'[1-9][0-9]{0,4}', raw_port, re.ASCII):
                     continue
+                host, port = raw_host, int(raw_port)
         elif ob.get('type') == 'http':
             url = ob.get('url')
             if isinstance(url, str) and url.strip():
@@ -1360,7 +1412,7 @@ def _unreachable_outbounds(outs, timeout=2):
             continue
         sock = None
         try:
-            sock = socket.create_connection((host, port), timeout=timeout)
+            sock = socket.create_connection((host, port), timeout=probe_timeout)
         except Exception:
             dead.append(name)
         finally:
@@ -1384,6 +1436,8 @@ def _rollback_outbounds(cfg, original):
          让面板能告诉用户"需要手动干预"，而不是静默留一个坏服务。
     """
     state = 'unknown'
+    if not isinstance(original, str):
+        return state
     try:
         # 原子写回并保持 0600 私有权限，避免断电半写或权限退化泄露混淆与鉴权密码。
         atomic_write_private(cfg, original.encode('utf-8'))
@@ -1392,9 +1446,14 @@ def _rollback_outbounds(cfg, original):
         #    后果是「回滚也失败」，用户彻底没救（真实事故）。
         _restart_hy2()
         for _i in range(10):
-            state = subprocess.run(['systemctl', 'is-active', 'hysteria-server'],
-                                   capture_output=True, text=True,
-                                   timeout=8).stdout.strip()
+            try:
+                state = subprocess.run(['systemctl', 'is-active', 'hysteria-server'],
+                                       capture_output=True, text=True,
+                                       encoding='utf-8', errors='replace',
+                                       timeout=8).stdout.strip()
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                _log_ignored('wait_service_poll', exc)
+                state = 'unknown'
             if state in ('active', 'failed', 'inactive'):
                 break
             time.sleep(1)
@@ -1527,7 +1586,8 @@ def portal_update_process_lock(base_dir):
     """
     if fcntl is None:
         return None
-    fd = os.open(Path(base_dir) / '.portal-update.lock', os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(Path(base_dir) / '.portal-update.lock',
+                 os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BaseException:
@@ -1607,12 +1667,19 @@ def _prune_portal_backups(directory, keep=3, protected=()):
     证书快照，同样是 `<file>.bak-<stamp>`。旧实现按 '.bak-' 一视同仁，
     自更新三轮之后就把这些用户数据快照删光了，它们的保留由 install.sh 自己管。
     """
+    keep = max(1, keep) if isinstance(keep, int) and not isinstance(keep, bool) else 3
     directory = Path(directory)
     protected = {Path(p).name for p in (protected or ())}
     owned = tuple(name + '.bak-' for name in PORTAL_BUNDLE_FILES)
+    items = []
     try:
-        items = [p for p in directory.iterdir()
-                 if p.is_file() and p.name.startswith(owned)]
+        for p in directory.iterdir():
+            try:
+                if p.is_symlink() or not p.is_file() or not p.name.startswith(owned):
+                    continue
+                items.append(p)
+            except OSError:
+                continue
     except OSError:
         return
     # 从文件名取轮次戳：<name>.bak-<YYYYmmdd-HHMMSS>-<pid>
@@ -1643,16 +1710,24 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20,
     全节点用户连不上，控制台也没法远程修 —— 所以重启后轮询 /api/health，
     限时内没有响应就把 .bak 换回去、删掉本次新增的文件，再重启一次。
     """
-    if isinstance(port, bool):
-        raise ValueError('invalid portal port')
-    port_num = int(port)
-    if not 1 <= port_num <= 65535:
-        raise ValueError('invalid portal port')
-    if isinstance(wait_seconds, bool):
-        raise ValueError('invalid wait_seconds')
-    wait_num = int(wait_seconds)
-    if not 1 <= wait_num <= 600:
-        raise ValueError('invalid wait_seconds')
+    def _strict_int_in_range(raw, lo, hi, label):
+        if isinstance(raw, bool):
+            raise ValueError(label)
+        if isinstance(raw, int):
+            val = raw
+        elif isinstance(raw, str):
+            s = raw.strip()
+            if not (s.isascii() and s.isdigit()) or len(s) > 16 or (len(s) > 1 and s.startswith('0')):
+                raise ValueError(label)
+            val = int(s)
+        else:
+            raise ValueError(label)
+        if not lo <= val <= hi:
+            raise ValueError(label)
+        return val
+
+    port_num = _strict_int_in_range(port, 1, 65535, 'invalid portal port')
+    wait_num = _strict_int_in_range(wait_seconds, 1, 600, 'invalid wait_seconds')
     probe = ("import urllib.request; "
              "urllib.request.urlopen('http://127.0.0.1:%d/api/health', timeout=2).read()"
              % port_num)
@@ -1719,6 +1794,8 @@ _MAX_BINARY_EXTRACT_BYTES = 256 * 1024 * 1024
 
 def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
     """带体积上限读取外部响应，防止异常超大响应耗尽门户内存。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError('invalid byte limit')
     try:
         raw = resp.read(limit + 1)
     except TypeError:
@@ -1730,6 +1807,10 @@ def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
 
 def _copy_stream_bounded(src, dst, limit, chunk_size=65536):
     """按块受限复制流，防止异常或恶意镜像与压缩炸弹写爆磁盘。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError('invalid stream limit')
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError('invalid chunk size')
     total = 0
     while True:
         try:
@@ -1820,7 +1901,7 @@ def parse_checksum_manifest(text, asset):
     兼容 CRLF、`*name`、`./name`，并允许按 basename 匹配（hysteria 的清单里
     路径形如 `build/hysteria-linux-amd64`）。
     """
-    if not isinstance(text, str) or not asset:
+    if not isinstance(text, str) or not isinstance(asset, str) or not asset:
         return None
     found = None
     count = 0
@@ -1829,10 +1910,10 @@ def parse_checksum_manifest(text, asset):
         if not line or line.startswith('#'):
             continue
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) != 2:
             continue
         digest = parts[0].lower()
-        name = parts[-1].lstrip('*')
+        name = parts[1].lstrip('*')
         while name.startswith('./'):
             name = name[2:]
         if name != asset and name.rsplit('/', 1)[-1] != asset:
@@ -2005,7 +2086,8 @@ def _require_disk_space(path, need_bytes):
 
 def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
     binary = Path(binary)
-    current = subprocess.run([str(binary), 'version'], capture_output=True, text=True, timeout=5).stdout
+    current = subprocess.run([str(binary), 'version'], capture_output=True, text=True,
+                             encoding='utf-8', errors='replace', timeout=5).stdout
     current_line = next((line.split(':', 1)[1].strip() for line in current.splitlines() if line.strip().startswith('Version:')), '')
     if '+' in current_line and not allow_custom:
         raise RuntimeError('当前核心含定制补丁，升级官方核心需要明确确认覆盖补丁')
@@ -2084,7 +2166,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
             if stream.read(4) != b'\x7fELF':
                 raise RuntimeError('下载内容不是 Linux 核心二进制，原核心未更改')
         candidate.chmod(0o755)
-        verified = subprocess.run([str(candidate), 'version'], capture_output=True, text=True, timeout=8)
+        verified = subprocess.run([str(candidate), 'version'], capture_output=True, text=True,
+                                  encoding='utf-8', errors='replace', timeout=8)
         newer = next((line.split(':', 1)[1].strip() for line in verified.stdout.splitlines() if line.strip().startswith('Version:')), '')
         if verified.returncode != 0 or not core_version_key(newer):
             raise RuntimeError('候选核心版本校验失败，原核心未更改')
@@ -2121,6 +2204,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 os.close(rb_fd)
                 rb_tmp = Path(rb_name)
                 shutil.copy2(backup, rb_tmp)
+                with rb_tmp.open('r+b') as rb_fh:
+                    os.fsync(rb_fh.fileno())
                 rb_tmp.chmod(0o755)
                 os.replace(rb_tmp, binary)
                 rb_tmp = None
@@ -2128,7 +2213,10 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 _log_ignored('upgrade_core_rollback_replace', rb_exc)
             finally:
                 if rb_tmp is not None:
-                    rb_tmp.unlink(missing_ok=True)
+                    try:
+                        rb_tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             try:
                 _restart_hy2()
             except Exception as rb_exc:
@@ -2171,7 +2259,7 @@ def portal_state_file_lock(directory='/etc/hysteria'):
         return
     lock_fd = None
     try:
-        lock_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        lock_fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
         if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         held[path] = 1
@@ -2203,7 +2291,8 @@ def core_operation_file_lock(directory='/etc/hysteria'):
 
 def acquire_core_operation_lock(directory='/etc/hysteria'):
     """Acquire a process-wide lock shared by install, upgrade, and uninstall paths."""
-    lock_fd = os.open(core_operation_lock_path(directory), os.O_CREAT | os.O_RDWR, 0o600)
+    lock_fd = os.open(core_operation_lock_path(directory),
+                      os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     if fcntl is not None:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -5102,7 +5191,9 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
 
     config_has_acme = False
     try:
-        config_has_acme = bool(re.search(r'^acme:', Path(config_path).read_text(encoding='utf-8'), re.M))
+        cfg_p = Path(config_path)
+        if cfg_p.is_file() and cfg_p.stat().st_size <= 4 * 1024 * 1024:
+            config_has_acme = bool(re.search(r'^acme:', cfg_p.read_text(encoding='utf-8'), re.M))
     except (OSError, UnicodeDecodeError):
         pass
 
@@ -5135,21 +5226,21 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     # 一张证书常覆盖多个域名，直接取第一个非通配 SAN 会在换证后把 SNI 悄悄
     # 换成另一个域名 —— 已发出的订阅全部连不上。install.sh 的 sync_cert_meta
     # 已经是这个优先级，两处必须一致。
-    raw_sn = m.get('server_name')
-    clean_meta_sn = raw_sn.strip() if isinstance(raw_sn, str) else ''
+    clean_meta_sn = _clean_host_scalar(m.get('server_name'))
     current_sn = clean_meta_sn.lower()
-    san_lower = [str(x).strip().lower() for x in (sans or [])]
+    san_list = [x.strip() for x in (sans or []) if isinstance(x, str) and x.strip()]
+    san_lower = [x.lower() for x in san_list]
     candidate = ''
     if current_sn and certificate_covers_domain(current_sn, san_lower, str(cn or '')):
         candidate = clean_meta_sn
     if not candidate:
-        for san in sans or []:
+        for san in san_list:
             if san.startswith('*.'):
                 continue
             if _is_dns_name(san):
                 candidate = san
                 break
-    if not candidate and _is_dns_name(cn):
+    if not candidate and isinstance(cn, str) and _is_dns_name(cn):
         candidate = cn
 
     if self_signed:
@@ -5161,8 +5252,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         new_insecure = False
         new_pin = ''
 
-    raw_pub_ip = m.get('public_ip')
-    clean_pub_ip = raw_pub_ip.strip() if isinstance(raw_pub_ip, str) else ''
+    clean_pub_ip = _clean_host_scalar(m.get('public_ip'))
     new_sn = candidate or clean_meta_sn or clean_pub_ip or 'localhost'
 
     changed = False
@@ -5180,7 +5270,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         changed = True
 
     if changed:
-        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, allow_nan=False).encode('utf-8'))
         print(f"[portal] 证书信任模型已自愈: cert_type={new_type} "
               f"is_insecure={new_insecure} server_name={new_sn} "
               f"pin={'<set>' if new_pin else '<empty>'} (证书={cert_file})",
@@ -5216,6 +5306,8 @@ def drop_meter_totals(data, user_id):
     之前 —— 用户已从内存删除、磁盘没保存、访问也没撤销，重启后「已删用户」
     原地复活并继续能连。注销必须优先完成，计量清理只是附带动作。
     """
+    if not isinstance(data, dict) or not isinstance(user_id, str) or not user_id:
+        return False
     meter = data.get('usage_meter')
     if not isinstance(meter, dict):
         return False
@@ -5237,6 +5329,8 @@ def drop_meter_totals(data, user_id):
 
 def restore_meter_user(data, user_id):
     """Allow a newly created account to start a fresh accounting lifecycle."""
+    if not isinstance(data, dict) or not isinstance(user_id, str) or not user_id:
+        return
     meter = data.get('usage_meter')
     if not isinstance(meter, dict):
         return
@@ -5247,6 +5341,8 @@ def restore_meter_user(data, user_id):
 
 def reconcile_meter_usage(data, user_id, requested):
     """Under data_lock, set an absolute quota value without altering measured counters."""
+    if not isinstance(data, dict) or not isinstance(user_id, str) or not user_id:
+        raise ValueError('invalid meter target')
     meter = data.get('usage_meter')
     if meter is None and 'usage_meter' not in data:
         meter = {}
@@ -5293,11 +5389,13 @@ def user_table(data):
 
 def legacy_used_bytes(data, uid):
     """计量模块缺失时的旧用量回退；记录损坏时给 0，不能让接口 500。"""
+    if not isinstance(uid, str) or not uid:
+        return 0
     user = user_table(data).get(uid)
     if not isinstance(user, dict):
         return 0
     value = user.get('used_bytes', 0)
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 TRAFFIC_SUSPEND_UNIT_RE = re.compile(r'^[a-z0-9][a-z0-9@._-]{0,127}$')
@@ -8389,7 +8487,7 @@ def sync_pin(m, root, meta_path):
                 atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
     elif m.get('pin_sha256'):
         m['pin_sha256'] = ''
-        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, allow_nan=False).encode('utf-8'))
 
 
 def prepare(meta_path, port, node_api_key=None):
@@ -8425,7 +8523,9 @@ def prepare(meta_path, port, node_api_key=None):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                             capture_output=True, timeout=20)
-        qr_svg = qr.stdout if (qr.returncode == 0 and b'<svg' in qr.stdout) else b''
+        low_qr = qr.stdout.lower() if qr.returncode == 0 and qr.stdout else b''
+        qr_svg = (qr.stdout if (b'<svg' in low_qr and b'<script' not in low_qr
+                                and b'<foreignobject' not in low_qr) else b'')
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
@@ -8436,7 +8536,7 @@ def prepare(meta_path, port, node_api_key=None):
     sub_port, sub_port_src = resolve_subscription_port(m)
     if m.get('subscription_port') != sub_port:
         m['subscription_port'] = sub_port
-        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, indent=2).encode('utf-8'))
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8'))
         print(f'[portal] 订阅端口已自愈为 {sub_port}（来源: {sub_port_src}）', file=sys.stderr)
     base = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
     subscription = f"https://{user}:{password}@{_host_for_url(host)}:{sub_port}/{token}/clash.yaml"
@@ -8467,7 +8567,7 @@ def prepare(meta_path, port, node_api_key=None):
         # 用 atomic_write_private：write_text 先按 umask 创建再 chmod，
         # 中间有一段文件是 0644 的窗口，里面装着全部用户密码与 api_key；
         # chmod 失败时更是永久 0644（2026-10-29 修）。
-        atomic_write_private(path, json.dumps(value, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(path, json.dumps(value, ensure_ascii=False, allow_nan=False).encode('utf-8'))
 
 
 def qr_svg_for(uri, timeout=20):
@@ -8859,10 +8959,11 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     # 老节点上的机主账号带着 2036 年的到期时间，adopt 时顺手改成新值。
     if isinstance(master, dict) and master.get('expires_at') == LEGACY_MASTER_EXPIRES_AT:
         master['expires_at'] = MASTER_EXPIRES_AT
-    # auth_password 缺失时不要崩（旧备份 / 手写 meta 可能没有这个键）：
-    # 保留旧的主密码，比让整个 adopt 失败要好。
-    if isinstance(m.get('auth_password'), str) and m['auth_password']:
-        master['password'] = m['auth_password']
+    # auth_password 缺失、纯空白或含控制字符时保留旧主密码，避免把损坏凭据覆盖进机主账号。
+    raw_auth_pw = m.get('auth_password')
+    if (isinstance(raw_auth_pw, str) and raw_auth_pw.strip()
+            and not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_auth_pw)):
+        master['password'] = raw_auth_pw
     # 门户登录密码（= Hy2 主密码）变化后，必须让旧会话失效：
     # 会话 Cookie 只用 session_secret 签名，而它此前从不轮换，
     # 改完密码后旧浏览器还能继续用 30 天（2026-10-30 修）。
@@ -8875,7 +8976,9 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     # 改为推进会话纪元而不是换 session_secret —— 后者同时是分享链接 k 的密钥。
     if data.get('auth_hash') != _new_hash or _rebuilt:
         data['auth_hash'] = _new_hash
-        if not isinstance(data.get('session_secret'), str) or not data['session_secret']:
+        raw_ss = data.get('session_secret')
+        if (not isinstance(raw_ss, str) or not raw_ss.strip()
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_ss)):
             data['session_secret'] = secrets.token_hex(32)
         epoch = data.get('session_epoch', 0)
         epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
@@ -8883,8 +8986,8 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     if node_api_key:
         data['api_key'] = node_api_key
         access['api_key'] = node_api_key
-        atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
-    atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(access_path, json.dumps(access, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+    atomic_write_private(path, json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     # _adopt_locked already holds portal_state_file_lock; refresh serializes its
     # own phase, so leave the shared lock before invoking it.
     return
@@ -8975,7 +9078,11 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
                   VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
     current = {}
     try:
+        if path.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError('xray.json too large')
         config = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(config, dict):
+            raise ValueError('xray.json top level not dict')
         for tag in MANAGED_INBOUND_TAGS:
             index, inbound = managed_inbound_index(config, tag)
             if index >= 0 and isinstance(inbound, dict):
@@ -9032,10 +9139,10 @@ def repair_missing_api_key(portal_path, data):
             if not isinstance(access, dict):
                 raise ValueError('portal-access.json 顶层不是 JSON 对象')
             access['api_key'] = new_key
-            atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
+            atomic_write_private(access_path, json.dumps(access, ensure_ascii=False, allow_nan=False).encode('utf-8'))
         data['api_key'] = new_key
         phase = 'portal'
-        atomic_write_private(portal_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(portal_path, json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     except AtomicWriteDurabilityError as exc:
         if phase == 'portal':
             data['api_key'] = new_key
@@ -9263,8 +9370,13 @@ def serve(path):
         # 排在本轮之后，用新快照重新生效。
         nonlocal last_enforced_blocked, last_enforce_error
         with access_apply_lock:
+            clean_force = (
+                {uid for uid in force_ids if isinstance(uid, str) and USER_ID_RE.match(uid)}
+                if isinstance(force_ids, (list, tuple, set, frozenset))
+                else set()
+            )
             with data_lock:
-                pending=pending_revocations(data) | set(force_ids)
+                pending=pending_revocations(data) | clean_force
                 snapshot=copy.deepcopy(data)
                 blocked=blocked_user_ids()
             acquired_core_lock = False
@@ -9441,12 +9553,11 @@ def serve(path):
                     cols = rest.split()
                     if len(cols) < 9:
                         continue
-                    try:
-                        rx_val, tx_val = int(cols[0]), int(cols[8])
-                    except ValueError:
+                    rx_raw, tx_raw = cols[0], cols[8]
+                    if not (rx_raw.isascii() and rx_raw.isdigit() and len(rx_raw) <= 24
+                            and tx_raw.isascii() and tx_raw.isdigit() and len(tx_raw) <= 24):
                         continue
-                    if rx_val < 0 or tx_val < 0:
-                        continue
+                    rx_val, tx_val = int(rx_raw), int(tx_raw)
                     rx += rx_val
                     tx += tx_val
                     seen.append(name)
@@ -9465,9 +9576,14 @@ def serve(path):
                              TUIC_SERVICE)
 
     def _unit_active(unit):
+        if not isinstance(unit, str) or not unit or unit.startswith('-'):
+            return False
+        if any(ord(ch) <= 32 or ord(ch) == 127 for ch in unit):
+            return False
         try:
             return subprocess.run(['systemctl', 'is-active', unit], capture_output=True,
-                                  text=True, timeout=5).stdout.strip() == 'active'
+                                  text=True, encoding='utf-8', errors='replace',
+                                  timeout=5).stdout.strip() == 'active'
         except Exception:
             return False
 
@@ -9600,7 +9716,7 @@ def serve(path):
         now = time.monotonic()
         # Persist the first sample immediately after start/reboot so a quick portal
         # restart cannot lose the new counter baseline or its accumulated usage.
-        if _meter_last_save[0] is not None and now - _meter_last_save[0] < METER_SAVE_INTERVAL:
+        if _meter_last_save[0] is not None and 0 <= now - _meter_last_save[0] < METER_SAVE_INTERVAL:
             return
         save_data()
         _meter_last_save[0] = now
@@ -9860,6 +9976,7 @@ def serve(path):
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
         gost_cfg_path = portal_path.parent / 'gost.yml'
         services = []
+        seen_ports = set()
         with data_lock:
             # 单条代理记录被改坏（null / 字符串 / 端口非数字）时跳过它：
             # 旧写法在这里抛异常，reload_gost 一律返回 False，
@@ -9879,11 +9996,12 @@ def serve(path):
                             port = cand_p if 1 <= cand_p <= 65535 else 0
                     elif isinstance(raw_port, str):
                         ps = raw_port.strip()
-                        if ps.isascii() and ps.isdigit() and not (len(ps) > 1 and ps.startswith('0')):
+                        if ps.isascii() and ps.isdigit() and len(ps) <= 16 and not (len(ps) > 1 and ps.startswith('0')):
                             cand_p = int(ps)
                             port = cand_p if 1 <= cand_p <= 65535 else 0
-                if not port:
+                if not port or port in seen_ports:
                     continue
+                seen_ports.add(port)
                 raw_user = svc.get('username', '')
                 raw_pass = svc.get('password', '')
                 safe_user = ''.join(ch for ch in raw_user if ord(ch) >= 32 and ord(ch) != 127) if isinstance(raw_user, str) else ''
@@ -10004,7 +10122,7 @@ def serve(path):
             cached_t = _ver_cache['t']
             cached_data = _ver_cache['data']
         ttl = 300 if cached_data is not None else 60
-        if cached_t and now - cached_t < ttl:
+        if cached_t and 0 <= now - cached_t < ttl:
             return dict(cached_data) if isinstance(cached_data, dict) else cached_data
         try:
             req = urllib.request.Request(
@@ -10022,7 +10140,11 @@ def serve(path):
             # GitHub 在限流/出错时返回的是对象（{"message": ...}），不是列表；
             # 旧写法 `for it in items` 直接抛 TypeError，虽然被下面 except 兜住，
             # 但每次都白跑一遍请求且永远拿不到缓存。
-            shas = ({it['name']: (it.get('sha') if isinstance(it.get('sha'), str) else '')
+            def _valid_blob_sha(val):
+                if isinstance(val, str) and 7 <= len(val) <= 64 and all(c in '0123456789abcdefABCDEF' for c in val):
+                    return val.lower()
+                return ''
+            shas = ({it['name']: _valid_blob_sha(it.get('sha'))
                      for it in items
                      if isinstance(it, dict) and isinstance(it.get('name'), str) and it['name']}
                     if isinstance(items, list) else {})
@@ -10066,7 +10188,9 @@ def serve(path):
     def gost_status():
         """检测 gost 服务运行状态。"""
         try:
-            out = subprocess.run(['systemctl', 'is-active', 'gost'], capture_output=True, text=True, timeout=3).stdout.strip()
+            out = subprocess.run(['systemctl', 'is-active', 'gost'], capture_output=True,
+                                 text=True, encoding='utf-8', errors='replace',
+                                 timeout=3).stdout.strip()
             return out == 'active'
         except Exception:
             return False
@@ -10089,8 +10213,13 @@ def serve(path):
             try:
                 with os.fdopen(fd, 'wb') as fh:
                     fh.write(GOST_SELFCHECK_SCRIPT.encode('utf-8'))
+                    fh.flush()
+                    os.fsync(fh.fileno())
             except BaseException:
-                tmp_path.unlink(missing_ok=True)
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 raise
             os.chmod(str(tmp_path), 0o755)
             os.replace(str(tmp_path), str(GOST_SELFCHECK_PATH))
@@ -10098,7 +10227,10 @@ def serve(path):
             return True
         except OSError as exc:
             if tmp_path is not None:
-                tmp_path.unlink(missing_ok=True)
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             _log_ignored('gost_selfcheck_write', exc)
             return False
 
@@ -12466,15 +12598,16 @@ if __name__ == '__main__':
                     portal_token = str(data.get('token') or '')
                 self.send_response(302)
                 self._responded = True
-                self.send_header('Location', prefix)
+                safe_loc = ''.join(ch for ch in str(prefix) if ord(ch) >= 32 and ord(ch) != 127)
+                self.send_header('Location', safe_loc or '/')
                 # 🔴 2026-10-31：Secure 属性必须与登入时**完全一致**，否则
                 # 清除不掉。HTTP 访问下浏览器不会回写带 Secure 的 Cookie，
                 # 于是「点了退出登录，其实还登录着」—— 共用电脑场景下这是
                 # 真事故（登出入口就是为它加的）。
                 _secure = '; Secure' if self._is_https_request() else ''
                 self.send_header('Set-Cookie',
-                                 'hy2_session=; Path=/%s/; HttpOnly; SameSite=Strict%s; Max-Age=0'
-                                 % (portal_token, _secure))
+                                 'hy2_session=; Path=%s; HttpOnly; SameSite=Strict%s; Max-Age=0'
+                                 % (_safe_cookie_path_token(portal_token), _secure))
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header('X-Frame-Options', 'DENY')
@@ -15937,11 +16070,13 @@ if __name__ == '__main__':
             # 判断依据只看本请求是否经 TLS（masquerade 会带
             # X-Forwarded-Proto），不看配置 —— 配置读错会把所有人锁在门外。
             secure = '; Secure' if self._is_https_request() else ''
-            cookie = (f'hy2_session={sess_val}; Path=/{portal_token}/; '
+            cookie_path = _safe_cookie_path_token(portal_token)
+            cookie = (f'hy2_session={sess_val}; Path={cookie_path}; '
                       f'HttpOnly; SameSite=Strict{secure}{max_age}')
             self.send_response(302)
             self._responded = True
-            self.send_header('Location', prefix)
+            safe_loc = ''.join(ch for ch in str(prefix) if ord(ch) >= 32 and ord(ch) != 127)
+            self.send_header('Location', safe_loc or '/')
             self.send_header('Set-Cookie', cookie)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
@@ -16444,8 +16579,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 协议是否真的在服务，以 xray.json 里有没有托管入站为准 ——
                     # data 里的配置是「上次生成成功」的残留，停用后仍在。
                     try:
-                        _xcfg = json.loads(Path('/etc/hysteria/xray.json')
-                                           .read_text(encoding='utf-8'))
+                        _xp = Path('/etc/hysteria/xray.json')
+                        _xst = _xp.lstat()
+                        if _xp.is_symlink() or not _xp.is_file() or _xst.st_size > 4 * 1024 * 1024:
+                            raise ValueError('xray.json 非法或过大')
+                        _xcfg = json.loads(_xp.read_bytes().decode('utf-8', errors='replace'))
+                        if not isinstance(_xcfg, dict):
+                            raise ValueError('xray.json 顶层非对象')
                         d_snap['vmess_inbound'] = managed_inbound_active(_xcfg, VMESS_INBOUND_TAG)
                         d_snap['reality_inbound'] = managed_inbound_active(_xcfg, REALITY_INBOUND_TAG)
                         d_snap['vlessenc_inbound'] = managed_inbound_active(_xcfg, VLESSENC_INBOUND_TAG)
@@ -16458,6 +16598,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         try:
                             out = subprocess.run(['systemctl', 'is-active', unit],
                                                  capture_output=True, text=True,
+                                                 encoding='utf-8', errors='replace',
                                                  timeout=3).stdout.strip()
                             return out == 'active'
                         except Exception:
@@ -16476,8 +16617,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         try:
                             cc = subprocess.run(
                                 ['sysctl', '-n', 'net.ipv4.tcp_congestion_control'],
-                                capture_output=True, text=True, timeout=3
+                                capture_output=True, text=True,
+                                encoding='utf-8', errors='replace', timeout=3
                             ).stdout.strip()
+                            cc = ''.join(ch for ch in cc if ord(ch) >= 32 and ord(ch) != 127)
                         except Exception:
                             cc = ''
                         return (cc.startswith('bbr'), cc)
@@ -16504,10 +16647,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 避免旧版 [:80] 截断漏掉定义及整文件读入内存；不可读时回落模块常量。
                     portal_version = PORTAL_VERSION
                     try:
-                        with Path(__file__).open(encoding='utf-8') as _ver_fp:
+                        with Path(__file__).open(encoding='utf-8', errors='replace') as _ver_fp:
                             for line in _ver_fp:
                                 if line.startswith('PORTAL_VERSION'):
-                                    parsed_ver = line.split('=', 1)[1].strip().strip('"\'')
+                                    rhs = line.split('=', 1)[1].split('#', 1)[0].strip()
+                                    parsed_ver = rhs.strip('"\'')
                                     if parsed_ver:
                                         portal_version = parsed_ver
                                     break
@@ -16821,7 +16965,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
                     except Exception:
                         qr_bytes = b''
-                    if b'<svg' not in qr_bytes or b'<script' in qr_bytes.lower():
+                    if not _is_safe_svg_payload(qr_bytes):
                         qr_bytes = QR_UNAVAILABLE_SVG.encode('utf-8')
                     return self.reply(200, qr_bytes, 'image/svg+xml')
                 elif action_file == '':
@@ -16829,9 +16973,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                     except Exception:
                         qr_svg = ''
-                    if '<svg' not in qr_svg:
-                        qr_svg = ''
-                    elif '<script' in qr_svg.lower():
+                    if not _is_safe_svg_payload(qr_svg):
                         qr_svg = ''
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
@@ -17067,6 +17209,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 except Exception:
                     return self.reply(500, '二维码生成失败（服务器可能未安装 qrencode），请改用「下载配置」导入'
                                       .encode('utf-8'))
+                if not _is_safe_svg_payload(qr_bytes):
+                    return self.reply(500, '二维码内容异常，请改用「下载配置」导入'.encode('utf-8'))
                 return self.reply(200, qr_bytes, 'image/svg+xml')
 
             if not self.is_authenticated():
@@ -17123,8 +17267,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 连接照样被掐断 —— 这是用户点「下载配置」的路径。
                 raw_content = data.get(key)
                 content = raw_content.encode() if isinstance(raw_content, str) else b''
-            if key == 'qr' and b'<svg' not in content:
-                # 生成不出二维码时给一张说明图（2026-11-13 修）：旧实现回空内容，页面上是一个裂开的图片。
+            if key == 'qr' and not _is_safe_svg_payload(content):
+                # 生成不出二维码或内容异常时给一张说明图（2026-11-13 修）：旧实现回空内容，页面上是一个裂开的图片。
                 content = QR_UNAVAILABLE_SVG.encode('utf-8')
             self.reply(200, content, mime)
 
@@ -17632,7 +17776,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 def _sysctl_read(param):
                     try:
                         return subprocess.run(['sysctl', '-n', param],
-                                              capture_output=True, text=True, timeout=2).stdout.strip()
+                                              capture_output=True, text=True,
+                                              encoding='utf-8', errors='replace',
+                                              timeout=2).stdout.strip()
                     except (OSError, subprocess.SubprocessError):
                         return ''
                 cc_out = _sysctl_read('net.ipv4.tcp_congestion_control')
@@ -17642,8 +17788,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 configured_bbr = ''
                 if conf_path.exists():
                     try:
-                        c_text = conf_path.read_text(encoding='utf-8')
-                    except (OSError, UnicodeDecodeError):
+                        c_st = conf_path.lstat()
+                        if not conf_path.is_symlink() and conf_path.is_file() and c_st.st_size <= 1024 * 1024:
+                            c_text = conf_path.read_bytes().decode('utf-8', errors='replace')
+                        else:
+                            c_text = ''
+                    except OSError:
                         c_text = ''
                     for line in c_text.splitlines():
                         stripped = line.strip()
@@ -17667,7 +17817,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     need_reboot = False
 
                 with data_lock:
-                    target_ver = data.get('bbr_target_version', '')
+                    raw_target_ver = data.get('bbr_target_version', '')
+                target_ver = (''.join(ch for ch in raw_target_ver if ord(ch) >= 32 and ord(ch) != 127)
+                              if isinstance(raw_target_ver, str) else '')
 
                 # tcp_available_congestion_control 只列出**已加载**的模块：新机器上
                 # tcp_bbr 还没 modprobe，只会看到 "reno cubic"，前端据此把按钮全禁用。
@@ -17710,7 +17862,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 applying = bool(data.get('egress_applying'))
                 error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
             try:
-                text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
+                _cfg_p = Path('/etc/hysteria/config.yaml')
+                _cfg_st = _cfg_p.lstat()
+                if _cfg_p.is_symlink() or not _cfg_p.is_file() or _cfg_st.st_size > 4 * 1024 * 1024:
+                    raise ValueError('config.yaml 非法或过大')
+                text = _cfg_p.read_bytes().decode('utf-8', errors='replace')
                 applied = text == render_egress_config(text, state) and _hy2_config_loaded('/etc/hysteria/config.yaml')
             except Exception:
                 applied = False
@@ -18166,6 +18322,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             seconds = float(seconds)
             if not (seconds > 0 and seconds < float('inf')):
                 return
+            seconds = min(seconds, 3600.0)
             with self.deadline_lock:
                 if request in self.deadlines:
                     self.deadlines[request] = max(self.deadlines[request],
@@ -18202,7 +18359,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 self.deadlines[request] = time.monotonic() + 30
             try:
                 super().process_request(request, address)
-            except Exception:
+            except BaseException:
                 with self.deadline_lock:
                     self.deadlines.pop(request, None)
                     heavy = self._heavy.pop(request, False)

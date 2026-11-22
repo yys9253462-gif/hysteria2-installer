@@ -1713,7 +1713,7 @@ async function setOutboundMode(mode) {
       confirmText: '切到全局',
       isDanger: true
     });
-    if (!confirmed) return;
+    if (!confirmed || obModeBusy) return;
   }
   obModeBusy = true;
   [obEls.btnGlobal, obEls.btnRules].forEach(b => { if (b) b.disabled = true; });
@@ -1738,6 +1738,7 @@ if (obEls.btnCancel) obEls.btnCancel.addEventListener('click', () => obResetForm
 
 if (obEls.btnSave) {
   obEls.btnSave.addEventListener('click', async () => {
+    if (obEls.btnSave.disabled) return;
     obMsg('保存中，正在重启服务生效...', '');
     obEls.btnSave.disabled = true;
     try {
@@ -1780,7 +1781,7 @@ if (obEls.list) {
         confirmText: '删除',
         isDanger: true
       });
-      if (!confirmed) return;
+      if (!confirmed || del.disabled) return;
       del.disabled = true;
       try {
         await obApi('delete', { name: name });
@@ -1794,7 +1795,8 @@ if (obEls.list) {
     } else if (edit) {
       e.preventDefault();
       const name = edit.getAttribute('data-ob-edit');
-      const found = OB_STATE.outbounds.find(x => x.name === name);
+      const found = (Array.isArray(OB_STATE.outbounds) ? OB_STATE.outbounds : []).find(x => x && x.name === name);
+      if (!found) return;
       obFillForm(found);
       window.scrollTo({ top: obEls.list.offsetTop - 120, behavior: 'smooth' });
     } else if (test) {
@@ -2519,15 +2521,18 @@ async function checkBbrStatus() {
   try {
     const res = await fetch(location.pathname + 'bbr-status', { credentials: 'same-origin' });
     if (seq !== checkBbrStatus._seq) return;
+    if (res.status === 401) { portalSessionExpired = true; markBbrFailed('登录已过期'); return; }
     if (!res.ok) { markBbrFailed(); return; }
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
     if (seq !== checkBbrStatus._seq) return;
     if (!json || typeof json !== 'object' || !json.ok) { markBbrFailed(json && json.error); return; }
 
+    const bbrAlgoMap = {v1:'bbr',v2:'bbr2',v3:'bbr3'};
     if (Array.isArray(json.available)) document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
-      const algo = {v1:'bbr',v2:'bbr2',v3:'bbr3'}[btn.dataset.version];
-      btn.disabled = !json.available.includes(algo);
+      const ver = btn.dataset ? btn.dataset.version : '';
+      const algo = Object.prototype.hasOwnProperty.call(bbrAlgoMap, ver) ? bbrAlgoMap[ver] : '';
+      btn.disabled = !algo || !json.available.includes(algo);
       btn.title = btn.disabled ? '当前内核未提供该算法，需要先使用支持它的内核' : '';
     });
     if (bbrCurrentText) bbrCurrentText.textContent = json.current || 'cubic';
@@ -3306,9 +3311,11 @@ async function pollTrafficSpeed() {
   trafficPollPending = true;
   try {
     const res = await fetch(location.pathname + 'traffic-speed', { credentials: 'same-origin' });
+    if (res.status === 401) { portalSessionExpired = true; return; }
     if (!res.ok) return;
-    const json = await res.json();
-    if (!json.ok) return;
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (!json || typeof json !== 'object' || !json.ok) return;
 
     if (speedRxEl) speedRxEl.textContent = fmtSpeed(json.node_rx || 0);
     if (speedTxEl) speedTxEl.textContent = fmtSpeed(json.node_tx || 0);
@@ -3966,7 +3973,10 @@ function renderAwgPeers(peers) {
   awgPeerTbody.querySelectorAll('[data-awg-del]').forEach(b => {
     b.addEventListener('click', async () => {
       if (b.disabled) return;
-      const n = decodeURIComponent(b.getAttribute('data-awg-del'));
+      const rawName = b.getAttribute('data-awg-del') || '';
+      let n = rawName;
+      try { n = decodeURIComponent(rawName); } catch (_) { n = rawName; }
+      if (!n) return;
       const confirmed = await showConfirm({
         title: '删除 AWG 客户端',
         text: '确认删除客户端「' + n + '」？该客户端会立即断开连接。',
@@ -4030,7 +4040,7 @@ if (btnAddAwgPeer) {
     const name = awgPeerName ? awgPeerName.value.trim() : '';
     const endpoint = (awgPeerEndpoint && awgPeerEndpoint.value.trim()) || awgCurrentEndpoint;
     if (!name) { alert('请填写客户端名称'); return; }
-    if (!/^[A-Za-z0-9_.-]{1,32}$/.test(name)) { alert('名称只允许字母、数字、点、下划线、连字符，且不超过 32 字符'); return; }
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$/.test(name)) { alert('名称须以字母或数字开头，仅允许字母、数字、点、下划线、连字符，且不超过 32 字符'); return; }
     if (!endpoint) { alert('请填写连接地址'); return; }
     // Open the tab synchronously in the click gesture; browsers block window.open
     // after an await because it no longer has transient user activation.
@@ -4039,20 +4049,23 @@ if (btnAddAwgPeer) {
     btnAddAwgPeer.disabled = true;
     try {
       const json = await awgPost('manage-amneziawg', { action: 'peer_add', name: name, endpoint: endpoint });
-      if (json.ok) {
+      if (json && json.ok) {
         if (awgPeerName) awgPeerName.value = '';
         const confUrl = location.pathname + 'awg-conf?name=' + encodeURIComponent(name)
           + '&endpoint=' + encodeURIComponent(endpoint);
-        if (confTab) confTab.location = confUrl;
-        else showToast('客户端已新增，请用列表中的“配置”按钮打开配置', 'success');
-        if (confTab) showToast('已新增客户端 ' + name + '，正在打开配置', 'success');
+        if (confTab && !confTab.closed) {
+          confTab.location = confUrl;
+          showToast('已新增客户端 ' + name + '，正在打开配置', 'success');
+        } else {
+          showToast('客户端已新增，请用列表中的“配置”按钮打开配置', 'success');
+        }
         loadAwgState();
       } else {
-        if (confTab) confTab.close();
-        alert(json.error || '新增失败');
+        if (confTab && !confTab.closed) confTab.close();
+        alert((json && json.error) || '新增失败');
       }
     } catch (e) {
-      if (confTab) confTab.close();
+      if (confTab && !confTab.closed) confTab.close();
       alert('新增失败: ' + (e && e.message ? e.message : e));
     } finally {
       btnAddAwgPeer.disabled = false;
@@ -4120,6 +4133,7 @@ LOGIN_SCRIPT = r"""
 function toggleSecret(id, btn) {
   const el = document.getElementById(id);
   if (!el) return;
+  if (!btn) return;
   if (el.type === 'password') {
     el.type = 'text';
     btn.textContent = '隐藏';
