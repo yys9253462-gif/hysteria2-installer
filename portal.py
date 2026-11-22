@@ -10384,6 +10384,7 @@ def serve(path):
 而不是留下一个 "active 但无监听" 的假健康状态.
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -10393,38 +10394,58 @@ CFG = '/etc/hysteria/gost.yml'
 
 def listening(port):
     for fam, addr in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')):
-        s = socket.socket(fam, socket.SOCK_STREAM)
+        s = None
         try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
             s.settimeout(1)
             if s.connect_ex((addr, port)) == 0:
                 return True
         except OSError:
             pass
         finally:
-            s.close()
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
     return False
 
 
 def main():
     try:
-        with open(CFG, encoding='utf-8') as fh:
-            svc = json.load(fh).get('services') or []
+        if os.path.islink(CFG):
+            raise OSError('配置文件不允许为符号链接')
+        try:
+            if os.lstat(CFG).st_size > 4 * 1024 * 1024:
+                raise ValueError('配置文件超过 4 MiB 上限')
+        except FileNotFoundError:
+            pass
+        with open(CFG, encoding='utf-8', errors='replace') as fh:
+            data = json.load(fh)
+        svc = data.get('services') if isinstance(data, dict) else []
+        if not isinstance(svc, list):
+            svc = []
     except Exception as exc:                     # 配置读不了 -> 交给 gost 自己报错
         print('selfcheck: 无法读取配置: %s' % exc, file=sys.stderr)
         return 0
 
     ports = []
     for s in svc:
+        if not isinstance(s, dict):
+            continue
         addr = str(s.get('addr') or '')
         tail = addr.rsplit(':', 1)[-1]
-        if tail.isdigit():
-            ports.append(int(tail))
+        if tail.isascii() and tail.isdigit() and len(tail) <= 5:
+            port = int(tail)
+            if 1 <= port <= 65535:
+                ports.append(port)
     ports = sorted(set(ports))
     if not ports:
         return 0                                  # 尚无代理, 合法
 
-    deadline = time.time() + 5
-    while time.time() < deadline:
+    deadline = time.monotonic() + 5
+    missing = list(ports)
+    while time.monotonic() < deadline:
         missing = [p for p in ports if not listening(p)]
         if not missing:
             return 0

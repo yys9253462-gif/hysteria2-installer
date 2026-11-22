@@ -5095,7 +5095,7 @@ install_warp_local_proxy() {
             log_err "wireproxy 包内没有 wireproxy 成员，已放弃安装。"
             return 1
         fi
-        TMP_EXTRACT="$(mktemp -d)"
+        TMP_EXTRACT="$(umask 077; mktemp -d)"
         # 只解出那一个确定成员，不再"取包内第一个可执行文件"当 root 二进制。
         if ! tar -xzf "${TMP_DIR}/${WP_ASSET}" -C "$TMP_EXTRACT" "$WP_MEMBER" 2>/dev/null; then
             rm -rf "$TMP_DIR" "$TMP_EXTRACT"
@@ -5177,6 +5177,10 @@ install_warp_local_proxy() {
     # 旧配置只写 IPv4，走 WARP 的域名一旦解析到 IPv6 就连不上（SE 上实测）。
     WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
     [[ -n "$WG_ADDR" ]] || WG_ADDR="172.16.0.2/32"
+    if [[ "$WG_PRIV" =~ [[:cntrl:]] || "$WG_PUB" =~ [[:cntrl:]] || "$WG_EP" =~ [[:cntrl:]] || "$WG_ADDR" =~ [[:cntrl:]] ]]; then
+        log_err "WireGuard 配置字段含非法控制字符，已中止写入。"
+        return 1
+    fi
     WG_ALLOWED="0.0.0.0/0"
     [[ "$WG_ADDR" == *:* ]] && WG_ALLOWED="0.0.0.0/0, ::/0"
     (
@@ -5231,8 +5235,11 @@ EOF
         log_err "写入 wireproxy.service 失败。"
         return 1
     fi
-    chmod 644 "$_wp_unit_tmp"
-    mv -f "$_wp_unit_tmp" /etc/systemd/system/wireproxy.service
+    if ! chmod 644 "$_wp_unit_tmp" || ! mv -f "$_wp_unit_tmp" /etc/systemd/system/wireproxy.service; then
+        rm -f "$_wp_unit_tmp"
+        log_err "落盘 wireproxy.service 失败。"
+        return 1
+    fi
     systemctl daemon-reload
     systemctl reset-failed wireproxy >/dev/null 2>&1 || true
     systemctl enable --now wireproxy >/dev/null 2>&1 || true
@@ -5258,7 +5265,7 @@ EOF
 #!/usr/bin/env bash
 set -u
 # 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
-probe() { curl --proxy socks5h://${WARP_SOCKS_ADDR} --silent --fail --max-time 6 "\$1" >/dev/null 2>&1; }
+probe() { curl --proxy socks5h://${WARP_SOCKS_ADDR} --silent --fail --max-time 6 --max-filesize 65536 "\$1" >/dev/null 2>&1; }
 if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
     systemctl reset-failed wireproxy >/dev/null 2>&1 || true
@@ -5295,8 +5302,11 @@ EOF
         log_err "写入 hy2-warp-watchdog.service 失败。"
         return 1
     fi
-    chmod 644 "$_wd_svc_tmp"
-    mv -f "$_wd_svc_tmp" /etc/systemd/system/hy2-warp-watchdog.service
+    if ! chmod 644 "$_wd_svc_tmp" || ! mv -f "$_wd_svc_tmp" /etc/systemd/system/hy2-warp-watchdog.service; then
+        rm -f "$_wd_svc_tmp"
+        log_err "落盘 hy2-warp-watchdog.service 失败。"
+        return 1
+    fi
 
     _wd_tmr_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.timer.XXXXXX")" || {
         log_err "无法创建 hy2-warp-watchdog.timer 临时文件。"
@@ -5319,8 +5329,11 @@ EOF
         log_err "写入 hy2-warp-watchdog.timer 失败。"
         return 1
     fi
-    chmod 644 "$_wd_tmr_tmp"
-    mv -f "$_wd_tmr_tmp" /etc/systemd/system/hy2-warp-watchdog.timer
+    if ! chmod 644 "$_wd_tmr_tmp" || ! mv -f "$_wd_tmr_tmp" /etc/systemd/system/hy2-warp-watchdog.timer; then
+        rm -f "$_wd_tmr_tmp"
+        log_err "落盘 hy2-warp-watchdog.timer 失败。"
+        return 1
+    fi
     systemctl daemon-reload
     systemctl enable --now hy2-warp-watchdog.timer >/dev/null 2>&1 || true
 
@@ -5567,6 +5580,7 @@ EOF
 而不是留下一个 "active 但无监听" 的假健康状态.
 """
 import json
+import os
 import socket
 import sys
 import time
@@ -5576,38 +5590,58 @@ CFG = '/etc/hysteria/gost.yml'
 
 def listening(port):
     for fam, addr in ((socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')):
-        s = socket.socket(fam, socket.SOCK_STREAM)
+        s = None
         try:
+            s = socket.socket(fam, socket.SOCK_STREAM)
             s.settimeout(1)
             if s.connect_ex((addr, port)) == 0:
                 return True
         except OSError:
             pass
         finally:
-            s.close()
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
     return False
 
 
 def main():
     try:
-        with open(CFG, encoding='utf-8') as fh:
-            svc = json.load(fh).get('services') or []
+        if os.path.islink(CFG):
+            raise OSError('配置文件不允许为符号链接')
+        try:
+            if os.lstat(CFG).st_size > 4 * 1024 * 1024:
+                raise ValueError('配置文件超过 4 MiB 上限')
+        except FileNotFoundError:
+            pass
+        with open(CFG, encoding='utf-8', errors='replace') as fh:
+            data = json.load(fh)
+        svc = data.get('services') if isinstance(data, dict) else []
+        if not isinstance(svc, list):
+            svc = []
     except Exception as exc:                     # 配置读不了 -> 交给 gost 自己报错
         print('selfcheck: 无法读取配置: %s' % exc, file=sys.stderr)
         return 0
 
     ports = []
     for s in svc:
+        if not isinstance(s, dict):
+            continue
         addr = str(s.get('addr') or '')
         tail = addr.rsplit(':', 1)[-1]
-        if tail.isdigit():
-            ports.append(int(tail))
+        if tail.isascii() and tail.isdigit() and len(tail) <= 5:
+            port = int(tail)
+            if 1 <= port <= 65535:
+                ports.append(port)
     ports = sorted(set(ports))
     if not ports:
         return 0                                  # 尚无代理, 合法
 
-    deadline = time.time() + 5
-    while time.time() < deadline:
+    deadline = time.monotonic() + 5
+    missing = list(ports)
+    while time.monotonic() < deadline:
         missing = [p for p in ports if not listening(p)]
         if not missing:
             return 0
