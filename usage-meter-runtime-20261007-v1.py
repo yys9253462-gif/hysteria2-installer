@@ -24,7 +24,10 @@ if getattr(core, 'ACCOUNTING_REVISION', None) != ACCOUNTING_REVISION:
     raise RuntimeError('usage_meter_core_revision_mismatch')
 
 def _parse_iso_utc_ts(raw):
-    dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+    cleaned = raw.strip()
+    if cleaned.endswith(('Z', 'z')):
+        cleaned = cleaned[:-1] + '+00:00'
+    dt = datetime.fromisoformat(cleaned)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
@@ -86,6 +89,9 @@ def _recent_gaps(m, window_seconds=86400):
         return [{'reason': 'invalid_gaps_container'}]
     if not gaps:
         return []
+    if (isinstance(window_seconds, bool) or not isinstance(window_seconds, (int, float))
+            or not math.isfinite(window_seconds) or window_seconds <= 0):
+        window_seconds = 86400
     # 结果只取决于全局 gaps，而 summary()/hot_summary() 会**按用户**各调一次，
     # /traffic-speed 每 2 秒 × 全部用户 × 最多 100 条 gap，实测 2000 用户
     # 单次 0.12 秒全花在重复计算上（2026-10-29 修）。
@@ -126,6 +132,8 @@ def _users_view(data):
 
 
 def _measurement_total(meter, enabled, uid):
+    if not isinstance(uid, str):
+        return None
     sources=meter.get('sources')
     if not enabled or not isinstance(sources,dict):
         return None
@@ -193,9 +201,17 @@ class PortalMeter:
         if self.read == self._read and "reality" in sources and isinstance(cfg, dict):
             binary = cfg.get("binary")
             if isinstance(binary, str) and binary:
-                try:
-                    exists = ('\x00' not in binary) and pathlib.Path(binary).is_file()
-                except (OSError, ValueError):
+                safe_bin = (
+                    bool(binary.strip())
+                    and not binary.strip().startswith('-')
+                    and not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in binary)
+                )
+                if safe_bin:
+                    try:
+                        exists = pathlib.Path(binary).is_file()
+                    except (OSError, ValueError):
+                        exists = False
+                else:
                     exists = False
                 if not exists:
                     sources.remove("reality")
@@ -390,7 +406,8 @@ class PortalMeter:
             gaps=m.get('gaps', [])
             if not isinstance(gaps, list):
                 gaps=[{'reason': 'invalid_gaps_container'}]
-            user=_users_view(self.data).get(uid,{})
+            safe_uid = uid if isinstance(uid, str) else None
+            user=_users_view(self.data).get(safe_uid,{}) if safe_uid is not None else {}
             legacy=user.get('legacy_auth_value',user.get('used_bytes',0)) if isinstance(user,dict) else None
             now_ts=time.time()
             live_fresh=(isinstance(self.live_snapshot, dict)
@@ -399,7 +416,7 @@ class PortalMeter:
                         and not isinstance(self.live_sampled_at, bool)
                         and math.isfinite(self.live_sampled_at)
                         and 0 <= now_ts - self.live_sampled_at < 45)
-            live_entry=self.live_snapshot['users'].get(uid) if live_fresh else None
+            live_entry=self.live_snapshot['users'].get(safe_uid) if (live_fresh and safe_uid is not None) else None
             if not isinstance(live_entry, dict):
                 live_entry={'ips': [], 'ok': False, 'hysteria_ok': False, 'reality_ok': False, 'error':'current online IP unavailable'}
             online_fresh=(isinstance(online_counts, dict)
@@ -409,7 +426,7 @@ class PortalMeter:
                           and 0 <= now_ts - online_sampled_at < 30)
             online_dev = None
             if online_fresh:
-                raw_dev = online_counts.get(uid, 0)
+                raw_dev = online_counts.get(safe_uid, 0) if safe_uid is not None else 0
                 online_dev = raw_dev if (type(raw_dev) is int and raw_dev >= 0) else 0
             return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),
@@ -473,5 +490,8 @@ class PortalMeter:
 
 
 def from_file(data,lock,save,path,on_speed=None):
-    config=json.loads(pathlib.Path(path).read_text(encoding='utf-8'))
+    cfg_path = pathlib.Path(path)
+    if cfg_path.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError('usage meter config too large')
+    config=json.loads(cfg_path.read_text(encoding='utf-8'))
     return PortalMeter(data,lock,save,config,on_speed=on_speed)

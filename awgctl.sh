@@ -90,13 +90,14 @@ require_jq() {
 # [min,max] 闭区间随机整数。用 /dev/urandom 而非 $RANDOM —— 后者只有 15 位，
 # 覆盖不了 H1~H4 需要的 5..2147483647 区间。
 awg_rand() {
-    local min="$1" max="$2" span r
-    span=$(( max - min + 1 ))
+    local min="${1:-}" max="${2:-}" span r
+    [[ "$min" =~ ^[0-9]+$ && "$max" =~ ^[0-9]+$ ]] || return 1
+    span=$(( 10#$max - 10#$min + 1 ))
     (( span > 0 )) || return 1
     # od 不可用时（极简镜像）会得到空串，直接参与算术会语法错误。
     r=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n')
     [[ "$r" =~ ^[0-9]+$ ]] || r="${RANDOM:-0}"
-    echo $(( min + r % span ))
+    echo $(( 10#$min + r % span ))
 }
 
 # 读取 meta 字段
@@ -111,16 +112,21 @@ meta_get() {
 
 # 写入 meta 字段（原子替换）
 meta_set() {
-    local key="$1" value="$2" tmp
+    local key="$1" value="$2" tmp=""
+    trap 'rm -f "${tmp:-}"; trap - RETURN' RETURN
     mkdir -p "$AWG_DIR"
     chmod 700 "$AWG_DIR"
     [[ -f "$AWG_META_FILE" ]] || (umask 077; echo '{}' > "$AWG_META_FILE")
-    tmp="$(umask 077; mktemp "${AWG_DIR}/.meta.XXXXXX")"
-    if jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$AWG_META_FILE" > "$tmp" 2>/dev/null; then
+    tmp="$(umask 077; mktemp "${AWG_DIR}/.meta.XXXXXX")" || die "创建 meta 临时文件失败 (key=${key})"
+    if jq --arg k "$key" --arg v "$value" \
+        'if type=="object" then .[$k] = $v else error("meta not object") end' \
+        "$AWG_META_FILE" > "$tmp" 2>/dev/null; then
         chmod 600 "$tmp"
         mv -f "$tmp" "$AWG_META_FILE"
+        tmp=""
     else
         rm -f "$tmp"
+        tmp=""
         die "写入 meta 失败 (key=${key})"
     fi
 }
@@ -384,7 +390,7 @@ validate_endpoint() {
         if [[ "$host" == \[*\] ]]; then
             host="${host#[}"; host="${host%]}"
             python3 -I -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]).version == 6 else 1)'                 "$host" 2>/dev/null || { log_err "方括号里必须是 IPv6 地址: ${ep}"; return 1; }
-        elif [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+        elif (( ${#host} > 253 )) || [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
             log_err "连接地址不是有效的域名或 IPv4: ${ep}"
             return 1
         elif [[ "${host##*.}" =~ ^[0-9]+$ ]] \
@@ -393,7 +399,7 @@ validate_endpoint() {
             log_err "连接地址不是有效的域名或 IPv4: ${ep}"
             return 1
         fi
-        # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置。
+        # 只校验形状会放过 99999 这种端口：它会被原样写进客户端配置（保留 5 位以内十进制解析）。
         if [[ -n "$port" ]]; then
             port="$((10#$port))"
         fi
@@ -1118,7 +1124,7 @@ cmd_peer_list() {
     {
         printf '%-20s %-16s %-20s %s\n' "名称" "隧道地址" "创建时间" "流量(下行/上行)"
         printf -- '--------------------------------------------------------------------------------\n'
-        jq -r '(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | [.name, .address, .created_at, .public_key] | @tsv' "$AWG_PEERS_FILE"
+        jq -r '(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | [(.name | if type=="string" then . else "" end), (.address | if type=="string" then . else "" end), (.created_at | if type=="string" then . else "" end), (.public_key | if type=="string" then . else "" end)] | @tsv' "$AWG_PEERS_FILE"
     } | AWG_TR="$transfer_data" awk -F'\t' '
         BEGIN {
             tr = ENVIRON["AWG_TR"]
@@ -1649,7 +1655,9 @@ cmd_qr() {
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
     validate_endpoint "$endpoint" || die "连接地址非法"
-    render_client_config "$name" "$endpoint" | qrencode -t ANSIUTF8
+    local conf
+    conf="$(render_client_config "$name" "$endpoint")" || exit 1
+    printf '%s\n' "$conf" | qrencode -t ANSIUTF8
 }
 
 # 解析 "名称 [--endpoint HOST]" 形式的参数。

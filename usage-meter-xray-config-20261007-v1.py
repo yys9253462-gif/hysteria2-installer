@@ -321,7 +321,7 @@ def enable_iplimit_routing(config_path, binary, address):
     backup_tmp=path.with_name(path.name+f'.before-iplimit.{nonce}.tmp')
     replaced=False
     try:
-        _write_private_bytes(candidate, json.dumps(config,indent=2).encode('utf-8'), orig_mode)
+        _write_private_bytes(candidate, json.dumps(config,indent=2,allow_nan=False).encode('utf-8'), orig_mode)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
         if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
         _write_private_bytes(backup_tmp, original, orig_mode)
@@ -349,8 +349,11 @@ def enable_iplimit_routing(config_path, binary, address):
             _rollback_restart_xray()
         raise
     finally:
-        candidate.unlink(missing_ok=True)
-        backup_tmp.unlink(missing_ok=True)
+        for _tmp in (candidate, backup_tmp):
+            try:
+                _tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
     return {'enabled':True,'changed':True,'backup':str(backup)}
 
 
@@ -396,7 +399,7 @@ def enable_reality_online(config_path, binary, address):
     if changed:
         replaced=False
         try:
-            _write_private_bytes(candidate, json.dumps(config,indent=2).encode('utf-8'), orig_mode)
+            _write_private_bytes(candidate, json.dumps(config,indent=2,allow_nan=False).encode('utf-8'), orig_mode)
             subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
             if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
             _write_private_bytes(backup_tmp, original, orig_mode)
@@ -427,8 +430,11 @@ def enable_reality_online(config_path, binary, address):
                 _rollback_restart_xray()
             raise
         finally:
-            candidate.unlink(missing_ok=True)
-            backup_tmp.unlink(missing_ok=True)
+            for _tmp in (candidate, backup_tmp):
+                try:
+                    _tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
     else:
         subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=5,check=True)
         subprocess.run([binary,'api','statsgetallonlineusers','--server='+address],capture_output=True,timeout=5,check=True)

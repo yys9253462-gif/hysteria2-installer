@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.65'
+PORTAL_VERSION = '2.66'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -240,13 +240,15 @@ _UNLOCK_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 def _unlock_read(resp, limit):
     # 分块传输被对端提前断开时 read() 会抛 IncompleteRead —— 判据只看页面里
     # 的几个标记，拿到的部分内容已经够用，不能因此把整项判成「检测失败」。
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        return ''
     try:
         raw = resp.read(limit)
     except http.client.IncompleteRead as e:
-        raw = e.partial
+        raw = (e.partial or b'')[:limit]
     if not raw:
         return ''
-    return raw.decode('utf-8', 'replace')
+    return raw[:limit].decode('utf-8', 'replace')
 
 
 def _unlock_fetch(url, timeout=8, limit=400000):
@@ -1726,6 +1728,8 @@ def _copy_stream_bounded(src, dst, limit, chunk_size=65536):
 
 
 def resolve_update_ref(ref):
+    if not isinstance(ref, str):
+        raise ValueError('Invalid immutable ref')
     if re.fullmatch(r'[0-9a-f]{40}', ref):
         return ref
     if ref != 'main':
@@ -1736,7 +1740,8 @@ def resolve_update_ref(ref):
                                      headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=8) as response:
             payload = json.loads(_read_bounded_bytes(response).decode('utf-8', 'replace'))
-            value = payload.get('sha', '') if isinstance(payload, dict) else ''
+            raw_sha = payload.get('sha') if isinstance(payload, dict) else ''
+            value = raw_sha if isinstance(raw_sha, str) else ''
     except Exception as exc:
         _log_ignored('resolve_update_ref.github', exc)
     if not re.fullmatch(r'[0-9a-f]{40}', value):
@@ -2085,7 +2090,10 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 _log_ignored('upgrade_core_rollback_restart', rb_exc)
         raise
     finally:
-        candidate.unlink(missing_ok=True)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 _portal_state_lock_guard = threading.Lock()
@@ -2263,6 +2271,10 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                                   binary='/usr/local/bin/xray', restart=True,
                                   enable=True):
     """Validate a candidate before replacing; restore prior config on start failure."""
+    if (not isinstance(binary, str) or not binary.strip() or binary.strip().startswith('-')
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in binary)):
+        raise ValueError('Xray 可执行文件路径无效')
+    candidate_payload = json.dumps(config, indent=2, allow_nan=False).encode('utf-8')
     path = Path(config_path)
     original = path.read_bytes() if path.exists() else None
     mode = (path.stat().st_mode & 0o777) or 0o600 if path.exists() else 0o600
@@ -2301,7 +2313,7 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
 
     replaced = False
     try:
-        _write_priv(candidate, json.dumps(config, indent=2).encode('utf-8'), mode)
+        _write_priv(candidate, candidate_payload, mode)
         test = subprocess.run([binary, 'run', '-test', '-c', str(candidate)],
                               capture_output=True, text=True, timeout=10)
         if test.returncode != 0:
@@ -2370,7 +2382,10 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                     _log_ignored('xray_transaction_rollback', rb_exc)
         raise
     finally:
-        candidate.unlink(missing_ok=True)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def set_outbound_apply_error(data, data_lock, save_data, msg):
@@ -2745,10 +2760,17 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
               username="", password=""):
     def field(identifier, value, kind="link", label=None):
         # 读屏念的是 aria-label（2026-11-13 修）：旧实现直接用元素 id，念出来是「hy2-link」这类代码名。
+        text = value if isinstance(value, str) else ""
         return (f'<textarea id="{identifier}" class="{kind}" aria-label="{html.escape(label or identifier)}" '
-                f'readonly spellcheck="false">{html.escape(value)}</textarea>')
+                f'readonly spellcheck="false">{html.escape(text)}</textarea>')
     def copy(identifier):
         return f'<button class="button primary" type="button" data-copy="{identifier}" data-orig="复制">复制</button>'
+
+    token_str = token if isinstance(token, str) else ""
+    token_attr = html.escape(token_str, quote=True)
+    username_str = username if isinstance(username, str) else ""
+    password_str = password if isinstance(password, str) else ""
+    api_key_str = api_key if isinstance(api_key, str) else ""
     
     # meta 字段先清洗再用（2026-11-06 修）：server_name / public_ip 为数字、列表或 null 时
     # 下面的 html.escape 抛 AttributeError，整个管理页 500；is_insecure 写成字符串 "false"
@@ -2788,7 +2810,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     # 单条记录不是 dict（手工编辑 / 截断写入）时跳过该行；`users` 整体不是
     # dict 时按空表渲染 —— 页面是 /auth 与所有管理操作的必经路径，
     # 这里抛异常等于整个控制台白屏，而两个服务仍然 active。
-    rows = [(uid, u) for uid, u in users.items() if isinstance(u, dict)]
+    rows = [(uid, u) for uid, u in users.items() if isinstance(uid, str) and isinstance(u, dict)]
     for uid, u in sorted(rows, key=lambda x: _safe_int(x[1].get("created_at") or 0),
                          reverse=True):
         used_bytes = _safe_int(u.get("used_bytes") or 0)
@@ -2839,8 +2861,8 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
           <td>{expires_str}</td>
           <td><code style="font-size:11px">{html.escape(password_hint(u.get("password")))}</code></td>
           <td>
-            {'' if uid == MASTER_USER_ID else f'''<button class="button primary btn-user-connect" style="padding:4px 10px;font-size:11px;margin-right:6px" type="button" data-uid="{html.escape(uid)}" data-token="{token}" data-key="{user_key}">专属连接</button>'''}
-            {'' if uid == MASTER_USER_ID else f'''<form method="POST" action="/{token}/manage-user" style="display:inline" class="js-confirm-delete" data-confirm="确定注销此用户？此操作不可撤销。">
+            {'' if uid == MASTER_USER_ID else f'''<button class="button primary btn-user-connect" style="padding:4px 10px;font-size:11px;margin-right:6px" type="button" data-uid="{html.escape(uid)}" data-token="{token_attr}" data-key="{html.escape(user_key, quote=True)}">专属连接</button>'''}
+            {'' if uid == MASTER_USER_ID else f'''<form method="POST" action="/{token_attr}/manage-user" style="display:inline" class="js-confirm-delete" data-confirm="确定注销此用户？此操作不可撤销。">
               <input type="hidden" name="action" value="delete">
               <input type="hidden" name="user_id" value="{html.escape(uid)}">
               <button class="button danger" style="padding:4px 10px;font-size:11px" type="submit">删除</button>
@@ -2870,9 +2892,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     #
     # 反过来，绝不能把这份负载挂到 /api/v1/ 的 Bearer 链路上去：api_key 的权限
     # 明确低于 Basic（前者够不着门户网页端），用低权限凭据换高权限凭据就是提权。
-    access_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
+    access_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/"
     access_json = json.dumps(
-        portal_access_payload(access_url, username, password, api_key or ""),
+        portal_access_payload(access_url, username_str, password_str, api_key_str),
         ensure_ascii=False)
     field_access_json = (
         f'<textarea id="teyir-access-json" class="config" aria-label="TEYIR 接入凭据（JSON）" '
@@ -2881,9 +2903,10 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     def _access_row(identifier, label, value):
         """克隆既有 api-box 的结构，保持与「API 基础地址」一行完全一致的观感。"""
+        val_text = value if isinstance(value, str) else ""
         return (f'<div class="api-box"><div><div style="font-size:11px;color:var(--muted);'
                 f'font-weight:700">{label}</div>'
-                f'<div class="api-key-code" id="{identifier}">{html.escape(value)}</div></div>'
+                f'<div class="api-key-code" id="{identifier}">{html.escape(val_text)}</div></div>'
                 f'<button class="button" type="button" data-copy="{identifier}" '
                 f'data-orig="复制">复制</button></div>')
 
@@ -2906,9 +2929,9 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <summary class="hint" style="cursor:pointer">或按字段单独复制（控制台里手工填写时才需要）</summary>
     <div style="display:grid;gap:10px;margin-top:12px">
       {_access_row("teyir-url-val", "门户地址 url", access_url)}
-      {_access_row("teyir-user-val", "门户用户名 username", username)}
-      {_access_row("teyir-pass-val", "门户密码 password", password)}
-      {_access_row("teyir-key-val", "api_key（Bearer 鉴权）", api_key or "")}
+      {_access_row("teyir-user-val", "门户用户名 username", username_str)}
+      {_access_row("teyir-pass-val", "门户密码 password", password_str)}
+      {_access_row("teyir-key-val", "api_key（Bearer 鉴权）", api_key_str)}
     </div>
   </details>
 
@@ -2926,7 +2949,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HY2 · 节点与集群中心</title><style>{STYLE}</style></head><body><main>
 <nav class="topbar" aria-label="页面标识"><div class="brand"><span class="logo">H₂</span> HYSTERIA <span> / 控制中心</span></div><span class="private">● 集群运行中</span></nav>
 <header class="hero"><div class="eyebrow">HYSTERIA 2 NODE DASHBOARD</div><h1>{html.escape(host)}</h1><p>官方核心驱动 · 极速 QUIC 代理 · 多用户开户与流量/IP限制{fake_sni_hint}</p>
-<form method="POST" action="/{token}/logout" style="margin-top:10px"><button class="button" type="submit" style="padding:6px 14px;font-size:12px">退出登录</button></form></header>
+<form method="POST" action="/{token_attr}/logout" style="margin-top:10px"><button class="button" type="submit" style="padding:6px 14px;font-size:12px">退出登录</button></form></header>
 
 <!-- 顶部 Tab 导航栏 -->
 <div class="tab-bar">
@@ -3001,7 +3024,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 
     <details style="margin-bottom:18px">
       <summary class="button" style="margin-bottom:12px;list-style:none">＋ 手动添加/开通新用户</summary>
-      <form class="modal-form js-user-form" method="POST" action="/{token}/manage-user">
+      <form class="modal-form js-user-form" method="POST" action="/{token_attr}/manage-user">
         <input type="hidden" name="action" value="create">
         
         <div class="form-field">
@@ -3860,7 +3883,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     <div class="api-box">
       <div>
         <div style="font-size:11px;color:var(--muted);font-weight:700">通信鉴权密钥 (Bearer API Key)</div>
-        <div class="api-key-code" id="api-key-val">{html.escape(api_key or "")}</div>
+        <div class="api-key-code" id="api-key-val">{html.escape(api_key_str)}</div>
       </div>
       <button class="button primary" type="button" data-copy="api-key-val" data-orig="复制 Key">复制 Key</button>
     </div>
@@ -4203,6 +4226,18 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # 数据被改坏时（非字典或字符串用量、非法到期时间）不能让客户页面 500：
     # 这几个值直接来自 portal.json（2026-10-30 修）。
     uinfo = uinfo if isinstance(uinfo, dict) else {}
+    host = host if isinstance(host, str) else ""
+    uid = uid if isinstance(uid, str) else ""
+    uri = uri if isinstance(uri, str) else ""
+    clash = clash if isinstance(clash, str) else ""
+    sing = sing if isinstance(sing, str) else ""
+    obfs_badge = obfs_badge if isinstance(obfs_badge, str) else ""
+    token_str = token if isinstance(token, str) else ""
+    user_key_str = user_key if isinstance(user_key, str) else ""
+    token_attr = html.escape(token_str, quote=True)
+    user_key_attr = html.escape(user_key_str, quote=True)
+    uid_url = quote(uid, safe='')
+    uid_attr = html.escape(uid, quote=True)
     used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
     limit_bytes = _safe_int(uinfo.get("limit_bytes") or 0)
     # 与 user_access_allowed 同源：徽标直接取自 user_access_denial。
@@ -4230,12 +4265,17 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # **绝不兜底成伪造的 8443**（8443 在本项目里是被主动避开的黑名单端口）。
     if sub_port is None:
         sub_port = resolve_subscription_port({})[0]
-    clash_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/clash.yaml?k={user_key}"
+    clash_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/u/{uid_url}/clash.yaml?k={user_key_str}"
     # sing-box 也给订阅链接（2026-11-13 加）：SFA / SFI 用「远程配置」填链接即可自动更新，
     # 响应头本来就带更新间隔；旧页面只给整段 JSON 和下载，节点换端口后客户得重新导入。
-    sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token}/u/{quote(uid)}/sing-box.json?k={user_key}"
-    # 生成不出二维码时说清楚（2026-11-13 修）：旧页面留一个空框，下面还写着「扫描即可直接接入」。
-    qr_block = (qr_svg if isinstance(qr_svg, str) and '<svg' in qr_svg
+    sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/u/{uid_url}/sing-box.json?k={user_key_str}"
+    # 生成不出二维码或含危险脚本/事件属性时说清楚（2026-11-13 修）：严禁内联不受信任的 SVG 脚本。
+    qr_safe = (
+        isinstance(qr_svg, str)
+        and re.match(r'^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b', qr_svg.strip(), re.I) is not None
+        and re.search(r'<script\b|<foreignObject\b|\bon[a-z]+\s*=', qr_svg, re.I) is None
+    )
+    qr_block = (qr_svg if qr_safe
                 else '<p class="hint">%s</p>' % html.escape(QR_UNAVAILABLE_TEXT))
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>个人专属连接 · {html.escape(uid)}</title><style>{STYLE}</style></head><body><main style="max-width:860px">
@@ -4263,7 +4303,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     <p class="hint">支持 v2rayNG / Shadowrocket / Nekobox</p>
     <div class="qr-frame" style="margin:16px 0">{qr_block}</div>
     <p class="hint">在客户端点击右上角扫描即可直接接入</p>
-    <div class="tags"><span class="tag">Hysteria 2</span><span class="tag">专属认证</span><span class="tag">{obfs_badge}</span></div>
+    <div class="tags"><span class="tag">Hysteria 2</span><span class="tag">专属认证</span><span class="tag">{html.escape(obfs_badge)}</span></div>
   </section>
 
   <!-- 直链与客户端配置 -->
@@ -4283,7 +4323,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
       <textarea id="u-clash-sub" class="link" aria-label="Clash 订阅链接" style="height:68px" readonly>{html.escape(clash_sub_url)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-clash-sub">复制订阅链接</button>
-        <a class="button" href="/{token}/u/{quote(uid)}/clash.yaml?k={user_key}" download="clash-{uid}.yaml">下载 clash.yaml ↓</a>
+        <a class="button" href="/{token_attr}/u/{uid_url}/clash.yaml?k={user_key_attr}" download="clash-{uid_attr}.yaml">下载 clash.yaml ↓</a>
       </div>
       <details style="margin-top:10px">
         <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
@@ -4297,7 +4337,7 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
       <textarea id="u-sing-sub" class="link" aria-label="Sing-box 订阅链接" style="height:68px" readonly>{html.escape(sing_sub_url)}</textarea>
       <div class="actions">
         <button class="button primary" type="button" data-copy="u-sing-sub">复制订阅链接</button>
-        <a class="button" href="/{token}/u/{quote(uid)}/sing-box.json?k={user_key}" download="sing-box-{uid}.json">下载 sing-box.json ↓</a>
+        <a class="button" href="/{token_attr}/u/{uid_url}/sing-box.json?k={user_key_attr}" download="sing-box-{uid_attr}.json">下载 sing-box.json ↓</a>
       </div>
       <details style="margin-top:10px">
         <summary style="font-size:11px;color:var(--muted)">查看/复制原始配置源码 (备用)</summary>
@@ -4848,6 +4888,8 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     """
     root = Path(root)
     state_path = Path(state_path) if state_path else root / 'cert-selfheal.json'
+    if not cert_file or not isinstance(cert_file, (str, os.PathLike)):
+        return False
     try:
         cert_file = Path(cert_file)
         if not cert_file.is_file():
@@ -4856,7 +4898,7 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         if not raw_cert:
             return False
         digest = hashlib.sha256(raw_cert).hexdigest()
-    except OSError:
+    except (OSError, TypeError, ValueError):
         return False
     state = {}
     if state_path.exists():
@@ -4890,10 +4932,17 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         return False
     # Record the bytes confirmed by the successful reload attempt. If no service
     # was active, this establishes the baseline for the next certificate update.
-    state['loaded_cert_sha256'] = digest
+    clean_state = {
+        k: v for k, v in state.items()
+        if not (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf')))
+    }
+    clean_state['loaded_cert_sha256'] = digest
     try:
-        atomic_write_private(state_path, json.dumps(state, ensure_ascii=False).encode('utf-8'))
-    except OSError as exc:
+        atomic_write_private(
+            state_path,
+            json.dumps(clean_state, ensure_ascii=False, allow_nan=False).encode('utf-8'),
+        )
+    except (OSError, ValueError, TypeError) as exc:
         print('[portal] 证书运行态指纹写入失败: %s' % str(exc)[:120], file=sys.stderr)
     return True
 
@@ -4915,13 +4964,21 @@ def record_cert_heal(root, state, before, after):
             try:
                 loaded = json.loads(state_path.read_text(encoding='utf-8'))
                 if isinstance(loaded, dict):
-                    previous = loaded
+                    previous = {
+                        k: v for k, v in loaded.items()
+                        if not (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf')))
+                    }
                 raw_count = previous.get('heal_count')
                 if isinstance(raw_count, bool):
                     prev_count = 0
+                elif isinstance(raw_count, int) and raw_count >= 0:
+                    prev_count = raw_count
+                elif isinstance(raw_count, float) and raw_count.is_integer() and raw_count >= 0:
+                    prev_count = int(raw_count)
+                elif isinstance(raw_count, str) and raw_count.strip().isascii() and raw_count.strip().isdigit():
+                    prev_count = int(raw_count.strip())
                 else:
-                    parsed_count = int(raw_count or 0)
-                    prev_count = parsed_count if parsed_count >= 0 else 0
+                    prev_count = 0
             except Exception:
                 prev_count = 0
         # before/after 是 meta 快照；被改成数字/列表时 `.get` 抛 AttributeError，
@@ -4938,7 +4995,10 @@ def record_cert_heal(root, state, before, after):
             'fields': [k for k in ('cert_type', 'server_name', 'is_insecure', 'pin_sha256')
                        if before.get(k) != after.get(k)],
         })
-        atomic_write_private(state_path, json.dumps(payload, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(
+            state_path,
+            json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8'),
+        )
     except Exception as e:
         print('[portal] 写入证书自愈痕迹失败: %s' % str(e)[:120], file=sys.stderr)
 
@@ -5270,22 +5330,46 @@ def users_list_entry(uid, info, tracker, now_ts, summary, ip_timeout):
     """
     if not isinstance(info, dict):
         return None
+    def _clean_nonneg_int(val):
+        if isinstance(val, bool) or val is None:
+            return 0
+        if isinstance(val, int):
+            return val if val >= 0 else 0
+        if isinstance(val, float):
+            return int(val) if math.isfinite(val) and val >= 0 else 0
+        if isinstance(val, str):
+            s = val.strip()
+            if s.isascii() and s.isdigit():
+                return int(s)
+        return 0
+
+    raw_exp = info.get('expires_at', 0)
+    clean_exp = None if raw_exp is None else _clean_nonneg_int(raw_exp)
+    raw_status = info.get('status', 'active')
+    clean_status = (
+        raw_status.strip()
+        if isinstance(raw_status, str) and raw_status.strip() and not any(ord(c) < 32 or ord(c) == 127 for c in raw_status)
+        else 'disabled'
+    )
+    clean_limit = _clean_nonneg_int(info.get('limit_bytes', 0))
+    clean_used = _clean_nonneg_int(info.get('used_bytes', 0))
+    clean_created = _clean_nonneg_int(info.get('created_at', 0))
     return {
         'user_id': uid,
-        'expires_at': info.get('expires_at', 0),
+        'expires_at': clean_exp,
         'active': user_access_allowed(info, now_ts),
-        'status': info.get('status', 'active'),
-        'traffic_limit_bytes': info.get('limit_bytes', 0),
-        'traffic_used_bytes': info.get('used_bytes', 0),
-        'limit_bytes': info.get('limit_bytes', 0),
-        'used_bytes': info.get('used_bytes', 0),
+        'status': clean_status,
+        'traffic_limit_bytes': clean_limit,
+        'traffic_used_bytes': clean_used,
+        'limit_bytes': clean_limit,
+        'used_bytes': clean_used,
         **summary,
         'online_ips': active_online_ips(tracker, uid, now_ts, ip_timeout),
         # 与鉴权同一判据：ip_limit=true 实际不限，报 0（2026-11-04 修）。
         'ip_limit': _display_ip_limit(info),
         # 缺 created_at 时报 0（未知）而不是「此刻」（2026-11-04 修）：旧实现每次轮询都给一个
         # 新时间戳，控制台按它比对 / 排序时，这些用户每轮都像刚变过、年龄永远是 0。
-        'created_at': info.get('created_at', 0),
+        'created_at': clean_created,
     }
 
 
@@ -5731,7 +5815,10 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
                         % (service, rollback_exc)) from rollback_exc
         raise
     finally:
-        candidate.unlink(missing_ok=True)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def sync_anytls_users(root, snapshot, apply=None, service_active=None, force_ids=()):
@@ -6414,7 +6501,15 @@ IP_DENY_TTL_RANGE = (30, 3600)
 
 def parse_ip_deny(params, now):
     """校验 users/ip-deny 请求。返回 (user_id, {ip: 过期时间})；不合法抛 ValueError。"""
-    user_id = str(params.get('user_id', '')).strip()
+    if not isinstance(params, dict):
+        raise ValueError('Invalid request payload')
+    if (isinstance(now, bool) or not isinstance(now, (int, float))
+            or now != now or now == float('inf') or now == float('-inf')):
+        raise ValueError('Invalid timestamp')
+    raw_uid = params.get('user_id')
+    if not isinstance(raw_uid, str):
+        raise ValueError('Invalid user_id format')
+    user_id = raw_uid.strip()
     if not USER_ID_RE.match(user_id):
         raise ValueError('Invalid user_id format')
     # 与其它 users/ 写接口一致（2026-11-04 修）：保留名不能被拉黑，否则 API Key 就能
@@ -6437,10 +6532,12 @@ def parse_ip_deny(params, now):
         raise ValueError('ttl must be between %d and %d seconds' % IP_DENY_TTL_RANGE)
     entries = {}
     for item in raw:
-        try:
-            addr = ipaddress.ip_address(str(item).strip())
-        except ValueError:
+        if not isinstance(item, str):
             raise ValueError('Invalid IP address: %s' % str(item)[:64])
+        try:
+            addr = ipaddress.ip_address(item.strip())
+        except ValueError:
+            raise ValueError('Invalid IP address: %s' % item[:64])
         # 带 zone 的 IPv6（fe80::1%eth0）永远匹配不上 /auth 的客户端地址，写进 Xray
         # 规则还会让整批 adrules 失败；IPv4 映射地址还原成 IPv4，与 /auth 同一写法（2026-11-04 修）。
         if getattr(addr, 'scope_id', None):
@@ -7293,7 +7390,10 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
                     _log_ignored('xray_access_rollback', rb_exc)
         raise
     finally:
-        candidate.unlink(missing_ok=True)
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
         last_good_tmp.unlink(missing_ok=True)
 
 
@@ -7842,8 +7942,10 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     m = m if isinstance(m, dict) else {}
     is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 标签会进 quote() 与客户端配置；非字符串（调用方传错或数据被改坏）
-    # 会抛 TypeError，把整页渲染和订阅下载一起打断。
-    name = name_override if isinstance(name_override, str) and name_override else ('Hy2-' + str(host))
+    # 会抛 TypeError，把整页渲染和订阅下载一起打断；同时剥除控制/换行字符防污染配置。
+    _strip_ctrl = lambda s: ''.join(c for c in s if ord(c) >= 32 and ord(c) != 127)
+    _clean_name = _strip_ctrl(name_override).strip() if isinstance(name_override, str) else ''
+    name = _clean_name if _clean_name else ('Hy2-' + str(host))
     # 🔴 只有「没有覆盖」才回落节点主密码（auth_override is None）。
     # 旧写法 `auth_override or ...` 把用户密码的空串/0/None 也当成「未指定」，
     # 于是密码被清空或改坏的用户，分享链接里会直接出现**机主密码**。
@@ -7851,8 +7953,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 密码来自用户记录，可能是数字/列表（手工编辑、旧格式）。quote() 只接受
     # 字符串，非字符串会让整个订阅/分享页 500；退回空串等于「这条链接不可用」，
     # 但仍能渲染页面并提示检查账号。
-    if not isinstance(password, str):
-        password = ''
+    password = _strip_ctrl(password) if isinstance(password, str) else ''
     # 端口必须落成合法整数（2026-10-25 修）：meta 被改坏时 listen_port 可能是
     # None / 字符串，旧代码会原样拼出 `hysteria2://...:None` 这种所有客户端
     # 都会拒绝的链接，而且没有任何报错提示。这里退回默认端口。
@@ -7871,8 +7972,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     raw_pin = m.get('pin_sha256')
     raw_pin = raw_pin.strip().lower() if isinstance(raw_pin, str) else ''
     pin_sha256 = raw_pin if len(raw_pin) == 64 and all(c in '0123456789abcdef' for c in raw_pin) else ''
-    if not isinstance(obfs_password, str):
-        obfs_password = ''
+    obfs_password = _strip_ctrl(obfs_password) if isinstance(obfs_password, str) else ''
     # 只认 起-止 / 起:止 且 1<=起<=止<=65535（2026-11-06 修）：'garbage'、'40000-20000' 原样
     # 写进 mport / ports / server_ports，sing-box 报 bad port range、整份配置加载失败。
     _hop = clean_hop_range(hop_port_range)
@@ -8077,8 +8177,8 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
             'interval': '5m', 'tolerance': 50,
         })
         sing_doc['route'] = {'final': 'PROXY'}
-    return (uri, json.dumps(clash, ensure_ascii=False, indent=2),
-            json.dumps(sing_doc, ensure_ascii=False, indent=2))
+    return (uri, json.dumps(clash, ensure_ascii=False, indent=2, allow_nan=False),
+            json.dumps(sing_doc, ensure_ascii=False, indent=2, allow_nan=False))
 
 
 def sync_pin(m, root, meta_path):
@@ -8100,7 +8200,7 @@ def sync_pin(m, root, meta_path):
             # 旧实现固定读 cert/server.crt，自签证书放在别处时写进一张无关证书的 pin，
             # 客户端 pin 校验全部失败。
             live = _resolve_live_cert(root, str(Path(root) / 'config.yaml'))[0]
-            new = pin_sha256_of_file(live) if Path(live).exists() else get_cert_pin_sha256(root)
+            new = pin_sha256_of_file(live) if (live and Path(live).is_file()) else get_cert_pin_sha256(root)
             if new != m.get('pin_sha256'):
                 m['pin_sha256'] = new
                 atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
@@ -8125,7 +8225,8 @@ def prepare(meta_path, port, node_api_key=None):
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     master_pw = m.get('auth_password')
-    if not isinstance(master_pw, str) or not master_pw.strip():
+    if (not isinstance(master_pw, str) or not master_pw.strip()
+            or any(ord(c) < 32 or ord(c) == 127 for c in master_pw)):
         raise ValueError('client_meta.json 缺少有效的 auth_password')
     # 先修信任模型（cert_type/server_name/is_insecure/pin），再对齐 pin。
     # 顺序不能反：sync_pin 依赖 is_insecure 判断 pin 该不该留，而 is_insecure
@@ -8880,7 +8981,7 @@ def serve(path):
         return firewall_port(port, proto, open_=False)
 
     def awg_endpoint_error(endpoint):
-        if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
+        if not isinstance(endpoint, str) or not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
             return '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'
         # 与 awgctl 的 validate_endpoint 同一规则（2026-11-04 修）：形状对了还得真是个主机，
         # 旧规则放过 "..." / "[:]" / "[1.2.3.4]"，客户端拿到后永远握不上手。
@@ -8894,8 +8995,9 @@ def serve(path):
                 return '方括号里必须是 IPv6 地址'
         else:
             host = host.rsplit(':', 1)[0] if ':' in host else host
-            if not re.fullmatch(r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
-                                r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
+            if len(host) > 253 or not re.fullmatch(
+                    r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
+                    r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
                 return '连接地址不是有效的域名或 IPv4'
             # 末段全是数字只能是 IPv4（顶级域不会全是数字，2026-11-12 修）：旧规则放过
             # 999.1.1.1 / 1.2.3 / 12345，客户端拿去当域名解析，永远握不上手。
@@ -9060,7 +9162,18 @@ def serve(path):
                 disk = None
             if isinstance(disk, dict):
                 merge_cli_owned_state(data, disk)
-        return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        try:
+            return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        except ValueError:
+            def _scrub_finite(obj):
+                if isinstance(obj, float):
+                    return obj if (obj == obj and obj != float('inf') and obj != float('-inf')) else None
+                if isinstance(obj, dict):
+                    return {k: _scrub_finite(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_scrub_finite(v) for v in obj]
+                return obj
+            return json.dumps(_scrub_finite(data), ensure_ascii=False, allow_nan=False).encode('utf-8')
 
     # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
     #
@@ -9367,7 +9480,14 @@ def serve(path):
                 rcfg = rcfg if isinstance(rcfg, dict) else {}
                 binary = rcfg.get('binary', '') if isinstance(rcfg.get('binary'), str) else ''
                 address = rcfg.get('address', '') if isinstance(rcfg.get('address'), str) else ''
-                if not (binary and address and xray_path.exists() and Path(binary).is_file()):
+                binary_ok = (bool(binary) and not binary.startswith('-')
+                             and not any(ord(ch) < 32 or ord(ch) == 127 for ch in binary))
+                if binary_ok:
+                    try:
+                        binary_ok = Path(binary).is_file()
+                    except (OSError, ValueError):
+                        binary_ok = False
+                if not (binary_ok and address and xray_path.exists()):
                     time.sleep(30); continue
                 # 模块级代码看不到 main() 内的嵌套函数，必须用 _unit_suspended。
                 if _unit_suspended('xray') or _systemd_state('xray') != 'active':
@@ -9532,13 +9652,15 @@ def serve(path):
                             port = cand_p if 1 <= cand_p <= 65535 else 0
                     elif isinstance(raw_port, str):
                         ps = raw_port.strip()
-                        if ps.isascii() and ps.isdigit():
+                        if ps.isascii() and ps.isdigit() and not (len(ps) > 1 and ps.startswith('0')):
                             cand_p = int(ps)
                             port = cand_p if 1 <= cand_p <= 65535 else 0
                 if not port:
                     continue
                 raw_user = svc.get('username', '')
                 raw_pass = svc.get('password', '')
+                safe_user = ''.join(ch for ch in raw_user if ord(ch) >= 32 and ord(ch) != 127) if isinstance(raw_user, str) else ''
+                safe_pass = ''.join(ch for ch in raw_pass if ord(ch) >= 32 and ord(ch) != 127) if isinstance(raw_pass, str) else ''
                 handler_type = 'socks5' if ptype == 'socks5' else 'http'
                 entry = {
                     'name': f'proxy-{idx}',
@@ -9546,8 +9668,8 @@ def serve(path):
                     'handler': {
                         'type': handler_type,
                         'auth': {
-                            'username': raw_user if isinstance(raw_user, str) else '',
-                            'password': raw_pass if isinstance(raw_pass, str) else '',
+                            'username': safe_user,
+                            'password': safe_pass,
                         },
                     },
                     'listener': {'type': 'tcp'},
@@ -9571,7 +9693,10 @@ def serve(path):
                'bypasses': [{'name': GOST_PRIVATE_BYPASS,
                              'matchers': list(PRIVATE_REJECT_RULES) + ['localhost', '*.localhost']}]}
         # gost.yml 里有代理账号密码，与 portal.json 同样必须一创建就是 0600。
-        atomic_write_private(gost_cfg_path, json.dumps(cfg, ensure_ascii=False, indent=2).encode('utf-8'))
+        atomic_write_private(
+            gost_cfg_path,
+            json.dumps(cfg, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8'),
+        )
 
     def gost_ports_ready():
         # 只等 write_gost_config 实际写进配置的端口（2026-11-03 修）：旧实现自己再解析
@@ -9608,13 +9733,19 @@ def serve(path):
                         return False
                     return True
                 if gost_status():
-                    r = subprocess.run(['systemctl', 'reload', 'gost'], capture_output=True, timeout=5)
-                    if r.returncode == 0:
-                        for _ in range(10):
-                            if gost_status() and gost_ports_ready():
-                                return True
-                            time.sleep(0.2)
-                subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=5)
+                    try:
+                        r = subprocess.run(['systemctl', 'reload', 'gost'], capture_output=True, timeout=5)
+                        if r.returncode == 0:
+                            for _ in range(10):
+                                if gost_status() and gost_ports_ready():
+                                    return True
+                                time.sleep(0.2)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                try:
+                    subprocess.run(['systemctl', 'reset-failed', 'gost'], capture_output=True, timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
                 r = subprocess.run(['systemctl', 'restart', 'gost'], capture_output=True, timeout=12)
                 if r.returncode != 0:
                     return False
@@ -9647,7 +9778,7 @@ def serve(path):
             cached_data = _ver_cache['data']
         ttl = 300 if cached_data is not None else 60
         if cached_t and now - cached_t < ttl:
-            return cached_data
+            return dict(cached_data) if isinstance(cached_data, dict) else cached_data
         try:
             req = urllib.request.Request(
                 'https://api.github.com/repos/' + AWG_REPO + '/contents/?ref=main',
@@ -9664,8 +9795,9 @@ def serve(path):
             # GitHub 在限流/出错时返回的是对象（{"message": ...}），不是列表；
             # 旧写法 `for it in items` 直接抛 TypeError，虽然被下面 except 兜住，
             # 但每次都白跑一遍请求且永远拿不到缓存。
-            shas = ({it['name']: it.get('sha', '') for it in items
-                     if isinstance(it, dict) and it.get('name')}
+            shas = ({it['name']: (it.get('sha') if isinstance(it.get('sha'), str) else '')
+                     for it in items
+                     if isinstance(it, dict) and isinstance(it.get('name'), str) and it['name']}
                     if isinstance(items, list) else {})
             if shas:
                 try:
@@ -9675,7 +9807,7 @@ def serve(path):
                 except NameError:
                     _ver_cache['t'] = now
                     _ver_cache['data'] = shas
-                return shas
+                return dict(shas)
         except Exception as exc:
             _log_ignored('version_check', exc)
         try:
@@ -9962,9 +10094,13 @@ if __name__ == '__main__':
         jsDelivr / raw 可能返回与所 pin commit 不符的内容（缓存污染或 CDN 侧篡改），
         只比对 marker 挡不住 —— 只要内容里含 marker 且语法合法就会被写盘。
         """
-        if ref != "main" and not re.fullmatch(r"[0-9a-f]{40}", ref):
+        if (not isinstance(filename, str)
+                or not re.fullmatch(r'[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*', filename)
+                or any(part in ('', '.', '..') for part in filename.split('/'))):
+            raise ValueError("invalid repo filename")
+        if not isinstance(ref, str) or (ref != "main" and not re.fullmatch(r"[0-9a-f]{40}", ref)):
             raise ValueError("invalid immutable ref")
-        if expect_blob is not None and not re.fullmatch(r"[0-9a-f]{40}", expect_blob):
+        if expect_blob is not None and (not isinstance(expect_blob, str) or not re.fullmatch(r"[0-9a-f]{40}", expect_blob)):
             raise ValueError("invalid expected blob sha")
         sources = [
             ('https://api.github.com/repos/' + AWG_REPO + '/contents/' + filename + '?ref=' + ref,
@@ -10015,6 +10151,12 @@ if __name__ == '__main__':
         现在 API 拿不到就返回 None，调用方必须 fail-closed（放弃更新）。
         marker 参数仅为兼容既有调用点保留，此处不再用于下载内容。
         """
+        if (not isinstance(filename, str)
+                or not re.fullmatch(r'[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*', filename)
+                or any(part in ('', '.', '..') for part in filename.split('/'))):
+            return None
+        if not isinstance(ref, str) or (ref != 'main' and not re.fullmatch(r'[0-9a-f]{40}', ref)):
+            return None
         try:
             url = ('https://api.github.com/repos/' + AWG_REPO + '/contents/'
                    + filename + '?ref=' + ref)
@@ -10072,6 +10214,7 @@ if __name__ == '__main__':
             replaced = False
             try:
                 with os.fdopen(fd, 'wb') as fh:
+                    fd = None
                     fh.write(content)
                     fh.flush()
                     os.fsync(fh.fileno())
@@ -10079,6 +10222,11 @@ if __name__ == '__main__':
                 os.replace(tmp_name, str(target_path))
                 replaced = True
             finally:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 if not replaced:
                     try:
                         os.unlink(tmp_name)
@@ -10691,13 +10839,16 @@ if __name__ == '__main__':
             pass
 
         def verify_api_key(self):
-            auth_header = self.headers.get('Authorization', '')
-            # api_key 为空/非字符串时一律拒绝（2026-10-29 修）：
+            auth_header = self.headers.get('Authorization') or ''
+            if not isinstance(auth_header, str) or len(auth_header) > 1024:
+                return False
+            # api_key 为空/非字符串/含空白或控制字符时一律拒绝（2026-10-29 修）：
             # 旧实现拼出常量 "Bearer "，而 HTTP 头允许尾随空格，
             # 一个 `Authorization: Bearer ` 就能通过 —— 等于 API 全开。
             with data_lock:
                 key = data.get('api_key')
-            if not isinstance(key, str) or not key or not key.isascii():
+            if (not isinstance(key, str) or not key or not key.isascii()
+                    or any(ord(ch) <= 32 or ord(ch) == 127 for ch in key)):
                 return False
             expected = 'Bearer ' + key
             # ⚠️ 必须先挡非 ASCII（2026-10-09 修）：hmac.compare_digest 遇到
@@ -10709,7 +10860,9 @@ if __name__ == '__main__':
             return hmac.compare_digest(auth_header, expected)
 
         def is_authenticated(self):
-            auth = self.headers.get('Authorization', '')
+            auth = self.headers.get('Authorization') or ''
+            if not isinstance(auth, str):
+                return False
             # 头部没有体积上限，而这里要对它做 sha256。超长 Basic 头
             # （几 MB 的 base64）会让每个请求都白算一次哈希，属于廉价放大。
             # 正常凭据远小于 1 KiB，直接拒绝更长的（2026-10-25）。
@@ -12167,6 +12320,9 @@ if __name__ == '__main__':
                         return self.reply_json(500, {'ok': False,
                             'error': 'usage-meter-config.json 缺少有效的 reality 配置（binary/address）'})
                     spec = importlib.util.spec_from_file_location('reality_online_config', Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py')
+                    if spec is None or spec.loader is None:
+                        return self.reply_json(500, {'ok': False,
+                            'error': '缺少计量配置模块 usage-meter-xray-config-20261007-v1.py'})
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
                     with core_operation_lock, core_operation_file_lock(), reality_apply_lock:
@@ -17184,16 +17340,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             不锚定前缀名。只认一种会让精简镜像的节点永远"未测得"，
             而界面上看不出原因。
             """
+            if (not isinstance(host, str) or not host.strip()
+                    or host.strip().startswith('-')
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in host)):
+                return None, None
             try:
                 # ⚠️ LC_ALL=C 是必需的（2026-10-09 修）：下面两个正则只认英文输出
                 # （'% packet loss' / 小数点分隔的 `= a/b/c`）。在本地化 locale 下
                 # 解析会全面失效 —— 实测 zh_CN 下丢包率解析不到，
                 # de_DE 下连 avg 都解析不到（逗号当小数点），测速永远显示「未测得」。
-                # -n 则保证 host 不会被当成命令选项。
+                # -n 与 -- 保证 host 不会被当成命令选项。
                 # 10 个包（2026-11-01 由 3 包改）：3 包时丢包率只有 0/33/67/100%
                 # 四档，丢一个包就跳 33%。10 包间隔 1 秒约 11 秒，超时给 20 秒。
                 proc = subprocess.run(
-                    ['ping', '-n', '-c', '10', '-W', '2', host],
+                    ['ping', '-n', '-c', '10', '-W', '2', '--', host.strip()],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=20,
                     env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
             except Exception:

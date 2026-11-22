@@ -116,7 +116,8 @@ hy2_manifest_sha256() {
     [[ -n "$asset" && -f "$manifest" && -r "$manifest" ]] || return 1
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%$'\r'}"
-        [[ -z "${line//[[:space:]]/}" ]] && continue
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" ]] && continue
         [[ "$line" == \#* ]] && continue
         [[ "$line" == *[[:space:]]* ]] || continue          # 畸形行：缺少分隔符
         digest="${line%%[[:space:]]*}"
@@ -124,7 +125,9 @@ hy2_manifest_sha256() {
         name="${name#"${name%%[![:space:]]*}"}"             # 去掉前导空白
         name="${name%$'\r'}"
         name="${name#\*}"
-        name="${name#./}"
+        while [[ "$name" == ./* ]]; do
+            name="${name#./}"
+        done
         base="${name##*/}"
         [[ "$name" == "$asset" || "$base" == "$asset" ]] || continue
         digest="$(printf '%s' "$digest" | tr 'A-F' 'a-f')"
@@ -159,7 +162,7 @@ hy2_dgst_sha256() {
 
 # 下载校验清单到 $2（仅取文本，不做任何执行）。
 hy2_fetch_manifest() {
-    curl -fsSL --connect-timeout 15 --max-time 30 --retry 2 --retry-delay 2 \
+    curl -fsSL --connect-timeout 15 --max-time 30 --max-filesize 2097152 --retry 2 --retry-delay 2 \
         -o "${2:-}" "${1:-}" 2>/dev/null
 }
 
@@ -1372,7 +1375,8 @@ find_cert_in_webserver() {
 # 结果是两行 0，`[[ … -lt 2 ]]` 算术报错判假 —— 不含证书的文件被当作完整链接受。
 pem_cert_count() {
     local n
-    n="$(grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null)" || true
+    [[ -f "${1:-}" && -r "$1" ]] || { echo 0; return 0; }
+    n="$(tr -d '\r' < "$1" 2>/dev/null | grep -cx -- '-----BEGIN CERTIFICATE-----')" || true
     [[ "$n" =~ ^[0-9]+$ ]] || n=0
     echo "$n"
 }
@@ -1452,7 +1456,9 @@ _cert_matches_domain() {
 #    协议、软件名字样，看上去和无数停放中的域名一样。
 # ------------------------------------------------------------------------------
 caddy_decoy_directives() {
-    local domain="$1"
+    local domain
+    domain="$(printf '%s' "${1:-}" | tr -cd 'A-Za-z0-9.:_-')"
+    [[ -n "$domain" ]] || domain="localhost"
     # Caddyfile 的反引号字符串可以多行、不做转义；正文里不能出现反引号。
     cat <<DEOF
 	header Content-Type "text/html; charset=utf-8"
@@ -2571,7 +2577,7 @@ if isinstance(_data, dict):
                 RESERVED.add(_p)
             elif isinstance(_p, str):
                 _ps = _p.strip()
-                if _ps.isascii() and _ps.isdigit():
+                if _ps.isascii() and _ps.isdigit() and not (len(_ps) > 1 and _ps.startswith('0')):
                     _pi = int(_ps)
                     if 1 <= _pi <= 65535:
                         RESERVED.add(_pi)
@@ -2584,7 +2590,7 @@ if isinstance(_data, dict):
                     RESERVED.add(_p)
                 elif isinstance(_p, str):
                     _ps = _p.strip()
-                    if _ps.isascii() and _ps.isdigit():
+                    if _ps.isascii() and _ps.isdigit() and not (len(_ps) > 1 and _ps.startswith('0')):
                         _pi = int(_ps)
                         if 1 <= _pi <= 65535:
                             RESERVED.add(_pi)
@@ -2631,7 +2637,7 @@ if len(sys.argv) > 2:
                 avoid.add(_p)
             elif isinstance(_p, str):
                 _s = _p.strip()
-                if _s.isascii() and _s.isdigit():
+                if _s.isascii() and _s.isdigit() and not (len(_s) > 1 and _s.startswith('0')):
                     _pi = int(_s)
                     if 1 <= _pi <= 65535:
                         avoid.add(_pi)
