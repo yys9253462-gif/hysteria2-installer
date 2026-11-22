@@ -1609,16 +1609,23 @@ setup_cert_via_existing_caddy() {
     fi
 
     # 备份后在同目录候选文件上构造并校验，校验通过才原子替换生产 Caddyfile
+    if [[ -L "$cf" ]]; then
+        log_err "/etc/caddy/Caddyfile 为符号链接，已拒绝修改。"
+        return 1
+    fi
     [[ -f "$cf" ]] || { log_err "找不到 /etc/caddy/Caddyfile。"; return 1; }
     bak="${cf}.bak-hy2-$(date +%Y%m%d-%H%M%S).$$"
-    cp -a "$cf" "$bak" || { log_err "备份 Caddyfile 失败。"; return 1; }
+    if [[ -L "$bak" ]] || ! (umask 077 && cp -a -- "$cf" "$bak"); then
+        log_err "备份 Caddyfile 失败。"
+        return 1
+    fi
     log_info "已备份 Caddyfile -> ${bak}"
 
     # 幂等：已存在该域名块就不重复追加
     local appended=0
     if ! grep -qE "^[[:space:]]*${domain//./\\.}([[:space:]]|\{)" "$cf"; then
         cand="$(umask 077 && mktemp "${cf}.hy2-tmp.XXXXXX")" || { log_err "创建 Caddyfile 候选临时文件失败。"; return 1; }
-        if ! cp -p "$cf" "$cand" || ! cat >> "$cand" <<CEOF
+        if ! cp -p -- "$cf" "$cand" || ! cat >> "$cand" <<CEOF
 
 # 证书签发站点（由 install.sh 自动追加）
 # 用途：本机 80/443 已被 Caddy 占用，内置 ACME 无法自行签发，
@@ -1628,20 +1635,24 @@ $(caddy_decoy_directives "$domain")
 }
 CEOF
         then
-            rm -f "$cand"
+            rm -f -- "$cand"
+            cand=""
             log_err "写入 Caddyfile 候选配置失败，生产配置未改动。"
             return 1
         fi
         if ! caddy validate --config "$cand" --adapter caddyfile >/dev/null 2>&1; then
-            rm -f "$cand"
+            rm -f -- "$cand"
+            cand=""
             log_err "追加后的 Caddyfile 校验不通过，生产配置未改动。"
             return 1
         fi
-        if ! mv -f "$cand" "$cf"; then
-            rm -f "$cand"
+        if ! mv -f -- "$cand" "$cf"; then
+            rm -f -- "$cand"
+            cand=""
             log_err "原子替换 Caddyfile 失败，生产配置未改动。"
             return 1
         fi
+        cand=""
         appended=1
     elif ! caddy validate --config "$cf" --adapter caddyfile >/dev/null 2>&1; then
         log_err "现有 Caddyfile 校验不通过，已中止。"
@@ -1653,7 +1664,7 @@ CEOF
     fi
     sleep 3
     # 触发签发
-    curl -s -o /dev/null -m 15 "http://${domain}/" 2>/dev/null || true
+    curl -s -o /dev/null -m 15 --max-filesize 65536 "http://${domain}/" 2>/dev/null || true
 
     log_info "等待 Caddy 完成 ACME 签发（通常 5~30 秒）..."
     local i
@@ -1716,27 +1727,28 @@ hy2_acme_ensure_renew_timer() {
     local home="$1" unit_dir="${HY2_SYSTEMD_DIR:-/etc/systemd/system}"
     local svc_tmp="" tmr_tmp=""
     trap 'trap - RETURN; rm -f "${svc_tmp:-}" "${tmr_tmp:-}" 2>/dev/null || true' RETURN
-    if [[ -z "$home" || "$home" =~ [[:space:][:cntrl:]\"\'\`\;] ]]; then
+    if [[ -z "$home" || "$home" == -* || "$home" =~ [[:space:][:cntrl:]\"\'\`\;%\$] ]]; then
         return 1
     fi
     if command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -qF 'acme.sh --cron'; then
         return 0
     fi
     command -v systemctl >/dev/null 2>&1 || return 1
+    if [[ -L "${unit_dir}" || -L "${unit_dir}/hy2-acme-renew.service" || -L "${unit_dir}/hy2-acme-renew.timer" ]]; then
+        return 1
+    fi
     svc_tmp="$(umask 077 && mktemp "${unit_dir}/.hy2-acme-renew.service.XXXXXX")" || return 1
     printf '%s\n' '[Unit]' 'Description=acme.sh certificate renewal (hysteria2-installer)' '' \
         '[Service]' 'Type=oneshot' "ExecStart=${home}/acme.sh --cron --home ${home}" \
         > "$svc_tmp" || return 1
-    chmod 0644 "$svc_tmp" 2>/dev/null || true
-    mv -f "$svc_tmp" "${unit_dir}/hy2-acme-renew.service" || return 1
+    chmod 0644 "$svc_tmp" && mv -f "$svc_tmp" "${unit_dir}/hy2-acme-renew.service" || return 1
     svc_tmp=""
     tmr_tmp="$(umask 077 && mktemp "${unit_dir}/.hy2-acme-renew.timer.XXXXXX")" || return 1
     printf '%s\n' '[Unit]' 'Description=Daily acme.sh renewal (hysteria2-installer)' '' \
         '[Timer]' 'OnCalendar=daily' 'RandomizedDelaySec=3600' 'Persistent=true' '' \
         '[Install]' 'WantedBy=timers.target' \
         > "$tmr_tmp" || return 1
-    chmod 0644 "$tmr_tmp" 2>/dev/null || true
-    mv -f "$tmr_tmp" "${unit_dir}/hy2-acme-renew.timer" || return 1
+    chmod 0644 "$tmr_tmp" && mv -f "$tmr_tmp" "${unit_dir}/hy2-acme-renew.timer" || return 1
     tmr_tmp=""
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl enable --now hy2-acme-renew.timer >/dev/null 2>&1
@@ -2281,31 +2293,42 @@ generate_self_signed_cert() {
     CERT_FILE="${HY2_CERT_DIR}/server.crt"
     KEY_FILE="${HY2_CERT_DIR}/server.key"
     IS_INSECURE="true"
+    local tmp_key="" tmp_cert="" _sn_re="${SERVER_NAME//./\\.}"
+    trap 'trap - RETURN; [[ -n "${tmp_key:-}" ]] && rm -f -- "$tmp_key"; [[ -n "${tmp_cert:-}" ]] && rm -f -- "$tmp_cert"' RETURN
+
+    if [[ -L "$HY2_CERT_DIR" || -L "$CERT_FILE" || -L "$KEY_FILE" ]]; then
+        log_err "自签名证书目录或目标文件路径为符号链接，已拒绝写入。"
+        return 1
+    fi
 
     # 已有一对可用的自签证书就沿用（2026-11-04 修）：「重新修改配置」默认走这里，旧实现每次
     # 重新生成，pin 跟着变，已发放的自签链接（带 pinSHA256）全部握手失败。
     # 要强制换新证书：HY2_REGEN_SELF_SIGNED=1。
-    if [[ "${HY2_REGEN_SELF_SIGNED:-0}" != "1" && -s "$CERT_FILE" && -s "$KEY_FILE" ]]             && _cert_key_usable "$CERT_FILE" "$KEY_FILE"             && openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -q "CN *= *${SERVER_NAME}"; then
+    if [[ "${HY2_REGEN_SELF_SIGNED:-0}" != "1" && -s "$CERT_FILE" && -s "$KEY_FILE" ]] \
+            && _cert_key_usable "$CERT_FILE" "$KEY_FILE" \
+            && openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -qE "(^|[[:space:],/])CN[[:space:]]*=[[:space:]]*${_sn_re}([[:space:],/]|$)"; then
         log_info "沿用现有自签名证书（pin 不变，已发放的客户端无需重新导入）。"
         return 0
     fi
     log_step "正在生成高拟真自签名 ECC 证书 (伪装 SNI: ${SERVER_NAME})..."
-    mkdir -p "$HY2_CERT_DIR"
-    local tmp_key tmp_cert
+    mkdir -p "$HY2_CERT_DIR" && chmod 700 "$HY2_CERT_DIR" || { log_err "无法准备自签名证书目录。"; return 1; }
     tmp_key="$(umask 077 && mktemp "${HY2_CERT_DIR}/.server.key.XXXXXX")" || { log_err "无法创建临时私钥文件。"; return 1; }
-    tmp_cert="$(umask 077 && mktemp "${HY2_CERT_DIR}/.server.crt.XXXXXX")" || { rm -f "$tmp_key"; log_err "无法创建临时证书文件。"; return 1; }
+    tmp_cert="$(umask 077 && mktemp "${HY2_CERT_DIR}/.server.crt.XXXXXX")" || { rm -f -- "$tmp_key"; tmp_key=""; log_err "无法创建临时证书文件。"; return 1; }
     if ! (umask 077; openssl ecparam -genkey -name prime256v1 -out "$tmp_key") \
             || ! openssl req -new -x509 -days 3650 -key "$tmp_key" -out "$tmp_cert" -subj "/CN=${SERVER_NAME}" >/dev/null 2>&1; then
-        rm -f "$tmp_key" "$tmp_cert"
+        rm -f -- "$tmp_key" "$tmp_cert"
+        tmp_key=""; tmp_cert=""
         log_err "自签名证书生成失败，未改动现有证书。"
         return 1
     fi
     chmod 600 "$tmp_key" && chmod 644 "$tmp_cert" \
-        && mv -f "$tmp_key" "$KEY_FILE" && mv -f "$tmp_cert" "$CERT_FILE" || {
-        rm -f "$tmp_key" "$tmp_cert"
+        && mv -f "$tmp_key" "$KEY_FILE" && { tmp_key=""; mv -f "$tmp_cert" "$CERT_FILE"; } || {
+        rm -f -- "${tmp_key:-}" "${tmp_cert:-}"
+        tmp_key=""; tmp_cert=""
         log_err "落盘自签名证书失败。"
         return 1
     }
+    tmp_cert=""
     log_info "自签名证书生成成功。"
 }
 
@@ -6829,13 +6852,25 @@ release_installer_core_lock() {
 }
 
 acquire_installer_core_lock() {
+    if [[ -L "$HY2_DIR" ]]; then
+        log_err "配置目录不得为符号链接: ${HY2_DIR}"
+        return 1
+    fi
     mkdir -p "$HY2_DIR" || return 1
     if [[ -n "${_INSTALLER_CORE_LOCK_FD:-}" ]]; then
         release_installer_core_lock
     fi
-    local lock_fd
-    exec {lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
+    local lock_fd _lock_file="${HY2_DIR}/.core-operation.lock" _old_umask=""
+    if [[ -L "$_lock_file" ]]; then
+        log_err "核心操作锁路径不得为符号链接: ${_lock_file}"
+        return 1
+    fi
+    _old_umask="$(umask)"
+    umask 077
+    exec {lock_fd}>>"$_lock_file" || {
+        umask "$_old_umask"
         log_err "无法创建核心操作锁。"; return 1; }
+    umask "$_old_umask"
     if ! flock -n "$lock_fd"; then
         exec {lock_fd}>&- 2>/dev/null || true
         log_err "门户正在修改节点核心，等待完成后重试。"
