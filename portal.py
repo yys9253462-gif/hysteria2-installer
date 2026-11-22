@@ -13943,28 +13943,33 @@ if __name__ == '__main__':
                 # 整个 /vmess-status 500，协议卡片整块空白。
                 _v = data.get('vmess_config')
                 vcfg = dict(_v) if isinstance(_v, dict) else {}
+            _clean_text = lambda v: (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else ''
+            )
             qr_svg = ''
-            _uri = vcfg.get('uri')
-            if active and isinstance(_uri, str) and _uri:
+            _uri = _clean_text(vcfg.get('uri'))
+            if active and _uri:
                 try:
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                                         input=_uri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vmess_qr', exc)
             return self.reply_json(200, {
                 'ok': True, 'installed': installed, 'active': active,
                 'config': {
-                    'uri': vcfg.get('uri', '') if active else '',
-                    'uuid': vcfg.get('uuid', '') if active else '',
-                    'domain': vcfg.get('domain', ''),
-                    'sni': vcfg.get('sni', ''),
-                    'ws_path': vcfg.get('ws_path', ''),
-                    'port': vcfg.get('port', 0) if active else 0,
+                    'uri': _uri if active else '',
+                    'uuid': _clean_text(vcfg.get('uuid')) if active else '',
+                    'domain': _clean_text(vcfg.get('domain')),
+                    'sni': _clean_text(vcfg.get('sni')),
+                    'ws_path': _clean_text(vcfg.get('ws_path')),
+                    'port': (_valid_port(vcfg.get('port')) or 0) if active else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -14460,11 +14465,24 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             self._extend_deadline(30)
+            _clean_text = lambda v: (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else ''
+            )
             acfg = _active_anytls_config() or {}
+            if not isinstance(acfg, dict):
+                acfg = {}
             running = bool(acfg) and _systemd_state(ANYTLS_SERVICE) == 'active'
             version = _singbox_version()
-            uri = anytls_uri_for_user(acfg, MASTER_USER_ID,
-                                      label='AnyTLS-' + str(acfg.get('domain', ''))) if acfg else ''
+            _adomain = _clean_text(acfg.get('domain'))
+            try:
+                uri = _clean_text(anytls_uri_for_user(
+                    acfg, MASTER_USER_ID, label='AnyTLS-' + _adomain
+                )) if acfg else ''
+            except Exception as exc:
+                _log_ignored('anytls_status_uri', exc)
+                uri = ''
             qr_svg = ''
             if running and uri:
                 try:
@@ -14472,7 +14490,7 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('anytls_qr', exc)
@@ -14484,9 +14502,9 @@ if __name__ == '__main__':
                 'active': running,
                 'config': {
                     'uri': uri if running else '',
-                    'domain': acfg.get('domain', ''),
-                    'sni': acfg.get('sni', ''),
-                    'port': acfg.get('port', 0) if running else 0,
+                    'domain': _adomain,
+                    'sni': _clean_text(acfg.get('sni')),
+                    'port': (_valid_port(acfg.get('port')) or 0) if running else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -14706,11 +14724,24 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             self._extend_deadline(30)
+            _clean_text = lambda v: (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else ''
+            )
             tcfg = _active_tuic_config() or {}
+            if not isinstance(tcfg, dict):
+                tcfg = {}
             running = bool(tcfg) and _systemd_state(TUIC_SERVICE) == 'active'
             version = _singbox_version()
-            uri = tuic_uri_for_user(tcfg, MASTER_USER_ID,
-                                    label='TUIC-' + str(tcfg.get('domain', ''))) if tcfg else ''
+            _tdomain = _clean_text(tcfg.get('domain'))
+            try:
+                uri = _clean_text(tuic_uri_for_user(
+                    tcfg, MASTER_USER_ID, label='TUIC-' + _tdomain
+                )) if tcfg else ''
+            except Exception as exc:
+                _log_ignored('tuic_status_uri', exc)
+                uri = ''
             qr_svg = ''
             if running and uri:
                 try:
@@ -14718,7 +14749,7 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('tuic_qr', exc)
@@ -14730,9 +14761,9 @@ if __name__ == '__main__':
                 'active': running,
                 'config': {
                     'uri': uri if running else '',
-                    'domain': tcfg.get('domain', ''),
-                    'sni': tcfg.get('sni', ''),
-                    'port': tcfg.get('port', 0) if running else 0,
+                    'domain': _tdomain,
+                    'sni': _clean_text(tcfg.get('sni')),
+                    'port': (_valid_port(tcfg.get('port')) or 0) if running else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -14863,27 +14894,32 @@ if __name__ == '__main__':
                 # 同 /vmess-status：非 dict 配置会让 dict() 抛异常。
                 _e = data.get('vlessenc_config')
                 ecfg = dict(_e) if isinstance(_e, dict) else {}
+            _clean_text = lambda v: (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else ''
+            )
             qr_svg = ''
-            _euri = ecfg.get('uri')
-            if active and isinstance(_euri, str) and _euri:
+            _euri = _clean_text(ecfg.get('uri'))
+            if active and _euri:
                 try:
                     qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                                         input=_euri.encode('utf-8'),
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('vlessenc_qr', exc)
             return self.reply_json(200, {
                 'ok': True, 'installed': installed, 'active': active,
                 'config': {
-                    'uri': ecfg.get('uri', '') if active else '',
+                    'uri': _euri if active else '',
                     'uuid': reality_uuid_for_user(MASTER_USER_ID) if active else '',
-                    'domain': ecfg.get('domain', ''),
-                    'sni': ecfg.get('sni', ''),
-                    'port': ecfg.get('port', 0) if active else 0,
+                    'domain': _clean_text(ecfg.get('domain')),
+                    'sni': _clean_text(ecfg.get('sni')),
+                    'port': (_valid_port(ecfg.get('port')) or 0) if active else 0,
                     'qr_svg': qr_svg,
                 },
             })
@@ -16787,7 +16823,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             with data_lock:
-                services = proxy_services(data)
+                services = [dict(s) for s in proxy_services(data) if isinstance(s, dict)]
             m = read_meta_file(meta_path)
             host = meta_display_host(m)
             return self.reply_json(200, {
@@ -16804,6 +16840,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """GET /check-version 的处理逻辑（从 do_GET 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(45)
             query = parse_qs(self.path.split('?', 1)[1]) if '?' in self.path else {}
             if query.get('force', ['0'])[0] == '1':
                 try:
@@ -16923,15 +16961,20 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             with data_lock:
                 rcfg = dict(config_section(data, 'reality_config'))
 
+            _clean_text = lambda v, default='': (
+                v.strip()
+                if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+                else default
+            )
             qr_svg = ''
-            _ruri = rcfg.get('uri')
-            if is_active and isinstance(_ruri, str) and _ruri:
+            _ruri = _clean_text(rcfg.get('uri'))
+            if is_active and _ruri:
                 try:
                     qr_res = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                                             input=_ruri.encode('utf-8'), capture_output=True, timeout=3)
                     if qr_res.returncode == 0:
                         qr_svg = qr_res.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception:
                     qr_svg = ''
@@ -16943,12 +16986,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 'config': {
                     # 停用后不再下发 URI（与 VMess / VLESS Encryption 对齐）：
                     # 前端虽已隐藏内容区，但接口仍返回可用链接会误导脚本调用方。
-                    'uri': rcfg.get('uri', '') if is_active else '',
-                    'uuid': rcfg.get('uuid', ''),
-                    'pub_key': rcfg.get('public_key', ''),
-                    'short_id': rcfg.get('short_id', ''),
+                    'uri': _ruri if is_active else '',
+                    'uuid': _clean_text(rcfg.get('uuid')),
+                    'pub_key': _clean_text(rcfg.get('public_key')),
+                    'short_id': _clean_text(rcfg.get('short_id')),
                     'flow': 'xtls-rprx-vision',
-                    'sni': rcfg.get('dest_sni', 'www.apple.com'),
+                    'sni': _clean_text(rcfg.get('dest_sni'), 'www.apple.com') or 'www.apple.com',
                     'port': (_valid_port(rcfg.get('port')) or 443) if is_active else 0,
                     'qr_svg': qr_svg if is_active else ''
                 }
