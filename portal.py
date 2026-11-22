@@ -12460,6 +12460,10 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     password_changed = False
+                    save_err_msg = ''
+                    _missing_meter = object()
+                    previous_record = None
+                    previous_meter = _missing_meter
                     with data_lock:
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
@@ -12535,69 +12539,29 @@ if __name__ == '__main__':
                                 rotate_user_view_key_on_change(existing, record)
                                 password_changed = (isinstance(existing, dict)
                                                     and existing.get('password') != record.get('password'))
+                            previous_record = copy.deepcopy(existing)
+                            previous_meter = (copy.deepcopy(data['usage_meter'])
+                                              if 'usage_meter' in data else _missing_meter)
                             if conflict is None and 'used_bytes' in params:
-                                # 同一共享锁覆盖对账、用户写入和落盘；失败时仅回滚
-                                # 本请求的两个字段。replace 后目录 fsync 失败属于未知
-                                # 落盘状态，save_data 的异常会明确告知调用方需核对。
-                                missing = object()
-                                previous_meter = (copy.deepcopy(data['usage_meter'])
-                                                  if 'usage_meter' in data else missing)
+                                save_err_msg = 'Reconciliation save failed; disk state may require verification'
                                 try:
                                     reconcile_meter_usage(data, user_id, initial_used)
                                     restore_meter_user(data, user_id)
                                     if not isinstance(data.get('users'), dict):
                                         data['users'] = {}
                                     data['users'][user_id] = record
-                                    save_data()
                                 except ValueError:
-                                    if previous_meter is missing:
+                                    if previous_meter is _missing_meter:
                                         data.pop('usage_meter', None)
                                     else:
                                         data['usage_meter'] = previous_meter
                                     conflict = (409, 'Invalid meter ledger; reconciliation not applied')
-                                except AtomicWriteDurabilityError:
-                                    # 文件已替换：保留新值并继续同步协议，随后返回不确定状态。
-                                    durability_uncertain = True
-                                except OSError:
-                                    if existing is None:
-                                        if isinstance(data.get('users'), dict):
-                                            data['users'].pop(user_id, None)
-                                    else:
-                                        if not isinstance(data.get('users'), dict):
-                                            data['users'] = {}
-                                        data['users'][user_id] = existing
-                                    if previous_meter is missing:
-                                        data.pop('usage_meter', None)
-                                    else:
-                                        data['usage_meter'] = previous_meter
-                                    conflict = (503, 'Reconciliation save failed; disk state may require verification')
                             elif conflict is None:
-                                previous_record = copy.deepcopy(existing)
-                                missing = object()
-                                previous_meter = (copy.deepcopy(data['usage_meter'])
-                                                  if 'usage_meter' in data else missing)
+                                save_err_msg = 'User save failed; disk state may require verification'
                                 restore_meter_user(data, user_id)
                                 if not isinstance(data.get('users'), dict):
                                     data['users'] = {}
                                 data['users'][user_id] = record
-                                try:
-                                    save_data()
-                                except AtomicWriteDurabilityError:
-                                    durability_uncertain = True
-                                except OSError:
-                                    if previous_record is None:
-                                        if isinstance(data.get('users'), dict):
-                                            data['users'].pop(user_id, None)
-                                    else:
-                                        if not isinstance(data.get('users'), dict):
-                                            data['users'] = {}
-                                        data['users'][user_id] = previous_record
-                                    if previous_meter is missing:
-                                        data.pop('usage_meter', None)
-                                    else:
-                                        data['usage_meter'] = previous_meter
-                                    reality_registry(data)
-                                    conflict = (503, 'User save failed; disk state may require verification')
                             if conflict is None:
                                 pwd, expires = record['password'], record['expires_at']
                                 ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
@@ -12611,6 +12575,27 @@ if __name__ == '__main__':
                     if conflict is not None:
                         # 锁已释放，现在才写响应。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
+                    # 落盘与 fsync 放到 data_lock 外执行，避免慢盘 fsync 阻塞全节点并发 /auth 鉴权。
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        # 文件已替换：保留新值并继续同步协议，随后返回不确定状态。
+                        durability_uncertain = True
+                    except OSError:
+                        with data_lock:
+                            if previous_record is None:
+                                if isinstance(data.get('users'), dict):
+                                    data['users'].pop(user_id, None)
+                            else:
+                                if not isinstance(data.get('users'), dict):
+                                    data['users'] = {}
+                                data['users'][user_id] = previous_record
+                            if previous_meter is _missing_meter:
+                                data.pop('usage_meter', None)
+                            else:
+                                data['usage_meter'] = previous_meter
+                            reality_registry(data)
+                        return self.reply_json(503, {'ok': False, 'error': save_err_msg})
                     if not durability_uncertain:
                         regenerate_page()
 
@@ -13046,8 +13031,8 @@ if __name__ == '__main__':
                     # 否则会出现"把面板自己锁在门外"的后果。
                     if user_id == MASTER_USER_ID and want != 'active':
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot disable the master account'})
-                    conflict = None
                     durability_uncertain = False
+                    previous = None
                     with data_lock:
                         _raw_users = data.get('users')
                         u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
@@ -13059,18 +13044,19 @@ if __name__ == '__main__':
                             before = u.get('status', 'active')
                             u['status'] = want
                             rotate_user_view_key_on_change(previous, u)
-                            try:
-                                save_data()
-                            except AtomicWriteDurabilityError:
-                                durability_uncertain = True
-                            except OSError:
-                                data['users'][user_id] = previous
-                                conflict = (503, 'User status save failed; disk state may require verification')
-                    if conflict is not None:
-                        return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
                     if missing:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(404, {'ok': False, 'error': 'User not found'})
+                    # 落盘与 fsync 放到 data_lock 外执行，避免慢盘 fsync 阻塞全节点并发 /auth 鉴权。
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        durability_uncertain = True
+                    except OSError:
+                        with data_lock:
+                            if isinstance(data.get('users'), dict):
+                                data['users'][user_id] = previous
+                        return self.reply_json(503, {'ok': False, 'error': 'User status save failed; disk state may require verification'})
                     if not durability_uncertain:
                         regenerate_page()
                     # ⚠️ 2026-10-04 补：停用/启用必须同步到 xray。
