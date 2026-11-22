@@ -13688,15 +13688,17 @@ if __name__ == '__main__':
                     previous = copy.deepcopy(data.get('proxy_services', []))
                     working = proxy_services(data)
                 if action == 'create':
+                    if len(working) >= 128:
+                        return 400, {'ok': False, 'error': '代理服务数量已达上限（最多 128 个），请先删除不用的代理'}
                     ptype = str(params.get('protocol') or params.get('type') or 'socks5').lower()
                     if ptype not in ('socks5', 'http', 'https'):
                         return 400, {'ok': False, 'error': '代理类型只能是 SOCKS5、HTTP 或 HTTPS'}
                     raw_port_in = params.get('port')
-                    if isinstance(raw_port_in, bool):
+                    if raw_port_in is not None and (isinstance(raw_port_in, bool) or not isinstance(raw_port_in, (int, str))):
                         return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
                     raw_port = str(raw_port_in if raw_port_in is not None else '').strip()
                     if raw_port:
-                        if not re.fullmatch(r'[0-9]{1,5}', raw_port):
+                        if not re.fullmatch(r'[1-9][0-9]{0,4}', raw_port):
                             return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
                         port = int(raw_port)
                         if not 1 <= port <= 65535:
@@ -13739,8 +13741,10 @@ if __name__ == '__main__':
                             _cfg_now = None
                         if not isinstance(_cfg_now, dict):
                             _cfg_now = None
+                    _port_snap_keys = ('proxy_services', 'reality_config', 'vmess_config', 'vlessenc_config',
+                                       'anytls_config', 'tuic_config', 'warp_config', 'port')
                     with data_lock:
-                        _data_now = dict(data)
+                        _data_now = {k: copy.deepcopy(data.get(k)) for k in _port_snap_keys if k in data}
                     _avoid = managed_reserved_ports(_meta_now, _data_now, _cfg_now, keep_disabled=True)
                     _avoid |= _listening_ports()
                     if port and port in _avoid:
@@ -13776,6 +13780,8 @@ if __name__ == '__main__':
                     password = raw_pass.strip() or secrets.token_hex(12)
                     if ptype in ('http', 'https') and ':' in username:
                         return 400, {'ok': False, 'error': 'HTTP Basic 认证用户名不能包含冒号'}
+                    if len(password) > 256:
+                        return 400, {'ok': False, 'error': '代理密码长度不能超过 256 个字符'}
                     if ptype == 'socks5' and (len(username.encode('utf-8')) > 255 or len(password.encode('utf-8')) > 255):
                         return 400, {'ok': False, 'error': 'SOCKS5 账号或密码不能超过 255 字节'}
                     _clean_note = ''.join(ch for ch in (raw_note_in or '') if ord(ch) >= 0x20 and ord(ch) != 0x7f).strip()[:200]
@@ -13825,8 +13831,10 @@ if __name__ == '__main__':
                     return 500, {'ok': False, 'applied': False,
                         'error': 'GOST 配置未成功应用或端口未监听，代理记录已恢复；请检查服务日志'}
                 if action == 'delete':
+                    _port_snap_keys = ('proxy_services', 'reality_config', 'vmess_config', 'vlessenc_config',
+                                       'anytls_config', 'tuic_config', 'warp_config', 'port')
                     with data_lock:
-                        data_snapshot = dict(data)
+                        data_snapshot = {k: copy.deepcopy(data.get(k)) for k in _port_snap_keys if k in data}
                     for item in working:
                         # data_snapshot 已剔除被删除的代理；不传 exclude_key 以免跳过其余仍在运行的同端口代理。
                         if item.get('id') == proxy_id and not protocol_port_in_use(
@@ -14009,8 +14017,16 @@ if __name__ == '__main__':
                     if asset_path.is_symlink():
                         return self.reply_json(409, {'ok': False, 'error':
                             '检测到 GOST 资产路径为符号链接，已拒绝安装：%s' % asset_path})
-                    old_assets[asset_path] = (asset_path.read_bytes(),
-                        asset_path.stat().st_mode & 0o777) if asset_path.exists() else None
+                    try:
+                        _ast = asset_path.lstat()
+                    except FileNotFoundError:
+                        old_assets[asset_path] = None
+                        continue
+                    _max_asset_bytes = 128 * 1024 * 1024 if asset_path == gost_binary else 4 * 1024 * 1024
+                    if not stat.S_ISREG(_ast.st_mode) or _ast.st_size > _max_asset_bytes:
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '检测到 GOST 资产路径不是常规文件或体积异常，已拒绝安装：%s' % asset_path})
+                    old_assets[asset_path] = (asset_path.read_bytes(), _ast.st_mode & 0o777)
                 with tempfile.TemporaryDirectory() as tmpdir:
                     archive_path = Path(tmpdir) / 'gost.tar.gz'
                     for u in download_urls:
