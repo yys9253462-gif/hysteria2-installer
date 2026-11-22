@@ -1389,7 +1389,9 @@ def _rollback_outbounds(cfg, original):
 
 
 def core_version_key(value):
-    match = re.search(r'(\d+)\.(\d+)\.(\d+)', str(value or ''))
+    if not isinstance(value, str):
+        return ()
+    match = re.search(r'(?<![0-9])([0-9]{1,8})\.([0-9]{1,8})\.([0-9]{1,8})(?![0-9])', value)
     return tuple(map(int, match.groups())) if match else ()
 
 
@@ -5613,7 +5615,7 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     """
     # 配置来自 portal.json：被改成数字/列表时 `.get` 直接抛 AttributeError，
     # 而调用点在用户订阅生成路径上 —— 一条坏配置让整份订阅 500。
-    if not isinstance(vcfg, dict):
+    if not isinstance(vcfg, dict) or not isinstance(user_id, str) or not user_id:
         return ''
     host, _sni = protocol_host_sni(vcfg, public_ip)
     # 与 VLESS-Reality 同一套端口校验：`"abc"` / True / 70000 会生成一条
@@ -5629,7 +5631,8 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
         path = ''
     if not (host and port and path):
         return ''
-    tag = label if isinstance(label, str) and label else ('VMess-WS-' + str(user_id))
+    raw_tag = label if isinstance(label, str) and label else ('VMess-WS-' + user_id)
+    tag = re.sub(r'[\x00-\x1f\x7f]', '', raw_tag) or ('VMess-WS-' + re.sub(r'[\x00-\x1f\x7f]', '', user_id))
     payload = {
         'v': '2', 'ps': tag, 'add': str(host), 'port': str(port),
         'id': vmess_uuid_for_user(user_id), 'aid': '0', 'scy': 'auto',
@@ -5637,7 +5640,7 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
         'tls': 'tls', 'sni': _sni, 'alpn': '',
         'fp': 'chrome',
     }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
     return 'vmess://' + base64.b64encode(raw).decode('ascii')
 
 
@@ -5784,10 +5787,11 @@ def anytls_uri_for_user(acfg, user_id, label=None):
     """anytls:// 直链（mihomo / sing-box 系 / Shadowrocket 通用格式）。"""
     # 配置可能是数字/字符串（旧版本可直编 portal.json），端口也可能是
     # "abc"/True —— 旧写法 int(port) 抛 ValueError，整份订阅生成失败。
-    if not isinstance(acfg, dict):
+    if not isinstance(acfg, dict) or not isinstance(user_id, str) or not user_id:
         return ''
     secret = acfg.get('secret')
-    if not isinstance(secret, str) or not secret:
+    if (not isinstance(secret, str) or not secret
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in secret)):
         return ''
     host, _sni = protocol_host_sni(acfg)
     port = _valid_port(acfg.get('port'))
@@ -5795,7 +5799,8 @@ def anytls_uri_for_user(acfg, user_id, label=None):
         return ''
     pwd = anytls_password_for_user(secret, user_id)
     params = urlencode({'sni': _sni})
-    tag = label if isinstance(label, str) and label else ('AnyTLS-' + str(user_id))
+    raw_tag = label if isinstance(label, str) and label else ('AnyTLS-' + user_id)
+    tag = re.sub(r'[\x00-\x1f\x7f]', '', raw_tag) or ('AnyTLS-' + re.sub(r'[\x00-\x1f\x7f]', '', user_id))
     return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(tag)}"
 
 
@@ -6024,10 +6029,11 @@ def build_tuic_config(tcfg, users, cert_file, key_file):
 
 def tuic_uri_for_user(tcfg, user_id, label=None):
     """tuic:// 直链（v2rayN / NekoBox / Shadowrocket / mihomo 通用格式）。"""
-    if not isinstance(tcfg, dict):
+    if not isinstance(tcfg, dict) or not isinstance(user_id, str) or not user_id:
         return ''
     secret = tcfg.get('secret')
-    if not isinstance(secret, str) or not secret:
+    if (not isinstance(secret, str) or not secret
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in secret)):
         return ''
     host, _sni = protocol_host_sni(tcfg)
     port = _valid_port(tcfg.get('port'))
@@ -6036,7 +6042,8 @@ def tuic_uri_for_user(tcfg, user_id, label=None):
     u, pwd = tuic_credentials_for_user(secret, user_id)
     params = urlencode({'sni': _sni, 'alpn': 'h3',
                         'congestion_control': 'bbr', 'udp_relay_mode': 'native'})
-    tag = label if isinstance(label, str) and label else ('TUIC-' + str(user_id))
+    raw_tag = label if isinstance(label, str) and label else ('TUIC-' + user_id)
+    tag = re.sub(r'[\x00-\x1f\x7f]', '', raw_tag) or ('TUIC-' + re.sub(r'[\x00-\x1f\x7f]', '', user_id))
     return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(tag)}"
 
 
@@ -6158,7 +6165,7 @@ def xray_unit_foreign(unit_path=XRAY_UNIT_PATH):
         text = Path(unit_path).read_text(encoding='utf-8')
     except FileNotFoundError:
         return False
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return True
     return XRAY_OWNED_EXECSTART not in text
 
@@ -6189,20 +6196,25 @@ def _version_tuple(value):
     `(1, 2, 0) > (1, 2)` 为真 —— 同一个版本写全/写短就会判成「当前版本更高」，
     「重新安装 / 修复」被静默拒绝（2026-10-30 修）。
     """
-    parts = re.findall(r'\d+', str(value or ''))
-    if not parts:
+    if not isinstance(value, str):
         return ()
-    numbers = [int(p) for p in parts[:4]]
+    raw_parts = re.findall(r'[0-9]+', value)
+    if not raw_parts or any(len(p) > 8 for p in raw_parts[:4]):
+        return ()
+    numbers = [int(p) for p in raw_parts[:4]]
     return tuple(numbers + [0] * (3 - len(numbers))) if len(numbers) < 3 else tuple(numbers)
 
 
 def _xray_version(binary='/usr/local/bin/xray', run=subprocess.run):
     """返回已安装 Xray 的版本字符串（如 '26.3.27'）；读不出来返回 ''。"""
+    if (not isinstance(binary, str) or not binary.strip() or binary.strip().startswith('-')
+            or any(ord(c) < 32 or ord(c) == 127 for c in binary)):
+        return ''
     try:
         out = run([binary, 'version'], capture_output=True, text=True, timeout=5)
     except Exception:
         return ''
-    m = re.search(r'Xray\s+v?(\d+(?:\.\d+)+)', (out.stdout or '') + (out.stderr or ''))
+    m = re.search(r'Xray\s+v?([0-9]{1,8}(?:\.[0-9]{1,8}){1,3})(?![0-9])', (out.stdout or '') + (out.stderr or ''))
     return m.group(1) if m else ''
 
 def install_xray_binary():
@@ -6449,7 +6461,7 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     ⚠️ encryption 必须逐字照抄客户端密钥（含 `.` 分隔的各段），
     任何字符被 URL 编码或截断都会导致握手失败。
     """
-    if not isinstance(vcfg, dict):
+    if not isinstance(vcfg, dict) or not isinstance(user_id, str) or not user_id:
         return ''
     host, _sni = protocol_host_sni(vcfg, public_ip)
     # 同 Reality / VMess：非整数端口会让客户端解析失败。
@@ -6457,7 +6469,8 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     enc = _clean_host_scalar(vcfg.get('encryption'))
     if not (host and port and enc):
         return ''
-    tag = label if isinstance(label, str) and label else ('VLESS-Enc-' + str(user_id))
+    raw_tag = label if isinstance(label, str) and label else ('VLESS-Enc-' + user_id)
+    tag = re.sub(r'[\x00-\x1f\x7f]', '', raw_tag) or ('VLESS-Enc-' + re.sub(r'[\x00-\x1f\x7f]', '', user_id))
     params = {'encryption': enc, 'security': 'tls', 'sni': _sni,
               'type': 'tcp', 'headerType': 'none', 'fp': 'chrome'}
     return (f"vless://{reality_uuid_for_user(user_id)}@{_host_for_url(host)}:{port}"
@@ -6480,7 +6493,13 @@ def user_access_denial(info, now=None):
         return 'Invalid user record'
     if info.get('status', 'active') != 'active':
         return 'User account inactive'
-    now = time.time() if now is None else now
+    if now is None:
+        now = time.time()
+    else:
+        if (isinstance(now, bool) or not isinstance(now, (int, float))
+                or not (float('-inf') < float(now) < float('inf'))):
+            return 'Invalid user record'
+        now = float(now)
     # 只有缺失 / None 表示永久；0、小数、数字字符串走同一时钟判定。
     try:
         expires_at = info.get('expires_at')
@@ -6496,8 +6515,13 @@ def user_access_denial(info, now=None):
                 return 'Invalid user record'
             if not expires_at > now:
                 return 'User account expired'
-        limit_bytes = int(info.get('limit_bytes', 0))
-        used_bytes = int(info.get('used_bytes', 0))
+        raw_limit = info.get('limit_bytes', 0)
+        raw_used = info.get('used_bytes', 0)
+        for raw_val in (raw_limit, raw_used):
+            if isinstance(raw_val, float) and (not math.isfinite(raw_val) or not raw_val.is_integer()):
+                return 'Invalid user record'
+        limit_bytes = int(raw_limit)
+        used_bytes = int(raw_used)
         if limit_bytes < 0 or used_bytes < 0:
             return 'Invalid user record'
     except (ValueError, TypeError, OverflowError):
@@ -10014,7 +10038,7 @@ def serve(path):
             return (Path('/etc/hysteria/.hy2-gost-owned').is_file() and unit.is_file()
                     and 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
                     in unit.read_text(encoding='utf-8'))
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return False
 
     def ensure_gost_unit():
@@ -10036,7 +10060,7 @@ def serve(path):
             return
         try:
             current = unit_path.read_text(encoding='utf-8') if unit_path.exists() else ''
-        except OSError:
+        except (OSError, UnicodeDecodeError):
             return
         needed = ('ExecReload=/bin/kill -HUP $MAINPID',
                   '-R 30s',
@@ -10059,6 +10083,8 @@ def serve(path):
                 fd = os.open(str(tmp_unit), flags, 0o644)
                 with os.fdopen(fd, 'wb') as fh:
                     fh.write(GOST_UNIT_CONTENT.encode('utf-8'))
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 os.chmod(str(tmp_unit), 0o644)
                 os.replace(str(tmp_unit), str(unit_path))
             except BaseException:
