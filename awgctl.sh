@@ -184,29 +184,31 @@ awg_transaction_snapshot() {
 
 # 通过同目录临时文件原子复制还原目标，避免覆盖运行中二进制触发 ETXTBSY 或留下半截配置。
 awg_atomic_copy_file() {
-    local src="$1" dst="$2" tmp
-    mkdir -p "$(dirname "$dst")" || return 1
+    local src="$1" dst="$2" tmp=""
+    trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
+    mkdir -p -- "$(dirname "$dst")" || return 1
     tmp="$(umask 077 && mktemp "${dst}.restore.XXXXXX")" || return 1
-    if ! cp -a "$src" "$tmp"; then
-        rm -f "$tmp"
+    if ! cp -a -- "$src" "$tmp"; then
+        rm -f -- "$tmp"
         return 1
     fi
-    if ! mv -f "$tmp" "$dst"; then
-        rm -f "$tmp"
+    if ! mv -f -- "$tmp" "$dst"; then
+        rm -f -- "$tmp"
         return 1
     fi
 }
 
 awg_atomic_install_bin() {
-    local src="$1" dst="$2" tmp
-    mkdir -p "$(dirname "$dst")" || return 1
+    local src="$1" dst="$2" tmp=""
+    trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
+    mkdir -p -- "$(dirname "$dst")" || return 1
     tmp="$(umask 077 && mktemp "${dst}.new.XXXXXX")" || return 1
-    if ! install -m 0755 "$src" "$tmp"; then
-        rm -f "$tmp"
+    if ! install -m 0755 -- "$src" "$tmp"; then
+        rm -f -- "$tmp"
         return 1
     fi
-    if ! mv -f "$tmp" "$dst"; then
-        rm -f "$tmp"
+    if ! mv -f -- "$tmp" "$dst"; then
+        rm -f -- "$tmp"
         return 1
     fi
 }
@@ -870,8 +872,13 @@ render_client_config() {
 # ==============================================================================
 
 write_service() {
-    local svc_dir tmp=""
+    local svc_dir tmp="" _v
     trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
+    for _v in "$AWG_REPO" "$AWG_GO_BIN" "$AWG_QUICK_BIN" "$AWG_BIN" "$AWG_LINK"; do
+        case "$_v" in
+            *$'\n'*|*$'\r'*) die "服务单元参数包含非法换行控制字符" ;;
+        esac
+    done
     svc_dir="$(dirname "$AWG_SERVICE")"
     mkdir -p "$svc_dir"
     tmp="$(umask 077 && mktemp "${svc_dir}/.awg-service.XXXXXX")"
@@ -987,13 +994,24 @@ next_peer_address() {
 peer_apply_live_add() {
     local pub="$1" psk="$2" addr="$3"
     service_active || return 0
-    local pskf=""
+    local pskf="" live_ok=0
     trap 'trap - RETURN; rm -f "${pskf:-}"' RETURN
-    pskf="$(umask 077 && mktemp)"
-    chmod 600 "$pskf"
-    printf '%s\n' "$psk" > "$pskf"
-    if ! "$AWG_BIN" set "$AWG_LINK" peer "$pub" preshared-key "$pskf" allowed-ips "${addr}/32" 2>/dev/null; then
-        rm -f "$pskf"
+    if [[ -n "$pub" && "$pub" != -* && ! "$pub" =~ [[:space:][:cntrl:]] && -n "$addr" && ! "$addr" =~ [[:space:][:cntrl:]] ]]; then
+        if [[ -n "$psk" ]]; then
+            pskf="$(umask 077 && mktemp)"
+            chmod 600 "$pskf"
+            printf '%s\n' "$psk" > "$pskf"
+            if "$AWG_BIN" set "$AWG_LINK" peer "$pub" preshared-key "$pskf" allowed-ips "${addr}/32" 2>/dev/null; then
+                live_ok=1
+            fi
+            rm -f "$pskf"
+        else
+            if "$AWG_BIN" set "$AWG_LINK" peer "$pub" allowed-ips "${addr}/32" 2>/dev/null; then
+                live_ok=1
+            fi
+        fi
+    fi
+    if [[ "$live_ok" != "1" ]]; then
         # 热添加失败时按刚渲染好的配置重启接口（2026-11-04 修，与 peer-del 一致）：旧实现
         # 只打一句「请 resync」并照报创建成功，用户拿到的配置永远握不上手。
         if ! awg_restart_service; then
@@ -1008,10 +1026,11 @@ peer_apply_live_add() {
 peer_apply_live_del() {
     local pub="$1"
     service_active || return 0
-    # 记录缺公钥（jq 输出 null / 空）或热移除失败时，按刚渲染好的配置重启接口
+    # 记录缺公钥（jq 输出 null / 空）、含空白控制字符、以横杠开头或热移除失败时，按刚渲染好的配置重启接口
     # （2026-11-03 修）：旧实现只打一句「请执行 resync」并照报删除成功，
     # 被删的客户端一直连着，直到有人手动 resync。
-    if [[ -n "$pub" && "$pub" != null ]] && "$AWG_BIN" set "$AWG_LINK" peer "$pub" remove 2>/dev/null; then
+    if [[ -n "$pub" && "$pub" != null && "$pub" != -* && ! "$pub" =~ [[:space:][:cntrl:]] ]] \
+            && "$AWG_BIN" set "$AWG_LINK" peer "$pub" remove 2>/dev/null; then
         return 0
     fi
     if ! awg_restart_service; then
@@ -1065,10 +1084,10 @@ cmd_peer_add() {
     [[ -n "$priv" && -n "$pub" && -n "$psk" ]] || die "生成客户端密钥失败"
     addr="$(next_peer_address)" || die "隧道地址池已满（10.66.66.0/24 上限 253 个客户端）"
     peers_backup="$(umask 077 && mktemp "${AWG_DIR}/.peers-backup.XXXXXX")" || die "无法创建客户端列表备份临时文件"
-    config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || die "无法创建服务端配置备份临时文件"
-    (umask 077; cp "$AWG_PEERS_FILE" "$peers_backup" && chmod 600 "$peers_backup") || die "无法备份客户端列表"
+    config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || { rm -f "${tmp:-}" "${peers_backup:-}"; die "无法创建服务端配置备份临时文件"; }
+    (umask 077; cp "$AWG_PEERS_FILE" "$peers_backup" && chmod 600 "$peers_backup") || { rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; die "无法备份客户端列表"; }
     if [[ -f "$AWG_CONFIG" ]]; then
-        (umask 077; cp "$AWG_CONFIG" "$config_backup" && chmod 600 "$config_backup") || die "无法备份服务端配置"
+        (umask 077; cp "$AWG_CONFIG" "$config_backup" && chmod 600 "$config_backup") || { rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; die "无法备份服务端配置"; }
         had_config=1
     fi
 
@@ -1118,10 +1137,10 @@ cmd_peer_del() {
     trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; trap - RETURN' RETURN
     pub="$(jq -r --arg n "$name" 'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.public_key | if type=="string" then . else empty end)) // empty' "$AWG_PEERS_FILE")"
     peers_backup="$(umask 077 && mktemp "${AWG_DIR}/.peers-backup.XXXXXX")" || die "无法创建客户端列表备份临时文件"
-    config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || die "无法创建服务端配置备份临时文件"
-    (umask 077; cp "$AWG_PEERS_FILE" "$peers_backup" && chmod 600 "$peers_backup") || die "无法备份客户端列表"
+    config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || { rm -f "${tmp:-}" "${peers_backup:-}"; die "无法创建服务端配置备份临时文件"; }
+    (umask 077; cp "$AWG_PEERS_FILE" "$peers_backup" && chmod 600 "$peers_backup") || { rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; die "无法备份客户端列表"; }
     if [[ -f "$AWG_CONFIG" ]]; then
-        (umask 077; cp "$AWG_CONFIG" "$config_backup" && chmod 600 "$config_backup") || die "无法备份服务端配置"
+        (umask 077; cp "$AWG_CONFIG" "$config_backup" && chmod 600 "$config_backup") || { rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; die "无法备份服务端配置"; }
         had_config=1
     fi
 
@@ -1159,12 +1178,14 @@ cmd_peer_list() {
 
     if [[ "${1:-}" == "--json" ]]; then
         # 不输出私钥，避免门户页面泄露；过滤非对象脏项
-        jq '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | {name, address, endpoint, public_key, created_at, enabled}]' "$AWG_PEERS_FILE"
+        jq '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | {name, address, endpoint, public_key, created_at, enabled}]' "$AWG_PEERS_FILE" \
+            || die "客户端列表无法解析：${AWG_PEERS_FILE}"
         return 0
     fi
 
     local count
-    count="$(jq '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object")] | length' "$AWG_PEERS_FILE")"
+    count="$(jq '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object")] | length' "$AWG_PEERS_FILE" 2>/dev/null)" \
+        || die "客户端列表无法解析：${AWG_PEERS_FILE}"
     if [[ "$count" == "0" ]]; then
         log_warn "尚无任何客户端。"
         return 0
@@ -1185,7 +1206,7 @@ cmd_peer_list() {
             tr = ENVIRON["AWG_TR"]
             n = split(tr, lines, "\n")
             for (i = 1; i <= n; i++) {
-                if (split(lines[i], f, /[ \t]+/) >= 3) { rx[f[1]] = f[2]; tx[f[1]] = f[3] }
+                if (split(lines[i], f, /[ \t]+/) >= 3 && f[2] ~ /^[0-9]+$/ && f[3] ~ /^[0-9]+$/) { rx[f[1]] = f[2]; tx[f[1]] = f[3] }
             }
         }
         NF < 4 { print; next }
