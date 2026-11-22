@@ -5270,22 +5270,46 @@ def users_list_entry(uid, info, tracker, now_ts, summary, ip_timeout):
     """
     if not isinstance(info, dict):
         return None
+    def _clean_nonneg_int(val):
+        if isinstance(val, bool) or val is None:
+            return 0
+        if isinstance(val, int):
+            return val if val >= 0 else 0
+        if isinstance(val, float):
+            return int(val) if math.isfinite(val) and val >= 0 else 0
+        if isinstance(val, str):
+            s = val.strip()
+            if s.isascii() and s.isdigit():
+                return int(s)
+        return 0
+
+    raw_exp = info.get('expires_at', 0)
+    clean_exp = None if raw_exp is None else _clean_nonneg_int(raw_exp)
+    raw_status = info.get('status', 'active')
+    clean_status = (
+        raw_status.strip()
+        if isinstance(raw_status, str) and raw_status.strip() and not any(ord(c) < 32 or ord(c) == 127 for c in raw_status)
+        else 'disabled'
+    )
+    clean_limit = _clean_nonneg_int(info.get('limit_bytes', 0))
+    clean_used = _clean_nonneg_int(info.get('used_bytes', 0))
+    clean_created = _clean_nonneg_int(info.get('created_at', 0))
     return {
         'user_id': uid,
-        'expires_at': info.get('expires_at', 0),
+        'expires_at': clean_exp,
         'active': user_access_allowed(info, now_ts),
-        'status': info.get('status', 'active'),
-        'traffic_limit_bytes': info.get('limit_bytes', 0),
-        'traffic_used_bytes': info.get('used_bytes', 0),
-        'limit_bytes': info.get('limit_bytes', 0),
-        'used_bytes': info.get('used_bytes', 0),
+        'status': clean_status,
+        'traffic_limit_bytes': clean_limit,
+        'traffic_used_bytes': clean_used,
+        'limit_bytes': clean_limit,
+        'used_bytes': clean_used,
         **summary,
         'online_ips': active_online_ips(tracker, uid, now_ts, ip_timeout),
         # 与鉴权同一判据：ip_limit=true 实际不限，报 0（2026-11-04 修）。
         'ip_limit': _display_ip_limit(info),
         # 缺 created_at 时报 0（未知）而不是「此刻」（2026-11-04 修）：旧实现每次轮询都给一个
         # 新时间戳，控制台按它比对 / 排序时，这些用户每轮都像刚变过、年龄永远是 0。
-        'created_at': info.get('created_at', 0),
+        'created_at': clean_created,
     }
 
 
@@ -7842,8 +7866,10 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     m = m if isinstance(m, dict) else {}
     is_insecure, server_name, public_ip, host = clean_node_identity(m)
     # 标签会进 quote() 与客户端配置；非字符串（调用方传错或数据被改坏）
-    # 会抛 TypeError，把整页渲染和订阅下载一起打断。
-    name = name_override if isinstance(name_override, str) and name_override else ('Hy2-' + str(host))
+    # 会抛 TypeError，把整页渲染和订阅下载一起打断；同时剥除控制/换行字符防污染配置。
+    _strip_ctrl = lambda s: ''.join(c for c in s if ord(c) >= 32 and ord(c) != 127)
+    _clean_name = _strip_ctrl(name_override).strip() if isinstance(name_override, str) else ''
+    name = _clean_name if _clean_name else ('Hy2-' + str(host))
     # 🔴 只有「没有覆盖」才回落节点主密码（auth_override is None）。
     # 旧写法 `auth_override or ...` 把用户密码的空串/0/None 也当成「未指定」，
     # 于是密码被清空或改坏的用户，分享链接里会直接出现**机主密码**。
@@ -7851,8 +7877,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 密码来自用户记录，可能是数字/列表（手工编辑、旧格式）。quote() 只接受
     # 字符串，非字符串会让整个订阅/分享页 500；退回空串等于「这条链接不可用」，
     # 但仍能渲染页面并提示检查账号。
-    if not isinstance(password, str):
-        password = ''
+    password = _strip_ctrl(password) if isinstance(password, str) else ''
     # 端口必须落成合法整数（2026-10-25 修）：meta 被改坏时 listen_port 可能是
     # None / 字符串，旧代码会原样拼出 `hysteria2://...:None` 这种所有客户端
     # 都会拒绝的链接，而且没有任何报错提示。这里退回默认端口。
@@ -7871,8 +7896,7 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     raw_pin = m.get('pin_sha256')
     raw_pin = raw_pin.strip().lower() if isinstance(raw_pin, str) else ''
     pin_sha256 = raw_pin if len(raw_pin) == 64 and all(c in '0123456789abcdef' for c in raw_pin) else ''
-    if not isinstance(obfs_password, str):
-        obfs_password = ''
+    obfs_password = _strip_ctrl(obfs_password) if isinstance(obfs_password, str) else ''
     # 只认 起-止 / 起:止 且 1<=起<=止<=65535（2026-11-06 修）：'garbage'、'40000-20000' 原样
     # 写进 mport / ports / server_ports，sing-box 报 bad port range、整份配置加载失败。
     _hop = clean_hop_range(hop_port_range)
@@ -8077,8 +8101,8 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
             'interval': '5m', 'tolerance': 50,
         })
         sing_doc['route'] = {'final': 'PROXY'}
-    return (uri, json.dumps(clash, ensure_ascii=False, indent=2),
-            json.dumps(sing_doc, ensure_ascii=False, indent=2))
+    return (uri, json.dumps(clash, ensure_ascii=False, indent=2, allow_nan=False),
+            json.dumps(sing_doc, ensure_ascii=False, indent=2, allow_nan=False))
 
 
 def sync_pin(m, root, meta_path):
@@ -8100,7 +8124,7 @@ def sync_pin(m, root, meta_path):
             # 旧实现固定读 cert/server.crt，自签证书放在别处时写进一张无关证书的 pin，
             # 客户端 pin 校验全部失败。
             live = _resolve_live_cert(root, str(Path(root) / 'config.yaml'))[0]
-            new = pin_sha256_of_file(live) if Path(live).exists() else get_cert_pin_sha256(root)
+            new = pin_sha256_of_file(live) if (live and Path(live).is_file()) else get_cert_pin_sha256(root)
             if new != m.get('pin_sha256'):
                 m['pin_sha256'] = new
                 atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
@@ -8125,7 +8149,8 @@ def prepare(meta_path, port, node_api_key=None):
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     master_pw = m.get('auth_password')
-    if not isinstance(master_pw, str) or not master_pw.strip():
+    if (not isinstance(master_pw, str) or not master_pw.strip()
+            or any(ord(c) < 32 or ord(c) == 127 for c in master_pw)):
         raise ValueError('client_meta.json 缺少有效的 auth_password')
     # 先修信任模型（cert_type/server_name/is_insecure/pin），再对齐 pin。
     # 顺序不能反：sync_pin 依赖 is_insecure 判断 pin 该不该留，而 is_insecure
