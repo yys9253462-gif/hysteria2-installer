@@ -10440,6 +10440,7 @@ def serve(path):
     gost_written_ports = []
     speedtest_lock = threading.Lock()
     unlock_check_lock = threading.Lock()
+    _ob_probe_sem = threading.BoundedSemaphore(4)
 
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
@@ -16885,7 +16886,7 @@ if __name__ == '__main__':
                             revoked_pending = True
                         else:
                             revoked_pending = False
-                            if previous_user is None:
+                            if not previous_had_user:
                                 if isinstance(data.get('users'), dict):
                                     data['users'].pop(user_id, None)
                             else:
@@ -16907,7 +16908,8 @@ if __name__ == '__main__':
                 regenerate_page()
                 self.send_response(302)
                 self._responded = True
-                self.send_header('Location', prefix + '#users')
+                safe_loc = ''.join(ch for ch in str(prefix) if ord(ch) >= 32 and ord(ch) != 127)
+                self.send_header('Location', (safe_loc or '/') + '#users')
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header('X-Frame-Options', 'DENY')
@@ -17056,6 +17058,10 @@ command -v curl >/dev/null 2>&1 || { echo "缺少 curl，无法继续" >&2; exit
 # unit 与 wp.conf；而 install.sh 卸载只认 .hy2-warp-owned，网页装的 WARP 卸载后
 # 还在跑、开机自启、watchdog 每 3 分钟拉起一次，wp.conf 里的私钥也留在盘上。
 WARP_OWNED_MARKER="/etc/hysteria/.hy2-warp-owned"
+if [ -L "$WARP_OWNED_MARKER" ] || [ -L "$WP_BIN" ] || [ -L /etc/systemd/system/wireproxy.service ] || [ -L "$WP_CFG" ]; then
+    echo "检测到 WARP 相关路径为符号链接，已拒绝安装以防覆盖宿主文件。" >&2
+    exit 1
+fi
 if [ ! -f "$WARP_OWNED_MARKER" ]; then
     if [ -f /etc/systemd/system/wireproxy.service ] && [ -f "$WP_CFG" ] \
             && grep -qF '# wireproxy config (managed by hysteria2-installer, do not edit)' "$WP_CFG" \
@@ -18745,10 +18751,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 kernel_ver = platform.release()
                 def _sysctl_read(param):
                     try:
-                        return subprocess.run(['sysctl', '-n', param],
-                                              capture_output=True, text=True,
-                                              encoding='utf-8', errors='replace',
-                                              timeout=2).stdout.strip()
+                        raw = subprocess.run(['sysctl', '-n', param],
+                                             capture_output=True, text=True,
+                                             encoding='utf-8', errors='replace',
+                                             timeout=2).stdout.strip()
+                        return ''.join(ch for ch in raw if ord(ch) >= 32 and ord(ch) != 127)
                     except (OSError, subprocess.SubprocessError):
                         return ''
                 cc_out = _sysctl_read('net.ipv4.tcp_congestion_control')
@@ -18759,7 +18766,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if conf_path.exists():
                     try:
                         c_st = conf_path.lstat()
-                        if not conf_path.is_symlink() and conf_path.is_file() and c_st.st_size <= 1024 * 1024:
+                        if stat.S_ISREG(c_st.st_mode) and c_st.st_size <= 1024 * 1024:
                             c_text = conf_path.read_bytes().decode('utf-8', errors='replace')
                         else:
                             c_text = ''
@@ -18773,7 +18780,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             continue
                         k_part, v_part = stripped.split('=', 1)
                         if k_part.strip() == 'net.ipv4.tcp_congestion_control':
-                            configured_bbr = v_part.split('#', 1)[0].split(';', 1)[0].strip()
+                            raw_cfg_bbr = v_part.split('#', 1)[0].split(';', 1)[0].strip()
+                            configured_bbr = ''.join(ch for ch in raw_cfg_bbr if ord(ch) >= 32 and ord(ch) != 127)
 
                 need_reboot = False
                 if configured_bbr and configured_bbr != cc_out:
@@ -18893,13 +18901,25 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(400, {'ok': False, 'error': '未知的出站类型，请刷新页面后重试'})
             if kind in ('socks5', 'http') and not addr:
                 return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
+            if len(addr) > 512 or any(ord(ch) < 32 or ord(ch) == 127 for ch in addr):
+                return self.reply_json(400, {'ok': False, 'error': '代理地址格式不合法或长度超限'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
-            if hasattr(self, '_extend_deadline'):
-                self._extend_deadline(45)
-            ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
-            if kind == 'warp' and not ip:
-                # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
-                ip = detect_outbound_ip('socks5', '127.0.0.1:40000', proxy_insecure=insecure)
+            try:
+                _probe_sem = _ob_probe_sem
+            except NameError:
+                _probe_sem = None
+            if _probe_sem is not None and not _probe_sem.acquire(blocking=False):
+                return self.reply_json(429, {'ok': False, 'error': '出站探测并发过多，请稍后再试'})
+            try:
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(45)
+                ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
+                if kind == 'warp' and not ip:
+                    # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
+                    ip = detect_outbound_ip('socks5', '127.0.0.1:40000', proxy_insecure=insecure)
+            finally:
+                if _probe_sem is not None:
+                    _probe_sem.release()
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})
 
         def _ob_manage(self):
