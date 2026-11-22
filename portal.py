@@ -1569,7 +1569,10 @@ def atomic_write_private(path, payload):
             os.fsync(fh.fileno())
     except BaseException:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             temp.unlink()
         except OSError:
@@ -1628,7 +1631,10 @@ def atomic_write_private(path, payload):
         except OSError as exc:
             raise AtomicWriteDurabilityError('file replaced; directory sync failed') from exc
         finally:
-            os.close(dfd)
+            try:
+                os.close(dfd)
+            except OSError:
+                pass
 
 
 def portal_update_process_lock(base_dir):
@@ -1644,7 +1650,10 @@ def portal_update_process_lock(base_dir):
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BaseException:
-        os.close(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
         raise
     return fd
 
@@ -2173,7 +2182,10 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
     except FileNotFoundError:
         pass
     fd, name = tempfile.mkstemp(prefix='.hysteria-update-', dir=str(binary.parent))
-    os.close(fd)
+    try:
+        os.close(fd)
+    except OSError:
+        pass
     candidate = Path(name)
     backup = None
     replaced = False
@@ -2383,7 +2395,10 @@ def core_operation_file_lock(directory='/etc/hysteria'):
     try:
         yield
     finally:
-        os.close(lock_fd)
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
 def acquire_core_operation_lock(directory='/etc/hysteria'):
@@ -2394,10 +2409,16 @@ def acquire_core_operation_lock(directory='/etc/hysteria'):
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
             raise RuntimeError('another core operation is running')
         except BaseException:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
             raise
     return lock_fd
 
@@ -2409,7 +2430,10 @@ def upgrade_core_binary(binary='/usr/local/bin/hysteria', backup_dir='/etc/hyste
         try:
             return _upgrade_core_binary_locked(binary, backup_dir, allow_custom)
         finally:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def gost_tls_paths(root):
@@ -2501,7 +2525,10 @@ def _write_private_bytes(target, payload, mode=0o600, call_path_chmod=False):
             os.fsync(handle.fileno())
     finally:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     if call_path_chmod:
         target.chmod(mode)
     os.chmod(str(target), mode)
@@ -3229,7 +3256,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
     access_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/"
     access_json = json.dumps(
         portal_access_payload(access_url, username_str, password_str, api_key_str),
-        ensure_ascii=False)
+        ensure_ascii=False, allow_nan=False)
     field_access_json = (
         f'<textarea id="teyir-access-json" class="config" aria-label="TEYIR 接入凭据（JSON）" '
         f'readonly spellcheck="false" style="height:92px">{html.escape(access_json)}</textarea>')
@@ -7222,7 +7249,7 @@ def kick_hy2_users(root, uids):
         return False
     if not clean_uids or not _valid_stats_secret(secret) or not _valid_loopback_stats_url(url):
         return False
-    req = urllib.request.Request(url + '/kick', data=json.dumps(clean_uids).encode(),
+    req = urllib.request.Request(url + '/kick', data=json.dumps(clean_uids, allow_nan=False).encode(),
                                  headers={'Authorization': secret, 'Content-Type': 'application/json'})
     with _open_loopback_stats(req, timeout=4):
         pass
@@ -7818,7 +7845,7 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
         if not _valid_stats_secret(secret):
             raise RuntimeError('cannot confirm Hy2 revocation: loopback stats secret unavailable')
         def request_stats(path, payload=None):
-            req = urllib.request.Request(url + path, data=json.dumps(payload).encode() if payload is not None else None,
+            req = urllib.request.Request(url + path, data=json.dumps(payload, allow_nan=False).encode() if payload is not None else None,
                                          headers={'Authorization': secret, 'Content-Type':'application/json'})
             with _open_loopback_stats(req, timeout=4) as response:
                 raw=_read_bounded_bytes(response, 4 * 1024 * 1024)
@@ -7941,7 +7968,7 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
                    if managed_inbound_index(xcfg,tag)[0]>=0}
     if not wanted_by_tag:
         return True
-    signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
+    signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True,allow_nan=False).encode()).hexdigest()
     epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,errors='replace',timeout=4,check=True).stdout.strip()
     current={}
     for tag in wanted_by_tag:
@@ -8837,7 +8864,7 @@ def sync_pin(m, root, meta_path):
             new = pin_sha256_of_file(live) if (live and Path(live).is_file()) else get_cert_pin_sha256(root)
             if new != m.get('pin_sha256'):
                 m['pin_sha256'] = new
-                atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
+                atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     elif m.get('pin_sha256'):
         m['pin_sha256'] = ''
         atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, allow_nan=False).encode('utf-8'))
@@ -9826,7 +9853,10 @@ def serve(path):
                 return False
             finally:
                 if acquired_core_lock:
-                    os.close(core_lock_fd)
+                    try:
+                        os.close(core_lock_fd)
+                    except OSError:
+                        pass
             with data_lock:
                 # 收回期间新排进来的待撤销项要保留，只清掉本轮已确认的。
                 previous_pending = pending_revocations(data)
@@ -13602,7 +13632,10 @@ if __name__ == '__main__':
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
             finally:
                 if update_lock_fd is not None:
-                    os.close(update_lock_fd)
+                    try:
+                        os.close(update_lock_fd)
+                    except OSError:
+                        pass
 
         def _manage_proxy_operation(self, action, params):
             # 报错在页面上原样弹给管理员（控制台也原样转给操作者），一律中文并说明怎么办（2026-11-13 修）。
