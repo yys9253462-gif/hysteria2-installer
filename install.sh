@@ -1841,8 +1841,12 @@ setup_cert_via_nginx() {
             --accountemail "$email" --keylength ec-256 || rc=$?
     else
         conf="/etc/nginx/conf.d/hy2-acme-${domain}.conf"
-        if [[ -e "$conf" ]]; then
-            log_warn "目标 Nginx 配置文件已存在，无法确认归属；保留原文件并跳过自动建站。"
+        if [[ -e "$conf" || -L "$conf" ]]; then
+            log_warn "目标 Nginx 配置文件已存在或为符号链接，无法确认归属；保留原文件并跳过自动建站。"
+            return 1
+        fi
+        if [[ -L "$HY2_ACME_WEBROOT" ]]; then
+            log_warn "HY2_ACME_WEBROOT 不允许为符号链接，跳过自动建站。"
             return 1
         fi
         if [[ ! -d /etc/nginx/conf.d ]]; then
@@ -1931,6 +1935,14 @@ EOF
     # 复制到 /etc/hysteria/cert 并登记续期后的重启命令：Hysteria / Xray / sing-box
     # 都只在启动时读证书，续期后不重启就一直用旧证书，到期即全部握手失败。
     local out_cert="${HY2_CERT_DIR}/acme-${domain}.crt" out_key="${HY2_CERT_DIR}/acme-${domain}.key"
+    if [[ -L "$HY2_CERT_DIR" || -L "$out_cert" || -L "$out_key" ]]; then
+        if [[ "$created_owned_conf" == 1 && -n "$conf" ]]; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+        fi
+        log_err "证书目标目录或文件不允许为符号链接，拒绝写入。"
+        return 1
+    fi
     mkdir -p "$HY2_CERT_DIR"
     if ! (umask 077; "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
@@ -1946,7 +1958,14 @@ EOF
         log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败或目标文件为空。"
         return 1
     fi
-    chmod 600 "$out_key"
+    chmod 600 "$out_key" || {
+        if [[ "$created_owned_conf" == 1 && -n "$conf" ]]; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+        fi
+        log_err "无法收紧私钥权限: ${out_key}"
+        return 1
+    }
     if [[ "$created_owned_conf" == 1 ]]; then
         mkdir -p "$HY2_DIR"
         (umask 077; : > "$HY2_DIR/.hy2-nginx-acme-${domain}.owned" && chmod 600 "$HY2_DIR/.hy2-nginx-acme-${domain}.owned")
@@ -2079,6 +2098,10 @@ setup_cert_via_dns_api() {
     # 并给 acme.sh 注册 deploy/reload hook；否则 --cron 只换磁盘文件，
     # Hysteria 仍会在内存里继续提供旧证书直到重启。
     local out_cert="${HY2_CERT_DIR}/acme-${domain}.crt" out_key="${HY2_CERT_DIR}/acme-${domain}.key"
+    if [[ -L "$HY2_CERT_DIR" || -L "$out_cert" || -L "$out_key" ]]; then
+        log_err "证书目标目录或文件不允许为符号链接，拒绝写入。"
+        return 1
+    fi
     mkdir -p "$HY2_CERT_DIR"
     if ! (umask 077; "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
@@ -5128,6 +5151,13 @@ install_warp_local_proxy() {
     WGCF_ACCT="${WGCF_DIR}/wgcf-account.toml"
     WP_BIN="/usr/local/bin/wireproxy"
     HY2_WARP_OWNED_MARKER="${HY2_DIR}/.hy2-warp-owned"
+    local _wpath
+    for _wpath in "$WGCF_BIN" "$WP_BIN" "$HY2_WARP_OWNED_MARKER" "$WGCF_DIR" "$WGCF_ACCT" "$WGCF_CONF" /etc/wireguard/wp.conf /etc/systemd/system/wireproxy.service /usr/local/bin/hy2-warp-watchdog.sh /etc/systemd/system/hy2-warp-watchdog.service /etc/systemd/system/hy2-warp-watchdog.timer; do
+        if [[ -L "$_wpath" ]]; then
+            log_err "检测到 WARP 相关路径为符号链接，已拒绝安装以防覆写宿主文件: ${_wpath}"
+            return 1
+        fi
+    done
     if [[ ! -f "$HY2_WARP_OWNED_MARKER" ]]; then
         if [[ -f /etc/systemd/system/wireproxy.service && -f /etc/wireguard/wp.conf ]] \
                 && grep -qF '# wireproxy config (managed by hysteria2-installer, do not edit)' \
@@ -5260,8 +5290,13 @@ install_warp_local_proxy() {
             log_err "wireproxy 解压失败"
             return 1
         fi
+        if [[ ! -f "${TMP_EXTRACT}/${WP_MEMBER}" || -L "${TMP_EXTRACT}/${WP_MEMBER}" ]]; then
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT"
+            log_err "wireproxy 解压成员不是常规文件或为符号链接，已放弃安装。"
+            return 1
+        fi
         local _wp_stage=""
-        _wp_stage="$(umask 022; mktemp "${WP_BIN}.new.XXXXXX")" || {
+        _wp_stage="$(umask 077; mktemp "${WP_BIN}.new.XXXXXX")" || {
             rm -rf "$TMP_DIR" "$TMP_EXTRACT"
             log_err "创建 wireproxy 暂存文件失败，现有文件未改动。"
             return 1
@@ -5368,7 +5403,7 @@ EOF
 
     # 5. wireproxy systemd 守护（同目录临时文件原子替换）
     local _wp_unit_tmp=""
-    _wp_unit_tmp="$(mktemp "/etc/systemd/system/wireproxy.service.XXXXXX")" || {
+    _wp_unit_tmp="$(umask 077; mktemp "/etc/systemd/system/wireproxy.service.XXXXXX")" || {
         log_err "无法创建 wireproxy.service 临时文件。"
         return 1
     }
@@ -5404,7 +5439,7 @@ EOF
     sleep 3
 
     # 6. 探活 wireproxy socks5
-    if curl --proxy socks5h://"$WARP_SOCKS_ADDR" --silent --fail --max-time 8 https://api4.ipify.org >/dev/null 2>&1; then
+    if curl --proxy socks5h://"$WARP_SOCKS_ADDR" --silent --fail --max-time 8 --max-filesize 65536 https://api4.ipify.org >/dev/null 2>&1; then
         log_info "WARP socks5 探活成功 (上游出口 IP 已切换)"
     else
         log_warn "WARP socks5 探活失败 (可能上游封禁或 NAT 类型受限), 服务已启动但需手动验证"
@@ -5442,7 +5477,7 @@ EOWD
     fi
 
     local _wd_svc_tmp="" _wd_tmr_tmp=""
-    _wd_svc_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.service.XXXXXX")" || {
+    _wd_svc_tmp="$(umask 077; mktemp "/etc/systemd/system/hy2-warp-watchdog.service.XXXXXX")" || {
         log_err "无法创建 hy2-warp-watchdog.service 临时文件。"
         return 1
     }
@@ -5466,7 +5501,7 @@ EOF
         return 1
     fi
 
-    _wd_tmr_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.timer.XXXXXX")" || {
+    _wd_tmr_tmp="$(umask 077; mktemp "/etc/systemd/system/hy2-warp-watchdog.timer.XXXXXX")" || {
         log_err "无法创建 hy2-warp-watchdog.timer 临时文件。"
         return 1
     }
