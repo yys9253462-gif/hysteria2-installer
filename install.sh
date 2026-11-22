@@ -187,7 +187,7 @@ hy2_git_blob_sha() {
 
 # 拒绝含绝对路径、`..`、反斜杠、空清单或链接/特殊文件成员的 tar 包（防路径穿越与符号链接逃逸）。
 hy2_tar_listing_safe() {
-    local member listing vlisting vline
+    local member clean listing vlisting vline
     [[ -f "${1:-}" ]] || return 1
     # 从 stdin 读包：GNU tar 会把带冒号的路径（如 Windows 盘符）当成远程主机。
     # 读不出清单或清单为空必须判为不安全（fail-closed），否则损坏或异常的包会被放行。
@@ -195,8 +195,14 @@ hy2_tar_listing_safe() {
     [[ -n "$listing" ]] || return 1
     while IFS= read -r member; do
         member="${member%$'\r'}"
+        clean="$member"
+        while [[ "$clean" == ./* ]]; do clean="${clean#./}"; done
+        [[ "$member" =~ [[:cntrl:]] ]] && return 1
         case "$member" in
-            /*|..|../*|*/../*|*/..|*\\*) return 1 ;;
+            /*|*\\*|*:* ) return 1 ;;
+        esac
+        case "$clean" in
+            ""|/*|..|../*|*/../*|*/.. ) return 1 ;;
         esac
     done <<<"$listing"
     vlisting="$(tar -tvzf - <"$1" 2>/dev/null)" || return 1
@@ -980,6 +986,10 @@ install_dependencies() {
 # 旧实现直接下 latest 再 `version` 试跑就覆盖：`version` 是被下载的二进制自己
 # 执行的，植入后门完全可以正常打印版本号，等于没有完整性校验。
 install_binary() {
+    if [[ -L "$HY2_BIN" ]]; then
+        log_err "${HY2_BIN} 不允许为符号链接，已放弃安装。"
+        return 1
+    fi
     log_step "获取 Hysteria 2 官方最新版本..."
     # ⚠️ 必须 `|| LATEST_TAG=""`（2026-10-09 修）：命令替换里的 curl 失败会因
     # `set -eo pipefail` 让整个赋值语句失败退出，于是下面那个 fallback 分支
@@ -989,7 +999,7 @@ install_binary() {
     LATEST_TAG=$(curl -s --max-time 10 --max-filesize=2097152 https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || LATEST_TAG=""
 
     local asset_arch asset tmpdir="" staged="" expected got
-    trap 'trap - RETURN; rm -rf "${tmpdir:-}" "${staged:-}"' RETURN
+    trap 'trap - RETURN; rm -rf -- "${tmpdir:-}" "${staged:-}"' RETURN
     if ! asset_arch="$(hy2_core_asset_arch "$HY2_ARCH")"; then
         log_err "Hysteria 2 不支持当前 CPU 架构: ${HY2_ARCH}"
         return 1
@@ -1001,7 +1011,7 @@ install_binary() {
         # 用固定版本目录而不是 `latest/`：`latest` 是浮动指针，下载与取摘要之间
         # 可能已经切换版本，导致摘要与资产对不上（或更糟：对上了另一个版本）。
         local resolved
-        resolved="$(curl -fsSIL --max-time 20 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
+        resolved="$(curl -fsSIL --max-time 20 --max-redirs 5 --max-filesize=2097152 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
             awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)" || resolved=""
         if [[ "$resolved" =~ /app/(v[0-9][^/]*)/${asset}$ ]]; then
             # 下载站只给出裸版本号（v2.13.0），而 GitHub 的 release tag 是
@@ -1066,12 +1076,15 @@ install_binary() {
         log_err "写入临时二进制文件失败，现有二进制未改动。"
         return 1
     fi
-    rm -rf "$tmpdir"
-    if ! mv -f "$staged" "$HY2_BIN"; then
-        rm -f "$staged"
+    rm -rf -- "$tmpdir"
+    tmpdir=""
+    if ! mv -f -- "$staged" "$HY2_BIN"; then
+        rm -f -- "$staged"
+        staged=""
         log_err "替换 ${HY2_BIN} 失败，现有二进制未改动。"
         return 1
     fi
+    staged=""
     log_info "Hysteria 2 二进制安装成功！版本信息: $($HY2_BIN version 2>&1 | grep -E '^Version:' | head -n1 || echo '未知')"
 }
 
@@ -1083,12 +1096,16 @@ install_binary() {
 # 端口也重新随机。一次「升级」就把正式证书降级成自签、换掉端口，
 # 已发放的客户端配置全部失效，而脚本一路显示正常完成。
 reuse_existing_cert_config() {
+    if [[ -L "$HY2_CONFIG" || -L "$HY2_META_FILE" ]]; then
+        log_err "主配置或元数据文件不允许为符号链接，拒绝复用现有证书配置。"
+        return 1
+    fi
     [[ -f "$HY2_CONFIG" ]] || return 1
     local txt cert key dom email mt insecure
     txt="$(cat "$HY2_CONFIG" 2>/dev/null || true)"
     [[ -n "$txt" ]] || return 1
     mt="$(jq -r '.cert_type // empty' "$HY2_META_FILE" 2>/dev/null || true)"
-    insecure="$(jq -r '.is_insecure // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    insecure="$(jq -r 'if has("is_insecure") then (.is_insecure|tostring) else "" end' "$HY2_META_FILE" 2>/dev/null || true)"
 
     if grep -qE '^acme:[[:space:]]*(#.*)?$' <<<"$txt"; then
         dom="$(awk '
@@ -1140,7 +1157,7 @@ reuse_existing_cert_config() {
                 else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
                 print v; exit
             }' <<<"$txt")"
-        [[ -n "$cert" && -n "$key" && -f "$cert" && -f "$key" ]] || return 1
+        [[ -n "$cert" && -n "$key" && "$cert" != -* && "$key" != -* && ! "$cert" =~ [[:cntrl:]] && ! "$key" =~ [[:cntrl:]] && -f "$cert" && -f "$key" ]] || return 1
         CERT_FILE="$cert"
         KEY_FILE="$key"
         if [[ "$mt" == "self_signed" || "$insecure" == "true" ]]; then
@@ -1166,6 +1183,10 @@ setup_certificates() {
     mkdir -p "$HY2_CERT_DIR"
     # 迁移准备阶段复用已验证的证书，不提前切换DNS来申请新证书。
     if [[ -n "${HY2_CUSTOM_CERT_FILE:-}" || -n "${HY2_CUSTOM_KEY_FILE:-}" ]]; then
+        if [[ "$HY2_CUSTOM_CERT_FILE" == -* || "$HY2_CUSTOM_KEY_FILE" == -* || "$HY2_CUSTOM_CERT_FILE" =~ [[:cntrl:]] || "$HY2_CUSTOM_KEY_FILE" =~ [[:cntrl:]] ]]; then
+            log_err "迁移证书或私钥路径非法（以 - 开头或含控制字符）"
+            return 1
+        fi
         [[ -f "${HY2_CUSTOM_CERT_FILE:-}" && -r "${HY2_CUSTOM_CERT_FILE:-}" && -s "${HY2_CUSTOM_CERT_FILE:-}" \
             && -f "${HY2_CUSTOM_KEY_FILE:-}" && -r "${HY2_CUSTOM_KEY_FILE:-}" && -s "${HY2_CUSTOM_KEY_FILE:-}" ]] || { log_err "迁移证书文件不可读或为空"; return 1; }
         openssl x509 -in "$HY2_CUSTOM_CERT_FILE" -noout -checkend 3600 >/dev/null || { log_err "迁移证书无效或即将过期"; return 1; }
@@ -6578,24 +6599,32 @@ restart_portal() {
 show_teyir_access() {
     require_installed || return 1
     local access="$HY2_DIR/portal-access.json"
+    if [[ -L "$access" ]]; then
+        log_err "门户凭据文件 ${access} 不允许为符号链接。"
+        return 1
+    fi
     [[ -f "$access" ]] || { log_err "未找到门户凭据文件 ${access}。"; return 1; }
     # 与 info 同一处理（2026-11-06 修）：文件损坏时给出可操作的提示，而不是一句 jq 解析错误。
     if ! jq -e 'type == "object"' "$access" >/dev/null 2>&1; then
         log_err "门户凭据文件 ${access} 已损坏，执行 bash install.sh refresh-page 可重建。"
         return 1
     fi
-    echo -e "\n${CYAN}------------ 接入 Teyir 控制台 ------------${PLAIN}"
-    echo -e "门户地址 url     : ${GREEN}$(jq -r '.url // ""' "$access")${PLAIN}"
-    echo -e "门户用户名       : ${GREEN}$(jq -r '.username // ""' "$access")${PLAIN}"
-    echo -e "门户密码         : ${GREEN}$(jq -r '.password // ""' "$access")${PLAIN}"
-    local key; key="$(jq -r '.api_key // ""' "$access")"
+    local url uname upwd key
+    url="$(jq -r '.url // ""' "$access")"
+    uname="$(jq -r '.username // ""' "$access")"
+    upwd="$(jq -r '.password // ""' "$access")"
+    key="$(jq -r '.api_key // ""' "$access")"
+    printf '\n%b------------ 接入 Teyir 控制台 ------------%b\n' "$CYAN" "$PLAIN"
+    printf '门户地址 url     : %b%s%b\n' "$GREEN" "$url" "$PLAIN"
+    printf '门户用户名       : %b%s%b\n' "$GREEN" "$uname" "$PLAIN"
+    printf '门户密码         : %b%s%b\n' "$GREEN" "$upwd" "$PLAIN"
     if [[ -n "$key" ]]; then
-        echo -e "API Key (Bearer) : ${GREEN}${key}${PLAIN}"
+        printf 'API Key (Bearer) : %b%s%b\n' "$GREEN" "$key" "$PLAIN"
     else
-        echo -e "API Key (Bearer) : ${YELLOW}（未找到 API Key，请重新执行第 1 项或第 4 项安装）${PLAIN}"
+        printf 'API Key (Bearer) : %b（未找到 API Key，请重新执行第 1 项或第 4 项安装）%b\n' "$YELLOW" "$PLAIN"
     fi
-    echo -e "${CYAN}--------------------------------------------${PLAIN}"
-    echo -e "${YELLOW}以上是节点的管理凭据，请勿外传。${PLAIN}"
+    printf '%b--------------------------------------------%b\n' "$CYAN" "$PLAIN"
+    printf '%b以上是节点的管理凭据，请勿外传。%b\n' "$YELLOW" "$PLAIN"
 }
 
 view_logs() {
