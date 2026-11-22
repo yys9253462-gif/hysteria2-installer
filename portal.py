@@ -1378,7 +1378,7 @@ def _unreachable_outbounds(outs, timeout=2):
     if not isinstance(outs, (list, tuple)):
         return []
     if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or not math.isfinite(timeout) or timeout <= 0):
+            or not (0 < timeout < float('inf'))):
         probe_timeout = 2.0
     else:
         probe_timeout = min(30.0, float(timeout))

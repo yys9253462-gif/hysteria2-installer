@@ -65,7 +65,8 @@ class PortalAssetsOutboundBbrTraffic401AwgNameAndLoginGuardsTests(unittest.TestC
         self.assertIn('!confTab.closed', add_part)
         self.assertIn('json && json.ok', add_part)
 
-        self.assertIn('if (!el || !btn) return;', self.login_js)
+        self.assertIn('if (!el) return;', self.login_js)
+        self.assertIn('if (!btn) return;', self.login_js)
 
     @unittest.skipUnless(NODE, '需要 node 运行 JS 行为验证')
     def test_node_runtime_syntax_and_behavior(self):

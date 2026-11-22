@@ -6578,12 +6578,12 @@ uninstall_all() {
         # 保留持锁 inode：删除它后并发安装器可能新建另一个锁文件并越过当前卸载。
         # 防误删守卫：拒绝空串、根目录、顶层系统目录与含 .. 的路径。
         local _bs='\'
-        local _hy2_clean="${HY2_DIR:-}"
+        local _hy2_clean="$HY2_DIR"
         while [[ "$_hy2_clean" == */ && "$_hy2_clean" != "/" ]]; do _hy2_clean="${_hy2_clean%/}"; done
         if [[ -z "$_hy2_clean" || "$_hy2_clean" == "/" || "$_hy2_clean" == */.. || "$_hy2_clean" == */../* \
                 || "$_hy2_clean" == *"${_bs}..${_bs}"* || "$_hy2_clean" == *"${_bs}.." \
                 || ! ( "$_hy2_clean" =~ ^/[^/]+/[^/]+ || "$_hy2_clean" =~ ^[A-Za-z]:[/\\][^/\\]+[/\\].+ ) ]]; then
-            log_err "拒绝清理非法目录 HY2_DIR='${HY2_DIR:-}'。"
+            log_err "拒绝清理非法目录 HY2_DIR='$HY2_DIR'。"
             return 1
         fi
         local hy2_path

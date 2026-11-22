@@ -763,8 +763,7 @@ render_server_config() {
         if [[ -s "$AWG_PEERS_FILE" ]]; then
             jq -r '
                 (.peers // []) | if type=="array" then .[] else empty end |
-                select(
-                    type=="object"
+                select(type=="object"
                     and (.public_key | type=="string" and length>0 and (test("[\r\n\t\u0000-\u001f\u007f ]") | not))
                     and (.address | type=="string"
                          and test("^(0|[1-9][0-9]{0,2})(\\.(0|[1-9][0-9]{0,2})){3}$")

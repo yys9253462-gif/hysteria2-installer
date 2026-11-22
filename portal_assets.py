@@ -4132,7 +4132,8 @@ loadAwgState();
 LOGIN_SCRIPT = r"""
 function toggleSecret(id, btn) {
   const el = document.getElementById(id);
-  if (!el || !btn) return;
+  if (!el) return;
+  if (!btn) return;
   if (el.type === 'password') {
     el.type = 'text';
     btn.textContent = '隐藏';
