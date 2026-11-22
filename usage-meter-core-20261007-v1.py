@@ -13,7 +13,8 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
         raise ValueError('invalid usage meter state')
     if source not in ('hysteria', 'reality'):
         raise ValueError('unknown source')
-    if not isinstance(epoch, str) or not epoch:
+    if (not isinstance(epoch, str) or not epoch.strip()
+            or any(ord(c) < 32 or ord(c) == 127 for c in epoch)):
         raise ValueError('missing service epoch')
     if not isinstance(counters, dict):
         raise ValueError('counters must be a dict')
@@ -35,7 +36,7 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
         active_users = normalized_active
     clean = {}
     for uid, pair in counters.items():
-        if not isinstance(uid, str) or not isinstance(pair, dict):
+        if not isinstance(uid, str) or not uid or not isinstance(pair, dict):
             raise ValueError('invalid counter entry')
         tx, rx = pair.get('tx'), pair.get('rx')
         if type(tx) is not int or type(rx) is not int or min(tx, rx) < 0:
@@ -212,6 +213,8 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
 def total_bytes(state, uid):
     if not isinstance(state, dict):
         raise ValueError('invalid usage meter state')
+    if not isinstance(uid, str) or not uid:
+        raise ValueError('invalid user id')
     totals = state.get('totals', {})
     if not isinstance(totals, dict):
         raise ValueError('invalid totals')
@@ -226,6 +229,8 @@ def adjusted_bytes(state, uid):
     """返回实测累计加账户有符号偏移；损坏状态和负结果均失败。"""
     if not isinstance(state, dict):
         raise ValueError('invalid usage meter state')
+    if not isinstance(uid, str) or not uid:
+        raise ValueError('invalid user id')
     total = total_bytes(state, uid)
     adjustments = state.get('adjustments', {})
     if not isinstance(adjustments, dict):
