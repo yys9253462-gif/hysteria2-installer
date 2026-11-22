@@ -11081,8 +11081,12 @@ if __name__ == '__main__':
 
             # 避开所有托管协议已占用的端口，而不只是 hy2 / 订阅端口。
             try:
-                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                            if Path('/etc/hysteria/xray.json').exists() else None)
+                _xp_cfg = Path('/etc/hysteria/xray.json')
+                if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
+                    _parsed_xcfg = json.loads(_xp_cfg.read_bytes().decode('utf-8', errors='replace'))
+                    _cfg_now = _parsed_xcfg if isinstance(_parsed_xcfg, dict) else None
+                else:
+                    _cfg_now = None
             except (OSError, ValueError):
                 _cfg_now = None
             with data_lock:
@@ -12703,6 +12707,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -13544,6 +13550,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -13634,6 +13642,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -13836,6 +13846,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14014,6 +14026,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14227,8 +14241,12 @@ if __name__ == '__main__':
             # 必须显式避开 Reality 的端口：它可能刚写进配置、尚未重启，
             # 监听表里还看不到，只靠 ss 探测会让两者撞同一个端口。
             try:
-                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                            if Path('/etc/hysteria/xray.json').exists() else None)
+                _xp_cfg = Path('/etc/hysteria/xray.json')
+                if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
+                    _parsed_xcfg = json.loads(_xp_cfg.read_bytes().decode('utf-8', errors='replace'))
+                    _cfg_now = _parsed_xcfg if isinstance(_parsed_xcfg, dict) else None
+                else:
+                    _cfg_now = None
             except (OSError, ValueError):
                 _cfg_now = None
             with data_lock:
@@ -14343,8 +14361,12 @@ if __name__ == '__main__':
                     config_section(data, 'vmess_config').get('port'),
                 }
             try:
-                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                            if Path('/etc/hysteria/xray.json').exists() else None)
+                _xp_cfg = Path('/etc/hysteria/xray.json')
+                if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
+                    _parsed_xcfg = json.loads(_xp_cfg.read_bytes().decode('utf-8', errors='replace'))
+                    _cfg_now = _parsed_xcfg if isinstance(_parsed_xcfg, dict) else None
+                else:
+                    _cfg_now = None
             except (OSError, ValueError):
                 _cfg_now = None
             with data_lock:
@@ -14460,6 +14482,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14683,6 +14707,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14728,7 +14754,13 @@ if __name__ == '__main__':
                 return [label for label, cfg in (('AnyTLS', _active_anytls_config()),
                                                  ('TUIC', _active_tuic_config())) if cfg]
             try:
-                cfg = json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
+                xp = Path('/etc/hysteria/xray.json')
+                xst = xp.lstat()
+                if xp.is_symlink() or not xp.is_file() or xst.st_size > 4 * 1024 * 1024:
+                    raise ValueError('xray.json 非法或过大')
+                cfg = json.loads(xp.read_bytes().decode('utf-8', errors='replace'))
+                if not isinstance(cfg, dict):
+                    raise ValueError('xray.json 顶层非对象')
             except FileNotFoundError:
                 # 没有配置文件 = 确实没有任何 Xray 协议在用，可以卸载。
                 return []
@@ -14765,6 +14797,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -14799,7 +14833,7 @@ if __name__ == '__main__':
                             try:
                                 is_en = subprocess.run(
                                     ['systemctl', 'is-enabled', unit], capture_output=True,
-                                    text=True, timeout=5)
+                                    text=True, encoding='utf-8', errors='replace', timeout=5)
                                 enabled_state = is_en.stdout.strip()
                                 is_en_rc = is_en.returncode
                             except (OSError, subprocess.SubprocessError):
@@ -14890,8 +14924,12 @@ if __name__ == '__main__':
                 old = dict(config_section(data, 'anytls_config'))
                 _data_now = dict(data)
             try:
-                _cfg_now = (json.loads(Path('/etc/hysteria/xray.json').read_text(encoding='utf-8'))
-                            if Path('/etc/hysteria/xray.json').exists() else None)
+                _xp_cfg = Path('/etc/hysteria/xray.json')
+                if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
+                    _parsed_xcfg = json.loads(_xp_cfg.read_bytes().decode('utf-8', errors='replace'))
+                    _cfg_now = _parsed_xcfg if isinstance(_parsed_xcfg, dict) else None
+                else:
+                    _cfg_now = None
             except (OSError, ValueError):
                 _cfg_now = None
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='anytls_config', keep_disabled=True)
@@ -15419,6 +15457,8 @@ if __name__ == '__main__':
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -17941,6 +17981,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '探测请求过大，请刷新页面后重试'})
                 length = int(_raw_cl_s)
                 if length > 8192:
                     return self.reply_json(413, {'ok': False, 'error': '探测请求过大，请刷新页面后重试'})
@@ -17982,6 +18024,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 _raw_cl_s = _raw_cl.strip()
                 if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
                 length = int(_raw_cl_s)
                 if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
@@ -18119,7 +18163,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': rule_error})
             else:
-                return self.reply_json(400, {'ok': False, 'error': '未知的操作类型：' + action})
+                safe_action = ''.join(ch for ch in action if ord(ch) >= 32 and ord(ch) != 127)[:64]
+                return self.reply_json(400, {'ok': False, 'error': '未知的操作类型：' + safe_action})
 
             try:
                 save_data()
@@ -18160,7 +18205,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 with _warp_probe_lock:
                     cached = _warp_probe_cache.get('value')
                     cached_at = _warp_probe_cache.get('at', 0)
-                if cached and time.monotonic() - cached_at < 30:
+                now_mono = time.monotonic()
+                if cached and 0 <= now_mono - cached_at < 30:
                     outbound_ip, connected = cached
                 else:
                     for warp_addr in ('127.0.0.1:19898', '127.0.0.1:40000'):
@@ -18172,7 +18218,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         _warp_probe_cache['value'] = (outbound_ip, connected)
                         _warp_probe_cache['at'] = time.monotonic()
             try:
-                cfg_text = Path('/etc/hysteria/config.yaml').read_text(encoding='utf-8')
+                _wcfg_p = Path('/etc/hysteria/config.yaml')
+                _wcfg_st = _wcfg_p.lstat()
+                if _wcfg_p.is_symlink() or not _wcfg_p.is_file() or _wcfg_st.st_size > 4 * 1024 * 1024:
+                    raise ValueError('config.yaml 非法或过大')
+                cfg_text = _wcfg_p.read_bytes().decode('utf-8', errors='replace')
                 applied = cfg_text == render_egress_config(cfg_text, state)
                 applied = applied and _hy2_config_loaded('/etc/hysteria/config.yaml')
             except Exception:
