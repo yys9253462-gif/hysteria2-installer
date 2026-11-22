@@ -1,5 +1,7 @@
 """节点计数器只读适配器；不 reset，不输出 secret。"""
+import errno
 import json
+import os
 import pathlib
 import stat
 import subprocess
@@ -37,17 +39,45 @@ def _read_bounded_json(path, max_bytes=8 * 1024 * 1024):
     p = pathlib.Path(path)
     if (not isinstance(p, _ORIG_PATH_CLS)
             or getattr(type(p), 'read_text', None) is not _ORIG_PATH_READ_TEXT):
-        text = p.read_text(encoding='utf-8')
+        try:
+            text = p.read_text(encoding='utf-8', errors='replace')
+        except TypeError:
+            text = p.read_text(encoding='utf-8')
         if len(text.encode('utf-8')) > max_bytes:
             raise ValueError('config file too large')
         return json.loads(text)
-    st = p.lstat()
-    if not stat.S_ISREG(st.st_mode):
-        raise ValueError('config path must be regular file')
-    if st.st_size > max_bytes:
-        raise ValueError('config file too large')
-    with open(p, 'rb') as fh:
-        raw = fh.read(max_bytes + 1)
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    if nofollow:
+        fd = None
+        try:
+            try:
+                fd = os.open(str(p), os.O_RDONLY | nofollow)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ValueError('config path must be regular file') from None
+                raise
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError('config path must be regular file')
+            if st.st_size > max_bytes:
+                raise ValueError('config file too large')
+            with os.fdopen(fd, 'rb') as fh:
+                fd = None
+                raw = fh.read(max_bytes + 1)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    else:
+        st = p.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError('config path must be regular file')
+        if st.st_size > max_bytes:
+            raise ValueError('config file too large')
+        with open(p, 'rb') as fh:
+            raw = fh.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ValueError('config file too large')
     return json.loads(raw.decode('utf-8', errors='replace'))

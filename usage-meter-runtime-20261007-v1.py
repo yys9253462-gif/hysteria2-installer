@@ -1,8 +1,10 @@
 """门户计量运行时：真实累计同步到 used_bytes；旧值另存 legacy_auth_value，不混入新窗口。"""
 import copy
+import errno
 import importlib.util
 import json
 import math
+import os
 import pathlib
 import stat
 import sys
@@ -126,6 +128,25 @@ def _recent_gaps(m, window_seconds=86400):
     with _recent_gaps_lock:
         _recent_gaps_cache.update(key=copy.deepcopy(cache_key), value=snapshot_val)
     return copy.deepcopy(snapshot_val)
+
+
+def _has_recent_gaps(m, window_seconds=86400):
+    """热路径布尔判据：命中缓存时直接返回布尔值，避免对每用户做整表 copy.deepcopy。"""
+    if not isinstance(m, dict):
+        return True
+    gaps = m.get('gaps', [])
+    if not isinstance(gaps, list):
+        return True
+    if not gaps:
+        return False
+    if (isinstance(window_seconds, bool) or not isinstance(window_seconds, (int, float))
+            or not math.isfinite(window_seconds) or window_seconds <= 0):
+        window_seconds = 86400
+    cache_key = (gaps, int(time.time() // 30), window_seconds)
+    with _recent_gaps_lock:
+        if _recent_gaps_cache.get('key') == cache_key:
+            return bool(_recent_gaps_cache['value'])
+    return bool(_recent_gaps(m, window_seconds))
 
 def _users_view(data):
     """门户的用户表；损坏（null/list/str）时按空表处理。
@@ -460,7 +481,7 @@ class PortalMeter:
                 online_dev = raw_dev if (type(raw_dev) is int and raw_dev >= 0) else 0
             return {'measured_bytes':measured,
                 'measurement_started_at':m.get('started_at'),
-                'measurement_ok':initialized and fresh and not _recent_gaps(m),
+                'measurement_ok':initialized and fresh and not _has_recent_gaps(m),
                 'measurement_current_ok': initialized and fresh,
                 'measurement_complete': initialized and not gaps,
                 'current_online': copy.deepcopy(live_entry),
@@ -496,7 +517,7 @@ class PortalMeter:
             measured=_measurement_total(m,enabled,uid)
             initialized=measured is not None
             return {'measured_bytes':measured,
-                'measurement_ok':initialized and fresh and not _recent_gaps(m),
+                'measurement_ok':initialized and fresh and not _has_recent_gaps(m),
                 'measurement_started_at':m.get('started_at'),
                 'measurement_scope':'since_measurement_started'}
 
@@ -521,12 +542,42 @@ class PortalMeter:
 
 def from_file(data,lock,save,path,on_speed=None):
     cfg_path = pathlib.Path(path)
-    st = cfg_path.lstat()
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        raise ValueError('usage meter config must be a regular file')
-    if st.st_size > 2 * 1024 * 1024:
+    max_bytes = 2 * 1024 * 1024
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    if nofollow:
+        fd = None
+        try:
+            try:
+                fd = os.open(str(cfg_path), os.O_RDONLY | nofollow)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ValueError('usage meter config must be a regular file') from None
+                raise
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError('usage meter config must be a regular file')
+            if st.st_size > max_bytes:
+                raise ValueError('usage meter config too large')
+            with os.fdopen(fd, 'rb') as fh:
+                fd = None
+                raw = fh.read(max_bytes + 1)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    else:
+        st = cfg_path.lstat()
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+            raise ValueError('usage meter config must be a regular file')
+        if st.st_size > max_bytes:
+            raise ValueError('usage meter config too large')
+        with open(cfg_path, 'rb') as fh:
+            raw = fh.read(max_bytes + 1)
+    if len(raw) > max_bytes:
         raise ValueError('usage meter config too large')
-    config=json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
+    config=json.loads(raw.decode('utf-8', errors='replace'))
     if not isinstance(config, dict):
         raise ValueError('usage meter config must be a JSON object')
     return PortalMeter(data,lock,save,config,on_speed=on_speed)
