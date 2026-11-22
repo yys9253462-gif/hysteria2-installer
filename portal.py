@@ -12486,16 +12486,17 @@ if __name__ == '__main__':
                         return 400, {'ok': False, 'error': 'HTTP Basic 认证用户名不能包含冒号'}
                     if ptype == 'socks5' and (len(username.encode('utf-8')) > 255 or len(password.encode('utf-8')) > 255):
                         return 400, {'ok': False, 'error': 'SOCKS5 账号或密码不能超过 255 字节'}
+                    _clean_note = ''.join(ch for ch in (raw_note_in or '') if ord(ch) >= 0x20 and ord(ch) != 0x7f).strip()[:200]
                     entry = {'id': 'proxy_' + secrets.token_hex(6), 'type': ptype, 'port': port,
                              'username': username, 'password': password, 'created_at': int(time.time()),
-                             'note': (raw_note_in or '').strip()[:200]}
+                             'note': _clean_note}
                     with data_lock:
                         data['proxy_services'] = working + [entry]
                 else:
                     proxy_id = str(params.get('id') or '').strip()
                     if not proxy_id:
                         return 400, {'ok': False, 'error': '请求缺少代理编号，请刷新页面后重试'}
-                    remaining = [item for item in working if item.get('id') != proxy_id]
+                    remaining = [item for item in working if isinstance(item, dict) and item.get('id') != proxy_id]
                     if len(remaining) == len(working):
                         return 404, {'ok': False, 'error': '这个代理服务已经不存在（可能已被删除），请刷新页面'}
                     with data_lock:
@@ -12503,7 +12504,12 @@ if __name__ == '__main__':
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
-                    raise
+                    if action == 'delete':
+                        try:
+                            reload_gost()
+                        except Exception as rel_exc:
+                            _log_ignored('proxy_durability_reload', rel_exc)
+                    return 503, {'ok': False, 'error': '代理配置已替换但目录刷盘状态不确定，请刷新确认后重试'}
                 except OSError:
                     with data_lock:
                         data['proxy_services'] = previous
@@ -12561,7 +12567,7 @@ if __name__ == '__main__':
                                         capture_output=True, timeout=3)
                     if qr.returncode == 0:
                         qr_svg = qr.stdout.decode('utf-8')
-                        if '<svg' not in qr_svg:
+                        if '<svg' not in qr_svg or '<script' in qr_svg.lower():
                             qr_svg = ''
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
@@ -13484,8 +13490,11 @@ if __name__ == '__main__':
                             self._generate_and_apply_reality(True)
                         if not Path('/usr/local/bin/xray').exists():
                             return self.reply_json(500, {'ok': False, 'error': 'Xray 未安装'})
-                        actual = subprocess.run(['systemctl', 'is-active', 'xray'],
-                                                capture_output=True, text=True, timeout=3).stdout.strip()
+                        try:
+                            actual = subprocess.run(['systemctl', 'is-active', 'xray'],
+                                                    capture_output=True, text=True, timeout=3).stdout.strip()
+                        except (OSError, subprocess.SubprocessError):
+                            actual = ''
                         if actual != 'active':
                             return self.reply_json(500, {'ok': False, 'error': 'Reality 尚未运行，不能报告已开启'})
                         new_active = True
@@ -13498,7 +13507,7 @@ if __name__ == '__main__':
                     try:
                         cfg_now = (json.loads(xray_path.read_text(encoding='utf-8'))
                                    if xray_path.exists() else None)
-                    except ValueError:
+                    except (OSError, ValueError):
                         cfg_now = None
                     if not (isinstance(cfg_now, dict) and has_managed_inbound(cfg_now, REALITY_INBOUND_TAG)):
                         return self.reply_json(409, {'ok': False, 'error':
@@ -13515,6 +13524,8 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': True, 'message': '已重置密钥并重启生效'})
 
                 return self.reply_json(400, {'ok': False, 'error': '未知的 Reality 操作类型，请刷新页面后重试'})
+            except AtomicWriteDurabilityError as e:
+                return self.reply_json(503, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': ('%s: %s' % (type(e).__name__, str(e)))[:160]})
 
@@ -13554,7 +13565,7 @@ if __name__ == '__main__':
                 raise RuntimeError('无法解析证书生效时间，%s 不能启用' % protocol)
             if not_before > time.time():
                 raise RuntimeError('证书尚未生效，%s 不能启用' % protocol)
-            names = set(sans or []) | ({cn} if cn else set())
+            names = {n for n in (sans or []) if isinstance(n, str) and n} | ({cn} if isinstance(cn, str) and cn else set())
             if not certificate_covers_domain(domain, sans, cn):
                 raise RuntimeError('证书不包含域名 %s（现有: %s）' % (
                     domain, ', '.join(sorted(names)) or '无'))
@@ -13921,6 +13932,8 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'active': False,
                         'error': 'VMess 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
+            except AtomicWriteDurabilityError as exc:
+                return self.reply_json(503, {'ok': False, 'error': str(exc)})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
@@ -14457,6 +14470,8 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'active': False,
                         'error': 'AnyTLS 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
+            except AtomicWriteDurabilityError as exc:
+                return self.reply_json(503, {'ok': False, 'error': str(exc)})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
@@ -14716,6 +14731,8 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'active': False,
                         'error': 'TUIC 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
+            except AtomicWriteDurabilityError as exc:
+                return self.reply_json(503, {'ok': False, 'error': str(exc)})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
@@ -14872,6 +14889,8 @@ if __name__ == '__main__':
                     return self.reply_json(500, {'ok': False, 'active': False,
                         'error': 'VLESS Encryption 已停用，但端口防火墙规则未能回收'})
                 return self.reply_json(200, {'ok': True, 'active': False})
+            except AtomicWriteDurabilityError as exc:
+                return self.reply_json(503, {'ok': False, 'error': str(exc)})
             except Exception as exc:
                 return self.reply_json(500, {'ok': False, 'error': str(exc)})
 
@@ -15880,6 +15899,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self._reply_with_warp_apply({
                     'message': 'WARP 通道安装完成，正在应用分流配置。',
                 })
+            except AtomicWriteDurabilityError as e:
+                return self.reply_json(503, {'ok': False, 'error': f'状态落盘不确定: {str(e)}'})
             except Exception as e:
                 return self.reply_json(500, {'ok': False, 'error': f'执行异常: {str(e)}'})
             finally:
