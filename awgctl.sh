@@ -1466,9 +1466,13 @@ cmd_uninstall() {
         revoke_firewall "$old_port"
     fi
 
-    # 防止异常环境变量将 AWG_DIR 指向根目录或顶层系统目录导致误删。
+    # 防止异常环境变量将 AWG_DIR 指向根目录或顶层系统目录导致误删（同时兼容 Windows 单测盘符路径）。
     local clean_awg_dir="${AWG_DIR%/}"
-    if [[ -z "$clean_awg_dir" || "$clean_awg_dir" != /*/* || "$clean_awg_dir" == *"/.."* || "$clean_awg_dir" == *".." ]]; then
+    clean_awg_dir="${clean_awg_dir%\\}"
+    if [[ -z "$clean_awg_dir" \
+        || ( "$clean_awg_dir" != /*/* && ! "$clean_awg_dir" =~ ^[A-Za-z]:[/\\][^/\\]+[/\\].+ ) \
+        || "$clean_awg_dir" == *"/../"* || "$clean_awg_dir" == *"/.." \
+        || "$clean_awg_dir" == *"\\..\\"* || "$clean_awg_dir" == *"\\.." ]]; then
         die "AWG_DIR 路径不安全（${AWG_DIR:-<empty>}），已拒绝删除目录。"
     fi
     case "$clean_awg_dir" in
