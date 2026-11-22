@@ -161,6 +161,41 @@ disk_devices() {
     esac
 }
 
+# 校验网卡名、IPv4 地址与掩码长度，避免把畸形网络配置写进新系统导致重启失联
+valid_iface() {
+    case "${1:-}" in
+        ''|.|..|-*|*[!A-Za-z0-9._:@-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 15 ]
+}
+
+valid_ipv4() {
+    _vi_ip="${1:-}"
+    case "$_vi_ip" in
+        ''|*[!0-9.]*|.*|*.|*..*) return 1 ;;
+    esac
+    _vi_old_ifs="$IFS"
+    IFS='.'
+    # shellcheck disable=SC2086
+    set -- $_vi_ip
+    IFS="$_vi_old_ifs"
+    [ $# -eq 4 ] || return 1
+    for _vi_o in "$1" "$2" "$3" "$4"; do
+        case "$_vi_o" in
+            ''|0?*|*[!0-9]*) return 1 ;;
+        esac
+        [ "${#_vi_o}" -le 3 ] && [ "$_vi_o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+valid_cidr() {
+    case "${1:-}" in
+        ''|0*|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#1}" -le 2 ] && [ "$1" -ge 1 ] && [ "$1" -le 32 ]
+}
+
 # ── 参数解析 ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -188,8 +223,9 @@ fi
 # 前置参数校验：在清空磁盘与生成 chroot 脚本前拦下非法值与注入字符，
 # 防止清盘后才在第 7/8 步因参数异常中止而导致机器无引导失联。
 case "$SWAP_MB" in
-    ''|*[!0-9]*) die "SWAP_MB 必须为非负整数（当前：$SWAP_MB）" ;;
+    ''|0?*|*[!0-9]*) die "SWAP_MB 必须为无前导零的非负整数（当前：$SWAP_MB）" ;;
 esac
+[ "${#SWAP_MB}" -le 6 ] || die "SWAP_MB 数值过大（上限 999999 MB，当前：$SWAP_MB）"
 case "$DEBIAN_SUITE" in
     ''|*[!A-Za-z0-9._-]*|-*|.*) die "DEBIAN_SUITE 含非法字符（当前：$DEBIAN_SUITE）" ;;
 esac
@@ -306,6 +342,9 @@ if [ -z "$(ip route show default 2>/dev/null)" ]; then
 fi
 
 DNS_HOST=$(printf '%s' "$MIRROR" | awk '{ sub(/^https?:\/\//, ""); sub(/\/.*$/, ""); if ($0 ~ /^\[/) { sub(/^\[/, ""); sub(/\].*$/, ""); } else { sub(/:[0-9]+$/, ""); } print }')
+case "$DNS_HOST" in
+    ''|-*|*[!A-Za-z0-9._:-]*) die "无法从镜像地址提取合法主机名（当前：$DNS_HOST）" ;;
+esac
 info "测试镜像站连通性：$DNS_HOST"
 if ping -c 2 -W 3 "$DNS_HOST" >/dev/null 2>&1; then
     ok "镜像站可达"
@@ -327,10 +366,14 @@ MAIN_IP=$(ip -4 addr show "$MAIN_IFACE" 2>/dev/null | awk '/inet /{print $2}' | 
 MAIN_GATE=$(ip route show default 2>/dev/null | awk '/^default/{for(i=1;i<NF;i++) if($i=="via"){print $(i+1); exit}}' | tr -d '[:space:]')
 MAIN_CIDR=$(ip -4 addr show "$MAIN_IFACE" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f2 | head -n1 | tr -d '[:space:]')
 
-if [ -z "$MAIN_IP" ] || [ -z "$MAIN_GATE" ] || [ -z "$MAIN_CIDR" ]; then
+if [ -z "$MAIN_IFACE" ] || [ -z "$MAIN_IP" ] || [ -z "$MAIN_GATE" ] || [ -z "$MAIN_CIDR" ]; then
     die "无法抽取网络配置（网卡=$MAIN_IFACE IP=$MAIN_IP 网关=$MAIN_GATE 掩码=$MAIN_CIDR）
        请先确认已联网，或在脚本里手工指定 MAIN_IP / MAIN_GATE / MAIN_CIDR"
 fi
+valid_iface "$MAIN_IFACE" || die "抽取到的网卡名格式异常：$MAIN_IFACE"
+valid_ipv4 "$MAIN_IP" || die "抽取到的 IPv4 地址格式异常：$MAIN_IP"
+valid_ipv4 "$MAIN_GATE" || die "抽取到的默认网关格式异常：$MAIN_GATE"
+valid_cidr "$MAIN_CIDR" || die "抽取到的子网掩码长度异常：$MAIN_CIDR"
 
 ok "网卡：$MAIN_IFACE"
 ok "IP：$MAIN_IP/$MAIN_CIDR"
@@ -779,7 +822,8 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '%s\n' "$BODY" | sed 's/^/        /'
 else
     trap 'rm -f "$MOUNT_DIR/tmp/_setup.sh" "$MOUNT_DIR/tmp/_rootpw"' EXIT INT TERM
-    printf '%s\n' "$BODY" > "$MOUNT_DIR/tmp/_setup.sh"
+    rm -f "$MOUNT_DIR/tmp/_setup.sh" "$MOUNT_DIR/tmp/_rootpw"
+    ( umask 077; printf '%s\n' "$BODY" > "$MOUNT_DIR/tmp/_setup.sh" )
     ( umask 077; printf 'root:%s\n' "$ROOT_PWD" > "$MOUNT_DIR/tmp/_rootpw" )
     _chroot_rc=0
     chroot "$MOUNT_DIR" /bin/sh /tmp/_setup.sh || _chroot_rc=$?
