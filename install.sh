@@ -1092,13 +1092,17 @@ setup_certificates() {
     mkdir -p "$HY2_CERT_DIR"
     # 迁移准备阶段复用已验证的证书，不提前切换DNS来申请新证书。
     if [[ -n "${HY2_CUSTOM_CERT_FILE:-}" || -n "${HY2_CUSTOM_KEY_FILE:-}" ]]; then
-        [[ -r "${HY2_CUSTOM_CERT_FILE:-}" && -r "${HY2_CUSTOM_KEY_FILE:-}" ]] || { log_err "迁移证书文件不可读"; return 1; }
+        [[ -f "${HY2_CUSTOM_CERT_FILE:-}" && -r "${HY2_CUSTOM_CERT_FILE:-}" && -s "${HY2_CUSTOM_CERT_FILE:-}" \
+            && -f "${HY2_CUSTOM_KEY_FILE:-}" && -r "${HY2_CUSTOM_KEY_FILE:-}" && -s "${HY2_CUSTOM_KEY_FILE:-}" ]] || { log_err "迁移证书文件不可读或为空"; return 1; }
         openssl x509 -in "$HY2_CUSTOM_CERT_FILE" -noout -checkend 3600 >/dev/null || { log_err "迁移证书无效或即将过期"; return 1; }
         openssl pkey -in "$HY2_CUSTOM_KEY_FILE" -noout >/dev/null 2>&1 || { log_err "迁移私钥无效"; return 1; }
-        local cert_pub key_pub
-        cert_pub=$(openssl x509 -in "$HY2_CUSTOM_CERT_FILE" -pubkey -noout | openssl pkey -pubin -outform DER | sha256sum | cut -d' ' -f1)
-        key_pub=$(openssl pkey -in "$HY2_CUSTOM_KEY_FILE" -pubout -outform DER | sha256sum | cut -d' ' -f1)
-        [[ "$cert_pub" == "$key_pub" ]] || { log_err "迁移证书与私钥不匹配"; return 1; }
+        local cert_pem key_pem cert_pub key_pub
+        cert_pem=$(openssl x509 -in "$HY2_CUSTOM_CERT_FILE" -pubkey -noout 2>/dev/null) || cert_pem=""
+        key_pem=$(openssl pkey -in "$HY2_CUSTOM_KEY_FILE" -pubout 2>/dev/null) || key_pem=""
+        [[ -n "$cert_pem" && -n "$key_pem" ]] || { log_err "迁移证书或私钥公钥提取失败"; return 1; }
+        cert_pub=$(printf '%s\n' "$cert_pem" | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+        key_pub=$(printf '%s\n' "$key_pem" | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+        [[ -n "$cert_pub" && "$cert_pub" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" && "$cert_pub" == "$key_pub" ]] || { log_err "迁移证书与私钥不匹配"; return 1; }
         CERT_TYPE="custom"
         CERT_FILE="$HY2_CUSTOM_CERT_FILE"
         KEY_FILE="$HY2_CUSTOM_KEY_FILE"
@@ -2331,13 +2335,13 @@ setup_system_firewall() {
     local s_port="$2"
     local e_port="$3"
 
-    if [[ ! "$port" =~ ^[0-9]+$ || ! "${HY2_SUB_PORT:-}" =~ ^[0-9]+$ ]] \
+    if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ || ! "${HY2_SUB_PORT:-}" =~ ^[1-9][0-9]{0,4}$ ]] \
             || (( 10#$port < 1 || 10#$port > 65535 || 10#$HY2_SUB_PORT < 1 || 10#$HY2_SUB_PORT > 65535 )); then
         log_err "防火墙放行参数非法（监听端口=${port:-空}，订阅端口=${HY2_SUB_PORT:-空}），已中止。"
         return 1
     fi
     if [[ -n "$s_port" || -n "$e_port" ]]; then
-        if [[ ! "$s_port" =~ ^[0-9]+$ || ! "$e_port" =~ ^[0-9]+$ ]] \
+        if [[ ! "$s_port" =~ ^[1-9][0-9]{0,4}$ || ! "$e_port" =~ ^[1-9][0-9]{0,4}$ ]] \
                 || (( 10#$s_port < 1 || 10#$s_port > 65535 || 10#$e_port < 1 || 10#$e_port > 65535 || 10#$s_port > 10#$e_port )); then
             log_err "防火墙端口跳跃区间非法（${s_port:-空}-${e_port:-空}），已中止。"
             return 1
@@ -4807,7 +4811,7 @@ install_warp_local_proxy() {
     if [[ ! -x "$WGCF_BIN" ]]; then
         log_step "下载 wgcf 二进制..."
         # 动态探测最新 release + asset 名 (避免硬编码版本号失效)
-        RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
+        RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
         if command -v jq >/dev/null 2>&1; then
             WGCF_TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
         else
@@ -4820,7 +4824,7 @@ install_warp_local_proxy() {
         WGCF_DL="wgcf_${WGCF_VER}_linux_${WGCF_ARCH}"
         WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/${WGCF_DL}"
         log_info "目标 wgcf 版本: v${WGCF_VER}"
-        TMP_DIR="$(mktemp -d)"
+        TMP_DIR="$(umask 077; mktemp -d)"
         if ! WGCF_SUM="$(hy2_expected_sha256 \
                 "https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/checksums.txt" \
                 "$WGCF_DL" "$TMP_DIR")"; then
@@ -4828,7 +4832,7 @@ install_warp_local_proxy() {
             log_err "取不到 wgcf v${WGCF_VER} 的官方 checksums.txt（或其中没有 ${WGCF_DL}），已放弃安装。"
             return 1
         fi
-        if ! curl -fsSL --max-time 120 -o "${TMP_DIR}/${WGCF_DL}" "$WGCF_URL"; then
+        if ! curl -fsSL --max-time 120 --max-filesize=167772160 -o "${TMP_DIR}/${WGCF_DL}" "$WGCF_URL"; then
             rm -rf "$TMP_DIR"
             log_err "wgcf 下载失败 ($WGCF_URL), 请检查网络或版本号"
             return 1
@@ -4865,7 +4869,7 @@ install_warp_local_proxy() {
             return 1
         fi
         log_step "下载 wireproxy 二进制..."
-        RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
+        RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
         if command -v jq >/dev/null 2>&1; then
             WP_TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
         else
@@ -4882,7 +4886,7 @@ install_warp_local_proxy() {
         WP_ASSET="wireproxy_linux_${WP_ARCH}.tar.gz"
         WP_URL="https://github.com/whyvl/wireproxy/releases/download/${WP_TAG}/${WP_ASSET}"
         log_info "目标 wireproxy 版本: ${WP_TAG}"
-        TMP_DIR="$(mktemp -d)"
+        TMP_DIR="$(umask 077; mktemp -d)"
         if ! WP_SUM="$(hy2_expected_sha256 \
                 "https://github.com/whyvl/wireproxy/releases/download/${WP_TAG}/checksums.txt" \
                 "$WP_ASSET" "$TMP_DIR")"; then
@@ -4890,7 +4894,7 @@ install_warp_local_proxy() {
             log_err "取不到 wireproxy ${WP_TAG} 的官方 checksums.txt（或其中没有 ${WP_ASSET}），已放弃安装。"
             return 1
         fi
-        if ! curl -fsSL --max-time 120 -o "${TMP_DIR}/${WP_ASSET}" "$WP_URL"; then
+        if ! curl -fsSL --max-time 120 --max-filesize=167772160 -o "${TMP_DIR}/${WP_ASSET}" "$WP_URL"; then
             rm -rf "$TMP_DIR"
             log_err "wireproxy 下载失败 ($WP_URL)"
             return 1
@@ -5169,7 +5173,7 @@ install_gost() {
     # 获取最新版本
     # ⚠️ 同样要 `|| GOST_LATEST=""`：api.github.com 不可达时 curl 失败会让
     # set -e 直接终止，下面的兜底版本号永远用不上（与 install_binary 同一个坑）。
-    GOST_LATEST=$(curl -s --max-time 15 https://api.github.com/repos/go-gost/gost/releases/latest | jq -r '.tag_name // empty') || GOST_LATEST=""
+    GOST_LATEST=$(curl -s --max-time 15 --max-filesize=2097152 https://api.github.com/repos/go-gost/gost/releases/latest | jq -r '.tag_name // empty') || GOST_LATEST=""
     if [[ -z "$GOST_LATEST" || "$GOST_LATEST" == "null" || "$GOST_LATEST" == *..* || ! "$GOST_LATEST" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
         GOST_LATEST="v3.3.0"
     fi
@@ -5213,7 +5217,7 @@ install_gost() {
     [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; _backup_gost_asset "$HY2_DIR/gost-cert/key.pem" old_key || return 1; }
     log_info "目标版本: ${GOST_LATEST} (${GOST_ASSET})"
     log_step "下载并解压 gost 二进制..."
-    TMP_DIR=$(mktemp -d)
+    TMP_DIR=$(umask 077; mktemp -d)
     _restore_gost_install() {
         # 同目录临时文件原子替换：避免覆写运行中 gost 二进制报 ETXTBSY，并防止中途失败中断后续恢复。
         _restore_gost_asset() {
@@ -5257,7 +5261,7 @@ install_gost() {
         log_err "取不到 gost ${GOST_LATEST} 的官方 checksums.txt（或其中没有 ${GOST_ASSET_NAME}），已放弃安装。"
         return 1
     fi
-    if ! curl -fL --progress-bar --max-time 300 -o "$TMP_DIR/$GOST_ASSET_NAME" "$DOWNLOAD_URL"; then
+    if ! curl -fL --progress-bar --max-time 300 --max-filesize=167772160 -o "$TMP_DIR/$GOST_ASSET_NAME" "$DOWNLOAD_URL"; then
         rm -rf "$TMP_DIR"
         _finish_gost_install
         log_err "gost 下载失败，请检查网络连接。"
