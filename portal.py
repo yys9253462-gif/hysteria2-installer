@@ -4787,6 +4787,9 @@ def _parse_cert_subject(cert_file):
     built after 2017 ignores CN and matches only SAN, so a cert whose CN is
     right but whose SAN is empty/wrong will still fail `CRYPTO_ERROR 0x150`.
     """
+    raw_path = str(cert_file)
+    if not raw_path or raw_path.startswith('-') or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_path):
+        return '', [], False
     cert_file = Path(cert_file)
     if not cert_file.is_file():
         return '', [], False
@@ -4795,13 +4798,15 @@ def _parse_cert_subject(cert_file):
         # 分别取 CN / SAN / issuer：不要合并成一次调用再切字符串 ——
         # `-subject -ext subjectAltName -issuer` 的输出里 SAN 块夹在
         # subject 与 issuer 之间，按 issuer 切会把 SAN 块并进 CN。
-        p_subj = subprocess.run(['openssl', 'x509', '-in', str(cert_file),
-                                 '-noout', '-subject'], capture_output=True, timeout=5, text=True)
-        p_iss = subprocess.run(['openssl', 'x509', '-in', str(cert_file),
-                                '-noout', '-issuer'], capture_output=True, timeout=5, text=True)
-        p_san = subprocess.run(['openssl', 'x509', '-in', str(cert_file),
+        p_subj = subprocess.run(['openssl', 'x509', '-in', raw_path,
+                                 '-noout', '-subject'], capture_output=True, timeout=5,
+                                text=True, encoding='utf-8', errors='replace')
+        p_iss = subprocess.run(['openssl', 'x509', '-in', raw_path,
+                                '-noout', '-issuer'], capture_output=True, timeout=5,
+                               text=True, encoding='utf-8', errors='replace')
+        p_san = subprocess.run(['openssl', 'x509', '-in', raw_path,
                                 '-noout', '-ext', 'subjectAltName'], timeout=5,
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, encoding='utf-8', errors='replace')
         if p_subj.returncode != 0:
             return '', [], False
 
@@ -5091,11 +5096,15 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
     if not cert_file.exists():
         return info
 
+    cert_path_str = str(cert_file)
+    if not cert_path_str or cert_path_str.startswith('-') or any(ord(ch) < 32 or ord(ch) == 127 for ch in cert_path_str):
+        return info
+
     try:
         # issuer 单独取（subject 已由 _parse_cert_subject 拿过）
-        p_iss = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout',
+        p_iss = subprocess.run(['openssl', 'x509', '-in', cert_path_str, '-noout',
                                 '-issuer', '-startdate', '-enddate'],
-                               capture_output=True, text=True, timeout=8)
+                               capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=8)
         raw = p_iss.stdout if p_iss.returncode == 0 else ''
         for line in raw.splitlines():
             line = line.strip()
@@ -5135,28 +5144,35 @@ def cert_status(root, meta=None, config_path='/etc/hysteria/config.yaml',
         info['warn_level'] = 'ok'
 
     # 自愈痕迹：让「刚刚自动修过一次」在界面上可见，而不是悄无声息。
-    if selfheal_state_path and Path(selfheal_state_path).exists():
+    if selfheal_state_path:
         try:
-            st = json.loads(Path(selfheal_state_path).read_text(encoding='utf-8'))
-            if isinstance(st, dict):
-                raw_healed_at = st.get('healed_at')
-                if not isinstance(raw_healed_at, bool):
-                    try:
-                        val = int(raw_healed_at or 0)
-                        if val >= 0:
-                            info['healed_at'] = val
-                    except (TypeError, ValueError):
-                        pass
-                raw_heal_count = st.get('heal_count')
-                if not isinstance(raw_heal_count, bool):
-                    try:
-                        val = int(raw_heal_count or 0)
-                        if val >= 0:
-                            info['heal_count'] = val
-                    except (TypeError, ValueError):
-                        pass
-                if isinstance(st.get('last_pin'), str) and st.get('last_pin'):
-                    info['pin_sha256'] = st['last_pin']
+            _sh_path = Path(selfheal_state_path)
+            if not _sh_path.is_symlink() and _sh_path.is_file() and _sh_path.lstat().st_size <= 1024 * 1024:
+                st = json.loads(_sh_path.read_bytes().decode('utf-8', errors='replace'))
+                if isinstance(st, dict):
+                    def _safe_nonneg_int(raw_val):
+                        if isinstance(raw_val, bool) or raw_val is None:
+                            return None
+                        if isinstance(raw_val, int):
+                            return raw_val if raw_val >= 0 else None
+                        if isinstance(raw_val, float):
+                            if not math.isfinite(raw_val) or raw_val < 0 or raw_val != int(raw_val):
+                                return None
+                            return int(raw_val)
+                        if isinstance(raw_val, str):
+                            s = raw_val.strip()
+                            if s.isascii() and s.isdigit() and len(s) <= 16:
+                                return int(s)
+                        return None
+
+                    _hat = _safe_nonneg_int(st.get('healed_at'))
+                    if _hat is not None:
+                        info['healed_at'] = _hat
+                    _hcnt = _safe_nonneg_int(st.get('heal_count'))
+                    if _hcnt is not None:
+                        info['heal_count'] = _hcnt
+                    if isinstance(st.get('last_pin'), str) and st.get('last_pin'):
+                        info['pin_sha256'] = st['last_pin']
         except Exception as exc:
             _log_ignored('cert_info.heal_state', exc)
 
@@ -7274,13 +7290,16 @@ def apply_reality_iplimit(binary, address, desired, run=subprocess.run):
     stale = sorted(current - set(desired))
     if missing:
         with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False, encoding='utf-8') as fh:
-            json.dump({'routing': {'rules': [desired[tag] for tag in missing]}}, fh)
+            json.dump({'routing': {'rules': [desired[tag] for tag in missing]}}, fh, allow_nan=False)
             rule_file = fh.name
         try:
             added = run([binary, 'api', 'adrules', server, '-append', rule_file],
                         capture_output=True, text=True, timeout=5)
         finally:
-            os.unlink(rule_file)
+            try:
+                os.unlink(rule_file)
+            except OSError:
+                pass
         if added.returncode != 0:
             raise RuntimeError('xray adrules failed')
     # 先加新规则再删旧规则：同一用户换 IP 集合时不留「没有规则」的空窗。
@@ -7313,10 +7332,14 @@ def read_reality_online_ips(binary, address, uids, run=subprocess.run):
         parts = name.split('>>>')
         online.add(parts[1] if len(parts) == 3 and parts[0] == 'user' else name)
     result = {}
-    # uids 由调用方从 limits 传入；容器被改坏时 set() 会抛 TypeError，
+    # uids 由调用方从 limits 传入；容器被改坏或混入不可哈希条目时 set() 会抛 TypeError，
     # 而调用方只会把异常当成「读不到在线数据」并把全部拦截规则撤掉。
     uids = uids if isinstance(uids, (list, tuple, set, frozenset, dict)) else ()
-    for uid in sorted(set(uids) & online):
+    clean_uids = {
+        u for u in uids
+        if isinstance(u, str) and u and not any(ord(ch) < 32 or ord(ch) == 127 for ch in u)
+    }
+    for uid in sorted(clean_uids & online):
         got = run([binary, 'api', 'statsonlineiplist', server, '--email=' + uid],
                   capture_output=True, text=True, timeout=5)
         if got.returncode != 0:
@@ -7341,10 +7364,13 @@ def read_reality_online_ips(binary, address, uids, run=subprocess.run):
 
 
 def _systemd_state(unit):
-    """systemctl is-active 的结果；拿不到（无 systemd、超时）时返回空串。"""
+    """systemctl is-active 的结果；拿不到（无 systemd、超时）或非法单元名时返回空串。"""
+    if (not isinstance(unit, str) or not unit or unit.startswith('-')
+            or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in unit)):
+        return ''
     try:
         return subprocess.run(['systemctl', 'is-active', unit], capture_output=True,
-                              text=True, timeout=5).stdout.strip()
+                              text=True, encoding='utf-8', errors='replace', timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return ''
 
@@ -7356,14 +7382,17 @@ def _service_stop_confirmed(result, state):
 
 def _systemd_service_snapshot(unit):
     """Capture active and boot-enable states independently for rollback."""
+    if (not isinstance(unit, str) or not unit or unit.startswith('-')
+            or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in unit)):
+        return {'active': '', 'enabled': ''}
     try:
         active = subprocess.run(['systemctl', 'is-active', unit], capture_output=True,
-                                text=True, timeout=5).stdout.strip()
+                                text=True, encoding='utf-8', errors='replace', timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         active = ''
     try:
         enabled = subprocess.run(['systemctl', 'is-enabled', unit], capture_output=True,
-                                 text=True, timeout=5).stdout.strip()
+                                 text=True, encoding='utf-8', errors='replace', timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         enabled = ''
     return {'active': active, 'enabled': enabled}
@@ -7425,23 +7454,41 @@ def _restore_systemd_service_state(unit, snapshot):
 def _restore_systemd_unit_file(path, original, mode=0o644):
     """Restore a unit file atomically, or remove it when it was newly created."""
     path = Path(path)
+    if path.is_symlink():
+        raise OSError('systemd unit path must not be a symlink: %s' % path)
     if original is None:
         path.unlink(missing_ok=True)
         return
     fd, temp_name = tempfile.mkstemp(prefix='.' + path.name + '.rollback.', dir=str(path.parent))
     temp_path = Path(temp_name)
     try:
-        os.fchmod(fd, mode)
+        if hasattr(os, 'fchmod'):
+            os.fchmod(fd, mode)
         with os.fdopen(fd, 'wb') as stream:
             fd = None
             stream.write(original)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp_path, path)
+        if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+            try:
+                _dfd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(_dfd)
+                finally:
+                    os.close(_dfd)
+            except OSError:
+                pass
     except BaseException:
         if fd is not None:
-            os.close(fd)
-        temp_path.unlink(missing_ok=True)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
 
 
