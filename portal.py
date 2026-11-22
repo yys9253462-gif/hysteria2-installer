@@ -11585,7 +11585,7 @@ if __name__ == '__main__':
                     if not isinstance(_raw_cl, str):
                         raise ValueError('invalid auth content-length')
                     _raw_cl_s = _raw_cl.strip()
-                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit() or len(_raw_cl_s) > 10:
                         raise ValueError('invalid auth content-length')
                     length = int(_raw_cl_s)
                     if length > 65536:
@@ -11620,6 +11620,7 @@ if __name__ == '__main__':
                                     raise ValueError('invalid bracket addr suffix')
                                 _port_s = _suffix[1:]
                                 if (not _port_s or not _port_s.isascii() or not _port_s.isdigit()
+                                        or len(_port_s) > 5
                                         or (len(_port_s) > 1 and _port_s.startswith('0'))
                                         or not (1 <= int(_port_s) <= 65535)):
                                     raise ValueError('invalid bracket addr port')
@@ -11741,7 +11742,7 @@ if __name__ == '__main__':
                     if not isinstance(_raw_cl, str):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
                     _raw_cl_s = _raw_cl.strip()
-                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit() or len(_raw_cl_s) > 10:
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
                     length = int(_raw_cl_s)
                     if length > 1048576:
@@ -11768,11 +11769,11 @@ if __name__ == '__main__':
                         for key in ('duration_days', 'ip_limit', 'expires_at', 'limit_bytes', 'used_bytes'):
                             if key in params:
                                 value = params[key]
-                                if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+                                if isinstance(value, bool) or (isinstance(value, float) and (not math.isfinite(value) or not value.is_integer())):
                                     raise ValueError()
                                 if isinstance(value, str):
                                     sval = value.strip()
-                                    if not (sval.isascii() and sval.isdigit()):
+                                    if not (sval.isascii() and sval.isdigit()) or len(sval) > 24:
                                         raise ValueError()
                                     value = sval
                                 params[key] = int(value)
@@ -12221,6 +12222,10 @@ if __name__ == '__main__':
                                 raw_expiry = u.get('expires_at')
                                 if isinstance(raw_expiry, bool):
                                     raise ValueError()
+                                if isinstance(raw_expiry, float) and (not math.isfinite(raw_expiry) or not raw_expiry.is_integer()):
+                                    raise ValueError()
+                                if isinstance(raw_expiry, str) and (not raw_expiry.strip().isascii() or len(raw_expiry.strip()) > 24):
+                                    raise ValueError()
                                 if raw_expiry is None:
                                     new_expiry = None
                                 else:
@@ -12230,6 +12235,10 @@ if __name__ == '__main__':
                                 # 已用超过这个量的用户续费后反而立刻被停（2026-11-04 修）。
                                 raw_limit = u.get('limit_bytes')
                                 if isinstance(raw_limit, bool):
+                                    raise ValueError()
+                                if isinstance(raw_limit, float) and (not math.isfinite(raw_limit) or not raw_limit.is_integer()):
+                                    raise ValueError()
+                                if isinstance(raw_limit, str) and (not raw_limit.strip().isascii() or len(raw_limit.strip()) > 24):
                                     raise ValueError()
                                 old_limit = int(raw_limit or 0)
                                 new_limit = old_limit + added_bytes if old_limit > 0 else old_limit
@@ -12287,6 +12296,13 @@ if __name__ == '__main__':
                         if len(global_ip_deny) > 4096:
                             for _stale_uid in list(global_ip_deny):
                                 active_ip_deny(global_ip_deny, _stale_uid, now_ts)
+                            while len(global_ip_deny) > 4096:
+                                oldest_uid = min(
+                                    global_ip_deny,
+                                    key=lambda u: max(global_ip_deny[u].values(), default=0.0)
+                                    if isinstance(global_ip_deny.get(u), dict) else 0.0,
+                                )
+                                global_ip_deny.pop(oldest_uid, None)
                         _raw_tracker = ip_tracker.get(user_id)
                         recent = ({
                             ip for ip, t in _raw_tracker.items()
@@ -12520,7 +12536,7 @@ if __name__ == '__main__':
 
                 elif sub == 'proxy-services/list':
                     with data_lock:
-                        items = proxy_services(data)
+                        items = [dict(s) for s in proxy_services(data) if isinstance(s, dict)]
                     m = read_meta_file(meta_path)
                     host = meta_display_host(m)
                     # 不脱敏 password, 调用方是受信 API key
@@ -12546,7 +12562,17 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'suspended must be a boolean'})
                     # 停用或恢复涉及多个 systemd 单元启停，续期死线避免撞上默认 30 秒超时。
                     self._extend_deadline(120)
-                    state, results = set_traffic_suspension(params['suspended'])
+                    try:
+                        state, results = set_traffic_suspension(params['suspended'])
+                    except AtomicWriteDurabilityError:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'Traffic suspension state written but durability uncertain; verify and retry'})
+                    except OSError as exc:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'Traffic suspension save failed; changes rolled back: ' + api_error_text(exc)})
+                    except Exception as exc:
+                        return self.reply_json(500, {'ok': False,
+                            'error': 'Traffic suspension failed: ' + api_error_text(exc)})
                     failed = [u for u, ok in results.items() if not ok]
                     return self.reply_json(200 if not failed else 500, {
                         'ok': not failed, 'suspended': state.get('suspended', False),
