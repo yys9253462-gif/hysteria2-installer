@@ -1881,15 +1881,20 @@ def git_blob_sha(data):
 def safe_tar_members(names, wanted):
     """校验 tar 成员名，并返回与 wanted 同名的**包内实际成员名**。
 
-    拒绝绝对路径、反斜杠、空字节与含 `..` 的成员（防以 root 写出临时目录），
+    拒绝绝对路径、反斜杠、空字节、控制字符、冒号盘符与含 `..` 的成员（防以 root 写出临时目录），
     且只接受一个精确同名的常规文件（不做"第一个可执行文件"兜底）。
     """
+    if not isinstance(wanted, str) or not wanted:
+        raise ValueError('tar 目标成员名无效')
     hits = []
     for name in names:
-        if not isinstance(name, str) or '\\' in name or '\x00' in name:
+        if (not isinstance(name, str) or not name or '\\' in name or ':' in name
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
             raise ValueError('tar 包内含不安全路径成员: %r' % (name,))
-        clean = name[2:] if name.startswith('./') else name
-        if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
+        clean = name
+        while clean.startswith('./'):
+            clean = clean[2:]
+        if not clean or name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
             raise ValueError('tar 包内含不安全路径成员: %s' % name)
         if clean == wanted or clean.rsplit('/', 1)[-1] == wanted:
             hits.append(name)
@@ -1900,12 +1905,17 @@ def safe_tar_members(names, wanted):
 
 def safe_zip_members(names, wanted):
     """校验 zip 成员名并返回唯一精确匹配的成员名。"""
+    if not isinstance(wanted, str) or not wanted:
+        raise ValueError('zip 目标成员名无效')
     hits = []
     for name in names:
-        if not isinstance(name, str) or '\\' in name or '\x00' in name:
+        if (not isinstance(name, str) or not name or '\\' in name or ':' in name
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in name)):
             raise ValueError('zip 包内含不安全路径成员: %r' % (name,))
-        clean = name[2:] if name.startswith('./') else name
-        if name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
+        clean = name
+        while clean.startswith('./'):
+            clean = clean[2:]
+        if not clean or name.startswith('/') or clean.startswith('/') or '..' in clean.split('/'):
             raise ValueError('zip 包内含不安全路径成员: %s' % name)
         if clean == wanted or clean.rsplit('/', 1)[-1] == wanted:
             hits.append(name)
@@ -1920,9 +1930,13 @@ HYSTERIA_ARCH_ASSET = {'amd64': 'amd64', 'arm64': 'arm64', 'armv7': 'arm'}
 
 
 def hysteria_asset_arch(machine=None):
-    machine = (machine or platform.machine()).lower()
+    if machine is None:
+        machine = platform.machine()
+    if not isinstance(machine, str):
+        return None
+    machine = machine.lower()
     arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64',
-            'arm64': 'arm64', 'armv7l': 'armv7', 'armv7': 'armv7'}.get(machine)
+            'arm64': 'arm64', 'armv7l': 'armv7', 'armv7': 'armv7', 'armhf': 'armv7'}.get(machine)
     return HYSTERIA_ARCH_ASSET.get(arch) if arch else None
 
 
@@ -1934,14 +1948,21 @@ def _prune_core_backups(directory, keep=3):
     旧实现从不清理：小盘 VPS 上历经几次升级就可能写满根分区，
     而 portal.json 的原子写入失败会连带影响用户数据（2026-10-29 加）。
     """
+    keep = max(1, keep) if isinstance(keep, int) and not isinstance(keep, bool) else 3
     directory = Path(directory)
+    entries = []
     try:
-        items = sorted((p for p in directory.iterdir()
-                        if p.is_file() and p.name.startswith(('hysteria-', 'xray-'))),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in directory.iterdir():
+            try:
+                if p.is_symlink() or not p.is_file() or not p.name.startswith(('hysteria-', 'xray-')):
+                    continue
+                entries.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
     except OSError:
         return
-    for old in items[keep:]:
+    entries.sort(key=lambda item: item[0], reverse=True)
+    for _, old in entries[keep:]:
         try:
             old.unlink()
         except OSError:
@@ -10562,12 +10583,15 @@ if __name__ == '__main__':
         with data_lock:
             expected_token = data.get('token')
             epoch = session_epoch()
-        if not isinstance(expected_token, str) or not expected_token or not expected_token.isascii():
+        if (not isinstance(expected_token, str) or not expected_token
+                or not expected_token.isascii() or '/' in expected_token
+                or any(ord(ch) <= 32 or ord(ch) == 127 for ch in expected_token)):
             return False
         now = time.time()
         for value in candidates:
             parts = value.split('.')
             if (len(parts) != 3 or not (parts[1].isascii() and parts[1].isdigit())
+                    or len(parts[1]) > 12 or (len(parts[1]) > 1 and parts[1].startswith('0'))
                     or not parts[0].isascii() or not parts[2].isascii()):
                 continue
             t, issued_at, sig = parts
@@ -11149,9 +11173,13 @@ if __name__ == '__main__':
             except (BrokenPipeError, ConnectionResetError):
                 self.close_connection = True
             except Exception as exc:
+                raw_cmd = str(getattr(self, 'command', '?'))
+                raw_path = str(getattr(self, 'path', '?')).split('?', 1)[0]
+                safe_cmd = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' ' for ch in raw_cmd)[:32]
+                safe_path = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' ' for ch in raw_path)[:200]
+                safe_err = ''.join(ch if ord(ch) >= 32 and ord(ch) != 127 else ' ' for ch in str(exc))[:200]
                 print('[portal] unhandled error on %s %s: %s: %s'
-                      % (getattr(self, 'command', '?'), getattr(self, 'path', '?'),
-                         type(exc).__name__, str(exc)[:200]), file=sys.stderr)
+                      % (safe_cmd, safe_path, type(exc).__name__, safe_err), file=sys.stderr)
                 # 已经发过响应头就不能再发第二个（会把 HTTP 流写坏）。
                 if getattr(self, '_responded', False):
                     self.close_connection = True
@@ -11177,6 +11205,8 @@ if __name__ == '__main__':
             _raw_cl_s = _raw_cl.strip()
             if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+            if len(_raw_cl_s) > 10:
+                return self.reply_json(413, {'ok': False, 'error': 'Request body exceeds 1 MiB'})
             body_length = int(_raw_cl_s)
             if body_length > 1024 * 1024:
                 return self.reply_json(413, {'ok': False, 'error': 'Request body exceeds 1 MiB'})
