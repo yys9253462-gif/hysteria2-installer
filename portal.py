@@ -8954,7 +8954,7 @@ def serve(path):
         return firewall_port(port, proto, open_=False)
 
     def awg_endpoint_error(endpoint):
-        if not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
+        if not isinstance(endpoint, str) or not VALID_AWG_ENDPOINT_RE.fullmatch(endpoint):
             return '连接地址只能是域名或 IP（可带 :端口），不允许换行、空格或特殊字符'
         # 与 awgctl 的 validate_endpoint 同一规则（2026-11-04 修）：形状对了还得真是个主机，
         # 旧规则放过 "..." / "[:]" / "[1.2.3.4]"，客户端拿到后永远握不上手。
@@ -8968,8 +8968,9 @@ def serve(path):
                 return '方括号里必须是 IPv6 地址'
         else:
             host = host.rsplit(':', 1)[0] if ':' in host else host
-            if not re.fullmatch(r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
-                                r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
+            if len(host) > 253 or not re.fullmatch(
+                    r'([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*'
+                    r'[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?', host):
                 return '连接地址不是有效的域名或 IPv4'
             # 末段全是数字只能是 IPv4（顶级域不会全是数字，2026-11-12 修）：旧规则放过
             # 999.1.1.1 / 1.2.3 / 12345，客户端拿去当域名解析，永远握不上手。
@@ -8981,8 +8982,8 @@ def serve(path):
         port_match = re.search(r':([0-9]+)$', endpoint)
         if port_match:
             raw_port = port_match.group(1)
-            if len(raw_port) > 5:
-                return '连接地址中的端口必须是 1-65535'
+            if len(raw_port) > 5 or raw_port.startswith('0'):
+                return '连接地址中的端口必须是 1-65535（不含前导零）'
             port = int(raw_port, 10)
             if not 1 <= port <= 65535:
                 return '连接地址中的端口必须是 1-65535'
