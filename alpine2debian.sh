@@ -102,17 +102,32 @@ usage() { awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"; exit 0; }
 # 在分区里再建分区表、擦掉这个分区的数据，却装不成系统。/sys/block 下只有整块磁盘；
 # 先解开符号链接（/dev/disk/by-id/... 指向的是整块磁盘时也要认）。用法：is_whole_disk <设备>
 is_whole_disk() {
-    [ -d "${SYS_BLOCK:-/sys/block}/$(basename "$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")")" ]
+    [ -n "${1:-}" ] || return 1
+    _wd_resolved="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
+    _wd_name="$(basename "$_wd_resolved" 2>/dev/null || printf '')"
+    case "$_wd_name" in
+        ''|.|..|*/*) return 1 ;;
+    esac
+    [ -d "${SYS_BLOCK:-/sys/block}/${_wd_name}" ]
 }
 
 # 从挂载表精确找出目标整盘或其分区，避免 /dev/nvme0n1 误命中 /dev/nvme0n10p1 或 /dev/sda 误命中 /dev/sdaa1
 disk_mounts() {
     _dm_d="$1"
     _dm_file="${2:-/proc/mounts}"
-    [ -r "$_dm_file" ] || return 0
+    [ -n "$_dm_d" ] && [ -r "$_dm_file" ] || return 0
     awk -v d="$_dm_d" '
-        BEGIN { pat = (d ~ /[0-9]$/) ? ("^" d "p[0-9]+$") : ("^" d "[0-9]+$") }
-        $1 == d || $1 ~ pat { print $2 }
+        BEGIN {
+            dlen = length(d)
+            need_p = (d ~ /[0-9]$/) ? 1 : 0
+        }
+        $1 == d { print $2; next }
+        length($1) > dlen && substr($1, 1, dlen) == d {
+            rest = substr($1, dlen + 1)
+            if ((need_p && rest ~ /^p[0-9]+$/) || (!need_p && rest ~ /^[0-9]+$/)) {
+                print $2
+            }
+        }
     ' "$_dm_file" 2>/dev/null
 }
 
@@ -251,6 +266,9 @@ if [ -z "$ROOT_PWD" ]; then
     if [ -t 0 ]; then read -r ROOT_PWD || ROOT_PWD=""; else read -r ROOT_PWD </dev/tty || ROOT_PWD=""; fi
 fi
 [ -n "$ROOT_PWD" ] || die "root 密码不能为空"
+case "$ROOT_PWD" in
+    *[[:cntrl:]]*) die "root 密码不能包含换行、回车或其他控制字符" ;;
+esac
 
 # ── 第 2 步：联网检查 ────────────────────────────────────────────────────
 info "第 2/9 步：检查网络与外网连通性"
@@ -287,7 +305,7 @@ if [ -z "$(ip route show default 2>/dev/null)" ]; then
        然后重新运行本脚本"
 fi
 
-DNS_HOST=$(printf '%s' "$MIRROR" | sed -E 's#^https?://##; s#/.*$##')
+DNS_HOST=$(printf '%s' "$MIRROR" | awk '{ sub(/^https?:\/\//, ""); sub(/\/.*$/, ""); if ($0 ~ /^\[/) { sub(/^\[/, ""); sub(/\].*$/, ""); } else { sub(/:[0-9]+$/, ""); } print }')
 info "测试镜像站连通性：$DNS_HOST"
 if ping -c 2 -W 3 "$DNS_HOST" >/dev/null 2>&1; then
     ok "镜像站可达"

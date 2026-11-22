@@ -162,17 +162,32 @@ password_ok() {
 # 擦的是这个分区、容量按 0 算，救援盘判断与后续步骤全部跑偏。/sys/block 下只有整块磁盘；
 # 先解开符号链接（/dev/disk/by-id/... 指向的是整块磁盘时也要认）。用法：is_whole_disk <设备>
 is_whole_disk() {
-    [ -d "${SYS_BLOCK:-/sys/block}/$(basename "$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")")" ]
+    [ -n "${1:-}" ] || return 1
+    _wd_resolved="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
+    _wd_name="$(basename "$_wd_resolved" 2>/dev/null || printf '')"
+    case "$_wd_name" in
+        ''|.|..|*/*) return 1 ;;
+    esac
+    [ -d "${SYS_BLOCK:-/sys/block}/${_wd_name}" ]
 }
 
 # 从挂载表精确找出目标整盘或其分区，避免 /dev/nvme0n1 误命中 /dev/nvme0n10p1 或 /dev/sda 误命中 /dev/sdaa1
 disk_mounts() {
     _dm_d="$1"
     _dm_file="${2:-/proc/mounts}"
-    [ -r "$_dm_file" ] || return 0
+    [ -n "$_dm_d" ] && [ -r "$_dm_file" ] || return 0
     awk -v d="$_dm_d" '
-        BEGIN { pat = (d ~ /[0-9]$/) ? ("^" d "p[0-9]+$") : ("^" d "[0-9]+$") }
-        $1 == d || $1 ~ pat { print $2 }
+        BEGIN {
+            dlen = length(d)
+            need_p = (d ~ /[0-9]$/) ? 1 : 0
+        }
+        $1 == d { print $2; next }
+        length($1) > dlen && substr($1, 1, dlen) == d {
+            rest = substr($1, dlen + 1)
+            if ((need_p && rest ~ /^p[0-9]+$/) || (!need_p && rest ~ /^[0-9]+$/)) {
+                print $2
+            }
+        }
     ' "$_dm_file" 2>/dev/null
 }
 
@@ -620,8 +635,11 @@ IN_FILE="$WORKDIR/InstallNET.sh"
 # 拿到的必须像个脚本：够大且以 #! 开头。被劫持或拿到报错网页时
 # 可能也有几十 KB，只看大小会把一个网页当成脚本以 root 执行。
 installnet_looks_valid() {
-    _got="$(wc -c < "$IN_FILE" 2>/dev/null | tr -d ' ')"
-    [ -n "$_got" ] && [ "$_got" -ge 50000 ] && head -n 1 "$IN_FILE" 2>/dev/null | grep -q '^#!'
+    _got="$(wc -c < "$IN_FILE" 2>/dev/null | tr -d '[:space:]')"
+    case "$_got" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$_got" -ge 50000 ] && [ "$_got" -le 2097152 ] && head -n 1 "$IN_FILE" 2>/dev/null | grep -q '^#!'
 }
 
 download_installnet() {
