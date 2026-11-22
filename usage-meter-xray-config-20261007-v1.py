@@ -17,6 +17,13 @@ def _validate_loopback_address(address):
         raise ValueError('stats endpoint must be loopback')
 
 
+def _validate_binary(binary):
+    if (not isinstance(binary, str) or not binary.strip()
+            or binary.strip().startswith('-')
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in binary)):
+        raise ValueError('invalid xray binary')
+
+
 def _client_level_key(raw_level):
     """将客户端 level 规整为非负整数字符串，忽略 null/布尔/非法值，避免污染 policy.levels。"""
     if isinstance(raw_level, bool) or raw_level is None:
@@ -170,6 +177,8 @@ def add_iplimit_routing(cfg):
     规则本身由 portal 在运行时用 `xray api adrules -append` 下发，不落盘；
     这里只保证接口和出站存在。黑洞必须排在已有出站之后，否则会变成默认出站。
     """
+    if not isinstance(cfg, dict):
+        raise ValueError('invalid xray config')
     api=cfg.get('api')
     if not isinstance(api, dict) or api.get('tag')!='usage-meter-api':
         raise ValueError('iplimit routing requires usage-meter api')
@@ -190,11 +199,19 @@ def add_iplimit_routing(cfg):
             default=copy.deepcopy(outbounds[0])
             default.pop('tag')
         outbounds.insert(0,default)
-    for index,outbound in enumerate(outbounds):
-        if isinstance(outbound, dict) and outbound.get('tag')==IPLIMIT_OUTBOUND_TAG and outbound.get('protocol')!='blackhole':
-            outbounds[index]={'protocol':'blackhole','tag':IPLIMIT_OUTBOUND_TAG}
-    if not any(isinstance(o, dict) and o.get('tag')==IPLIMIT_OUTBOUND_TAG for o in outbounds):
-        outbounds.append({'protocol':'blackhole','tag':IPLIMIT_OUTBOUND_TAG})
+    # 去重所有重复的托管黑洞 tag，保证 outbounds[1:] 中只保留一条干净的 blackhole 出站。
+    deduped = []
+    seen_block = False
+    for outbound in outbounds:
+        if isinstance(outbound, dict) and outbound.get('tag') == IPLIMIT_OUTBOUND_TAG:
+            if not seen_block:
+                deduped.append({'protocol': 'blackhole', 'tag': IPLIMIT_OUTBOUND_TAG})
+                seen_block = True
+            continue
+        deduped.append(outbound)
+    if not seen_block:
+        deduped.append({'protocol': 'blackhole', 'tag': IPLIMIT_OUTBOUND_TAG})
+    outbounds[:] = deduped
     return cfg
 
 
@@ -209,12 +226,15 @@ def api_rule_first(cfg):
     Reality 计量与设备上限静默失效（斯德哥尔摩/香港/洛杉矶实测）。
     API 规则只匹配本地 dokodemo 入站，放最前不影响任何用户流量。返回是否改动。
     """
+    if not isinstance(cfg, dict):
+        raise ValueError('invalid xray config')
     routing=_ensure_dict(cfg,'routing')
     rules=_ensure_list(routing,'rules')
-    if API_RULE in rules:
-        if rules.index(API_RULE)==0:return False
-        rules.remove(API_RULE)
-    rules.insert(0,copy.deepcopy(API_RULE))
+    others = [r for r in rules if r != API_RULE]
+    desired = [copy.deepcopy(API_RULE)] + others
+    if rules == desired:
+        return False
+    rules[:] = desired
     return True
 
 
@@ -276,6 +296,7 @@ def _rollback_restart_xray():
 
 def enable_iplimit_routing(config_path, binary, address):
     """幂等开启设备上限所需的路由接口；预检后替换，重启失败恢复原配置。不触碰 clients。"""
+    _validate_binary(binary)
     _validate_loopback_address(address)
     path=pathlib.Path(config_path)
     original=path.read_bytes()
@@ -335,6 +356,7 @@ def enable_iplimit_routing(config_path, binary, address):
 
 def enable_reality_online(config_path, binary, address):
     """只开启在线统计；校验后替换，失败恢复原配置，不触碰用户或 Reality 参数。"""
+    _validate_binary(binary)
     _validate_loopback_address(address)
     path=pathlib.Path(config_path)
     original=path.read_bytes()
@@ -344,6 +366,7 @@ def enable_reality_online(config_path, binary, address):
     policy=_ensure_dict(config,'policy')
     levels=_ensure_dict(policy,'levels')
     inbounds=_ensure_list(config,'inbounds')
+    original_clients=[copy.deepcopy(_inbound_clients(i)) for i in inbounds]
     used={'0'}
     for inbound in inbounds:
         clients=_inbound_clients(inbound)
@@ -362,6 +385,8 @@ def enable_reality_online(config_path, binary, address):
         elif not isinstance(lv, dict):
             raise ValueError('invalid xray policy level')
         lv['statsUserOnline']=True
+    if original_clients!=[_inbound_clients(i) for i in inbounds]:
+        raise ValueError('enable_reality_online must not modify inbound clients')
     nonce=secrets.token_hex(6)
     candidate=path.with_name(path.name+f'.online-candidate.{nonce}.json')
     # 固定备份名，与 before-iplimit 同理（2026-11-03 修）：时间戳文件名每次改动
