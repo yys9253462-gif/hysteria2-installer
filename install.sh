@@ -6258,8 +6258,7 @@ uninstall_all() {
 
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         acquire_installer_core_lock || return 1
-        local _lock_trap='trap - RETURN; if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi'
-        trap "$_lock_trap" RETURN
+        trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi; trap - RETURN' RETURN
         log_step "正在停止并删除系统服务..."
         systemctl stop hysteria-server 2>/dev/null || true
         systemctl disable hysteria-server 2>/dev/null || true
@@ -6438,7 +6437,7 @@ uninstall_all() {
         if [[ "$awg_confirm" =~ ^[Yy]$ ]]; then
             log_step "正在卸载 AmneziaWG..."
             awg_ensure_ctl 2>/dev/null || true
-            trap "$_lock_trap" RETURN
+            trap 'if declare -F release_installer_core_lock >/dev/null 2>&1; then release_installer_core_lock; fi; trap - RETURN' RETURN
             # 控制工具卸载失败时（停不下来 / 禁用失败）它会刻意保留全部资产并退出非零。
             # 旧实现吞掉退出码、删掉控制工具、照报「已卸载」：AWG 实际还在跑，
             # 却没了管理它的工具（2026-11-03 修）。

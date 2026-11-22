@@ -82,10 +82,17 @@ class ProtocolsWarpAndProxyDurability503AndCertGuardsTests(unittest.TestCase):
         st, body = fn_rel(_FakeHandler(b'action=disable'), '/tok/')
         self.assertEqual(st, 503, body)
 
+        class _MissingPath:
+            def __init__(self, p):
+                self.p = str(p)
+            def exists(self):
+                return False
+
         # 2) _h_post_manage_vmess (enable -> _apply_vmess_enable 抛 AtomicWriteDurabilityError)
         h_vm = _FakeHandler(b'action=enable')
         h_vm._apply_vmess_enable = Mock(side_effect=portal.AtomicWriteDurabilityError('dir sync'))
         fn_vm = _extract_method('_h_post_manage_vmess', {
+            'Path': _MissingPath,
             'unit_suspended': lambda u: False,
             'core_operation_lock': threading.Lock(),
             'core_operation_file_lock': nullcontext,
@@ -127,6 +134,7 @@ class ProtocolsWarpAndProxyDurability503AndCertGuardsTests(unittest.TestCase):
         h_ve = _FakeHandler(b'action=enable')
         h_ve._apply_vlessenc_enable = Mock(side_effect=portal.AtomicWriteDurabilityError('dir sync'))
         fn_ve = _extract_method('_h_post_manage_vlessenc', {
+            'Path': _MissingPath,
             'unit_suspended': lambda u: False,
             'core_operation_lock': threading.Lock(),
             'core_operation_file_lock': nullcontext,

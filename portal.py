@@ -10133,9 +10133,16 @@ if __name__ == '__main__':
         _clean_created = lambda v: (
             v.strip()
             if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
-            else (v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else '')
+            else (v if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and (v - v == 0) else '')
         )
-        _port_val = _valid_port(meta.get('port'))
+        _raw_port = meta.get('port')
+        _port_val = 0
+        if isinstance(_raw_port, int) and not isinstance(_raw_port, bool) and 1 <= _raw_port <= 65535:
+            _port_val = _raw_port
+        elif isinstance(_raw_port, str):
+            _ps = _raw_port.strip()
+            if _ps.isascii() and _ps.isdigit() and not _ps.startswith('0') and 1 <= int(_ps) <= 65535:
+                _port_val = int(_ps)
         clean_peers = []
         for p in peers_raw:
             _pname = _clean_scalar(p.get('name'))

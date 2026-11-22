@@ -714,13 +714,9 @@ render_server_config() {
         if [[ -s "$AWG_PEERS_FILE" ]]; then
             jq -r '
                 (.peers // []) | if type=="array" then .[] else empty end |
-                select(
-                    type=="object"
-                    and (.public_key | type=="string" and length>0 and (test("[\\r\\n\\t\\u0000-\\u001f\\u007f ]") | not))
-                    and (.address | type=="string" and test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"))
-                ) |
-                "\n[Peer]\n# \((.name | if type=="string" then gsub("[\\r\\n\\t\\u0000-\\u001f\\u007f]"; "") else "peer" end) | if length>0 then . else "peer" end)\nPublicKey = \(.public_key)" +
-                (if (.preshared_key | type=="string" and length>0 and (test("[\\r\\n\\t\\u0000-\\u001f\\u007f ]") | not)) then "\nPresharedKey = \(.preshared_key)" else "" end) +
+                select(type=="object" and (.public_key | type=="string" and length>0 and (test("[\r\n\t\u0000-\u001f\u007f ]") | not)) and (.address | type=="string" and test("^[0-9]{1,3}(\\.[0-9]{1,3}){3}$"))) |
+                "\n[Peer]\n# \((.name | if type=="string" then gsub("[\r\n\t\u0000-\u001f\u007f]"; "") else "peer" end) | if length>0 then . else "peer" end)\nPublicKey = \(.public_key)" +
+                (if (.preshared_key | type=="string" and length>0 and (test("[\r\n\t\u0000-\u001f\u007f ]") | not)) then "\nPresharedKey = \(.preshared_key)" else "" end) +
                 "\nAllowedIPs = \(.address)/32"
             ' "$AWG_PEERS_FILE"
         fi
@@ -999,7 +995,7 @@ cmd_peer_add() {
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
 
     local priv pub psk addr tmp="" peers_backup="" config_backup="" had_config=0
-    trap 'trap - RETURN; rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"' RETURN
+    trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; trap - RETURN' RETURN
     # 先生成密钥、分配地址，再做备份（2026-11-03 修）：地址池满 / genkey 失败时
     # 旧实现在备份之后 die，每次都留下一份带全部客户端私钥的备份文件。
     priv="$(genkey)"
@@ -1058,7 +1054,7 @@ cmd_peer_del() {
     peer_exists "$name" || die "客户端不存在: ${name}"
 
     local pub tmp="" peers_backup="" config_backup="" had_config=0
-    trap 'trap - RETURN; rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"' RETURN
+    trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"; trap - RETURN' RETURN
     pub="$(jq -r --arg n "$name" 'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.public_key | if type=="string" then . else empty end)) // empty' "$AWG_PEERS_FILE")"
     peers_backup="$(umask 077 && mktemp "${AWG_DIR}/.peers-backup.XXXXXX")" || die "无法创建客户端列表备份临时文件"
     config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || die "无法创建服务端配置备份临时文件"

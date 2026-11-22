@@ -81,14 +81,14 @@ portal_ensure_py || true
         un = _extract_fn(INSTALL_SRC, 'uninstall_all')
         self.assertGreaterEqual(fi.count('trap "$_lock_trap" RETURN'), 3)
         self.assertGreaterEqual(fr.count('trap "$_lock_trap" RETURN'), 2)
-        self.assertGreaterEqual(un.count('trap "$_lock_trap" RETURN'), 2)
+        self.assertGreaterEqual(un.count('release_installer_core_lock; fi; trap - RETURN'), 2)
 
     def test_awgctl_return_traps_self_clear(self):
         """awgctl.sh 全部 RETURN 陷阱均须带 trap - RETURN 自清，防污染调用方作用域。"""
         for name in ('download_binaries', 'write_service', 'peer_apply_live_add', 'cmd_peer_add', 'cmd_peer_del'):
             body = _extract_fn(AWG_SRC, name)
             self.assertIn('RETURN', body, f'{name} 应含 RETURN 陷阱')
-            self.assertIn('trap - RETURN;', body, f'{name} 的 RETURN 陷阱必须带 trap - RETURN; 自清')
+            self.assertIn('trap - RETURN', body, f'{name} 的 RETURN 陷阱必须带 trap - RETURN 自清')
 
 
 if __name__ == '__main__':
