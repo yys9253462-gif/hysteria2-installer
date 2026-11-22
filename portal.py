@@ -1086,7 +1086,7 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
         return False, '读取 Hysteria 配置失败: %s' % exc
     with data_lock:
         state = routing_state(data)
-        if state['outbound_mode'] == 'global' and not clean_outbounds(state['custom_outbounds']):
+        if state['outbound_mode'] == 'global' and not _renderable_outbounds(state['custom_outbounds']):
             data['outbound_mode'] = 'rules'
             state['outbound_mode'] = 'rules'
     rendered = render_egress_config(original, state)
@@ -1107,11 +1107,14 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
             os.replace(tmp, cfg)
             replaced = True
             if hasattr(os, 'O_DIRECTORY'):
-                dir_fd = os.open(cfg.parent, os.O_RDONLY | os.O_DIRECTORY)
                 try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
+                    dir_fd = os.open(cfg.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
         finally:
             if fd is not None:
                 try:
@@ -13144,11 +13147,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -13216,7 +13230,8 @@ if __name__ == '__main__':
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
-                    raise
+                    return self.reply_json(503, {'ok': False,
+                        'error': 'WARP 设置已落盘，但目录持久化同步不确定，请刷新页面核对后重试'})
                 except OSError:
                     with data_lock:
                         if previous_warp_state_exists:
@@ -17060,8 +17075,22 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                if not 0 <= length <= 8192:
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
+                    return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
+                length = int(_raw_cl_s)
+                if length > 8192:
                     return self.reply_json(413, {'ok': False, 'error': '探测请求过大，请刷新页面后重试'})
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
             except (ValueError, TypeError, OSError):
@@ -17074,7 +17103,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if kind in ('socks5', 'http') and not addr:
                 return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
-            self._extend_deadline(45)
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(45)
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
             if kind == 'warp' and not ip:
                 # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
@@ -17086,11 +17116,22 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -17157,8 +17198,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             previous_egress = {key: (key in data, copy.deepcopy(data.get(key))) for key in
                                                ('custom_outbounds', 'warp_rules', 'outbound_mode')}
                             data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
-                            # 删光最后一个自定义出站时同步切回按域名分流，避免持久化留下 global + 空出站。
-                            if not data['custom_outbounds'] and data.get('outbound_mode') == 'global':
+                            # 删光最后一个可渲染自定义出站时同步切回按域名分流，避免持久化留下 global + 无可用出站。
+                            _remain_valid = [o for o in clean_outbounds(data['custom_outbounds']) if validate_outbound(o)[0]]
+                            if not _remain_valid and data.get('outbound_mode') == 'global':
                                 data['outbound_mode'] = 'rules'
                             # 🔴 必须同步清理引用它的分流规则，否则 ACL 里会留下
                             #    不存在的出站名 ⇒ Hysteria 启动失败（且用户毫无察觉）。
@@ -17179,6 +17221,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 no_valid_outbounds = False
                 with data_lock:
                     valid_outs = clean_outbounds(routing_state(data)['custom_outbounds'])
+                    valid_outs = [o for o in valid_outs if validate_outbound(o)[0]]
                     if mode == 'global' and not valid_outs:
                         no_valid_outbounds = True
                     else:
@@ -17203,9 +17246,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if action == 'rule-add':
                         cleaned = _clean_route_domain(dom)
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()
+                        _usable_outs = [o for o in clean_outbounds(state['custom_outbounds']) if validate_outbound(o)[0]]
                         if not _valid_route_domain(cleaned):
                             rule_error = '域名格式不正确'
-                        elif not outbound_target_exists(target, state['custom_outbounds']):
+                        elif not outbound_target_exists(target, _usable_outs):
                             rule_error = '所选出站不存在，请刷新页面后重新选择已配置的出站'
                         else:
                             rules = [r for r in rules if r['domain'] != cleaned]
@@ -17228,7 +17272,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             try:
                 save_data()
             except AtomicWriteDurabilityError:
-                raise
+                return self.reply_json(503, {'ok': False,
+                    'error': '出站设置已落盘，但目录持久化同步不确定，请刷新页面核对后重试'})
             except OSError as exc:
                 with data_lock:
                     for key, (existed, value) in previous_egress.items():
@@ -17248,7 +17293,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 state = routing_state(data)
                 enabled = state['warp_enabled']
                 rules = [r['domain'] for r in normalize_route_rules(state['warp_rules']) if r['outbound'] in ('warp', 'warp_socks')]
-                overridden = state['outbound_mode'] == 'global' and bool(clean_outbounds(state['custom_outbounds']))
+                overridden = state['outbound_mode'] == 'global' and bool(_renderable_outbounds(clean_outbounds(state['custom_outbounds'])))
             # 统一到 wgcf + wireproxy(127.0.0.1:19898)；同时兼容尚未升级、
             # 仍跑官方 cloudflare-warp(127.0.0.1:40000) 的旧节点，避免误报「未安装」
             is_installed = warp_backend_installed()
