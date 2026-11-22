@@ -2749,7 +2749,7 @@ setup_iptables_port_hopping() {
     local e_port="$3"
     local hop_skip=""
 
-    if [[ ! "$l_port" =~ ^[0-9]+$ || ! "$s_port" =~ ^[0-9]+$ || ! "$e_port" =~ ^[0-9]+$ ]] \
+    if [[ ! "$l_port" =~ ^[1-9][0-9]{0,4}$ || ! "$s_port" =~ ^[1-9][0-9]{0,4}$ || ! "$e_port" =~ ^[1-9][0-9]{0,4}$ ]] \
             || (( 10#$l_port < 1 || 10#$l_port > 65535 || 10#$s_port < 1 || 10#$s_port > 65535 || 10#$e_port < 1 || 10#$e_port > 65535 || 10#$s_port > 10#$e_port )); then
         log_err "端口跳跃参数非法（监听=${l_port}，区间=${s_port}-${e_port}），拒绝配置。"
         return 1
@@ -2816,6 +2816,7 @@ setup_iptables_port_hopping() {
     # 兜底部署 systemd 端口跳跃自愈守护服务（同目录临时文件原子落盘），保证开机/重启 100% 自动恢复规则
     local _ipt_unit="/etc/systemd/system/hy2-iptables.service"
     local _ipt_unit_tmp=""
+    trap 'rm -f "${_ipt_unit_tmp:-}"; trap - RETURN' RETURN
     _ipt_unit_tmp="$(umask 022; mktemp "${_ipt_unit}.XXXXXX")" || {
         log_err "无法为 ${_ipt_unit} 创建临时文件。"
         return 1
@@ -2899,6 +2900,7 @@ generate_server_config() {
     fi
 
     local _cfg_tmp=""
+    trap 'rm -f "${_cfg_tmp:-}"; trap - RETURN' RETURN
     _cfg_tmp="$(umask 077; mktemp "${HY2_CONFIG}.XXXXXX")" || {
         log_err "无法为 ${HY2_CONFIG} 创建临时文件，原配置未改动。"
         return 1
@@ -3002,11 +3004,14 @@ EOF
     fi
     if ! chmod 600 "$_cfg_tmp" || ! mv -f "$_cfg_tmp" "$HY2_CONFIG"; then
         rm -f "$_cfg_tmp"
+        _cfg_tmp=""
         log_err "原子写入 ${HY2_CONFIG} 失败。"
         return 1
     fi
+    _cfg_tmp=""
 
-    # 写入 toggle_warp.sh 控制脚本，供 portal.py 或命令行无感知调用
+    # 写入 toggle_warp.sh 控制脚本，供 portal.py 或命令行无感知调用（先防符号链接劫持）
+    [[ ! -L "$HY2_DIR/toggle_warp.sh" ]] || rm -f "$HY2_DIR/toggle_warp.sh"
     cat > "$HY2_DIR/toggle_warp.sh" <<'EOTW'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -4444,7 +4449,7 @@ sync_cert_meta() {
     [[ -f "$cert_file" ]] || return 0
 
     local cn sans subject issuer self_signed="false" acme_block="false"
-    cn="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *//p' | head -1 | sed 's/ *$//')"
+    cn="$(openssl x509 -in "$cert_file" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -1 | sed 's/[[:space:]]*$//')"
     # 收集**全部** SAN：一张证书常覆盖多个域名，只取第一个会把 server_name
     # 写成错的（客户端 SNI 对不上 → 握手失败）。具体选哪个在下面决定。
     sans="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | tr '\n' ' ')"
@@ -4472,7 +4477,9 @@ sync_cert_meta() {
     if [[ "$self_signed" == "true" ]]; then
         new_type="self_signed"; new_insecure="true"
         new_pin="$(openssl x509 -in "$cert_file" -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print $NF}' | tr 'A-F' 'a-f' || true)"
-        [[ "$new_pin" =~ ^[0-9a-f]{64}$ ]] || new_pin=""
+        if [[ ! "$new_pin" =~ ^[0-9a-f]{64}$ || "$new_pin" == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]]; then
+            new_pin=""
+        fi
     else
         [[ "$acme_block" == "true" ]] && new_type="acme" || new_type="custom"
         new_insecure="false"
@@ -4499,19 +4506,22 @@ sync_cert_meta() {
     if [[ "$new_pin" != "$cur_pin" ]]; then
         log_warn "  pin_sha256: ${cur_pin:-<空>} -> ${new_pin:-<清空>}"
     fi
-    local tmp_meta
+    local tmp_meta=""
+    trap 'rm -f "${tmp_meta:-}"; trap - RETURN' RETURN
     tmp_meta="$(umask 077 && mktemp "${HY2_META_FILE}.XXXXXX")" || {
         log_err "无法创建临时元数据文件，client_meta.json 保持不变。"
         return 1
     }
     if jq --arg t "$new_type" --argjson i "$new_insecure" --arg s "$new_sn" --arg p "$new_pin" \
-          '.cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p' \
+          'if type=="object" then .cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p else error("meta not object") end' \
           "$HY2_META_FILE" > "$tmp_meta" 2>/dev/null && [[ -s "$tmp_meta" ]]; then
         chmod 600 "$tmp_meta"
         mv -f "$tmp_meta" "$HY2_META_FILE"
+        tmp_meta=""
         log_info "证书信任模型已自愈。"
     else
         rm -f "$tmp_meta"
+        tmp_meta=""
         log_err "证书信任模型自愈写盘失败，client_meta.json 保持不变。"
         return 1
     fi
@@ -6580,8 +6590,14 @@ flow_install() {
     setup_certificates || _step_rc=$?
     trap "$_lock_trap" RETURN
     [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
-    setup_ports_and_obfs
-    generate_server_config
+    _step_rc=0
+    setup_ports_and_obfs || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
+    _step_rc=0
+    generate_server_config || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     _step_rc=0
     setup_systemd || _step_rc=$?
@@ -6689,8 +6705,14 @@ flow_reconfigure() {
     setup_certificates || _step_rc=$?
     trap "$_lock_trap" RETURN
     [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
-    setup_ports_and_obfs
-    generate_server_config
+    _step_rc=0
+    setup_ports_and_obfs || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
+    _step_rc=0
+    generate_server_config || _step_rc=$?
+    trap "$_lock_trap" RETURN
+    [[ "$_step_rc" -eq 0 ]] || return "$_step_rc"
     setup_system_firewall "$LISTEN_PORT" "$HOP_START" "$HOP_END"
     close_replaced_ports "$_old_listen" "$_old_sub"
     _step_rc=0
