@@ -25,6 +25,7 @@ import shlex
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -88,6 +89,11 @@ def github_token():
         with _github_token_lock:
             _github_token_cache.update(mtime=None, token='')
         return ''
+    raw_mode = getattr(st, 'st_mode', 0)
+    if stat.S_IFMT(raw_mode) and not stat.S_ISREG(raw_mode):
+        with _github_token_lock:
+            _github_token_cache.update(mtime=None, token='')
+        return ''
     if getattr(st, 'st_size', 0) > 4096:
         with _github_token_lock:
             _github_token_cache.update(mtime=None, token='')
@@ -96,14 +102,14 @@ def github_token():
     stamp = (
         getattr(st, 'st_mtime_ns', st.st_mtime),
         getattr(st, 'st_ctime_ns', getattr(st, 'st_ctime', 0)),
-        getattr(st, 'st_mode', 0),
+        raw_mode,
         getattr(st, 'st_ino', 0),
         getattr(st, 'st_size', 0),
     )
     with _github_token_lock:
         if stamp == _github_token_cache.get('mtime'):
             return _github_token_cache.get('token', '')
-    mode = getattr(st, 'st_mode', 0) & 0o777
+    mode = raw_mode & 0o777
     # 只在 POSIX 上检查：Windows 没有对应的权限位语义，
     # stat() 恒返回 0666，照此判断会让所有 Windows 环境都无法使用 token。
     if os.name == 'posix' and mode and mode & 0o077:
@@ -117,7 +123,10 @@ def github_token():
         if callable(read_bytes):
             value = read_bytes().decode('utf-8', errors='replace').strip()
         else:
-            value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
+            try:
+                value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8', errors='replace').strip()
+            except TypeError:
+                value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
     except (OSError, UnicodeDecodeError):
         value = ''
     # 只接受 token 字符集，防止把换行等注入到请求头里。
@@ -1606,6 +1615,8 @@ def atomic_write_private(path, payload):
                 last = exc
                 time.sleep(0.02)
             if not temp.exists():
+                if path.is_symlink():
+                    raise OSError('目标文件不允许为符号链接，已拒绝回落写入')
                 with open(path, 'wb') as fh:
                     fh.write(payload)
                     fh.flush()
@@ -3055,7 +3066,10 @@ def _read_xray_json(path='/etc/hysteria/xray.json', *, strict=False):
         if callable(read_bytes):
             raw_text = read_bytes().decode('utf-8', errors='replace')
         else:
-            raw_text = p.read_text(encoding='utf-8')
+            try:
+                raw_text = p.read_text(encoding='utf-8', errors='replace')
+            except TypeError:
+                raw_text = p.read_text(encoding='utf-8')
         parsed = json.loads(raw_text)
     except (OSError, ValueError):
         if strict:
@@ -4771,14 +4785,14 @@ def _openssl_sha256_hex(cert_file, timeout=8):
     if not cert_str or cert_str.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in cert_str):
         return ''
     tmp = None
+    fd = None
     out_fh = None
     try:
         fd, tmp = tempfile.mkstemp(prefix='.cert-der-', suffix='.der')
-        os.close(fd)
-        # ⚠️ 用 with 打开目的文件：直接给 stdout=open(...) 会把句柄交给子进程
-        # 且永不关闭，而本函数在页面刷新路径上被反复调用 —— 句柄耗尽后
-        # 门户会开始报 "Too many open files"，整片接口 500。
-        out_fh = open(tmp, 'wb')
+        # 直接用 os.fdopen 接管 mkstemp 句柄，消除先 close 再 open 的 TOCTOU 窗口，
+        # 且确保异常时可靠关闭句柄不致泄漏。
+        out_fh = os.fdopen(fd, 'wb')
+        fd = None
         conv = subprocess.run(['openssl', 'x509', '-in', cert_str, '-outform', 'DER'],
                               stdout=out_fh, stderr=subprocess.PIPE, timeout=timeout)
         out_fh.close()
@@ -4798,6 +4812,11 @@ def _openssl_sha256_hex(cert_file, timeout=8):
         _log_ignored('openssl_sha256', exc)
         return ''
     finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if out_fh is not None:
             try:
                 out_fh.close()
@@ -5458,9 +5477,10 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     config_has_acme = False
     try:
         cfg_p = Path(config_path)
-        if cfg_p.is_file() and cfg_p.stat().st_size <= 4 * 1024 * 1024:
-            config_has_acme = bool(re.search(r'^acme:', cfg_p.read_text(encoding='utf-8'), re.M))
-    except (OSError, UnicodeDecodeError):
+        if not cfg_p.is_symlink() and cfg_p.is_file() and cfg_p.lstat().st_size <= 4 * 1024 * 1024:
+            _cfg_text = cfg_p.read_bytes().decode('utf-8', errors='replace')
+            config_has_acme = bool(re.search(r'^acme:', _cfg_text, re.M))
+    except OSError:
         pass
 
     # 证书解析统一走 _resolve_live_cert —— 自愈与界面显示必须是同一张证书，
@@ -13472,11 +13492,14 @@ if __name__ == '__main__':
                             changed = True
                         if changed:
                             try:
-                                _dfd = os.open(str(base_dir), os.O_RDONLY)
+                                _dfd = os.open(str(base_dir), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
                                 try:
                                     os.fsync(_dfd)
                                 finally:
-                                    os.close(_dfd)
+                                    try:
+                                        os.close(_dfd)
+                                    except OSError:
+                                        pass
                             except OSError:
                                 pass
                             # 只保留最近 3 **轮**更新留下的备份；本轮的必须护住
@@ -16424,11 +16447,14 @@ if __name__ == '__main__':
                         os.chmod(str(tmp_path), 0o644)
                         os.replace(str(tmp_path), str(target_path))
                         try:
-                            dir_fd = os.open(str(target_path.parent), os.O_RDONLY)
+                            dir_fd = os.open(str(target_path.parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
                             try:
                                 os.fsync(dir_fd)
                             finally:
-                                os.close(dir_fd)
+                                try:
+                                    os.close(dir_fd)
+                                except OSError:
+                                    pass
                         except OSError:
                             pass
                     except BaseException:
