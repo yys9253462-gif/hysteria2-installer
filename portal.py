@@ -6395,8 +6395,10 @@ def install_singbox():
                                     or (parts and ':' in parts[0])
                                     or '..' in parts):
                                 raise ValueError('tar 包内含不安全路径成员: %s' % mname)
-                            if m.issym() or m.islnk() or not (m.isfile() or m.isdir()):
-                                raise ValueError('tar 包内含不允许的链接或特殊文件成员: %s' % mname)
+                            if m.issym() or m.islnk():
+                                raise ValueError('tar 包内含不允许的链接成员: %s' % mname)
+                            if not (m.isfile() or m.isdir()):
+                                raise ValueError('tar 包内含不允许的特殊文件成员: %s' % mname)
                             if m.isfile():
                                 regular_names.append(mname)
                         member_name = safe_tar_members(regular_names, 'sing-box')
