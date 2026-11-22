@@ -1527,7 +1527,8 @@ def portal_update_process_lock(base_dir):
     """
     if fcntl is None:
         return None
-    fd = os.open(Path(base_dir) / '.portal-update.lock', os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(Path(base_dir) / '.portal-update.lock',
+                 os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BaseException:
@@ -1607,12 +1608,19 @@ def _prune_portal_backups(directory, keep=3, protected=()):
     证书快照，同样是 `<file>.bak-<stamp>`。旧实现按 '.bak-' 一视同仁，
     自更新三轮之后就把这些用户数据快照删光了，它们的保留由 install.sh 自己管。
     """
+    keep = max(1, keep) if isinstance(keep, int) and not isinstance(keep, bool) else 3
     directory = Path(directory)
     protected = {Path(p).name for p in (protected or ())}
     owned = tuple(name + '.bak-' for name in PORTAL_BUNDLE_FILES)
+    items = []
     try:
-        items = [p for p in directory.iterdir()
-                 if p.is_file() and p.name.startswith(owned)]
+        for p in directory.iterdir():
+            try:
+                if p.is_symlink() or not p.is_file() or not p.name.startswith(owned):
+                    continue
+                items.append(p)
+            except OSError:
+                continue
     except OSError:
         return
     # 从文件名取轮次戳：<name>.bak-<YYYYmmdd-HHMMSS>-<pid>
@@ -1643,16 +1651,24 @@ def portal_update_restart_script(port, backups, created, wait_seconds=20,
     全节点用户连不上，控制台也没法远程修 —— 所以重启后轮询 /api/health，
     限时内没有响应就把 .bak 换回去、删掉本次新增的文件，再重启一次。
     """
-    if isinstance(port, bool):
-        raise ValueError('invalid portal port')
-    port_num = int(port)
-    if not 1 <= port_num <= 65535:
-        raise ValueError('invalid portal port')
-    if isinstance(wait_seconds, bool):
-        raise ValueError('invalid wait_seconds')
-    wait_num = int(wait_seconds)
-    if not 1 <= wait_num <= 600:
-        raise ValueError('invalid wait_seconds')
+    def _strict_int_in_range(raw, lo, hi, label):
+        if isinstance(raw, bool):
+            raise ValueError(label)
+        if isinstance(raw, int):
+            val = raw
+        elif isinstance(raw, str):
+            s = raw.strip()
+            if not (s.isascii() and s.isdigit()) or len(s) > 16 or (len(s) > 1 and s.startswith('0')):
+                raise ValueError(label)
+            val = int(s)
+        else:
+            raise ValueError(label)
+        if not lo <= val <= hi:
+            raise ValueError(label)
+        return val
+
+    port_num = _strict_int_in_range(port, 1, 65535, 'invalid portal port')
+    wait_num = _strict_int_in_range(wait_seconds, 1, 600, 'invalid wait_seconds')
     probe = ("import urllib.request; "
              "urllib.request.urlopen('http://127.0.0.1:%d/api/health', timeout=2).read()"
              % port_num)
@@ -1719,6 +1735,8 @@ _MAX_BINARY_EXTRACT_BYTES = 256 * 1024 * 1024
 
 def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
     """带体积上限读取外部响应，防止异常超大响应耗尽门户内存。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError('invalid byte limit')
     try:
         raw = resp.read(limit + 1)
     except TypeError:
@@ -1730,6 +1748,10 @@ def _read_bounded_bytes(resp, limit=_MAX_REMOTE_META_BYTES):
 
 def _copy_stream_bounded(src, dst, limit, chunk_size=65536):
     """按块受限复制流，防止异常或恶意镜像与压缩炸弹写爆磁盘。"""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError('invalid stream limit')
+    if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+        raise ValueError('invalid chunk size')
     total = 0
     while True:
         try:
@@ -1820,7 +1842,7 @@ def parse_checksum_manifest(text, asset):
     兼容 CRLF、`*name`、`./name`，并允许按 basename 匹配（hysteria 的清单里
     路径形如 `build/hysteria-linux-amd64`）。
     """
-    if not isinstance(text, str) or not asset:
+    if not isinstance(text, str) or not isinstance(asset, str) or not asset:
         return None
     found = None
     count = 0
@@ -1829,10 +1851,10 @@ def parse_checksum_manifest(text, asset):
         if not line or line.startswith('#'):
             continue
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) != 2:
             continue
         digest = parts[0].lower()
-        name = parts[-1].lstrip('*')
+        name = parts[1].lstrip('*')
         while name.startswith('./'):
             name = name[2:]
         if name != asset and name.rsplit('/', 1)[-1] != asset:
@@ -2005,7 +2027,8 @@ def _require_disk_space(path, need_bytes):
 
 def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
     binary = Path(binary)
-    current = subprocess.run([str(binary), 'version'], capture_output=True, text=True, timeout=5).stdout
+    current = subprocess.run([str(binary), 'version'], capture_output=True, text=True,
+                             encoding='utf-8', errors='replace', timeout=5).stdout
     current_line = next((line.split(':', 1)[1].strip() for line in current.splitlines() if line.strip().startswith('Version:')), '')
     if '+' in current_line and not allow_custom:
         raise RuntimeError('当前核心含定制补丁，升级官方核心需要明确确认覆盖补丁')
@@ -2084,7 +2107,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
             if stream.read(4) != b'\x7fELF':
                 raise RuntimeError('下载内容不是 Linux 核心二进制，原核心未更改')
         candidate.chmod(0o755)
-        verified = subprocess.run([str(candidate), 'version'], capture_output=True, text=True, timeout=8)
+        verified = subprocess.run([str(candidate), 'version'], capture_output=True, text=True,
+                                  encoding='utf-8', errors='replace', timeout=8)
         newer = next((line.split(':', 1)[1].strip() for line in verified.stdout.splitlines() if line.strip().startswith('Version:')), '')
         if verified.returncode != 0 or not core_version_key(newer):
             raise RuntimeError('候选核心版本校验失败，原核心未更改')
@@ -2121,6 +2145,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 os.close(rb_fd)
                 rb_tmp = Path(rb_name)
                 shutil.copy2(backup, rb_tmp)
+                with rb_tmp.open('r+b') as rb_fh:
+                    os.fsync(rb_fh.fileno())
                 rb_tmp.chmod(0o755)
                 os.replace(rb_tmp, binary)
                 rb_tmp = None
@@ -2128,7 +2154,10 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                 _log_ignored('upgrade_core_rollback_replace', rb_exc)
             finally:
                 if rb_tmp is not None:
-                    rb_tmp.unlink(missing_ok=True)
+                    try:
+                        rb_tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             try:
                 _restart_hy2()
             except Exception as rb_exc:
@@ -2171,7 +2200,7 @@ def portal_state_file_lock(directory='/etc/hysteria'):
         return
     lock_fd = None
     try:
-        lock_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        lock_fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
         if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         held[path] = 1
@@ -2203,7 +2232,8 @@ def core_operation_file_lock(directory='/etc/hysteria'):
 
 def acquire_core_operation_lock(directory='/etc/hysteria'):
     """Acquire a process-wide lock shared by install, upgrade, and uninstall paths."""
-    lock_fd = os.open(core_operation_lock_path(directory), os.O_CREAT | os.O_RDWR, 0o600)
+    lock_fd = os.open(core_operation_lock_path(directory),
+                      os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     if fcntl is not None:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
