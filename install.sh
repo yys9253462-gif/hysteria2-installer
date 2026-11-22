@@ -1697,12 +1697,15 @@ CEOF
         sleep 5
     done
     if [[ "$appended" == 1 ]]; then
-        rb_tmp="$(umask 077 && mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
-        if [[ -n "$rb_tmp" ]] && cp -p "$bak" "$rb_tmp" 2>/dev/null && mv -f "$rb_tmp" "$cf" 2>/dev/null; then
-            :
-        else
-            rm -f "$rb_tmp" 2>/dev/null || true
-            cp -a "$bak" "$cf" 2>/dev/null || true
+        if [[ ! -L "$cf" && ! -L "$bak" ]]; then
+            rb_tmp="$(umask 077 && mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
+            if [[ -n "$rb_tmp" ]] && cp -p -- "$bak" "$rb_tmp" 2>/dev/null && mv -f -- "$rb_tmp" "$cf" 2>/dev/null; then
+                rb_tmp=""
+            else
+                rm -f -- "${rb_tmp:-}" 2>/dev/null || true
+                rb_tmp=""
+                cp -a -- "$bak" "$cf" 2>/dev/null || true
+            fi
         fi
         systemctl reload caddy 2>/dev/null || true
         log_warn "签发超时，已从备份回滚本次自动追加到 Caddyfile 的占位站点块。"
@@ -2366,8 +2369,8 @@ generate_self_signed_cert() {
         log_err "自签名证书生成失败，未改动现有证书。"
         return 1
     fi
-    chmod 600 "$tmp_key" && chmod 644 "$tmp_cert" \
-        && mv -f "$tmp_key" "$KEY_FILE" && { tmp_key=""; mv -f "$tmp_cert" "$CERT_FILE"; } || {
+    chmod 600 -- "$tmp_key" && chmod 644 -- "$tmp_cert" \
+        && mv -f -- "$tmp_key" "$KEY_FILE" && { tmp_key=""; mv -f -- "$tmp_cert" "$CERT_FILE"; } || {
         rm -f -- "${tmp_key:-}" "${tmp_cert:-}"
         tmp_key=""; tmp_cert=""
         log_err "落盘自签名证书失败。"
@@ -6157,7 +6160,7 @@ awg_ensure_ctl() {
 # 绝不能拿来当连接地址，必须回退到公网 IP。
 awg_suggest_endpoint() {
     local sn="" ip="" insecure=""
-    if [[ -f "$HY2_META_FILE" ]]; then
+    if [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]; then
         sn="$(jq -r '.server_name // empty'  "$HY2_META_FILE" 2>/dev/null || true)"
         ip="$(jq -r '.public_ip // empty'    "$HY2_META_FILE" 2>/dev/null || true)"
         insecure="$(jq -r '.is_insecure // empty' "$HY2_META_FILE" 2>/dev/null || true)"
@@ -6179,7 +6182,7 @@ awg_suggest_endpoint() {
 # 读取当前已安装的协议线
 awg_current_line() {
     local v="3"
-    if [[ -f "$AWG_META_FILE" ]]; then
+    if [[ ! -L "$AWG_META_FILE" && -f "$AWG_META_FILE" ]]; then
         v="$(jq -r '.line // "3"' "$AWG_META_FILE" 2>/dev/null || echo 3)"
     fi
     if [[ "$v" != "2" && "$v" != "3" ]]; then
@@ -6285,22 +6288,25 @@ install_amneziawg() {
     fi
     if [[ -z "$endpoint" ]]; then
         log_warn "未提供连接地址，将跳过首个客户端创建，之后可手动补。"
+    elif [[ "$endpoint" == -* || "$endpoint" =~ [[:space:][:cntrl:]] ]]; then
+        log_err "连接地址不合法（不能以 - 开头或含空白/控制字符）。"
+        return 1
     fi
 
     # --- 首个客户端 ---
     local client="client1"
     if [[ -n "$endpoint" ]]; then
         local has_peers="0"
-        if [[ -f "$AWG_PEERS_FILE" ]]; then
-            has_peers="$(jq -r '[.peers[]?]|length' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
+        if [[ ! -L "$AWG_PEERS_FILE" && -f "$AWG_PEERS_FILE" ]]; then
+            has_peers="$(jq -r 'if (.peers | type) == "array" then (.peers | map(select(type=="object")) | length) else 0 end' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
         fi
         if [[ "$has_peers" == "0" ]]; then
             echo ""
             read -rp "请为首个客户端命名 [默认: client1]: " client || true
             client="${client// /}"
             client="${client:-client1}"
-            if [[ "$client" == "." || "$client" == ".." || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
-                log_err "客户端名称不合法（仅允许 1-32 位字母/数字/._-，且不能为 . 或 ..）。"
+            if ! [[ "$client" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]; then
+                log_err "客户端名称不合法（须以字母/数字开头，仅允许 1-32 位字母/数字/._-）。"
                 return 1
             fi
         fi
@@ -6318,8 +6324,8 @@ install_amneziawg() {
 
     # 已有客户端或未提供连接地址时不创建首个客户端，避免报"客户端已存在"或与上方提示矛盾
     local peer_count="0"
-    if [[ -f "$AWG_PEERS_FILE" ]]; then
-        peer_count="$(jq -r '[.peers[]?]|length' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
+    if [[ ! -L "$AWG_PEERS_FILE" && -f "$AWG_PEERS_FILE" ]]; then
+        peer_count="$(jq -r 'if (.peers | type) == "array" then (.peers | map(select(type=="object")) | length) else 0 end' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
     fi
     if [[ -n "$endpoint" && "$peer_count" == "0" ]]; then
         args+=(--client "$client")
@@ -6347,8 +6353,12 @@ awg_menu_add_peer() {
         log_err "名称不能为空。"
         return 1
     fi
-    if ! [[ "$name" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
-        log_err "名称只允许字母、数字、点、下划线、连字符，且不超过 32 字符。"
+    if [[ "$name" == -* || "$name" =~ [[:cntrl:]] ]]; then
+        log_err "客户端名称不合法（不能以 - 开头或含控制字符）。"
+        return 1
+    fi
+    if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]; then
+        log_err "名称须以字母或数字开头，仅允许字母、数字、点、下划线、连字符，且不超过 32 字符。"
         return 1
     fi
 
@@ -6357,6 +6367,10 @@ awg_menu_add_peer() {
     endpoint="${endpoint:-$suggestion}"
     if [[ -z "$endpoint" ]]; then
         log_err "必须提供连接地址才能生成客户端配置。"
+        return 1
+    fi
+    if [[ "$endpoint" == -* || "$endpoint" =~ [[:space:][:cntrl:]] ]]; then
+        log_err "连接地址不合法（不能以 - 开头或含空白/控制字符）。"
         return 1
     fi
 
@@ -6387,6 +6401,10 @@ awg_menu_del_peer() {
     read -rp "请输入要删除的客户端名称: " name || true
     if [[ -z "$name" ]]; then
         log_err "名称不能为空。"
+        return 1
+    fi
+    if [[ "$name" == -* || "$name" =~ [[:cntrl:]] ]]; then
+        log_err "客户端名称不合法（不能以 - 开头或含控制字符）。"
         return 1
     fi
 
