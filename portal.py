@@ -13448,9 +13448,12 @@ if __name__ == '__main__':
                                 #   「回滚成功」却仍然打不开。
                                 # 回滚脚本 portal_update_restart_script 拿的是
                                 # backups 列表里的具体路径，改名字不影响它。
+                                _dst_st = dest.lstat()
+                                if not stat.S_ISREG(_dst_st.st_mode) or _dst_st.st_size > 16 * 1024 * 1024:
+                                    raise OSError('目标门户文件非常规文件或体积异常: %s' % fname)
                                 bak = dest.with_name('%s.bak-%s' % (dest.name, stamp))
                                 old_bytes = dest.read_bytes()
-                                old_mode = dest.stat().st_mode & 0o777
+                                old_mode = _dst_st.st_mode & 0o777
                                 bak_tmp = dest.with_name('%s.bak-tmp-%s' % (dest.name, os.urandom(4).hex()))
                                 _bfd = None
                                 try:
@@ -13533,8 +13536,13 @@ if __name__ == '__main__':
                             _rfd = None
                             try:
                                 bak_path = Path(bak)
+                                if bak_path.is_symlink():
+                                    raise OSError('回滚备份不允许为符号链接: %s' % bak_path.name)
+                                _bak_st = bak_path.lstat()
+                                if not stat.S_ISREG(_bak_st.st_mode) or _bak_st.st_size > 16 * 1024 * 1024:
+                                    raise OSError('回滚备份非常规文件或体积异常: %s' % bak_path.name)
                                 bak_bytes = bak_path.read_bytes()
-                                bak_mode = bak_path.stat().st_mode & 0o777
+                                bak_mode = _bak_st.st_mode & 0o777
                                 rb_tmp = Path(dest).with_name(
                                     '%s.rb-%s' % (Path(dest).name, os.urandom(4).hex()))
                                 _rfd = os.open(str(rb_tmp), _rb_flags, bak_mode or 0o600)
@@ -13563,6 +13571,17 @@ if __name__ == '__main__':
                                 Path(dest).unlink(missing_ok=True)
                             except OSError as exc:
                                 _log_ignored('portal_update.rollback_unlink', exc)
+                        try:
+                            _rb_dfd = os.open(str(base_dir), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                            try:
+                                os.fsync(_rb_dfd)
+                            finally:
+                                try:
+                                    os.close(_rb_dfd)
+                                except OSError:
+                                    pass
+                        except OSError:
+                            pass
                         return self.reply_json(500, {'ok': False, 'error':
                             '更新过程中出错，已回滚到原版本：%s' % e})
 
@@ -15665,9 +15684,11 @@ if __name__ == '__main__':
             version = _singbox_version()
             if not version or version < ANYTLS_MIN_SINGBOX:
                 raise RuntimeError('sing-box 核心未安装或版本低于 1.12，请先在「核心管理」中安装')
+            _port_snap_keys = ('proxy_services', 'reality_config', 'vmess_config', 'vlessenc_config',
+                               'anytls_config', 'tuic_config', 'warp_config', 'port')
             with data_lock:
                 old = dict(config_section(data, 'anytls_config'))
-                _data_now = dict(data)
+                _data_now = {k: copy.deepcopy(data.get(k)) for k in _port_snap_keys if k in data}
             try:
                 _xp_cfg = Path('/etc/hysteria/xray.json')
                 if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
@@ -15700,15 +15721,24 @@ if __name__ == '__main__':
                     users = anytls_users(preview)
                 if unit_path.is_symlink():
                     raise RuntimeError('AnyTLS 服务单元不允许为符号链接')
-                previous_unit = unit_path.read_bytes() if (unit_path.exists() and unit_path.lstat().st_size <= 1024 * 1024) else None
-                unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
+                previous_unit = None
+                unit_mode = 0o644
+                if unit_path.exists():
+                    _au_st = unit_path.lstat()
+                    if not stat.S_ISREG(_au_st.st_mode) or _au_st.st_size > 1024 * 1024:
+                        raise RuntimeError('AnyTLS 服务单元不是常规文件或超过 1 MiB 上限')
+                    previous_unit = unit_path.read_bytes()
+                    unit_mode = _au_st.st_mode & 0o777
                 unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
                 cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
                 if cfg_path.is_symlink():
                     raise RuntimeError('anytls.json 不允许为符号链接')
-                if cfg_path.exists() and cfg_path.lstat().st_size > 4 * 1024 * 1024:
-                    raise RuntimeError('anytls.json 超过 4 MiB 上限')
-                previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
+                previous_file = None
+                if cfg_path.exists():
+                    _ac_st = cfg_path.lstat()
+                    if not stat.S_ISREG(_ac_st.st_mode) or _ac_st.st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('anytls.json 不是常规文件或超过 4 MiB 上限')
+                    previous_file = cfg_path.read_bytes()
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                 try:
                     if previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8'):
@@ -15972,9 +16002,12 @@ if __name__ == '__main__':
                     own_port_active=_systemd_state(TUIC_SERVICE) == 'active')
                 if not listen_port:
                     raise RuntimeError('在 %d-%d 内找不到空闲的 UDP 端口' % TUIC_PORT_RANGE)
+                _old_tuic_secret = old.get('secret') if (
+                    isinstance(old.get('secret'), str) and old.get('secret').strip()
+                    and not any(ord(c) < 32 or ord(c) == 127 for c in old.get('secret'))
+                ) else ''
                 new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
-                           'secret': old.get('secret') if isinstance(old.get('secret'), str) and old.get('secret')
-                           else secrets.token_hex(32)}
+                           'secret': _old_tuic_secret or secrets.token_hex(32)}
                 with data_lock:
                     # 先发布启用状态，再写配置/启动服务。撤销线程若此时拍快照，
                     # 会看到 enabled 并等待 tuic_apply_lock，而不会把这次同步误判成无事可做。
@@ -15986,8 +16019,10 @@ if __name__ == '__main__':
                     if callable(_u_sym) and _u_sym():
                         raise RuntimeError('TUIC 服务单元不允许为符号链接')
                     _u_lstat = getattr(unit_path, 'lstat', None)
-                    if unit_path.exists() and callable(_u_lstat) and _u_lstat().st_size > 1024 * 1024:
-                        raise RuntimeError('TUIC 服务单元超过 1 MiB 上限')
+                    if unit_path.exists() and callable(_u_lstat):
+                        _tu_st = _u_lstat()
+                        if (hasattr(_tu_st, 'st_mode') and not stat.S_ISREG(_tu_st.st_mode)) or _tu_st.st_size > 1024 * 1024:
+                            raise RuntimeError('TUIC 服务单元不是常规文件或超过 1 MiB 上限')
                     previous_unit = unit_path.read_bytes() if unit_path.exists() else None
                     unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                     unit_changed = previous_unit != TUIC_UNIT_CONTENT.encode('utf-8')
@@ -15996,8 +16031,10 @@ if __name__ == '__main__':
                     if callable(_c_sym) and _c_sym():
                         raise RuntimeError('tuic.json 不允许为符号链接')
                     _c_lstat = getattr(cfg_path, 'lstat', None)
-                    if cfg_path.exists() and callable(_c_lstat) and _c_lstat().st_size > 4 * 1024 * 1024:
-                        raise RuntimeError('tuic.json 超过 4 MiB 上限')
+                    if cfg_path.exists() and callable(_c_lstat):
+                        _tc_st = _c_lstat()
+                        if (hasattr(_tc_st, 'st_mode') and not stat.S_ISREG(_tc_st.st_mode)) or _tc_st.st_size > 4 * 1024 * 1024:
+                            raise RuntimeError('tuic.json 不是常规文件或超过 4 MiB 上限')
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
                     if unit_changed:
