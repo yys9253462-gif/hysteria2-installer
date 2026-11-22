@@ -1346,22 +1346,31 @@ let OB_STATE = { mode: 'rules', outbounds: [], rules: [], builtin: [] };
 
 async function loadOutbounds() {
   if (!obEls.list) return;
+  const seq = (loadOutbounds._seq = (loadOutbounds._seq || 0) + 1);
   let failure = '';
   try {
     const res = await fetch(location.pathname + 'outbounds/list',
       { credentials: 'same-origin' });
+    if (seq !== loadOutbounds._seq) return;
     if (!res.ok) { failure = 'HTTP ' + res.status; return; }
     const json = await res.json();
-    if (!json.ok) { failure = json.error || '服务器返回失败'; return; }
-    OB_STATE = { mode: json.mode || 'rules', outbounds: json.outbounds || [], rules: json.rules || [], builtin: json.builtin || [] };
+    if (seq !== loadOutbounds._seq) return;
+    if (!json || !json.ok) { failure = (json && json.error) || '服务器返回失败'; return; }
+    OB_STATE = {
+      mode: json.mode || 'rules',
+      outbounds: Array.isArray(json.outbounds) ? json.outbounds : [],
+      rules: Array.isArray(json.rules) ? json.rules : [],
+      builtin: Array.isArray(json.builtin) ? json.builtin : [],
+    };
     obSetModeUI(OB_STATE.mode);
     renderOutboundList(OB_STATE.outbounds);
     renderOutboundRules(OB_STATE.rules, OB_STATE.outbounds, OB_STATE.builtin);
     if (json.apply_error && !json.applying && !json.applied) obMsg(json.apply_error, 'err');
   } catch (e) {
+    if (seq !== loadOutbounds._seq) return;
     failure = (e && e.message) || '网络异常';
   } finally {
-    if (failure) {
+    if (failure && seq === loadOutbounds._seq) {
       const text = '出站配置加载失败（' + failure + '），请刷新页面重试';
       [obEls.modeNote, obEls.list, obEls.rulesList].forEach(el => markLoadFailed(el, text));
     }
@@ -1896,7 +1905,7 @@ async function checkRealityStatus() {
       // 没有新二维码时清空旧的（2026-11-04 修，与 VMess 一致）：重置密钥后 qrencode 超时
       // 返回空，旧二维码留在页面上，里面还是旧 pbk，扫了连不上。同时校验只渲染合法 SVG。
       if (realityQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         realityQrBox.innerHTML = _qr;
       }
       if (realitySniVal) realitySniVal.textContent = (cfg.sni || 'www.apple.com') + ':' + (cfg.port || 443);
@@ -1926,7 +1935,7 @@ if (btnToggleReality) {
   btnToggleReality.addEventListener('click', async () => {
     if (btnToggleReality.disabled) return;
     const action = await protocolSwitchAction(btnToggleReality, 'Reality');
-    if (!action) return;
+    if (!action || btnToggleReality.disabled) return;
     const prevText = btnToggleReality.textContent;
     btnToggleReality.disabled = true;
     btnToggleReality.textContent = '切换中...';
@@ -1954,6 +1963,7 @@ if (btnToggleReality) {
 
 if (btnResetRealityKeys) {
   btnResetRealityKeys.addEventListener('click', async () => {
+    if (btnResetRealityKeys.disabled) return;
     const confirmed = await showConfirm({
       title: '重新生成 Reality 密钥',
       text: '确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。',
@@ -1961,7 +1971,7 @@ if (btnResetRealityKeys) {
       confirmText: '重新生成',
       isDanger: true
     });
-    if (!confirmed) return;
+    if (!confirmed || btnResetRealityKeys.disabled) return;
     // 请求期间禁用（2026-11-04 修）：连点会连续重置两次，第一次导出的订阅随即失效。
     btnResetRealityKeys.disabled = true;
     try {
@@ -2075,7 +2085,7 @@ async function checkVmessStatus() {
       if (vmessContentBox) vmessContentBox.style.display = 'block';
       if (vmessUriVal) vmessUriVal.value = cfg.uri || '';
       if (vmessQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         vmessQrBox.innerHTML = _qr;
       }
       if (vmessDomainVal) vmessDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
@@ -2100,7 +2110,7 @@ if (btnToggleVmess) {
     // 否则两次 toggle 会一开一关，最终状态与用户预期相反。
     if (btnToggleVmess.disabled) return;
     const action = await protocolSwitchAction(btnToggleVmess, 'VMess');
-    if (!action) return;
+    if (!action || btnToggleVmess.disabled) return;
     const prevText = btnToggleVmess.textContent;
     btnToggleVmess.disabled = true;
     btnToggleVmess.textContent = '切换中...';
@@ -2184,7 +2194,7 @@ async function checkVlessencStatus() {
       if (vlessencContentBox) vlessencContentBox.style.display = 'block';
       if (vlessencUriVal) vlessencUriVal.value = cfg.uri || '';
       if (vlessencQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         vlessencQrBox.innerHTML = _qr;
       }
       if (vlessencDomainVal) vlessencDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
@@ -2207,7 +2217,7 @@ if (btnToggleVlessenc) {
   btnToggleVlessenc.addEventListener('click', async () => {
     if (btnToggleVlessenc.disabled) return;
     const action = await protocolSwitchAction(btnToggleVlessenc, 'VLESS Encryption');
-    if (!action) return;
+    if (!action || btnToggleVlessenc.disabled) return;
     const prevText = btnToggleVlessenc.textContent;
     btnToggleVlessenc.disabled = true;
     btnToggleVlessenc.textContent = '切换中...';
@@ -2287,7 +2297,7 @@ async function checkAnytlsStatus() {
       if (anytlsUriVal) anytlsUriVal.value = cfg.uri || '';
       const qrBox = document.getElementById('anytls-qr-box');
       if (qrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         qrBox.innerHTML = _qr;
       }
       const domainEl = document.getElementById('anytls-domain-val');
@@ -2310,7 +2320,7 @@ if (btnToggleAnytls) {
   btnToggleAnytls.addEventListener('click', async () => {
     if (btnToggleAnytls.disabled) return;
     const action = await protocolSwitchAction(btnToggleAnytls, 'AnyTLS');
-    if (!action) return;
+    if (!action || btnToggleAnytls.disabled) return;
     const prevText = btnToggleAnytls.textContent;
     btnToggleAnytls.disabled = true;
     btnToggleAnytls.textContent = '切换中...';
@@ -2390,7 +2400,7 @@ async function checkTuicStatus() {
       if (tuicUriVal) tuicUriVal.value = cfg.uri || '';
       const qrBox = document.getElementById('tuic-qr-box');
       if (qrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         qrBox.innerHTML = _qr;
       }
       const domainEl = document.getElementById('tuic-domain-val');
@@ -2413,7 +2423,7 @@ if (btnToggleTuic) {
   btnToggleTuic.addEventListener('click', async () => {
     if (btnToggleTuic.disabled) return;
     const action = await protocolSwitchAction(btnToggleTuic, 'TUIC');
-    if (!action) return;
+    if (!action || btnToggleTuic.disabled) return;
     const prevText = btnToggleTuic.textContent;
     btnToggleTuic.disabled = true;
     btnToggleTuic.textContent = '切换中...';
@@ -2956,7 +2966,7 @@ async function installCore(core, btn) {
     icon: '🧱',
     confirmText: '开始安装'
   });
-  if (!confirmed) return;
+  if (!confirmed || btn.disabled) return;
   btn.disabled = true;
   const orig = btn.textContent;
   btn.textContent = '⏳ 正在下载并校验...';
@@ -2989,7 +2999,7 @@ async function uninstallCore(core, btn) {
     confirmText: '确定卸载',
     isDanger: true
   });
-  if (!confirmed) return;
+  if (!confirmed || btn.disabled) return;
   btn.disabled = true;
   const orig = btn.textContent;
   btn.textContent = '⏳ 正在卸载...';
@@ -3464,17 +3474,20 @@ if (btnInstallGost) {
 
 async function loadProxyServices() {
   if (!proxyTbody) return;
+  const seq = (loadProxyServices._seq = (loadProxyServices._seq || 0) + 1);
   try {
     const res = await fetch(location.pathname + 'proxy-services', { credentials: 'same-origin' });
+    if (seq !== loadProxyServices._seq) return;
     if (!res.ok) {
       markStatusUnknown(gostBadge);
       markLoadFailed(proxyTbody, '代理服务列表加载失败（HTTP ' + res.status + '），请刷新页面重试');
       return;
     }
     const json = await res.json();
-    if (!json.ok) {
-      markStatusUnknown(gostBadge, json.error);
-      markLoadFailed(proxyTbody, '代理服务列表加载失败（' + (json.error || '服务器返回失败') + '），请刷新页面重试');
+    if (seq !== loadProxyServices._seq) return;
+    if (!json || !json.ok) {
+      markStatusUnknown(gostBadge, json && json.error);
+      markLoadFailed(proxyTbody, '代理服务列表加载失败（' + ((json && json.error) || '服务器返回失败') + '），请刷新页面重试');
       return;
     }
 
@@ -3564,8 +3577,10 @@ async function loadProxyServices() {
       });
     });
   } catch (_) {
-    markStatusUnknown(gostBadge);
-    markLoadFailed(proxyTbody, '代理服务列表加载失败，请刷新页面重试');
+    if (seq === loadProxyServices._seq) {
+      markStatusUnknown(gostBadge);
+      markLoadFailed(proxyTbody, '代理服务列表加载失败，请刷新页面重试');
+    }
   }
 }
 
@@ -3679,7 +3694,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div class="user-connect-grid">
           <div style="text-align:center;background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px">
             <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:8px">专属二维码扫码导入</div>
-            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg') && !/<script/i.test(json.qr_svg)) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
+            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg') && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(json.qr_svg.trim()) && !/<script/i.test(json.qr_svg) && !/<foreignObject\b/i.test(json.qr_svg) && !/\bon[a-z]+\s*=/i.test(json.qr_svg)) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
             <div style="font-size:11px;color:var(--muted);margin-top:8px">Shadowrocket / v2rayNG / Nekobox</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:12px">
@@ -3788,11 +3803,14 @@ function setAwgBadge(text, bg, color) {
 
 async function loadAwgState() {
   if (!awgBadge) return;
+  const seq = (loadAwgState._seq = (loadAwgState._seq || 0) + 1);
   try {
     const res = await fetch(location.pathname + 'awg-state', { credentials: 'same-origin' });
+    if (seq !== loadAwgState._seq) return;
     if (!res.ok) { markStatusUnknown(awgBadge); return; }
     const json = await res.json();
-    if (!json.ok) { markStatusUnknown(awgBadge, json.error); return; }
+    if (seq !== loadAwgState._seq) return;
+    if (!json || !json.ok) { markStatusUnknown(awgBadge, json && json.error); return; }
 
     awgCurrentEndpoint = json.endpoint || '';
     awgCurrentLine = json.line || '3';
@@ -3825,7 +3843,7 @@ async function loadAwgState() {
     if (awgPanel) awgPanel.style.display = 'block';
 
     renderAwgPeers(json.peers || []);
-  } catch (e) { markStatusUnknown(awgBadge); }   // 不弹窗，只在徽章上标出查询失败
+  } catch (e) { if (seq === loadAwgState._seq) markStatusUnknown(awgBadge); }   // 不弹窗，只在徽章上标出查询失败
 }
 
 // 创建时间按浏览器本地时间显示（2026-11-13 修）：awgctl 存的是 UTC（…Z），旧实现原样显示，
