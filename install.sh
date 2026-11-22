@@ -2635,20 +2635,25 @@ backup_state_before_reconfigure() {
     # 若随后失败/中断，旧 config.yaml 仍可能引用旧证书指纹。
     for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
              "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
+        if [[ -L "$f" ]]; then
+            log_warn "跳过符号链接文件（不纳入配置快照）: ${f}"
+            continue
+        fi
         [[ -f "$f" ]] || continue
-        if (umask 077 && cp -p "$f" "${f}.bak-${snapshot_id}" 2>/dev/null) \
-                && chmod 600 "${f}.bak-${snapshot_id}" 2>/dev/null; then
+        if [[ ! -L "${f}.bak-${snapshot_id}" ]] \
+                && (umask 077 && cp -p -- "$f" "${f}.bak-${snapshot_id}" 2>/dev/null) \
+                && chmod 600 -- "${f}.bak-${snapshot_id}" 2>/dev/null; then
             saved=$((saved + 1))
         else
             failed=$((failed + 1))
-            rm -f "${f}.bak-${snapshot_id}" 2>/dev/null || true
+            rm -f -- "${f}.bak-${snapshot_id}" 2>/dev/null || true
         fi
     done
     if (( failed > 0 )); then
         # 任何已有关键文件备份失败都中止后续写入，且保留之前可用的恢复点。
         for f in "$HY2_META_FILE" "${HY2_DIR}/portal.json" "${HY2_DIR}/portal-access.json" \
                  "$HY2_CONFIG" "${HY2_CERT_DIR}/server.crt" "${HY2_CERT_DIR}/server.key"; do
-            [[ -n "$f" ]] && rm -f "${f}.bak-${snapshot_id}" 2>/dev/null || true
+            [[ -n "$f" ]] && rm -f -- "${f}.bak-${snapshot_id}" 2>/dev/null || true
         done
         log_err "关键配置快照有 ${failed} 个文件失败；已中止重配置，原服务配置未改动。"
         return 1
@@ -5826,7 +5831,11 @@ EOF
 awg_fetch_ctl() {
     local out="$1"
     local ref expected blob tmp="" staged=""
-    trap 'trap - RETURN; rm -f "${tmp:-}" "${staged:-}"' RETURN
+    if [[ -z "$out" || -L "$out" || -L "$(dirname "$out")" ]]; then
+        log_err "awgctl.sh 目标路径无效或为符号链接，已拒绝写入: ${out}"
+        return 1
+    fi
+    trap 'trap - RETURN; [[ -n "${tmp:-}" ]] && rm -f -- "$tmp"; [[ -n "${staged:-}" ]] && rm -f -- "$staged"' RETURN
 
     # 只解析一次，三个源都读同一快照；解析失败就放弃，绝不回退到浮动 main。
     ref="$(curl -fsSL --max-time 15 --max-filesize=2097152 "https://api.github.com/repos/${AWG_REPO}/commits/main" 2>/dev/null |
@@ -5899,24 +5908,35 @@ awg_ensure_ctl() {
         force="yes"
     fi
 
+    if [[ -z "${AWG_CTL_BIN:-}" || -L "$AWG_CTL_BIN" || -L "$(dirname "$AWG_CTL_BIN")" ]]; then
+        log_err "AmneziaWG 控制工具路径无效或为符号链接: ${AWG_CTL_BIN:-}"
+        return 1
+    fi
+
     if [[ "$force" != "yes" && -x "$AWG_CTL_BIN" ]]; then
         return 0
     fi
 
-    local src="" dir="" tmp=""
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    local src="" dir="" tmp="" staged=""
+    local _awg_trap='trap - RETURN; [[ -n "${tmp:-}" ]] && rm -f -- "$tmp"; [[ -n "${staged:-}" ]] && rm -f -- "$staged"'
+    trap "$_awg_trap" RETURN
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" && ! -L "${BASH_SOURCE[0]}" ]]; then
         dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || dir=""
-        if [[ -n "$dir" && -f "${dir}/awgctl.sh" ]]; then
+        if [[ -n "$dir" && -f "${dir}/awgctl.sh" && ! -L "${dir}/awgctl.sh" ]]; then
             src="${dir}/awgctl.sh"
         fi
     fi
 
     if [[ -z "$src" ]]; then
         tmp="$(umask 077; mktemp)" || return 1
-        if awg_fetch_ctl "$tmp"; then
+        local _fetch_rc=0
+        awg_fetch_ctl "$tmp" || _fetch_rc=$?
+        trap "$_awg_trap" RETURN
+        if [[ "$_fetch_rc" -eq 0 ]]; then
             src="$tmp"
         else
-            rm -f "$tmp"
+            rm -f -- "$tmp"
+            tmp=""
             if [[ "$force" == "yes" && -x "$AWG_CTL_BIN" ]]; then
                 log_warn "刷新 awgctl.sh 失败（网络问题？），继续沿用现有版本。"
                 return 0
@@ -5934,28 +5954,33 @@ awg_ensure_ctl() {
         if [[ -n "$new_sum" && "$new_sum" == "$old_sum" ]]; then
             log_info "AmneziaWG 控制工具已是最新，无需更新。"
             if [[ -n "$tmp" ]]; then
-                rm -f "$tmp"
+                rm -f -- "$tmp"
+                tmp=""
             fi
             return 0
         fi
     fi
 
-    local staged=""
     staged="$(umask 077; mktemp "${AWG_CTL_BIN}.new.XXXXXX")" || {
-        [[ -n "$tmp" ]] && rm -f "$tmp"
+        [[ -n "$tmp" ]] && rm -f -- "$tmp"
+        tmp=""
         log_err "安装 ${AWG_CTL_BIN} 失败"
         return 1
     }
     if ! install -m 0755 "$src" "$staged" || ! mv -f "$staged" "$AWG_CTL_BIN"; then
-        rm -f "$staged"
+        rm -f -- "$staged"
+        staged=""
         if [[ -n "$tmp" ]]; then
-            rm -f "$tmp"
+            rm -f -- "$tmp"
+            tmp=""
         fi
         log_err "安装 ${AWG_CTL_BIN} 失败"
         return 1
     fi
+    staged=""
     if [[ -n "$tmp" ]]; then
-        rm -f "$tmp"
+        rm -f -- "$tmp"
+        tmp=""
     fi
 
     if [[ "$force" == "yes" ]]; then
@@ -6878,12 +6903,24 @@ flow_update_core() {
     check_arch || return 1
     require_installed || return 1
     # 与门户终端升级共享同一锁，串行保护备份、替换、重启和回滚整个事务。
-    local update_lock_fd="" rollback_file=""
+    local update_lock_fd="" rollback_file="" _lock_file="${HY2_DIR}/.core-operation.lock" _old_umask=""
     local _core_trap='trap - RETURN; [[ -n "${rollback_file:-}" ]] && rm -f "$rollback_file"; [[ -n "${update_lock_fd:-}" ]] && exec {update_lock_fd}>&- 2>/dev/null || true'
     trap "$_core_trap" RETURN
-    exec {update_lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
+    if [[ -L "$_lock_file" ]]; then
+        log_err "核心升级锁路径不得为符号链接: ${_lock_file}"
+        return 1
+    fi
+    if [[ -L "$HY2_BIN" ]]; then
+        log_err "核心二进制路径不得为符号链接: ${HY2_BIN}"
+        return 1
+    fi
+    _old_umask="$(umask)"
+    umask 077
+    exec {update_lock_fd}>>"$_lock_file" || {
+        umask "$_old_umask"
         update_lock_fd=""
         log_err "无法创建核心升级锁。"; return 1; }
+    umask "$_old_umask"
     if ! flock -n "$update_lock_fd"; then
         log_err "另一个核心升级正在运行，请稍后重试。"
         return 1
@@ -7004,13 +7041,31 @@ close_replaced_ports() {
     _close_one() {   # $1=port $2=proto
         is_valid_port "$1" || return 0
         grep -qxF "$1" <<<"$in_use" && return 0
+        local _closed=0 _failed=0
         if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-            ufw delete allow "$1/$2" >/dev/null 2>&1 || true
+            if ufw delete allow "$1/$2" >/dev/null 2>&1; then
+                _closed=1
+            else
+                _failed=1
+            fi
         fi
         if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-            firewall-cmd --remove-port="$1/$2" --permanent >/dev/null 2>&1                 && firewall-cmd --reload >/dev/null 2>&1 || true
+            if firewall-cmd --remove-port="$1/$2" --permanent >/dev/null 2>&1 \
+                    && firewall-cmd --reload >/dev/null 2>&1; then
+                _closed=1
+            else
+                _failed=1
+            fi
         fi
-        log_info "已收回旧端口 $1/$2 的防火墙放行。"
+        if (( _failed > 0 )); then
+            if declare -F log_warn >/dev/null 2>&1; then
+                log_warn "收回旧端口 $1/$2 的防火墙放行时存在失败项，请手工核查防火墙规则。"
+            else
+                log_info "收回旧端口 $1/$2 的防火墙放行时存在失败项，请手工核查防火墙规则。"
+            fi
+        elif (( _closed > 0 )); then
+            log_info "已收回旧端口 $1/$2 的防火墙放行。"
+        fi
     }
     [[ -n "$old_udp" && "$old_udp" != "$LISTEN_PORT" ]] && _close_one "$old_udp" udp
     [[ -n "$old_tcp" && "$old_tcp" != "$HY2_SUB_PORT" ]] && _close_one "$old_tcp" tcp
