@@ -684,24 +684,24 @@ def upsert_outbound_block(cfg_text, outbounds):
         return text
 
     block = '\n'.join(render_outbound_yaml(ob) for ob in cleaned)
-    if 'outbounds:' in text:
-        # 插到 outbounds 段的末尾（顶格行的下一行起）
-        lines = text.split('\n')
-        idx = next((i for i, l in enumerate(lines) if l.startswith('outbounds:')), None)
-        if idx is None:
-            text = text.rstrip('\n') + '\noutbounds:\n' + block + '\n'
-        else:
-            # 找 outbounds: 之后第一个顶格行，在它前面插入
-            insert_at = len(lines)
-            for j in range(idx + 1, len(lines)):
-                s = lines[j]
-                if s.strip() and s[:1] not in (' ', '\t'):
-                    insert_at = j
-                    break
-            new_lines = lines[:insert_at] + block.split('\n') + lines[insert_at:]
-            text = '\n'.join(new_lines)
-    else:
+    lines = text.split('\n')
+    idx = next((i for i, l in enumerate(lines)
+                if re.match(r'^outbounds:\s*(?:\[\s*\]\s*)?(?:#.*)?$', l)), None)
+    if idx is None:
         text = text.rstrip('\n') + '\n\noutbounds:\n' + block + '\n'
+    else:
+        # 若原行是内联空数组 `outbounds: []`，先展开为块列表头，避免追加 `- name:` 产生非法 YAML。
+        if re.match(r'^outbounds:\s*\[\s*\]', lines[idx]):
+            lines[idx] = 'outbounds:'
+        # 找 outbounds: 之后第一个顶格行，在它前面插入
+        insert_at = len(lines)
+        for j in range(idx + 1, len(lines)):
+            s = lines[j]
+            if s.strip() and s[:1] not in (' ', '\t'):
+                insert_at = j
+                break
+        new_lines = lines[:insert_at] + block.split('\n') + lines[insert_at:]
+        text = '\n'.join(new_lines)
     return text.rstrip('\n') + '\n'
 
 
@@ -831,7 +831,9 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     if not isinstance(tail_outbound, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', tail_outbound):
         tail_outbound = 'direct'
     names = [ob['name'] for ob in (outbounds or [])]
-    existing = set(_existing_outbound_names() if existing_names is None else existing_names)
+    raw_existing = _existing_outbound_names() if existing_names is None else existing_names
+    existing = ({n for n in raw_existing if isinstance(n, str) and re.fullmatch(r'[A-Za-z0-9_-]+', n)}
+                if isinstance(raw_existing, (list, tuple, set, frozenset)) else set())
     available = set(names) | existing | {'direct', 'reject'}
     acl = _acl_head()
 
@@ -846,6 +848,7 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     # sorted 是稳定排序，同层级的规则仍保持添加顺序。
     rules = sorted((r for r in rules if isinstance(r, dict)),
                    key=lambda r: -(r.get('domain').strip('.').count('.') if isinstance(r.get('domain'), str) else 0))
+    seen_rules = set()
     for r in rules:
         if not isinstance(r, dict):
             continue
@@ -858,6 +861,10 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
         # 出站可能已被用户删除或被改坏 —— 引用不存在的名字会让 Hysteria 起不来
         if target not in available:
             target = 'warp_socks' if 'warp_socks' in existing else tail_outbound
+        pair = (target, dom)
+        if pair in seen_rules:
+            continue
+        seen_rules.add(pair)
         acl.append('    - %s(suffix:%s)' % (target, dom))
 
     acl.append('    - %s(all)' % tail_outbound)
@@ -894,8 +901,11 @@ def _clean_route_domain(raw):
 
 
 def _valid_route_domain(domain):
-    """判断规范化后的分流域名是否合法（禁止连续点与非法字符）。"""
-    return bool(domain) and '..' not in domain and bool(re.fullmatch(r'[a-z0-9.-]+', domain))
+    """判断规范化后的分流域名是否合法（限长 253、禁止连续点、前导/尾随连字符与非法字符）。"""
+    return (isinstance(domain, str) and 1 <= len(domain) <= 253 and '..' not in domain
+            and bool(re.fullmatch(
+                r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*',
+                domain)))
 
 
 def build_warp_acl_config(original, enabled, rules):
@@ -931,6 +941,7 @@ def build_warp_acl_config(original, enabled, rules):
                       key=lambda r: -(r.get('domain').strip('.').count('.')
                                       if isinstance(r, dict) and isinstance(r.get('domain'), str)
                                       else (r.strip('.').count('.') if isinstance(r, str) else 0)))
+    seen_rules = set()
     for rule in _ordered:  # 同 build_acl_block：具体域名在前
         raw_dom = rule.get('domain') if isinstance(rule, dict) else rule
         if not isinstance(raw_dom, str):
@@ -939,6 +950,10 @@ def build_warp_acl_config(original, enabled, rules):
         target = raw_target if isinstance(raw_target, str) and raw_target in allowed_targets else warp_name
         domain = raw_dom.strip().lower().strip('.')
         if _valid_route_domain(domain):
+            pair = (target, domain)
+            if pair in seen_rules:
+                continue
+            seen_rules.add(pair)
             lines.append('    - %s(suffix:%s)' % (target, domain))
     lines.append('    - %s(all)' % tail)
     return text.rstrip('\n') + '\n\n' + '\n'.join(lines) + '\n'
@@ -6281,7 +6296,11 @@ def install_xray_binary():
                     staged = Path('/usr/local/bin/xray.new.%s' % secrets.token_hex(6))
                     replaced = False
                     try:
-                        with zf.open(info, 'r') as src_f, open(staged, 'wb') as dst_f:
+                        _st_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        if hasattr(os, 'O_NOFOLLOW'):
+                            _st_flags |= os.O_NOFOLLOW
+                        _st_fd = os.open(str(staged), _st_flags, 0o755)
+                        with zf.open(info, 'r') as src_f, os.fdopen(_st_fd, 'wb') as dst_f:
                             _copy_stream_bounded(src_f, dst_f, _MAX_BINARY_EXTRACT_BYTES)
                             dst_f.flush()
                             os.fsync(dst_f.fileno())
@@ -6298,7 +6317,10 @@ def install_xray_binary():
                         break
                     finally:
                         if not replaced:
-                            staged.unlink(missing_ok=True)
+                            try:
+                                staged.unlink(missing_ok=True)
+                            except OSError:
+                                pass
             except Exception as exc:
                 errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
 
@@ -6318,7 +6340,7 @@ def install_singbox():
         return True, 'sing-box %s 已安装' % '.'.join(map(str, current))
     machine = platform.machine().lower()
     arch = {'x86_64': 'amd64', 'amd64': 'amd64', 'aarch64': 'arm64', 'arm64': 'arm64',
-            'armv7l': 'armv7', 'armv7': 'armv7'}.get(machine)
+            'armv7l': 'armv7', 'armv7': 'armv7', 'armhf': 'armv7'}.get(machine)
     if not arch:
         return False, '不支持的 CPU 架构: %s' % machine
     try:
@@ -6363,13 +6385,18 @@ def install_singbox():
                         regular_names = []
                         for m in all_members:
                             mname = m.name or ''
-                            clean = mname[2:] if mname.startswith('./') else mname
-                            if (mname.startswith('/') or clean.startswith('/')
-                                    or '\\' in mname or '\x00' in mname
-                                    or '..' in clean.split('/')):
+                            if not mname or '\\' in mname or any(ord(ch) < 32 or ord(ch) == 127 for ch in mname):
                                 raise ValueError('tar 包内含不安全路径成员: %s' % mname)
-                            if m.issym() or m.islnk():
-                                raise ValueError('tar 包内含不允许的链接成员: %s' % mname)
+                            clean = mname
+                            while clean.startswith('./'):
+                                clean = clean[2:]
+                            parts = clean.split('/')
+                            if (mname.startswith('/') or clean.startswith('/')
+                                    or (parts and ':' in parts[0])
+                                    or '..' in parts):
+                                raise ValueError('tar 包内含不安全路径成员: %s' % mname)
+                            if m.issym() or m.islnk() or not (m.isfile() or m.isdir()):
+                                raise ValueError('tar 包内含不允许的链接或特殊文件成员: %s' % mname)
                             if m.isfile():
                                 regular_names.append(mname)
                         member_name = safe_tar_members(regular_names, 'sing-box')
@@ -6377,7 +6404,11 @@ def install_singbox():
                         extracted = tar.extractfile(member)
                         if extracted is None:
                             raise ValueError('tar 包内无法读取 sing-box 成员')
-                        with extracted as src, open(staged, 'wb') as dst:
+                        _sb_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                        if hasattr(os, 'O_NOFOLLOW'):
+                            _sb_flags |= os.O_NOFOLLOW
+                        _sb_fd = os.open(str(staged), _sb_flags, 0o755)
+                        with extracted as src, os.fdopen(_sb_fd, 'wb') as dst:
                             _copy_stream_bounded(src, dst, _MAX_BINARY_EXTRACT_BYTES)
                             dst.flush()
                             os.fsync(dst.fileno())
@@ -6390,7 +6421,10 @@ def install_singbox():
                     return True, 'sing-box %s 安装完成' % ver
                 finally:
                     if not replaced:
-                        staged.unlink(missing_ok=True)
+                        try:
+                            staged.unlink(missing_ok=True)
+                        except OSError:
+                            pass
             except Exception as exc:
                 errors.append('%s: %s: %s' % (host, type(exc).__name__, exc))
     return False, '下载 sing-box 失败 —— ' + ' ｜ '.join(errors)
@@ -6409,6 +6443,8 @@ def install_singbox():
 
 VLESSENC_DECRYPTION_RE = re.compile(
     r'^mlkem768x25519plus\.(native|xorpub|random)\.[0-9]+s?(-[0-9]+)?\.[A-Za-z0-9_\-]+$')
+VLESSENC_ENCRYPTION_RE = re.compile(
+    r'^mlkem768x25519plus\.(native|xorpub|random)\.[A-Za-z0-9._\-]+$')
 
 
 def generate_vless_encryption_pair(binary='/usr/local/bin/xray'):
@@ -6419,7 +6455,13 @@ def generate_vless_encryption_pair(binary='/usr/local/bin/xray'):
     而 Xray 自己的提示也写明「Ephemeral key exchange is Post-Quantum safe anyway」——
     临时密钥交换本身已是后量子安全，第一组足够。
     """
-    out = subprocess.run([binary, 'vlessenc'], capture_output=True, text=True, timeout=10)
+    if (not isinstance(binary, str) or not binary.strip() or binary.strip().startswith('-')
+            or any(ord(c) < 32 or ord(c) == 127 for c in binary)):
+        raise RuntimeError('xray 二进制路径不合法，无法生成 VLESS Encryption 密钥')
+    try:
+        out = subprocess.run([binary, 'vlessenc'], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError('xray vlessenc 执行异常，无法生成 VLESS Encryption 密钥: %s' % type(exc).__name__) from exc
     if out.returncode != 0:
         raise RuntimeError('xray vlessenc 执行失败，无法生成 VLESS Encryption 密钥')
     dec = enc = ''
@@ -6433,8 +6475,8 @@ def generate_vless_encryption_pair(binary='/usr/local/bin/xray'):
             break
     if not (dec and enc):
         raise RuntimeError('xray vlessenc 输出里没有找到密钥对')
-    if not VLESSENC_DECRYPTION_RE.match(dec):
-        raise RuntimeError('生成的 decryption 格式不符合预期，已放弃写入')
+    if not VLESSENC_DECRYPTION_RE.match(dec) or not VLESSENC_ENCRYPTION_RE.match(enc):
+        raise RuntimeError('生成的 decryption/encryption 格式不符合预期，已放弃写入')
     return dec, enc
 
 
