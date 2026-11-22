@@ -1726,6 +1726,8 @@ def _copy_stream_bounded(src, dst, limit, chunk_size=65536):
 
 
 def resolve_update_ref(ref):
+    if not isinstance(ref, str):
+        raise ValueError('Invalid immutable ref')
     if re.fullmatch(r'[0-9a-f]{40}', ref):
         return ref
     if ref != 'main':
@@ -1736,7 +1738,8 @@ def resolve_update_ref(ref):
                                      headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=8) as response:
             payload = json.loads(_read_bounded_bytes(response).decode('utf-8', 'replace'))
-            value = payload.get('sha', '') if isinstance(payload, dict) else ''
+            raw_sha = payload.get('sha') if isinstance(payload, dict) else ''
+            value = raw_sha if isinstance(raw_sha, str) else ''
     except Exception as exc:
         _log_ignored('resolve_update_ref.github', exc)
     if not re.fullmatch(r'[0-9a-f]{40}', value):
@@ -6471,7 +6474,15 @@ IP_DENY_TTL_RANGE = (30, 3600)
 
 def parse_ip_deny(params, now):
     """校验 users/ip-deny 请求。返回 (user_id, {ip: 过期时间})；不合法抛 ValueError。"""
-    user_id = str(params.get('user_id', '')).strip()
+    if not isinstance(params, dict):
+        raise ValueError('Invalid request payload')
+    if (isinstance(now, bool) or not isinstance(now, (int, float))
+            or now != now or now == float('inf') or now == float('-inf')):
+        raise ValueError('Invalid timestamp')
+    raw_uid = params.get('user_id')
+    if not isinstance(raw_uid, str):
+        raise ValueError('Invalid user_id format')
+    user_id = raw_uid.strip()
     if not USER_ID_RE.match(user_id):
         raise ValueError('Invalid user_id format')
     # 与其它 users/ 写接口一致（2026-11-04 修）：保留名不能被拉黑，否则 API Key 就能
@@ -6494,10 +6505,12 @@ def parse_ip_deny(params, now):
         raise ValueError('ttl must be between %d and %d seconds' % IP_DENY_TTL_RANGE)
     entries = {}
     for item in raw:
-        try:
-            addr = ipaddress.ip_address(str(item).strip())
-        except ValueError:
+        if not isinstance(item, str):
             raise ValueError('Invalid IP address: %s' % str(item)[:64])
+        try:
+            addr = ipaddress.ip_address(item.strip())
+        except ValueError:
+            raise ValueError('Invalid IP address: %s' % item[:64])
         # 带 zone 的 IPv6（fe80::1%eth0）永远匹配不上 /auth 的客户端地址，写进 Xray
         # 规则还会让整批 adrules 失败；IPv4 映射地址还原成 IPv4，与 /auth 同一写法（2026-11-04 修）。
         if getattr(addr, 'scope_id', None):
@@ -9121,7 +9134,18 @@ def serve(path):
                 disk = None
             if isinstance(disk, dict):
                 merge_cli_owned_state(data, disk)
-        return json.dumps(data, ensure_ascii=False).encode('utf-8')
+        try:
+            return json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8')
+        except ValueError:
+            def _scrub_finite(obj):
+                if isinstance(obj, float):
+                    return obj if (obj == obj and obj != float('inf') and obj != float('-inf')) else None
+                if isinstance(obj, dict):
+                    return {k: _scrub_finite(v) for k, v in obj.items()}
+                if isinstance(obj, (list, tuple)):
+                    return [_scrub_finite(v) for v in obj]
+                return obj
+            return json.dumps(_scrub_finite(data), ensure_ascii=False, allow_nan=False).encode('utf-8')
 
     # ---- 整机流量与超额停用（2026-10-14，供主控制台的节点流量限额使用）----
     #
@@ -9428,7 +9452,14 @@ def serve(path):
                 rcfg = rcfg if isinstance(rcfg, dict) else {}
                 binary = rcfg.get('binary', '') if isinstance(rcfg.get('binary'), str) else ''
                 address = rcfg.get('address', '') if isinstance(rcfg.get('address'), str) else ''
-                if not (binary and address and xray_path.exists() and Path(binary).is_file()):
+                binary_ok = (bool(binary) and not binary.startswith('-')
+                             and not any(ord(ch) < 32 or ord(ch) == 127 for ch in binary))
+                if binary_ok:
+                    try:
+                        binary_ok = Path(binary).is_file()
+                    except (OSError, ValueError):
+                        binary_ok = False
+                if not (binary_ok and address and xray_path.exists()):
                     time.sleep(30); continue
                 # 模块级代码看不到 main() 内的嵌套函数，必须用 _unit_suspended。
                 if _unit_suspended('xray') or _systemd_state('xray') != 'active':
@@ -10764,13 +10795,16 @@ if __name__ == '__main__':
             pass
 
         def verify_api_key(self):
-            auth_header = self.headers.get('Authorization', '')
-            # api_key 为空/非字符串时一律拒绝（2026-10-29 修）：
+            auth_header = self.headers.get('Authorization') or ''
+            if not isinstance(auth_header, str) or len(auth_header) > 1024:
+                return False
+            # api_key 为空/非字符串/含空白或控制字符时一律拒绝（2026-10-29 修）：
             # 旧实现拼出常量 "Bearer "，而 HTTP 头允许尾随空格，
             # 一个 `Authorization: Bearer ` 就能通过 —— 等于 API 全开。
             with data_lock:
                 key = data.get('api_key')
-            if not isinstance(key, str) or not key or not key.isascii():
+            if (not isinstance(key, str) or not key or not key.isascii()
+                    or any(ord(ch) <= 32 or ord(ch) == 127 for ch in key)):
                 return False
             expected = 'Bearer ' + key
             # ⚠️ 必须先挡非 ASCII（2026-10-09 修）：hmac.compare_digest 遇到
@@ -10782,7 +10816,9 @@ if __name__ == '__main__':
             return hmac.compare_digest(auth_header, expected)
 
         def is_authenticated(self):
-            auth = self.headers.get('Authorization', '')
+            auth = self.headers.get('Authorization') or ''
+            if not isinstance(auth, str):
+                return False
             # 头部没有体积上限，而这里要对它做 sha256。超长 Basic 头
             # （几 MB 的 base64）会让每个请求都白算一次哈希，属于廉价放大。
             # 正常凭据远小于 1 KiB，直接拒绝更长的（2026-10-25）。
