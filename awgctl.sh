@@ -926,9 +926,10 @@ revoke_firewall() {
 # ==============================================================================
 
 peers_init() {
+    local tmp=""
+    trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
     if [[ ! -f "$AWG_PEERS_FILE" ]]; then
         mkdir -p "$AWG_DIR"
-        local tmp
         tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers-init.XXXXXX")"
         if ! printf '{"peers":[]}\n' > "$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$AWG_PEERS_FILE"; then
             rm -f "$tmp"
@@ -938,16 +939,16 @@ peers_init() {
 }
 
 peer_exists() {
-    local name="$1" n
+    local name="$1" n="0"
     [[ -f "$AWG_PEERS_FILE" ]] || return 1
-    n="$(jq -r --arg n "$name" '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n)] | length' "$AWG_PEERS_FILE")"
-    [[ "$n" != "0" && -n "$n" ]]
+    n="$(jq -r --arg n "$name" '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n)] | length' "$AWG_PEERS_FILE" 2>/dev/null)" || n="0"
+    [[ "$n" =~ ^[1-9][0-9]*$ ]]
 }
 
 # 分配下一个隧道内网地址（.2 起，.1 留给服务端）
 next_peer_address() {
     local used n
-    used="$(jq -r '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | .address | select(type=="string")] | join(" ")' "$AWG_PEERS_FILE" 2>/dev/null || echo "")"
+    used="$(jq -r '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object") | .address | select(type=="string") | split("/")[0]] | join(" ")' "$AWG_PEERS_FILE" 2>/dev/null || echo "")"
     for n in $(seq 2 254); do
         if [[ " ${used} " != *" ${AWG_SUBNET}.${n} "* ]]; then
             echo "${AWG_SUBNET}.${n}"
@@ -1227,6 +1228,14 @@ cmd_install() {
     if [[ -n "$endpoint" ]]; then
         validate_endpoint "$endpoint" || die "连接地址非法"
     fi
+    if [[ -n "$client" ]]; then
+        if [[ "$client" == "." || "$client" == ".." || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
+            die "客户端名称非法（仅允许 1-32 位字母/数字/._-，且不能为 . 或 ..）: ${client}"
+        fi
+    fi
+    if [[ -n "$server_name" && "$server_name" =~ [[:cntrl:]] ]]; then
+        die "--server-name 不能包含换行或控制字符"
+    fi
 
     # 架构
     local arch
@@ -1298,13 +1307,13 @@ cmd_install() {
     _s4="$(meta_get S4)"
     if [[ -n "$(meta_get S1)" && "$line" == "3" ]]; then
         local _sk _sv _need_regen=0
-        if [[ ! "$_s4" =~ ^[0-9]+$ ]] || (( 10#$_s4 < 12 )); then
+        if [[ ! "$_s4" =~ ^[0-9]{1,5}$ ]] || (( 10#$_s4 < 12 )); then
             log_warn "旧 S4=${_s4} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
             _need_regen=1
         else
             for _sk in S1 S2 S3; do
                 _sv="$(meta_get "$_sk")"
-                if [[ -n "$_sv" ]] && { [[ ! "$_sv" =~ ^[0-9]+$ ]] || (( 10#$_sv < 12 )); }; then
+                if [[ -n "$_sv" ]] && { [[ ! "$_sv" =~ ^[0-9]{1,5}$ ]] || (( 10#$_sv < 12 )); }; then
                     log_warn "旧 ${_sk}=${_sv} 不满足 3.x 头部保护的 >=12 要求，重新生成全部混淆参数（已发放的客户端需重新导入）"
                     _need_regen=1
                     break
@@ -1589,7 +1598,7 @@ cmd_update() {
     old_line="$(version_line)"
 
     awg_transaction_snapshot || die "无法为 AWG 更新创建回滚快照"
-    trap 'rc=$?; if [[ $rc -ne 0 && -n "${AWG_TRANSACTION_DIR:-}" ]]; then awg_transaction_restore || log_err "更新失败且 AWG 原状态恢复不完整，请立即检查 ${AWG_DIR}"; fi' EXIT
+    trap awg_transaction_on_exit EXIT
     download_binaries "$line" "$arch"
     preflight_binaries
     meta_set arch "$arch"
@@ -1604,7 +1613,7 @@ cmd_update() {
             local _sk _sv _need_regen=0
             for _sk in S1 S2 S3 S4; do
                 _sv="$(meta_get "$_sk")"
-                if [[ ! "$_sv" =~ ^[0-9]+$ ]] || (( 10#$_sv < 12 )); then
+                if [[ ! "$_sv" =~ ^[0-9]{1,5}$ ]] || (( 10#$_sv < 12 )); then
                     log_warn "旧 ${_sk}=${_sv} 不满足 3.x 头部保护的 >=12 要求，正在重新生成全部混淆参数"
                     _need_regen=1
                     break
