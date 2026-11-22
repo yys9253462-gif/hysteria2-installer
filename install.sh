@@ -2293,7 +2293,8 @@ generate_self_signed_cert() {
     CERT_FILE="${HY2_CERT_DIR}/server.crt"
     KEY_FILE="${HY2_CERT_DIR}/server.key"
     IS_INSECURE="true"
-    local tmp_key="" tmp_cert="" _sn_re="${SERVER_NAME//./\\.}"
+    local tmp_key="" tmp_cert="" _sn_re=""
+    _sn_re="$(printf '%s' "$SERVER_NAME" | sed 's/[.[\*^$()+?{|]/\\&/g')"
     trap 'trap - RETURN; [[ -n "${tmp_key:-}" ]] && rm -f -- "$tmp_key"; [[ -n "${tmp_cert:-}" ]] && rm -f -- "$tmp_cert"' RETURN
 
     if [[ -L "$HY2_CERT_DIR" || -L "$CERT_FILE" || -L "$KEY_FILE" ]]; then
@@ -2306,7 +2307,7 @@ generate_self_signed_cert() {
     # 要强制换新证书：HY2_REGEN_SELF_SIGNED=1。
     if [[ "${HY2_REGEN_SELF_SIGNED:-0}" != "1" && -s "$CERT_FILE" && -s "$KEY_FILE" ]] \
             && _cert_key_usable "$CERT_FILE" "$KEY_FILE" \
-            && openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -qE "(^|[[:space:],/])CN[[:space:]]*=[[:space:]]*${_sn_re}([[:space:],/]|$)"; then
+            && openssl x509 -in "$CERT_FILE" -noout -subject 2>/dev/null | grep -qE "(^|[[:space:],/=])CN[[:space:]]*=[[:space:]]*${_sn_re}([[:space:],/]|$)"; then
         log_info "沿用现有自签名证书（pin 不变，已发放的客户端无需重新导入）。"
         return 0
     fi
@@ -4922,7 +4923,7 @@ fi
 unset _out
 exit 0
 EOCS
-    } && chmod 755 -- "$_sh_script_tmp" && mv -f -- "$_sh_script_tmp" /usr/local/bin/hy2-cert-selfheal.sh || {
+    } && chmod 755 "$_sh_script_tmp" && mv -f "$_sh_script_tmp" /usr/local/bin/hy2-cert-selfheal.sh || {
         rm -f -- "$_sh_script_tmp"
         return 1
     }
@@ -4938,7 +4939,7 @@ After=network.target
 Type=oneshot
 ExecStart=/usr/local/bin/hy2-cert-selfheal.sh
 EOCU
-    } && chmod 644 -- "$_sh_svc_tmp" && mv -f -- "$_sh_svc_tmp" /etc/systemd/system/hy2-cert-selfheal.service || {
+    } && chmod 644 "$_sh_svc_tmp" && mv -f "$_sh_svc_tmp" /etc/systemd/system/hy2-cert-selfheal.service || {
         rm -f -- "$_sh_svc_tmp"
         return 1
     }
@@ -4957,7 +4958,7 @@ Unit=hy2-cert-selfheal.service
 [Install]
 WantedBy=timers.target
 EOCT
-    } && chmod 644 -- "$_sh_tmr_tmp" && mv -f -- "$_sh_tmr_tmp" /etc/systemd/system/hy2-cert-selfheal.timer || {
+    } && chmod 644 "$_sh_tmr_tmp" && mv -f "$_sh_tmr_tmp" /etc/systemd/system/hy2-cert-selfheal.timer || {
         rm -f -- "$_sh_tmr_tmp"
         return 1
     }
@@ -4968,14 +4969,14 @@ EOCT
     local cert_watch_dir="$HY2_CERT_DIR"
     local _cc
     _cc="$(config_tls_cert "$HY2_CONFIG")"
-    if [[ -n "$_cc" && ! "$_cc" =~ [[:cntrl:]%\$] ]]; then
+    if [[ -n "$_cc" && ! "$_cc" =~ [[:cntrl:]] && ! "$_cc" =~ [%\$] ]]; then
         if [[ "$_cc" != /* ]]; then
             cert_watch_dir="$(dirname "${HY2_DIR}/${_cc}")"
         else
             cert_watch_dir="$(dirname "$_cc")"
         fi
     fi
-    [[ -d "$cert_watch_dir" && ! -L "$cert_watch_dir" && ! "$cert_watch_dir" =~ [[:cntrl:]%\$] ]] || cert_watch_dir="$HY2_CERT_DIR"
+    [[ -d "$cert_watch_dir" && ! -L "$cert_watch_dir" && ! "$cert_watch_dir" =~ [[:cntrl:]] && ! "$cert_watch_dir" =~ [%\$] ]] || cert_watch_dir="$HY2_CERT_DIR"
 
     _sh_pth_tmp="$(umask 077; mktemp /etc/systemd/system/hy2-cert-selfheal.path.XXXXXX)" || return 1
     {
@@ -4990,7 +4991,7 @@ Unit=hy2-cert-selfheal.service
 [Install]
 WantedBy=paths.target
 EOCP
-    } && chmod 644 -- "$_sh_pth_tmp" && mv -f -- "$_sh_pth_tmp" /etc/systemd/system/hy2-cert-selfheal.path || {
+    } && chmod 644 "$_sh_pth_tmp" && mv -f "$_sh_pth_tmp" /etc/systemd/system/hy2-cert-selfheal.path || {
         rm -f -- "$_sh_pth_tmp"
         return 1
     }

@@ -67,7 +67,7 @@ class InstallHopPortalSelfhealAndWarpMigrateGuardsTests(unittest.TestCase):
         self.assertIn('[[ -L "$_sh_target" ]]', fn_sh)
         self.assertIn('umask 077; mktemp /etc/systemd/system/hy2-cert-selfheal.timer.XXXXXX', fn_sh)
         self.assertIn('umask 077; mktemp /etc/systemd/system/hy2-cert-selfheal.path.XXXXXX', fn_sh)
-        self.assertIn('[[ -d "$cert_watch_dir" && ! -L "$cert_watch_dir" && ! "$cert_watch_dir" =~ [[:cntrl:]%\\$] ]]', fn_sh)
+        self.assertIn('[[ -d "$cert_watch_dir" && ! -L "$cert_watch_dir" && ! "$cert_watch_dir" =~ [[:cntrl:]] && ! "$cert_watch_dir" =~ [%\\$] ]]', fn_sh)
         self.assertIn('systemctl daemon-reload || return 1', fn_sh)
 
     def test_warp_migrate_legacy_outbound_runtime_validation_and_trap(self):
