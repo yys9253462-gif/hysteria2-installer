@@ -35,9 +35,8 @@ class InstallGenerateConfigToggleWarpSyncCertAndRefreshGuardsTests(unittest.Test
         """generate_server_config 须拒符号链接、校验三大端口，且 toggle_warp.sh 须拒符号链接配置与限探活大小。"""
         fn = _extract_fn('generate_server_config')
         self.assertIn('[[ -L "$HY2_DIR" || -L "$HY2_CONFIG" ]]', fn)
-        self.assertIn('is_valid_port "${LISTEN_PORT:-}"', fn)
-        self.assertIn('is_valid_port "${PORTAL_LOCAL_PORT:-}"', fn)
-        self.assertIn('is_valid_port "${HY2_SUB_PORT:-}"', fn)
+        self.assertIn('for _vp in "${LISTEN_PORT:-}" "${PORTAL_LOCAL_PORT:-}" "${HY2_SUB_PORT:-}"; do', fn)
+        self.assertIn('10#$_vp < 1 || 10#$_vp > 65535', fn)
 
         m = re.search(r"cat > \"\$HY2_DIR/toggle_warp\.sh\" <<'EOTW'\n(.*?)\nEOTW", INSTALL_SH, re.S)
         self.assertIsNotNone(m)

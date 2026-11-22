@@ -860,7 +860,11 @@ render_client_config() {
         die "HeaderProtectionKey 包含非法空白或控制字符，已中止渲染"
     fi
     [[ -n "$endpoint" ]] || die "缺少有效的连接地址 (Endpoint)，请通过 --endpoint 指定"
-    validate_endpoint "$endpoint" >/dev/null 2>&1 || die "连接地址 (Endpoint) 非法，已中止渲染: ${name}"
+    if declare -F validate_endpoint >/dev/null 2>&1; then
+        validate_endpoint "$endpoint" >/dev/null 2>&1 || die "连接地址 (Endpoint) 非法，已中止渲染: ${name}"
+    elif [[ "$endpoint" =~ [[:space:][:cntrl:]] ]]; then
+        die "连接地址 (Endpoint) 非法，已中止渲染: ${name}"
+    fi
     if ! endpoint_has_port "$endpoint"; then
         [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || die "AWG 服务端端口配置无效: ${port}"
     fi

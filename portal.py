@@ -17166,9 +17166,9 @@ if [ ! -f "$WGCF_CONF" ]; then
 fi
 chmod 600 "$WGCF_CONF" 2>/dev/null || true
 
-WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF")
-WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF")
-WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF")
+WG_PRIV=$(awk '/^PrivateKey/{print $3; exit}' "$WGCF_CONF" | tr -d '\r')
+WG_PUB=$(awk -F'= ' '/^PublicKey/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
+WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
 # 与 install.sh 一致：用 wgcf 下发的双栈地址，否则解析到 IPv6 的 WARP 域名连不上。
 WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
 [ -n "$WG_ADDR" ] || WG_ADDR="172.16.0.2/32"

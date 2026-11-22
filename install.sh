@@ -3076,10 +3076,13 @@ generate_server_config() {
     python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "需要 Python 3.9+")'
     require_systemd_247 || return 1
     select_subscription_port || { log_err "订阅端口分配失败，安装中止。"; return 1; }
-    if ! is_valid_port "${LISTEN_PORT:-}" || ! is_valid_port "${PORTAL_LOCAL_PORT:-}" || ! is_valid_port "${HY2_SUB_PORT:-}"; then
-        log_err "服务端监听端口、门户端口或订阅端口不合法，未改动 ${HY2_CONFIG}。"
-        return 1
-    fi
+    local _vp
+    for _vp in "${LISTEN_PORT:-}" "${PORTAL_LOCAL_PORT:-}" "${HY2_SUB_PORT:-}"; do
+        if [[ ! "$_vp" =~ ^[1-9][0-9]{0,4}$ ]] || (( 10#$_vp < 1 || 10#$_vp > 65535 )); then
+            log_err "服务端监听端口、门户端口或订阅端口不合法，未改动 ${HY2_CONFIG}。"
+            return 1
+        fi
+    done
 
     # 先把门户整包取下来、校验通过、落地，再写 config.yaml（2026-11-03 修）。
     # 旧顺序是先重写 config.yaml（auth 指向新选的 PORTAL_LOCAL_PORT），最后才在
