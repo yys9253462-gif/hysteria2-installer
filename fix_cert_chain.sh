@@ -51,20 +51,24 @@ cert_of () {   # 从 config.yaml 取出 tls.cert 路径
              print; exit
          }' "$1"
 }
-n_certs () { local n; n="$(grep -c 'BEGIN CERTIFICATE' "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
+n_certs () { local n; n="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
 # 证书文件第一张证书（叶证书）的公钥指纹；损坏或无法解析时返回空串，避免对空输入求 sha256 引发假匹配。
 leaf_pub () {
-    local pub
+    local pub h
     pub="$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null)" || return 1
     [[ -n "$pub" ]] || return 1
-    printf '%s\n' "$pub" | openssl sha256 2>/dev/null | awk '{print $NF}'
+    h="$(printf '%s\n' "$pub" | openssl sha256 2>/dev/null | awk '{print $NF}')" || return 1
+    [[ -n "$h" && "$h" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]] || return 1
+    printf '%s\n' "$h"
 }
 # 只改 tls: 段里的 cert: 行，按字面替换（2026-11-04 修）：旧实现 sed 全文替换且把路径当
 # 正则，key: "/x/a.cer.key" 这种同前缀路径会一起被改坏，hysteria 随即起不来。
 set_tls_cert () {   # $1=config $2=new path
-    local tmp
+    local tmp=""
+    trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
+    [[ -n "$2" ]] || return 1
     case "$2" in
-        *'"'*|*'\'*|*$'\n'*|*$'\r'*) return 1 ;;
+        *'"'*|*'\'*|*$'\n'*|*$'\r'*|*$'\t'*) return 1 ;;
     esac
     tmp="$(umask 077 && mktemp "${1}.XXXXXX")" || return 1
     NEW_CERT="$2" awk '
@@ -160,10 +164,10 @@ else
     FULL=""
     # 候选链的叶证书必须就是当前这张（2026-11-04 修）：多域名机器上上级目录的
     # fullchain 可能属于别的域名，旧实现照单全收，服务端随即出示错的证书。
-    _want="$(leaf_pub "$CERT_FILE")"
+    _want="$(leaf_pub "$CERT_FILE")" || _want=""
     for cand in "$DIR/fullchain.cer" "$DIR/fullchain.pem" "$DIR/../fullchain.cer" "$DIR/../fullchain.pem"; do
         if [[ -f "$cand" ]] && [[ "$(n_certs "$cand")" -ge 2 ]] \
-                && [[ -n "$_want" && "$(leaf_pub "$cand")" == "$_want" ]]; then
+                && [[ -n "$_want" && "$(leaf_pub "$cand" || true)" == "$_want" ]]; then
             FULL="$cand"; break
         fi
     done
