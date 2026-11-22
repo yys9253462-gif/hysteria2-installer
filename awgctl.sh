@@ -789,6 +789,8 @@ render_client_config() {
     if endpoint_has_port "$endpoint"; then
         local ep_host="${endpoint%:*}" ep_port="${endpoint##*:}"
         echo "Endpoint = ${ep_host}:$((10#$ep_port))"
+    elif [[ "$endpoint" == *:* && "$endpoint" != \[*\] ]]; then
+        echo "Endpoint = [${endpoint}]:${port}"
     else
         echo "Endpoint = ${endpoint}:${port}"
     fi
@@ -989,6 +991,7 @@ cmd_peer_add() {
     priv="$(genkey)"
     pub="$(pubkey_of "$priv")"
     psk="$(genpsk)"
+    [[ -n "$priv" && -n "$pub" && -n "$psk" ]] || die "生成客户端密钥失败"
     addr="$(next_peer_address)" || die "隧道地址池已满（10.66.66.0/24 上限 253 个客户端）"
     peers_backup="$(umask 077 && mktemp "${AWG_DIR}/.peers-backup.XXXXXX")" || die "无法创建客户端列表备份临时文件"
     config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || die "无法创建服务端配置备份临时文件"
@@ -999,12 +1002,13 @@ cmd_peer_add() {
     fi
 
     tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers.XXXXXX")"
-    # 同 peer-del：jq 失败时空输出不能盖掉原有客户端（2026-11-04 修）。
+    # 同 peer-del：jq 失败时空输出不能盖掉原有客户端（2026-11-04 修）；
+    # 同时归一化 .peers 数组并过滤非对象脏项，防止损坏结构导致无法新增。
     if ! jq --arg n "$name" --arg ip "$addr" --arg priv "$priv" \
        --arg pub "$pub" --arg psk "$psk" --arg ep "$endpoint" \
        --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-       '.peers += [{name:$n, address:$ip, private_key:$priv, public_key:$pub,
-                    preshared_key:$psk, endpoint:$ep, created_at:$ts, enabled:true}]' \
+       '.peers = (((.peers // []) | if type=="array" then map(select(type=="object")) else [] end) + [{name:$n, address:$ip, private_key:$priv, public_key:$pub,
+                    preshared_key:$psk, endpoint:$ep, created_at:$ts, enabled:true}])' \
        "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
         rm -f "$tmp" "$peers_backup" "$config_backup"
         die "客户端列表无法解析，未做任何修改：${AWG_PEERS_FILE}"
@@ -1041,7 +1045,7 @@ cmd_peer_del() {
 
     local pub tmp="" peers_backup="" config_backup="" had_config=0
     trap 'rm -f "${tmp:-}" "${peers_backup:-}" "${config_backup:-}"' RETURN
-    pub="$(jq -r --arg n "$name" '.peers[]? | select(.name==$n) | .public_key // empty' "$AWG_PEERS_FILE")"
+    pub="$(jq -r --arg n "$name" 'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.public_key | if type=="string" then . else empty end)) // empty' "$AWG_PEERS_FILE")"
     peers_backup="$(umask 077 && mktemp "${AWG_DIR}/.peers-backup.XXXXXX")" || die "无法创建客户端列表备份临时文件"
     config_backup="$(umask 077 && mktemp "${AWG_DIR}/.conf-backup.XXXXXX")" || die "无法创建服务端配置备份临时文件"
     (umask 077; cp "$AWG_PEERS_FILE" "$peers_backup" && chmod 600 "$peers_backup") || die "无法备份客户端列表"
@@ -1052,8 +1056,8 @@ cmd_peer_del() {
 
     tmp="$(umask 077 && mktemp "${AWG_DIR}/.peers.XXXXXX")"
     # jq 失败（peers.json 结构被改坏）时不能拿空输出覆盖原文件（2026-11-04 修）：
-    # 那会一次删光全部客户端。
-    if ! jq --arg n "$name" '.peers |= map(select(.name != $n))' "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
+    # 那会一次删光全部客户端；同时过滤非对象脏项，防止单个 null/数字导致删除彻底失败。
+    if ! jq --arg n "$name" '.peers = ((.peers // []) | if type=="array" then map(select(type=="object" and .name != $n)) else [] end)' "$AWG_PEERS_FILE" > "$tmp" || [[ ! -s "$tmp" ]]; then
         rm -f "$tmp" "$peers_backup" "$config_backup"
         die "客户端列表无法解析，未做任何修改：${AWG_PEERS_FILE}"
     fi
@@ -1134,7 +1138,7 @@ cmd_client_conf() {
 
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
-            '(.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)' "$AWG_PEERS_FILE")"
+            'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)) // empty' "$AWG_PEERS_FILE")"
     fi
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
@@ -1235,6 +1239,7 @@ cmd_install() {
         log_info "沿用已有服务端密钥"
     fi
     pub="$(pubkey_of "$priv")"
+    [[ -n "$priv" && -n "$pub" ]] || die "生成服务端密钥对失败"
 
     local old_port
     old_port="$(meta_get port)"
@@ -1285,7 +1290,10 @@ cmd_install() {
 
     # 3.x 头部保护密钥
     if [[ "$line" == "3" && -z "$(meta_get HeaderProtectionKey)" ]]; then
-        meta_set HeaderProtectionKey "$(genkey)"
+        local _hp_key
+        _hp_key="$(genkey)"
+        [[ -n "$_hp_key" ]] || die "生成 3.x 头部保护密钥失败"
+        meta_set HeaderProtectionKey "$_hp_key"
         log_info "已生成 3.x 头部保护密钥 (HeaderProtectionKey)"
     fi
 
@@ -1623,7 +1631,7 @@ cmd_qr() {
     peer_exists "$name" || die "客户端不存在: ${name}"
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
-            '(.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)' "$AWG_PEERS_FILE")"
+            'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)) // empty' "$AWG_PEERS_FILE")"
     fi
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
