@@ -969,6 +969,7 @@ def normalize_route_rules(rules):
     if not isinstance(rules, (list, tuple, set, frozenset)):
         return []
     result = []
+    seen = set()
     for item in rules:
         if isinstance(item, str):
             item = {'domain': item, 'outbound': 'warp_socks'}
@@ -982,6 +983,10 @@ def normalize_route_rules(rules):
             raw_ob = item.get('outbound')
             ob = (raw_ob.strip() if isinstance(raw_ob, str)
                   and re.fullmatch(r'[A-Za-z0-9_-]+', raw_ob.strip()) else 'warp_socks')
+            pair = (domain, ob)
+            if pair in seen:
+                continue
+            seen.add(pair)
             result.append({'domain': domain, 'outbound': ob})
     return result
 
@@ -1010,6 +1015,8 @@ def routing_state(data):
 
 
 def render_egress_config(original, state):
+    if not isinstance(original, str):
+        raise ValueError('invalid hysteria config text')
     if not isinstance(state, dict):
         state = {}
     enabled = bool(state.get('warp_enabled', False))
@@ -2652,12 +2659,25 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
     这是订阅端口的**权威来源** —— 门户的公网入口就是这个 masquerade 端口
     （`listenHTTPS`），订阅链接必须用它。
     """
+    max_bytes = 4 * 1024 * 1024
     try:
-        text = Path(config_path).read_text(encoding='utf-8')
+        with open(config_path, 'rb') as fh:
+            raw_bytes = fh.read(max_bytes + 1)
+        if len(raw_bytes) > max_bytes:
+            return None
+        text = raw_bytes.decode('utf-8')
     except (OSError, UnicodeDecodeError):
         return None
+    in_masq = False
     for line in text.split('\n'):
         stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if len(line) - len(line.lstrip()) == 0:
+            in_masq = bool(re.match(r'^masquerade:\s*(?:#.*)?$', stripped))
+            continue
+        if not in_masq:
+            continue
         if stripped.startswith('listenHTTPS:'):
             raw = stripped.split(':', 1)[1].strip()
             # 行尾注释（`:11690  # 订阅端口`）YAML 合法：旧实现整串判不成数字，
@@ -2666,7 +2686,7 @@ def read_masquerade_port(config_path='/etc/hysteria/config.yaml'):
             # 形如 ":11690" / "0.0.0.0:11690" / "11690"
             # 去掉可能的引号（`: "8443"` 这种写法 YAML 完全合法）。
             raw = raw.rsplit(':', 1)[-1].strip().strip('"').strip("'")
-            if raw.isascii() and raw.isdigit():
+            if raw.isascii() and raw.isdigit() and len(raw) <= 16:
                 port = int(raw)
                 # 端口 0 或越界不能当作有效值返回：调用方会把它拼进订阅链接，
                 # 生成一个永远连不上的地址（2026-10-25 修）。
@@ -5818,13 +5838,20 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
     candidate = config_path.with_name(config_path.stem + '.candidate.json')
     replaced = False
     try:
-        _write_private_bytes(candidate, json.dumps(config, indent=2, ensure_ascii=False).encode('utf-8'), 0o600)
+        _write_private_bytes(
+            candidate,
+            json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False).encode('utf-8'),
+            0o600,
+        )
         run([ANYTLS_BINARY, 'check', '-c', str(candidate)],
             capture_output=True, timeout=15, check=True)
         candidate.replace(config_path)
         replaced = True
         if restart:
-            run(['systemctl', 'reset-failed', service], capture_output=True, timeout=5)
+            try:
+                run(['systemctl', 'reset-failed', service], capture_output=True, timeout=5)
+            except (OSError, subprocess.SubprocessError) as rf_exc:
+                _log_ignored('anytls_reset_failed', rf_exc)
             run(['systemctl', 'restart', service], capture_output=True, timeout=15, check=True)
             run(['systemctl', 'is-active', '--quiet', service],
                 capture_output=True, timeout=5, check=True)
@@ -5839,7 +5866,10 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
                 _log_ignored('anytls_config_rollback_file', rb_exc)
             if restart and original is not None:
                 try:
-                    run(['systemctl', 'reset-failed', service], capture_output=True, timeout=5)
+                    try:
+                        run(['systemctl', 'reset-failed', service], capture_output=True, timeout=5)
+                    except (OSError, subprocess.SubprocessError) as rf_exc:
+                        _log_ignored('anytls_rollback_reset_failed', rf_exc)
                     run(['systemctl', 'restart', service], capture_output=True, timeout=15, check=True)
                 except Exception as rollback_exc:
                     raise RuntimeError(
@@ -6085,11 +6115,14 @@ def sync_tuic_users(root, snapshot, apply=None, service_active=None, force_ids=(
 
 def _singbox_version(binary=ANYTLS_BINARY, run=subprocess.run):
     """返回 sing-box 版本元组；读不出来返回 None。"""
+    if (not isinstance(binary, str) or not binary.strip() or binary.strip().startswith('-')
+            or any(ord(c) < 32 or ord(c) == 127 for c in binary)):
+        return None
     try:
         out = run([binary, 'version'], capture_output=True, text=True, timeout=5).stdout
     except Exception:
         return None
-    m = re.search(r'version\s+v?(\d+)\.(\d+)\.(\d+)', out or '')
+    m = re.search(r'version\s+v?(\d{1,8})\.(\d{1,8})\.(\d{1,8})(?!\d)', out or '')
     return tuple(int(x) for x in m.groups()) if m else None
 
 
@@ -11039,7 +11072,7 @@ if __name__ == '__main__':
             now = time.monotonic()
             with data_lock:
                 if bucket == 'api':
-                    self.server.api_requests[:] = [t for t in self.server.api_requests if now - t < 1]
+                    self.server.api_requests[:] = [t for t in self.server.api_requests if 0 <= now - t < 1]
                     if len(self.server.api_requests) >= 50:
                         return False
                     self.server.api_requests.append(now)
@@ -11049,7 +11082,7 @@ if __name__ == '__main__':
                     anon = getattr(self.server, 'api_anon_requests', None)
                     if anon is None:
                         anon = self.server.api_anon_requests = []
-                    anon[:] = [t for t in anon if now - t < 1]
+                    anon[:] = [t for t in anon if 0 <= now - t < 1]
                     if len(anon) >= 50:
                         return False
                     anon.append(now)
@@ -11064,13 +11097,13 @@ if __name__ == '__main__':
                     # 且四种可区分回复（User not found / inactive / expired /
                     # Traffic quota exceeded）构成完美的密码 oracle，可无限爆破。
                     # 桶要小得多：/auth 只有 hysteria 握手才会调，QPS 天然很低。
-                    self.server.auth_requests[:] = [t for t in self.server.auth_requests if now - t < 1]
+                    self.server.auth_requests[:] = [t for t in self.server.auth_requests if 0 <= now - t < 1]
                     if len(self.server.auth_requests) >= 20:
                         return False
                     self.server.auth_requests.append(now)
                     return True
                 else:
-                    self.server.requests[:] = [t for t in self.server.requests if now - t < 1]
+                    self.server.requests[:] = [t for t in self.server.requests if 0 <= now - t < 1]
                     if len(self.server.requests) >= 50:
                         return False
                     # 失败按来源计（2026-11-03 修）：旧实现是进程全局桶，拿到分享链接
@@ -11094,14 +11127,14 @@ if __name__ == '__main__':
             now = time.monotonic()
             with data_lock:
                 self.server.login_failures[:] = [
-                    t for t in self.server.login_failures if now - t < 600]
+                    t for t in self.server.login_failures if 0 <= now - t < 600]
                 # 按来源计 10 次 / 10 分钟（2026-11-03 修）：旧实现全局 10 次，知道
                 # token 的人刷 10 次错误密码就把管理员锁在门外。全局保留 200 次作
                 # 兜底，换来源爆破的总尝试次数仍然有界。
                 source = self._web_source_key()
                 per_source = self.server.login_source_failures.get(source)
                 if per_source is not None:
-                    per_source[:] = [t for t in per_source if now - t < 600]
+                    per_source[:] = [t for t in per_source if 0 <= now - t < 600]
                     if not per_source:
                         self.server.login_source_failures.pop(source, None)
                         per_source = []
@@ -11118,8 +11151,8 @@ if __name__ == '__main__':
                     # 而那唯一一条里也没有来源。
                     logged = self.server.__dict__.setdefault('_login_lock_logged_at', {})
                     key = '全局' if global_locked else source
-                    if now - logged.get(key, now - 600) >= 600:
-                        for old_key in [k for k, t in logged.items() if now - t >= 600]:
+                    if now - logged.get(key, now - 600) >= 600 or now < logged.get(key, now):
+                        for old_key in [k for k, t in logged.items() if now - t >= 600 or now < t]:
                             del logged[old_key]
                         # 同步限制锁定日志去重表容量，防止海量来源在同一窗口撑爆内存。
                         while len(logged) >= 4096:
@@ -11136,12 +11169,16 @@ if __name__ == '__main__':
             now = time.monotonic()
             with data_lock:
                 self.server.login_failures[:] = [
-                    t for t in self.server.login_failures if now - t < 600]
+                    t for t in self.server.login_failures if 0 <= now - t < 600]
                 self.server.login_failures.append(now)
+                if len(self.server.login_failures) > 1000:
+                    del self.server.login_failures[:-1000]
                 table = self.server.login_source_failures
                 key = self._web_source_key()
-                bucket = [t for t in table.get(key, []) if now - t < 600]
+                bucket = [t for t in table.get(key, []) if 0 <= now - t < 600]
                 bucket.append(now)
+                if len(bucket) > 200:
+                    bucket = bucket[-200:]
                 table[key] = bucket
                 table.move_to_end(key)
                 while len(table) > 4096:
@@ -11172,9 +11209,12 @@ if __name__ == '__main__':
             hysteria v2.13.0 实测：xForwarded 会用真实来源**整体替换**客户端带的
             X-Forwarded-For；取最后一项，在追加式代理下同样不吃伪造的前置项。
             """
-            forwarded = self.headers.get('X-Forwarded-For') or ''
-            hop = forwarded.split(',')[-1].strip() if forwarded else ''
-            return auth_rate_key(hop or self.client_address[0])
+            headers = getattr(self, 'headers', None)
+            forwarded = (headers.get('X-Forwarded-For') if headers is not None else '') or ''
+            hop = forwarded.split(',')[-1].strip() if isinstance(forwarded, str) and forwarded else ''
+            addr = getattr(self, 'client_address', None)
+            peer = addr[0] if isinstance(addr, (tuple, list)) and addr else ''
+            return auth_rate_key(hop or peer)
 
         def record_failure(self):
             now = time.monotonic()
