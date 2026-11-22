@@ -3043,6 +3043,10 @@ require_systemd_247() {
 
 generate_server_config() {
     log_step "生成 Hysteria 2 服务端配置: ${HY2_CONFIG}..."
+    if [[ -L "$HY2_DIR" || -L "$HY2_CONFIG" ]]; then
+        log_err "配置目录或主配置文件不允许为符号链接，安装中止。"
+        return 1
+    fi
     mkdir -p "$HY2_DIR"
     # 只在缺 python3 时重装依赖（缺它门户起不来）。qrencode 缺失只影响
     # 二维码，旧写法会让每次生成配置都跑一遍 apt-get update（2026-10-29 修）。
@@ -3051,6 +3055,10 @@ generate_server_config() {
     python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else "需要 Python 3.9+")'
     require_systemd_247 || return 1
     select_subscription_port || { log_err "订阅端口分配失败，安装中止。"; return 1; }
+    if ! is_valid_port "${LISTEN_PORT:-}" || ! is_valid_port "${PORTAL_LOCAL_PORT:-}" || ! is_valid_port "${HY2_SUB_PORT:-}"; then
+        log_err "服务端监听端口、门户端口或订阅端口不合法，未改动 ${HY2_CONFIG}。"
+        return 1
+    fi
 
     # 先把门户整包取下来、校验通过、落地，再写 config.yaml（2026-11-03 修）。
     # 旧顺序是先重写 config.yaml（auth 指向新选的 PORTAL_LOCAL_PORT），最后才在
@@ -3190,7 +3198,7 @@ set -euo pipefail
 umask 077
 ACTION="${1:-0}" # 1: enable, 0: disable
 CONFIG="/etc/hysteria/config.yaml"
-[[ -f "$CONFIG" ]] || exit 1
+[[ ! -L "$CONFIG" && -f "$CONFIG" ]] || exit 1
 
 # 仅提取顶格 acl 块本身（不含排在后面的 obfs 等段落），供收尾判断是否需要重启
 extract_acl() { awk 'BEGIN{f=0} /^acl:/{f=1;print;next} f && /^[^ \t#]/{f=0} f' "$1"; }
@@ -3204,7 +3212,7 @@ awk 'BEGIN{d=0} /^acl:/{d=1;next} d && /^[^ \t#]/{d=0} !d' "$CONFIG" > "$TMP_CFG
 
 if [[ "$ACTION" == "1" ]]; then
     # 统一走 wgcf + wireproxy 出口（不再依赖官方 warp-cli）：探活失败则拉起 wireproxy
-    if ! curl --proxy "socks5h://127.0.0.1:19898" --silent --fail --max-time 6 https://api4.ipify.org >/dev/null 2>&1; then
+    if ! curl --proxy "socks5h://127.0.0.1:19898" --silent --fail --max-time 6 --max-filesize 65536 https://api4.ipify.org >/dev/null 2>&1; then
         systemctl reset-failed wireproxy >/dev/null 2>&1 || true
         systemctl restart wireproxy >/dev/null 2>&1 || true
         sleep 2
@@ -3266,7 +3274,7 @@ trap - EXIT
 if [[ "${BEFORE_ACL:-}" != "$(extract_acl "$CONFIG")" ]]; then
     # 流量超额停用期间只改配置不拉起服务（2026-11-04 修），否则手动跑一次本脚本就绕过限额；
     # 重启前清失败计数，连续切换几次不会撞上 StartLimitBurst 把服务锁死。
-    if [[ "$(jq -r '.traffic_suspend.suspended // false' /etc/hysteria/portal.json 2>/dev/null)" != "true" ]]; then
+    if [[ ! -L /etc/hysteria/portal.json ]] && [[ "$(jq -r 'if type=="object" and (.traffic_suspend|type)=="object" then (.traffic_suspend.suspended // false) else false end' /etc/hysteria/portal.json 2>/dev/null || true)" != "true" ]]; then
         systemctl stop hysteria-server 2>/dev/null || true
         systemctl reset-failed hysteria-server 2>/dev/null || true
         systemctl start hysteria-server 2>/dev/null || true
@@ -4654,6 +4662,10 @@ config_tls_cert() {
 }
 
 sync_cert_meta() {
+    if [[ -L "$HY2_META_FILE" || -L "$HY2_CONFIG" ]]; then
+        log_err "client_meta.json 或 config.yaml 不允许为符号链接，拒绝证书信任模型自愈。"
+        return 1
+    fi
     [[ -f "$HY2_META_FILE" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
     [[ -f "$HY2_CONFIG" ]] || return 0
@@ -4664,6 +4676,10 @@ sync_cert_meta() {
     #    否则 `-f` 判空一定失败，自愈会被静默跳过（2026-10-08 真实踩到）。
     local cert_file
     cert_file="$(config_tls_cert "$HY2_CONFIG")"
+    if [[ -n "$cert_file" && ( "$cert_file" == -* || "$cert_file" =~ [[:cntrl:]] ) ]]; then
+        log_err "tls.cert 路径非法（以 - 开头或含控制字符），已拒绝解析。"
+        return 1
+    fi
     if [[ -n "$cert_file" && "$cert_file" != /* && ! -f "$cert_file" ]]; then
         [[ -f "${HY2_DIR}/${cert_file}" ]] && cert_file="${HY2_DIR}/${cert_file}"
     fi
@@ -4673,6 +4689,10 @@ sync_cert_meta() {
         # ACME 证书在 hysteria 的缓存里，交给 portal.py 的 sync_cert_trust 处理。
         grep -q '^acme:' "$HY2_CONFIG" && return 0
         cert_file="${HY2_CERT_DIR}/server.crt"
+    fi
+    if [[ "$cert_file" == -* || "$cert_file" =~ [[:cntrl:]] ]]; then
+        log_err "证书路径非法（以 - 开头或含控制字符），已拒绝解析。"
+        return 1
     fi
     [[ -f "$cert_file" ]] || return 0
 
@@ -4742,9 +4762,8 @@ sync_cert_meta() {
     }
     if jq --arg t "$new_type" --argjson i "$new_insecure" --arg s "$new_sn" --arg p "$new_pin" \
           'if type=="object" then .cert_type=$t | .is_insecure=$i | .server_name=$s | .pin_sha256=$p else error("meta not object") end' \
-          "$HY2_META_FILE" > "$tmp_meta" 2>/dev/null && [[ -s "$tmp_meta" ]]; then
-        chmod 600 "$tmp_meta"
-        mv -f "$tmp_meta" "$HY2_META_FILE"
+          "$HY2_META_FILE" > "$tmp_meta" 2>/dev/null && [[ -s "$tmp_meta" ]] \
+          && chmod 600 "$tmp_meta" && mv -f "$tmp_meta" "$HY2_META_FILE"; then
         tmp_meta=""
         log_info "证书信任模型已自愈。"
     else
@@ -4759,6 +4778,10 @@ sync_cert_meta() {
 refresh_portal() {
     # 只要求 portal.json：portal-access.json 丢失时 refresh 会重建一份凭据
     # （保留 token / API Key / 用户），不该让「刷新页面」直接失败（2026-10-30 修）。
+    if [[ -L "$HY2_DIR" || -L "$HY2_DIR/portal.json" || -L "$HY2_DIR/portal.py" ]]; then
+        log_err "门户目录或核心文件不允许为符号链接，已拒绝刷新。"
+        return 1
+    fi
     [[ -f "$HY2_DIR/portal.json" ]] || { log_err "未找到已有网页配置，请先安装。"; return 1; }
     if ! portal_ensure_py; then
         log_err "门户文件更新或完整性验证失败，保留现有门户服务。"
