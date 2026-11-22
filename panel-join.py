@@ -57,6 +57,10 @@ PORTAL = "/etc/hysteria/portal.json"
 META = "/etc/hysteria/client_meta.json"
 
 
+MAX_CONFIG_BYTES = 4 * 1024 * 1024
+_HOST_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+
+
 def _safe_host(value):
     if not isinstance(value, str):
         return ""
@@ -70,6 +74,8 @@ def _safe_host(value):
         except ValueError:
             return ""
         return str(ip) if ip.version == 6 else ""
+    if len(host) > 253 or ".." in host or not _HOST_RE.match(host):
+        return ""
     return host
 
 
@@ -100,8 +106,12 @@ def read(path):
     if not os.path.isfile(path):
         return None
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            return f.read()
+        with open(path, "rb") as f:
+            raw = f.read(MAX_CONFIG_BYTES + 1)
+        if len(raw) > MAX_CONFIG_BYTES:
+            print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
+            return None
+        return raw.decode("utf-8", errors="replace")
     except OSError:
         return None
 
@@ -175,14 +185,18 @@ def acme_first_domain(text):
             else:
                 m = item_re.match(raw)
                 if m:
-                    return m.group(1)
+                    cand = _safe_host(m.group(1))
+                    if cand:
+                        return cand
                 continue
         m_inline = inline_re.match(stripped)
         if m_inline:
             for item in m_inline.group(1).split(","):
                 cand = item.strip().strip('"').strip("'").strip()
                 if cand and token_re.match(cand):
-                    return cand
+                    cand = _safe_host(cand)
+                    if cand:
+                        return cand
             continue
         if re.match(r"^domains:\s*(?:#.*)?$", stripped):
             domains_indent = indent
@@ -222,8 +236,9 @@ def main():
 
     raw_api_key = meta.get("api_key")
     api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
-    if any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in api_key):
-        print("portal.json 中的 api_key 包含非法空白或控制字符，请检查配置文件。", file=sys.stderr)
+    if (not api_key.isascii()
+            or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in api_key)):
+        print("portal.json 中的 api_key 包含非法空白、非 ASCII 或控制字符，请检查配置文件。", file=sys.stderr)
         return 2
     if args.name is not None:
         if any(ord(ch) < 32 or ord(ch) == 127 for ch in args.name):
@@ -234,7 +249,8 @@ def main():
     if isinstance(raw_portal_port, int) and not isinstance(raw_portal_port, bool) and 1 <= raw_portal_port <= 65535:
         portal_port = raw_portal_port
     elif (isinstance(raw_portal_port, str) and raw_portal_port.strip().isascii()
-          and raw_portal_port.strip().isdigit() and 1 <= int(raw_portal_port.strip()) <= 65535):
+          and raw_portal_port.strip().isdigit() and len(raw_portal_port.strip()) <= 16
+          and 1 <= int(raw_portal_port.strip()) <= 65535):
         portal_port = int(raw_portal_port.strip())
     else:
         portal_port = None
@@ -271,8 +287,8 @@ def main():
                     https_port = m2.group(1)
                     break
     # 端口 0 / 越界拼出的地址永远连不上，旧实现照样输出并返回 0（2026-11-12 修）；
-    # 同时去掉十进制前导零（如 08443 -> 8443），避免严格 URL 解析器拒绝。
-    if https_port.isascii() and https_port.isdigit() and 1 <= int(https_port) <= 65535:
+    # 同时去掉十进制前导零（如 08443 -> 8443），避免严格 URL 解析器拒绝，并限制数字串长度防止超大整数异常。
+    if https_port.isascii() and https_port.isdigit() and len(https_port) <= 16 and 1 <= int(https_port) <= 65535:
         https_port = str(int(https_port))
     else:
         https_port = ""
@@ -291,7 +307,7 @@ def main():
     # `listen` 也可能带主机（`0.0.0.0:443` / `[::]:443`）：旧实现只去掉开头的冒号，
     # listen_port 变成 null、建议节点名成了 `a.com-0.0.0.0:443`（2026-11-12 修）。
     listen = (cfg.get("listen", {}).get("__value__") or "").rpartition(":")[2].strip()
-    if listen.isascii() and listen.isdigit() and 1 <= int(listen) <= 65535:
+    if listen.isascii() and listen.isdigit() and len(listen) <= 16 and 1 <= int(listen) <= 65535:
         listen = str(int(listen))
     else:
         listen = ""
@@ -314,7 +330,7 @@ def main():
     }
 
     if args.format == "json":
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
         return 0
 
     if args.format == "curl" or args.register:
@@ -346,7 +362,7 @@ def main():
             "name": args.name or result["suggested_name"],
             "api_url": result["api_url"],
             "api_key": result["api_key"],
-        }, ensure_ascii=False)
+        }, ensure_ascii=False, allow_nan=False)
         # 每个值都按 shell 规则引用（2026-11-04 修）：旧实现原样放进单引号，--name 里一个 '
         # 就能拼出任意命令，用户粘贴即执行。JWT 不原样打印，用环境变量引用，免得留在终端/历史里。
         print("curl -X POST %s \\" % shlex.quote(panel + "/api/nodes"))
@@ -362,15 +378,16 @@ def main():
         if not args.admin_token or not args.admin_token.strip():
             print("--register 需要 --admin-token", file=sys.stderr)
             return 2
-        if any(ord(ch) < 32 or ord(ch) == 127 for ch in args.admin_token):
-            print("--admin-token 不能包含换行或控制字符", file=sys.stderr)
-            return 2
         admin_token = args.admin_token.strip()
+        if (not admin_token.isascii()
+                or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in admin_token)):
+            print("--admin-token 不能包含空白、非 ASCII 或控制字符", file=sys.stderr)
+            return 2
         body = json.dumps({
             "name": args.name or result["suggested_name"],
             "api_url": result["api_url"],
             "api_key": result["api_key"],
-        }, ensure_ascii=False).encode()
+        }, ensure_ascii=False, allow_nan=False).encode()
         req = urllib.request.Request(panel + "/api/nodes", data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + admin_token)

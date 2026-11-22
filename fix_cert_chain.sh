@@ -51,7 +51,7 @@ cert_of () {   # 从 config.yaml 取出 tls.cert 路径
              print; exit
          }' "$1"
 }
-n_certs () { local n; n="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
+n_certs () { local n; n="$(grep -Ec '^-----BEGIN CERTIFICATE-----[[:space:]]*$' "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
 # 证书文件第一张证书（叶证书）的公钥指纹；损坏或无法解析时返回空串，避免对空输入求 sha256 引发假匹配。
 leaf_pub () {
     local pub h
@@ -85,7 +85,8 @@ set_tls_cert () {   # $1=config $2=new path
 }
 # 通过同目录临时文件原子回滚配置，避免覆盖过程中断留下半截 config.yaml。
 restore_config_file () {   # $1=backup $2=target
-    local tmp
+    local tmp=""
+    trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
     tmp="$(umask 077 && mktemp "${2}.restore.XXXXXX")" || return 1
     cp -a "$1" "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$2" || { rm -f "$tmp"; return 1; }
@@ -109,7 +110,7 @@ masq_https_port () {   # $1=config
             sub(/[[:space:]]+#.*$/, "", v)
             gsub(/["\047[:space:]]/, "", v)
             n = split(v, parts, ":"); v = parts[n]
-            if (v ~ /^[0-9]+$/ && v + 0 >= 1 && v + 0 <= 65535) { print v + 0; exit }
+            if (v ~ /^[1-9][0-9]*$/ && length(v) <= 5 && v + 0 >= 1 && v + 0 <= 65535) { print v + 0; exit }
         }' "$1"
 }
 # 验证用的 SNI：先取 SAN 里第一个 DNS 名（通配符换成 www.），没有 SAN 再退回 CN，
@@ -120,10 +121,13 @@ cert_sni () {   # $1=cert
     s="$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null \
          | grep -o 'DNS:[^,[:space:]]*' | head -n1 | cut -d: -f2)" || true
     if [[ -z "$s" ]]; then
-        s="$(openssl x509 -in "$1" -noout -subject -nameopt RFC2253 2>/dev/null \
-             | sed 's/^subject= *//' | tr ',' '\n' | sed -n 's/^CN=//p' | head -n1)" || true
+        s="$(openssl x509 -in "$1" -noout -subject -nameopt multiline 2>/dev/null \
+             | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -n1)" || true
     fi
     [[ "$s" == \*.* ]] && s="www.${s#\*.}"
+    if [[ ! "$s" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]; then
+        s=""
+    fi
     printf '%s' "$s"
 }
 
