@@ -2855,15 +2855,22 @@ async function waitPortalBack(timeoutMs = 300000, intervalMs = 3000) {
 if (btnRebootServer) {
   btnRebootServer.addEventListener('click', async () => {
     if (btnRebootServer.disabled) return;
+    if (btnRebootServer._confirming) return;
     // 按危险操作处理（2026-11-13 修）：重启期间所有连接都会中断，旧实现焦点停在「确定」，回车就重启。
-    const confirmed = await showConfirm({
-      title: '安全重启服务器',
-      text: '确定要立即重启服务器以完成新 BBR 内核网络参数生效吗？服务器将在 10 秒内安全完成重启，页面将自动发起 25 秒倒计时并在就绪后重连。\n'
-        + '重启期间所有用户的连接都会中断，直到服务器重新启动完成。',
-      icon: '🔄',
-      confirmText: '确定立即重启',
-      isDanger: true
-    });
+    btnRebootServer._confirming = true;
+    let confirmed = false;
+    try {
+      confirmed = await showConfirm({
+        title: '安全重启服务器',
+        text: '确定要立即重启服务器以完成新 BBR 内核网络参数生效吗？服务器将在 10 秒内安全完成重启，页面将自动发起 25 秒倒计时并在就绪后重连。\n'
+          + '重启期间所有用户的连接都会中断，直到服务器重新启动完成。',
+        icon: '🔄',
+        confirmText: '确定立即重启',
+        isDanger: true
+      });
+    } finally {
+      btnRebootServer._confirming = false;
+    }
     if (!confirmed || btnRebootServer.disabled) return;
     btnRebootServer.disabled = true;
     btnRebootServer.textContent = '⏳ 重启指令已发送...';
@@ -3290,20 +3297,27 @@ async function waitForCoreUpgrade() {
 
 async function doUpgrade(target) {
   if (doUpgrade._busy) return;
+  if (doUpgrade._confirming) return;
   const names = { core: 'Hysteria 2 官方核心', portal: '控制面板自身', awg: 'AmneziaWG 引擎' };
   const btns = { core: btnUpdateCore, portal: btnUpdatePortal, awg: btnUpdateAwgEngine };
   if (!Object.prototype.hasOwnProperty.call(names, target)) return;
   const btn = btns[target];
   const custom = target === 'core' && coreVerDisplay?.textContent.includes('+');
   // SCRIPT 是 Python 原始字符串：换行写 \n。写成 \\n 到 JS 里是字面的反斜杠加 n，弹窗上显示「\n」（2026-11-13 修）。
-  const confirmed = await showConfirm({
-    title: '升级 ' + names[target],
-    text: '确定要升级 ' + names[target] + ' 吗？' + (custom ? '\n当前含定制补丁，升级官方核心会替换补丁。' : ''),
-    icon: '⬆️',
-    confirmText: '开始升级',
-    isDanger: custom,
-    isWarn: !custom
-  });
+  doUpgrade._confirming = true;
+  let confirmed = false;
+  try {
+    confirmed = await showConfirm({
+      title: '升级 ' + names[target],
+      text: '确定要升级 ' + names[target] + ' 吗？' + (custom ? '\n当前含定制补丁，升级官方核心会替换补丁。' : ''),
+      icon: '⬆️',
+      confirmText: '开始升级',
+      isDanger: custom,
+      isWarn: !custom
+    });
+  } finally {
+    doUpgrade._confirming = false;
+  }
   if (!confirmed || doUpgrade._busy) return;
   doUpgrade._busy = true;
   let reloading = false;
@@ -3697,16 +3711,18 @@ async function loadProxyServices() {
     proxyTbody.innerHTML = services.map(s => {
       const safeTypeClass = Object.prototype.hasOwnProperty.call(typeLabel, s.type) ? s.type : '';
       const displayType = safeTypeClass ? typeLabel[safeTypeClass] : String(s.type || '');
-      const fullUrl = `${s.type || ''}://${encodeURIComponent(s.username || '')}:${encodeURIComponent(s.password || '')}@${proxyHostPart}:${s.port}`;
+      const safeUser = typeof s.username === 'string' ? s.username : '';
+      const safePass = typeof s.password === 'string' ? s.password : '';
+      const fullUrl = `${s.type || ''}://${encodeURIComponent(safeUser)}:${encodeURIComponent(safePass)}@${proxyHostPart}:${s.port}`;
       return `
       <tr>
         <td><span class="proxy-type ${safeTypeClass}">${obEsc(displayType)}</span></td>
         <td><code style="font-size:12px;font-weight:700;color:var(--accent)">:${obEsc(s.port)}</code></td>
-        <td><code style="font-size:12px">${obEsc(s.username)}</code></td>
-        <td><code style="font-size:12px">${obEsc(s.password)}</code></td>
+        <td><code style="font-size:12px">${obEsc(safeUser)}</code></td>
+        <td><code style="font-size:12px">${obEsc(safePass)}</code></td>
         <td>
           <div style="display:flex;align-items:center;gap:6px">
-            <code style="font-size:11px;background:#f5f8f7;padding:2px 6px;border-radius:4px;word-break:break-all">${obEsc(s.type)}://${obEsc(s.username)}:****@${obEsc(proxyHostPart)}:${obEsc(s.port)}</code>
+            <code style="font-size:11px;background:#f5f8f7;padding:2px 6px;border-radius:4px;word-break:break-all">${obEsc(s.type)}://${obEsc(safeUser)}:****@${obEsc(proxyHostPart)}:${obEsc(s.port)}</code>
             <button class="button" style="padding:2px 8px;font-size:11px;white-space:nowrap" type="button" data-copy-link="${obEsc(fullUrl)}">复制链接</button>
           </div>
         </td>
@@ -3720,13 +3736,20 @@ async function loadProxyServices() {
     proxyTbody.querySelectorAll('[data-proxy-del]').forEach(btn => {
       btn.addEventListener('click', async () => {
         if (btn.disabled) return;
-        const confirmed = await showConfirm({
-          title: '删除代理服务',
-          text: '确定删除该代理服务？',
-          icon: '🗑️',
-          confirmText: '删除',
-          isDanger: true
-        });
+        if (btn.dataset.confirming === '1') return;
+        btn.dataset.confirming = '1';
+        let confirmed = false;
+        try {
+          confirmed = await showConfirm({
+            title: '删除代理服务',
+            text: '确定删除该代理服务？',
+            icon: '🗑️',
+            confirmText: '删除',
+            isDanger: true
+          });
+        } finally {
+          delete btn.dataset.confirming;
+        }
         if (!confirmed || btn.disabled) return;
         btn.disabled = true;
         try {
@@ -3799,8 +3822,8 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
     const userKey = btn.dataset.key;
     if (!uModal || !uModalBody) return;
     
-    uModalTitle.textContent = '用户专属连接: ' + uid;
-    uModalSub.textContent = '正在获取专属配置与独立连接页...';
+    if (uModalTitle) uModalTitle.textContent = '用户专属连接: ' + uid;
+    if (uModalSub) uModalSub.textContent = '正在获取专属配置与独立连接页...';
     uModalBody.innerHTML = '<div style="text-align:center;padding:36px;color:var(--muted)">加载专属数据中...</div>';
     uModal.classList.add('show');
     focusModal(uModalClose);
@@ -3817,12 +3840,13 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
       }
       if (res.ok === false || !json || !json.ok) throw new Error((json && json.error) || ('网络请求异常 (HTTP ' + res.status + ')'));
       
-      uModalSub.textContent = json.note ? ('备注: ' + json.note) : '专属独立配置与下载链接';
+      if (uModalSub) uModalSub.textContent = (typeof json.note === 'string' && json.note) ? ('备注: ' + json.note) : '专属独立配置与下载链接';
       
-      const shareUrl = location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '?k=' + userKey;
+      const encKey = encodeURIComponent(userKey || '');
+      const shareUrl = location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '?k=' + encKey;
       // 与客户分享页一致也给 sing-box 订阅（2026-11-13 加）：接口一直回着 sing_box，旧弹窗只用了
       // Clash 那份，用 sing-box / Hiddify 的客户只能让管理员另开分享页去找。
-      const singSubPath = '/' + token + '/u/' + encodeURIComponent(uid) + '/sing-box.json?k=' + userKey;
+      const singSubPath = '/' + token + '/u/' + encodeURIComponent(uid) + '/sing-box.json?k=' + encKey;
       // 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）：UDP 不通的客户要靠 Reality / VMess
       // 等 TCP 协议兜底，旧弹窗只有 Hy2 一条，管理员只能另开分享页去找。
       const extraLinksHtml = (Array.isArray(json.extra_links) ? json.extra_links : [])
@@ -3894,9 +3918,9 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
             <div>
               <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:4px">Clash / Mihomo 专属订阅链接:</div>
               <div class="input-with-action">
-                <input type="text" id="um-clash-sub" aria-label="Clash 订阅链接" value="${obEsc(location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '/clash.yaml?k=' + userKey)}" readonly style="font-size:11px;height:36px">
+                <input type="text" id="um-clash-sub" aria-label="Clash 订阅链接" value="${obEsc(location.origin + '/' + token + '/u/' + encodeURIComponent(uid) + '/clash.yaml?k=' + encKey)}" readonly style="font-size:11px;height:36px">
                 <button class="button primary" style="padding:0 12px;height:36px;font-size:11px" type="button" data-modal-copy="um-clash-sub">复制订阅</button>
-                <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="${obEsc('/' + token + '/u/' + encodeURIComponent(uid) + '/clash.yaml?k=' + userKey)}" download="clash-${obEsc(uid)}.yaml">下载 ↓</a>
+                <a class="button" style="padding:0 10px;height:36px;font-size:11px" href="${obEsc('/' + token + '/u/' + encodeURIComponent(uid) + '/clash.yaml?k=' + encKey)}" download="clash-${obEsc(uid)}.yaml">下载 ↓</a>
               </div>
               <details style="margin-top:6px">
                 <summary style="font-size:11px;color:var(--muted)">查看/复制配置文本</summary>
@@ -4006,8 +4030,8 @@ async function loadAwgState() {
     if (seq !== loadAwgState._seq) return;
     if (!json || !json.ok) { markStatusUnknown(awgBadge, json && json.error); return; }
 
-    awgCurrentEndpoint = json.endpoint || '';
-    awgCurrentLine = json.line || '3';
+    awgCurrentEndpoint = typeof json.endpoint === 'string' ? json.endpoint : '';
+    awgCurrentLine = (typeof json.line === 'string' && json.line) ? json.line : '3';
     if (awgEndpointInput && !awgEndpointInput.value) awgEndpointInput.value = awgCurrentEndpoint;
     if (awgPeerEndpoint && !awgPeerEndpoint.value) awgPeerEndpoint.value = awgCurrentEndpoint;
     if (awgMetaChip) awgMetaChip.textContent = json.installed ? ('AWG ' + awgCurrentLine + '.x') : '未安装';
@@ -4036,7 +4060,7 @@ async function loadAwgState() {
     if (awgMetaPeers) awgMetaPeers.textContent = '客户端 ' + (json.peer_count || 0) + ' 个';
     if (awgPanel) awgPanel.style.display = 'block';
 
-    renderAwgPeers(json.peers || []);
+    renderAwgPeers(Array.isArray(json.peers) ? json.peers : []);
   } catch (e) { if (seq === loadAwgState._seq) markStatusUnknown(awgBadge); }   // 不弹窗，只在徽章上标出查询失败
 }
 
