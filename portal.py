@@ -12371,7 +12371,10 @@ if __name__ == '__main__':
 
                 # 动态开户 (支持 duration_days, ip_limit, traffic_gb)
                 if sub == 'users/create':
-                    user_id = (params.get('user_id') or ('hy2_' + secrets.token_hex(6))).strip()
+                    raw_uid = params.get('user_id')
+                    if raw_uid is not None and not isinstance(raw_uid, str):
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
+                    user_id = ((raw_uid or '') or ('hy2_' + secrets.token_hex(6))).strip()
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
                     if not user_id_shareable(user_id):
@@ -12391,6 +12394,9 @@ if __name__ == '__main__':
                     if pwd != pwd.strip():
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: password must not start or end with whitespace'})
+                    if len(pwd) > 256:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: password length must be <= 256'})
                     if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: password must not contain control characters'})
@@ -12399,10 +12405,18 @@ if __name__ == '__main__':
                     # 连接被掐断，客户端只看到 "Remote end closed connection"，
                     # 完全看不出是参数问题。这里统一解析并给出 400。
                     try:
-                        days = int(params.get('duration_days', 30))
-                        ip_limit = int(params.get('ip_limit', 0))
-                        traffic_gb = float(params.get('traffic_gb', 0))
-                        expires = int(params.get('expires_at', now_ts + days * 86400))
+                        _raw_days = params.get('duration_days', 30)
+                        _raw_ipl = params.get('ip_limit', 0)
+                        _raw_tgb = params.get('traffic_gb', 0)
+                        _raw_exp = params.get('expires_at')
+                        _raw_lb = params.get('limit_bytes')
+                        _raw_ub = params.get('used_bytes', 0)
+                        if any(isinstance(_v, bool) for _v in (_raw_days, _raw_ipl, _raw_tgb, _raw_exp, _raw_lb, _raw_ub)):
+                            raise ValueError()
+                        days = int(_raw_days)
+                        ip_limit = int(_raw_ipl)
+                        traffic_gb = float(_raw_tgb)
+                        expires = int(_raw_exp) if _raw_exp is not None else int(now_ts + days * 86400)
                     except (ValueError, TypeError, OverflowError):
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: duration_days / ip_limit / traffic_gb / expires_at must be numeric'})
@@ -12681,9 +12695,10 @@ if __name__ == '__main__':
                     try:
                         changes = {}
                         if 'password' in params:
-                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修），且拒绝控制字符。
+                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修），且拒绝控制字符与超长密码。
                             if (not isinstance(params['password'], str) or not params['password'].strip()
                                     or params['password'] != params['password'].strip()
+                                    or len(params['password']) > 256
                                     or any(ord(ch) < 32 or ord(ch) == 127 for ch in params['password'])):
                                 raise ValueError()
                             changes['password'] = params['password']
@@ -12714,6 +12729,7 @@ if __name__ == '__main__':
                     password_changed = False
                     status_disabled = False
                     result = None
+                    previous = None
                     with data_lock:
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
@@ -12728,21 +12744,23 @@ if __name__ == '__main__':
                             password_changed = previous.get('password') != u.get('password')
                             status_disabled = u.get('status') == 'disabled'
                             rotate_user_view_key_on_change(previous, u)
-                            try:
-                                save_data()
-                            except AtomicWriteDurabilityError:
-                                durability_uncertain = True
-                            except OSError:
-                                data['users'][user_id] = previous
-                                conflict = (503, 'User update save failed; disk state may require verification')
-                            if conflict is None:
-                                result = {k: copy.deepcopy(v) for k, v in u.items() if k not in ('password', 'view_nonce')}
-                                # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
-                                result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
-                                result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
+                            result = {k: copy.deepcopy(v) for k, v in u.items() if k not in ('password', 'view_nonce')}
+                            # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
+                            result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
+                            result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
+                    # 落盘与 fsync 放到 data_lock 外执行，避免慢盘 fsync 阻塞全节点并发 /auth 鉴权。
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        durability_uncertain = True
+                    except OSError:
+                        with data_lock:
+                            if isinstance(data.get('users'), dict):
+                                data['users'][user_id] = previous
+                        return self.reply_json(503, {'ok': False, 'error': 'User update save failed; disk state may require verification'})
                     if not durability_uncertain:
                         regenerate_page()
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
@@ -12778,6 +12796,7 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid renewal: extend_days must be 1..36500; add_traffic_gb must be finite and 0..1000000'})
                     conflict = None
                     durability_uncertain = False
+                    previous = None
                     with data_lock:
                         _raw_users = data.get('users')
                         u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
@@ -12827,19 +12846,22 @@ if __name__ == '__main__':
                                 # 到期与否由 expires_at 判定，不依赖 status。
                                 previous = copy.deepcopy(u)
                                 u.update(expires_at=new_expiry, limit_bytes=new_limit)
-                                try:
-                                    save_data()
-                                except AtomicWriteDurabilityError:
-                                    durability_uncertain = True
-                                except OSError:
-                                    data['users'][user_id] = previous
-                                    conflict = (503, 'Renewal save failed; disk state may require verification')
                                 exp_at = u['expires_at']
                                 lim_b = u.get('limit_bytes', 0)
                                 status_now = u.get('status', 'active')
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
+                    # 落盘与 fsync 放到 data_lock 外执行，避免慢盘 fsync 阻塞全节点并发 /auth 鉴权。
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        durability_uncertain = True
+                    except OSError:
+                        with data_lock:
+                            if isinstance(data.get('users'), dict):
+                                data['users'][user_id] = previous
+                        return self.reply_json(503, {'ok': False, 'error': 'Renewal save failed; disk state may require verification'})
                     if not durability_uncertain:
                         regenerate_page()
                     # 续费后立即同步协议客户端：过期用户续费后不必等 5 秒的
@@ -14551,6 +14573,7 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': '未知 WARP 操作'})
 
                 bad_domain = False
+                too_many_rules = False
                 warp_not_installed = False
                 # 文件系统探测放在 data_lock 外执行，避免磁盘抖动时阻塞 /auth 鉴权。
                 warp_installed = warp_backend_installed() if action in ('toggle', 'enable') else True
@@ -14583,6 +14606,8 @@ if __name__ == '__main__':
                         domain = _clean_route_domain(form.get('domain', [''])[0])
                         if not _valid_route_domain(domain):
                             bad_domain = True
+                        elif not any(r['domain'] == domain for r in rules) and len(rules) >= 500:
+                            too_many_rules = True
                         else:
                             rules = [r for r in rules if r['domain'] != domain]
                             rules.append({'domain': domain, 'outbound': 'warp_socks'})
@@ -14594,8 +14619,8 @@ if __name__ == '__main__':
                         rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
                         keep = {r['domain'] for r in rules}
                         rules.extend({'domain': d, 'outbound': 'warp_socks'} for d in DEFAULT_WARP_DOMAINS if d not in keep)
-                    # 域名不合法或未安装 WARP 时直接拒绝、不落盘，锁内也不能先写脏规则。
-                    if not bad_domain and not warp_not_installed and (rules or previous_warp_rules_exists):
+                    # 域名不合法、规则超上限或未安装 WARP 时直接拒绝、不落盘，锁内也不能先写脏规则。
+                    if not bad_domain and not too_many_rules and not warp_not_installed and (rules or previous_warp_rules_exists):
                         data['warp_rules'] = rules
                     new_state = bool(data.get('warp_enabled'))
                     current_rules = [r['domain'] for r in rules if r['outbound'] in ('warp', 'warp_socks')]
@@ -14603,6 +14628,8 @@ if __name__ == '__main__':
                 if bad_domain:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
+                if too_many_rules:
+                    return self.reply_json(400, {'ok': False, 'error': '分流规则数量已达上限（最多 500 条），请先删除不需要的规则'})
                 if warp_not_installed:
                     return self.reply_json(409, {'ok': False, 'error':
                         '本机尚未安装 WARP（wireproxy），请先在「出站分流」里安装 WARP 再开启'})
@@ -16623,6 +16650,8 @@ if __name__ == '__main__':
                     if pwd != pwd.strip() and pwd.strip():
                         return self.reply(400, '密码首尾不能有空白字符'.encode('utf-8'))
                     pwd = pwd.strip() or secrets.token_hex(16)
+                    if len(pwd) > 256:
+                        return self.reply(400, '密码长度不能超过 256 个字符'.encode('utf-8'))
                     if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
                         return self.reply(400, '密码不能包含换行或控制字符'.encode('utf-8'))
                     # 同 REST 通道：非数字或全角数字输入必须回 400，而不是让异常掐断连接。
@@ -18886,6 +18915,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     ok, cleaned, err = validate_outbound(entry)
                     if not ok:
                         return self.reply_json(400, {'ok': False, 'error': err})
+                    too_many_outbounds = False
                     with data_lock:
                         previous_egress = {'custom_outbounds': ('custom_outbounds' in data,
                                                                 copy.deepcopy(data.get('custom_outbounds')))}
@@ -18897,10 +18927,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                              if isinstance(outbound, dict) and outbound.get('name') == cleaned['name']),
                             None)
                         if existing_index is None:
-                            outs.append(cleaned)
+                            if len(outs) >= 64:
+                                too_many_outbounds = True
+                            else:
+                                outs.append(cleaned)
                         else:
                             outs[existing_index] = cleaned
-                        data['custom_outbounds'] = outs
+                        if not too_many_outbounds:
+                            data['custom_outbounds'] = outs
+                    if too_many_outbounds:
+                        return self.reply_json(400, {'ok': False, 'error': '自定义出站数量已达上限（最多 64 个），请先删除不需要的出站'})
                     msg = '出站「%s」已保存' % cleaned['name']
                 else:
                     name = (form.get('name', [''])[0] or '').strip()
@@ -18972,6 +19008,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             rule_error = '域名格式不正确'
                         elif not outbound_target_exists(target, _usable_outs):
                             rule_error = '所选出站不存在，请刷新页面后重新选择已配置的出站'
+                        elif not any(r['domain'] == cleaned for r in rules) and len(rules) >= 500:
+                            rule_error = '分流规则数量已达上限（最多 500 条），请先删除不需要的规则'
                         else:
                             rules = [r for r in rules if r['domain'] != cleaned]
                             rules.append({'domain': cleaned, 'outbound': target})
