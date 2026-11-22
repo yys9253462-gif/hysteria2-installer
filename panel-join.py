@@ -126,6 +126,32 @@ def meta_host(meta_text):
 
 
 def read(path):
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | nofollow)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            if st.st_size > MAX_CONFIG_BYTES:
+                print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
+                return None
+            with os.fdopen(fd, "rb") as f:
+                fd = None
+                raw = f.read(MAX_CONFIG_BYTES + 1)
+            if len(raw) > MAX_CONFIG_BYTES:
+                print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
+                return None
+            return raw.decode("utf-8", errors="replace")
+        except OSError:
+            return None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
     try:
         st = os.lstat(path)
     except OSError:
@@ -447,8 +473,13 @@ def main():
         except urllib.error.HTTPError as e:
             try:
                 detail = e.read(4096).decode("utf-8", errors="replace")[:300]
+            except OSError as read_exc:
+                detail = f"(响应体读取失败: {read_exc})"
             finally:
-                e.close()
+                try:
+                    e.close()
+                except OSError:
+                    pass
             print(f"登记失败 HTTP {e.code}: {detail}", file=sys.stderr)
             return 1
         except Exception as e:
