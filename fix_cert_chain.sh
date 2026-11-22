@@ -31,6 +31,7 @@ while [[ $# -gt 0 ]]; do
         *) echo "未知参数: $1"; exit 2 ;;
     esac
 done
+[[ "$CONFIG" == -* ]] && CONFIG="./$CONFIG"
 
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_cyn=$'\033[36m'; c_rst=$'\033[0m'
 info(){ echo "${c_cyn}[*]${c_rst} $*"; }
@@ -131,7 +132,7 @@ cert_sni () {   # $1=cert
     printf '%s' "$s"
 }
 
-[[ -f "$CONFIG" ]] || { err "找不到配置文件：$CONFIG"; exit 1; }
+[[ ! -L "$CONFIG" && -f "$CONFIG" ]] || { err "找不到有效的常规配置文件（不允许符号链接）：$CONFIG"; exit 1; }
 if [[ "$DRY_RUN" != "1" && "${EUID:-$(id -u)}" -ne 0 ]]; then
     err "需要 root 运行（要改 $CONFIG 并重启服务）；只检查请加 --dry-run。"; exit 1
 fi
@@ -190,12 +191,17 @@ else
         exit 0
     fi
 
-    BK="${CONFIG}.bak.$(date +%Y%m%d%H%M%S).$$"
-    (umask 077 && cp -a "$CONFIG" "$BK" && chmod 600 "$BK") || { rm -f "$BK"; err "备份配置失败，未做任何修改。"; exit 1; }
+    BK="$(umask 077 && mktemp "${CONFIG}.bak.$(date +%Y%m%d%H%M%S).XXXXXX")" || { err "创建备份文件失败，未做任何修改。"; exit 1; }
+    (umask 077 && cp -a -- "$CONFIG" "$BK" && chmod 600 "$BK") || { rm -f -- "$BK"; err "备份配置失败，未做任何修改。"; exit 1; }
     info "已备份原配置：$BK"
 
     set_tls_cert "$CONFIG" "$FULL" || { restore_config_file "$BK" "$CONFIG" || true; err "写入配置失败，已恢复备份。"; exit 1; }
     NEW="$(cert_of "$CONFIG")"
+    if [[ "$NEW" != "$FULL" ]]; then
+        restore_config_file "$BK" "$CONFIG" || true
+        err "写入后回读校验不一致（期望：$FULL，实际：${NEW:-空}），已恢复备份。"
+        exit 1
+    fi
     ok "tls.cert 已更新为：$NEW"
     FINAL_CERT="$FULL"
     CHANGED=1
@@ -238,7 +244,7 @@ if command -v openssl >/dev/null 2>&1; then
                  | grep -E 's:|i:|Verify return code' || true)"
     fi
     echo "$CHAIN" | sed 's/^/    /'
-    if echo "$CHAIN" | grep -q 'Verify return code: 0'; then
+    if echo "$CHAIN" | grep -Eq 'Verify return code: 0([^0-9]|$)'; then
         ok "证书链完整，客户端可正常校验。完成。"
     else
         warn "验证未通过（可能 SNI 不匹配或链仍不完整），请人工复查。"
