@@ -4553,6 +4553,9 @@ def _openssl_sha256_hex(cert_file, timeout=8):
     先用 `openssl x509 -outform DER` 输出到临时文件（带超时），再用
     `openssl dgst -sha256 -binary` 读取（带超时），全链路可控。
     """
+    cert_str = str(cert_file) if isinstance(cert_file, (str, os.PathLike)) else ''
+    if not cert_str or cert_str.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in cert_str):
+        return ''
     tmp = None
     out_fh = None
     try:
@@ -4562,7 +4565,7 @@ def _openssl_sha256_hex(cert_file, timeout=8):
         # 且永不关闭，而本函数在页面刷新路径上被反复调用 —— 句柄耗尽后
         # 门户会开始报 "Too many open files"，整片接口 500。
         out_fh = open(tmp, 'wb')
-        conv = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-outform', 'DER'],
+        conv = subprocess.run(['openssl', 'x509', '-in', cert_str, '-outform', 'DER'],
                               stdout=out_fh, stderr=subprocess.PIPE, timeout=timeout)
         out_fh.close()
         out_fh = None
@@ -4572,7 +4575,10 @@ def _openssl_sha256_hex(cert_file, timeout=8):
                              capture_output=True, timeout=timeout)
         if dig.returncode != 0:
             return ''
-        hexval = (dig.stdout or b'').decode('utf-8', 'replace').split()[0].strip().lower()
+        parts = (dig.stdout or b'').decode('utf-8', 'replace').split()
+        if not parts:
+            return ''
+        hexval = parts[0].strip().lower()
         return hexval if len(hexval) == 64 and all(c in '0123456789abcdef' for c in hexval) else ''
     except Exception as exc:
         _log_ignored('openssl_sha256', exc)
@@ -4606,8 +4612,11 @@ def _config_tls_cert_path(config_path='/etc/hysteria/config.yaml'):
     self-signed server.crt.
     """
     try:
-        text = Path(config_path).read_text(encoding='utf-8')
-    except (OSError, UnicodeDecodeError):
+        cp = Path(config_path)
+        if cp.stat().st_size > 4 * 1024 * 1024:
+            return ''
+        text = cp.read_bytes().decode('utf-8', errors='replace')
+    except OSError:
         return ''
     in_tls = False
     for raw in text.split('\n'):
@@ -4820,24 +4829,34 @@ def _cert_key_candidates(cert_file):
 
 def cert_key_matches(cert_file, key_file):
     """证书与私钥是否成对：比较二者的公钥指纹。"""
+    cert_str = str(cert_file) if isinstance(cert_file, (str, os.PathLike)) else ''
+    key_str = str(key_file) if isinstance(key_file, (str, os.PathLike)) else ''
+    for item in (cert_str, key_str):
+        if not item or item.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in item):
+            return False
     try:
-        pub = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout', '-pubkey'],
+        pub = subprocess.run(['openssl', 'x509', '-in', cert_str, '-noout', '-pubkey'],
                              capture_output=True, timeout=5)
-        if pub.returncode != 0:
+        if pub.returncode != 0 or not (pub.stdout or b'').strip():
             return False
         pub_digest = subprocess.run(['openssl', 'sha256'], input=pub.stdout,
                                     capture_output=True, timeout=5)
-        prv = subprocess.run(['openssl', 'pkey', '-in', str(key_file), '-pubout'],
+        if pub_digest.returncode != 0:
+            return False
+        prv = subprocess.run(['openssl', 'pkey', '-in', key_str, '-pubout'],
                              capture_output=True, timeout=5)
-        if prv.returncode != 0:
+        if prv.returncode != 0 or not (prv.stdout or b'').strip():
             return False
         prv_digest = subprocess.run(['openssl', 'sha256'], input=prv.stdout,
                                     capture_output=True, timeout=5)
+        if prv_digest.returncode != 0:
+            return False
     except Exception:
         return False
-    a = pub_digest.stdout.split()[-1] if pub_digest.stdout.split() else b''
-    b = prv_digest.stdout.split()[-1] if prv_digest.stdout.split() else b''
-    return bool(a) and a == b
+    a = pub_digest.stdout.split()[-1].lower() if pub_digest.stdout.split() else b''
+    b = prv_digest.stdout.split()[-1].lower() if prv_digest.stdout.split() else b''
+    _empty_sha = b'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    return bool(a) and a != _empty_sha and a == b
 
 
 def _find_cert_key(cert_file, cfg_dir):
@@ -4848,8 +4867,12 @@ def _find_cert_key(cert_file, cfg_dir):
     cfg_dir = Path(cfg_dir)
     candidates = []
     try:
-        text = (cfg_dir / 'config.yaml').read_text(encoding='utf-8')
-    except (OSError, UnicodeDecodeError):
+        cfg_file = cfg_dir / 'config.yaml'
+        if cfg_file.stat().st_size <= 4 * 1024 * 1024:
+            text = cfg_file.read_bytes().decode('utf-8', errors='replace')
+        else:
+            text = ''
+    except OSError:
         text = ''
     in_tls = False
     for raw in text.splitlines():
@@ -5027,6 +5050,17 @@ def _cert_summary(root, meta, config_path='/etc/hysteria/config.yaml'):
         return {'ok': False}
 
 
+def _scrub_nonfinite_json(obj):
+    """递归将非有限浮点（NaN/Infinity）替换为 None，确保严格 JSON 序列化不抛 ValueError。"""
+    if isinstance(obj, float):
+        return obj if (obj == obj and obj != float('inf') and obj != float('-inf')) else None
+    if isinstance(obj, dict):
+        return {k: _scrub_nonfinite_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_scrub_nonfinite_json(v) for v in obj]
+    return obj
+
+
 def sync_cert_runtime(root, cert_file, state_path=None):
     """Reload active TLS listeners after the certificate file actually changes.
 
@@ -5039,10 +5073,10 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         return False
     try:
         cert_file = Path(cert_file)
-        if not cert_file.is_file():
+        if not cert_file.is_file() or cert_file.stat().st_size > 4 * 1024 * 1024:
             return False
         raw_cert = cert_file.read_bytes()
-        if not raw_cert:
+        if not raw_cert or len(raw_cert) > 4 * 1024 * 1024:
             return False
         digest = hashlib.sha256(raw_cert).hexdigest()
     except (OSError, TypeError, ValueError):
@@ -5050,9 +5084,10 @@ def sync_cert_runtime(root, cert_file, state_path=None):
     state = {}
     if state_path.exists():
         try:
-            loaded = json.loads(state_path.read_text(encoding='utf-8'))
-            if isinstance(loaded, dict):
-                state = loaded
+            if not state_path.is_symlink() and state_path.is_file() and state_path.lstat().st_size <= 1024 * 1024:
+                loaded = json.loads(state_path.read_bytes().decode('utf-8', errors='replace'))
+                if isinstance(loaded, dict):
+                    state = loaded
         except (OSError, ValueError):
             state = {}
     previous = state.get('loaded_cert_sha256')
@@ -5079,10 +5114,7 @@ def sync_cert_runtime(root, cert_file, state_path=None):
         return False
     # Record the bytes confirmed by the successful reload attempt. If no service
     # was active, this establishes the baseline for the next certificate update.
-    clean_state = {
-        k: v for k, v in state.items()
-        if not (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf')))
-    }
+    clean_state = _scrub_nonfinite_json(state)
     clean_state['loaded_cert_sha256'] = digest
     try:
         atomic_write_private(
@@ -5109,12 +5141,12 @@ def record_cert_heal(root, state, before, after):
         previous = {}
         if state_path.exists():
             try:
-                loaded = json.loads(state_path.read_text(encoding='utf-8'))
+                if not state_path.is_symlink() and state_path.is_file() and state_path.lstat().st_size <= 1024 * 1024:
+                    loaded = json.loads(state_path.read_bytes().decode('utf-8', errors='replace'))
+                else:
+                    loaded = None
                 if isinstance(loaded, dict):
-                    previous = {
-                        k: v for k, v in loaded.items()
-                        if not (isinstance(v, float) and (v != v or v == float('inf') or v == float('-inf')))
-                    }
+                    previous = _scrub_nonfinite_json(loaded)
                 raw_count = previous.get('heal_count')
                 if isinstance(raw_count, bool):
                     prev_count = 0
@@ -5122,7 +5154,8 @@ def record_cert_heal(root, state, before, after):
                     prev_count = raw_count
                 elif isinstance(raw_count, float) and raw_count.is_integer() and raw_count >= 0:
                     prev_count = int(raw_count)
-                elif isinstance(raw_count, str) and raw_count.strip().isascii() and raw_count.strip().isdigit():
+                elif (isinstance(raw_count, str) and raw_count.strip().isascii()
+                      and raw_count.strip().isdigit() and len(raw_count.strip()) <= 16):
                     prev_count = int(raw_count.strip())
                 else:
                     prev_count = 0
@@ -9011,7 +9044,9 @@ def selfheal(meta_path, config_path='/etc/hysteria/config.yaml'):
     if not meta_file.is_file():
         return False
     try:
-        m = json.loads(meta_file.read_text(encoding='utf-8'))
+        if meta_file.stat().st_size > 4 * 1024 * 1024:
+            return False
+        m = json.loads(meta_file.read_bytes().decode('utf-8', errors='replace'))
     except (OSError, ValueError):
         return False
     # 合法 JSON 但不是对象（[] / "x" / null）时同样当作「读不到」（2026-11-03 修）：
