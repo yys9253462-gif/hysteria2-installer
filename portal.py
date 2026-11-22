@@ -5160,7 +5160,9 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
 
     config_has_acme = False
     try:
-        config_has_acme = bool(re.search(r'^acme:', Path(config_path).read_text(encoding='utf-8'), re.M))
+        cfg_p = Path(config_path)
+        if cfg_p.is_file() and cfg_p.stat().st_size <= 4 * 1024 * 1024:
+            config_has_acme = bool(re.search(r'^acme:', cfg_p.read_text(encoding='utf-8'), re.M))
     except (OSError, UnicodeDecodeError):
         pass
 
@@ -5193,21 +5195,21 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     # 一张证书常覆盖多个域名，直接取第一个非通配 SAN 会在换证后把 SNI 悄悄
     # 换成另一个域名 —— 已发出的订阅全部连不上。install.sh 的 sync_cert_meta
     # 已经是这个优先级，两处必须一致。
-    raw_sn = m.get('server_name')
-    clean_meta_sn = raw_sn.strip() if isinstance(raw_sn, str) else ''
+    clean_meta_sn = _clean_host_scalar(m.get('server_name'))
     current_sn = clean_meta_sn.lower()
-    san_lower = [str(x).strip().lower() for x in (sans or [])]
+    san_list = [x.strip() for x in (sans or []) if isinstance(x, str) and x.strip()]
+    san_lower = [x.lower() for x in san_list]
     candidate = ''
     if current_sn and certificate_covers_domain(current_sn, san_lower, str(cn or '')):
         candidate = clean_meta_sn
     if not candidate:
-        for san in sans or []:
+        for san in san_list:
             if san.startswith('*.'):
                 continue
             if _is_dns_name(san):
                 candidate = san
                 break
-    if not candidate and _is_dns_name(cn):
+    if not candidate and isinstance(cn, str) and _is_dns_name(cn):
         candidate = cn
 
     if self_signed:
@@ -5219,8 +5221,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         new_insecure = False
         new_pin = ''
 
-    raw_pub_ip = m.get('public_ip')
-    clean_pub_ip = raw_pub_ip.strip() if isinstance(raw_pub_ip, str) else ''
+    clean_pub_ip = _clean_host_scalar(m.get('public_ip'))
     new_sn = candidate or clean_meta_sn or clean_pub_ip or 'localhost'
 
     changed = False
@@ -5238,7 +5239,7 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
         changed = True
 
     if changed:
-        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, allow_nan=False).encode('utf-8'))
         print(f"[portal] 证书信任模型已自愈: cert_type={new_type} "
               f"is_insecure={new_insecure} server_name={new_sn} "
               f"pin={'<set>' if new_pin else '<empty>'} (证书={cert_file})",
@@ -5274,6 +5275,8 @@ def drop_meter_totals(data, user_id):
     之前 —— 用户已从内存删除、磁盘没保存、访问也没撤销，重启后「已删用户」
     原地复活并继续能连。注销必须优先完成，计量清理只是附带动作。
     """
+    if not isinstance(data, dict) or not isinstance(user_id, str) or not user_id:
+        return False
     meter = data.get('usage_meter')
     if not isinstance(meter, dict):
         return False
@@ -5295,6 +5298,8 @@ def drop_meter_totals(data, user_id):
 
 def restore_meter_user(data, user_id):
     """Allow a newly created account to start a fresh accounting lifecycle."""
+    if not isinstance(data, dict) or not isinstance(user_id, str) or not user_id:
+        return
     meter = data.get('usage_meter')
     if not isinstance(meter, dict):
         return
@@ -5305,6 +5310,8 @@ def restore_meter_user(data, user_id):
 
 def reconcile_meter_usage(data, user_id, requested):
     """Under data_lock, set an absolute quota value without altering measured counters."""
+    if not isinstance(data, dict) or not isinstance(user_id, str) or not user_id:
+        raise ValueError('invalid meter target')
     meter = data.get('usage_meter')
     if meter is None and 'usage_meter' not in data:
         meter = {}
@@ -5351,11 +5358,13 @@ def user_table(data):
 
 def legacy_used_bytes(data, uid):
     """计量模块缺失时的旧用量回退；记录损坏时给 0，不能让接口 500。"""
+    if not isinstance(uid, str) or not uid:
+        return 0
     user = user_table(data).get(uid)
     if not isinstance(user, dict):
         return 0
     value = user.get('used_bytes', 0)
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
 
 TRAFFIC_SUSPEND_UNIT_RE = re.compile(r'^[a-z0-9][a-z0-9@._-]{0,127}$')
@@ -8447,7 +8456,7 @@ def sync_pin(m, root, meta_path):
                 atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
     elif m.get('pin_sha256'):
         m['pin_sha256'] = ''
-        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, allow_nan=False).encode('utf-8'))
 
 
 def prepare(meta_path, port, node_api_key=None):
@@ -8483,7 +8492,9 @@ def prepare(meta_path, port, node_api_key=None):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                             capture_output=True, timeout=20)
-        qr_svg = qr.stdout if (qr.returncode == 0 and b'<svg' in qr.stdout) else b''
+        low_qr = qr.stdout.lower() if qr.returncode == 0 and qr.stdout else b''
+        qr_svg = (qr.stdout if (b'<svg' in low_qr and b'<script' not in low_qr
+                                and b'<foreignobject' not in low_qr) else b'')
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
@@ -8494,7 +8505,7 @@ def prepare(meta_path, port, node_api_key=None):
     sub_port, sub_port_src = resolve_subscription_port(m)
     if m.get('subscription_port') != sub_port:
         m['subscription_port'] = sub_port
-        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, indent=2).encode('utf-8'))
+        atomic_write_private(Path(meta_path), json.dumps(m, ensure_ascii=False, indent=2, allow_nan=False).encode('utf-8'))
         print(f'[portal] 订阅端口已自愈为 {sub_port}（来源: {sub_port_src}）', file=sys.stderr)
     base = f"https://{_host_for_url(host)}:{sub_port}/{token}/"
     subscription = f"https://{user}:{password}@{_host_for_url(host)}:{sub_port}/{token}/clash.yaml"
@@ -8525,7 +8536,7 @@ def prepare(meta_path, port, node_api_key=None):
         # 用 atomic_write_private：write_text 先按 umask 创建再 chmod，
         # 中间有一段文件是 0644 的窗口，里面装着全部用户密码与 api_key；
         # chmod 失败时更是永久 0644（2026-10-29 修）。
-        atomic_write_private(path, json.dumps(value, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(path, json.dumps(value, ensure_ascii=False, allow_nan=False).encode('utf-8'))
 
 
 def qr_svg_for(uri, timeout=20):
@@ -8917,10 +8928,11 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     # 老节点上的机主账号带着 2036 年的到期时间，adopt 时顺手改成新值。
     if isinstance(master, dict) and master.get('expires_at') == LEGACY_MASTER_EXPIRES_AT:
         master['expires_at'] = MASTER_EXPIRES_AT
-    # auth_password 缺失时不要崩（旧备份 / 手写 meta 可能没有这个键）：
-    # 保留旧的主密码，比让整个 adopt 失败要好。
-    if isinstance(m.get('auth_password'), str) and m['auth_password']:
-        master['password'] = m['auth_password']
+    # auth_password 缺失、纯空白或含控制字符时保留旧主密码，避免把损坏凭据覆盖进机主账号。
+    raw_auth_pw = m.get('auth_password')
+    if (isinstance(raw_auth_pw, str) and raw_auth_pw.strip()
+            and not any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_auth_pw)):
+        master['password'] = raw_auth_pw
     # 门户登录密码（= Hy2 主密码）变化后，必须让旧会话失效：
     # 会话 Cookie 只用 session_secret 签名，而它此前从不轮换，
     # 改完密码后旧浏览器还能继续用 30 天（2026-10-30 修）。
@@ -8933,7 +8945,9 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     # 改为推进会话纪元而不是换 session_secret —— 后者同时是分享链接 k 的密钥。
     if data.get('auth_hash') != _new_hash or _rebuilt:
         data['auth_hash'] = _new_hash
-        if not isinstance(data.get('session_secret'), str) or not data['session_secret']:
+        raw_ss = data.get('session_secret')
+        if (not isinstance(raw_ss, str) or not raw_ss.strip()
+                or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_ss)):
             data['session_secret'] = secrets.token_hex(32)
         epoch = data.get('session_epoch', 0)
         epoch = epoch if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0 else 0
@@ -8941,8 +8955,8 @@ def _adopt_locked(meta_path, port, node_api_key=None):
     if node_api_key:
         data['api_key'] = node_api_key
         access['api_key'] = node_api_key
-        atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
-    atomic_write_private(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(access_path, json.dumps(access, ensure_ascii=False, allow_nan=False).encode('utf-8'))
+    atomic_write_private(path, json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     # _adopt_locked already holds portal_state_file_lock; refresh serializes its
     # own phase, so leave the shared lock before invoking it.
     return
@@ -9033,7 +9047,11 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
                   VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
     current = {}
     try:
+        if path.stat().st_size > 4 * 1024 * 1024:
+            raise ValueError('xray.json too large')
         config = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(config, dict):
+            raise ValueError('xray.json top level not dict')
         for tag in MANAGED_INBOUND_TAGS:
             index, inbound = managed_inbound_index(config, tag)
             if index >= 0 and isinstance(inbound, dict):
@@ -9090,10 +9108,10 @@ def repair_missing_api_key(portal_path, data):
             if not isinstance(access, dict):
                 raise ValueError('portal-access.json 顶层不是 JSON 对象')
             access['api_key'] = new_key
-            atomic_write_private(access_path, json.dumps(access, ensure_ascii=False).encode('utf-8'))
+            atomic_write_private(access_path, json.dumps(access, ensure_ascii=False, allow_nan=False).encode('utf-8'))
         data['api_key'] = new_key
         phase = 'portal'
-        atomic_write_private(portal_path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        atomic_write_private(portal_path, json.dumps(data, ensure_ascii=False, allow_nan=False).encode('utf-8'))
     except AtomicWriteDurabilityError as exc:
         if phase == 'portal':
             data['api_key'] = new_key
