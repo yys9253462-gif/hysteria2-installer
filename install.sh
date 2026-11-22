@@ -2294,7 +2294,7 @@ generate_self_signed_cert() {
     KEY_FILE="${HY2_CERT_DIR}/server.key"
     IS_INSECURE="true"
     local tmp_key="" tmp_cert="" _sn_re=""
-    _sn_re="$(printf '%s' "$SERVER_NAME" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+    _sn_re="$(printf '%s' "$SERVER_NAME" | sed 's/[.[\*^$()+?{}|]/\\&/g')"
     trap 'trap - RETURN; [[ -n "${tmp_key:-}" ]] && rm -f -- "$tmp_key"; [[ -n "${tmp_cert:-}" ]] && rm -f -- "$tmp_cert"' RETURN
 
     if [[ -L "$HY2_CERT_DIR" || -L "$CERT_FILE" || -L "$KEY_FILE" ]]; then
