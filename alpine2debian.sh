@@ -103,8 +103,8 @@ usage() { awk 'NR == 1 { next } /^#/ { print; next } { exit }' "$0"; exit 0; }
 # 先解开符号链接（/dev/disk/by-id/... 指向的是整块磁盘时也要认）。用法：is_whole_disk <设备>
 is_whole_disk() {
     [ -n "${1:-}" ] || return 1
-    _wd_resolved="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
-    _wd_name="$(basename "$_wd_resolved" 2>/dev/null || printf '')"
+    _wd_resolved="$(readlink -f -- "$1" 2>/dev/null || printf '%s' "$1")"
+    _wd_name="$(basename -- "$_wd_resolved" 2>/dev/null || printf '')"
     case "$_wd_name" in
         ''|.|..|*/*) return 1 ;;
     esac
@@ -241,7 +241,7 @@ for _url_val in "$MIRROR" "$SECURITY_MIRROR"; do
         *) die "镜像地址必须以 http:// 或 https:// 开头（当前：$_url_val）" ;;
     esac
     case "$_url_val" in
-        *[!A-Za-z0-9._~:/?#%+-]*)
+        *[!A-Za-z0-9._~:/%+-]*)
             die "镜像地址含非法字符（当前：$_url_val）" ;;
     esac
 done
@@ -616,7 +616,10 @@ else
             _maj="${1:-}"; _min="${2:-}"
         fi
 
-        if [ -n "$_maj" ] && [ -n "$_min" ]; then
+        case "$_maj:$_min" in
+            ''|*:*[!0-9]*|*[!0-9]*:*|:*|*:) _maj=""; _min="" ;;
+        esac
+        if [ -n "$_maj" ] && [ -n "$_min" ] && [ "${#_maj}" -le 5 ] && [ "${#_min}" -le 5 ]; then
             # 先删掉可能存在的坏节点，再重建
             [ -e "$_node" ] && rm -f "$_node" 2>/dev/null || true
             if mknod "$_node" b "$_maj" "$_min" 2>/dev/null; then
@@ -751,6 +754,7 @@ if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s 写入 %s/etc/resolv.conf = %s\n' \
         "$c_ylw" "$c_rst" "$MOUNT_DIR" "$(printf '%s' "$RESOLV_BODY" | tr '\n' ' ')"
 else
+    [ ! -L "$MOUNT_DIR/etc/resolv.conf" ] || rm -f "$MOUNT_DIR/etc/resolv.conf"
     printf '%s\n' "$RESOLV_BODY" > "$MOUNT_DIR/etc/resolv.conf"
 fi
 
@@ -863,6 +867,7 @@ NET_EOF
 if [ "$DRY_RUN" = "1" ]; then
     printf '    %s[dry-run]%s /etc/network/interfaces：\n%s\n' "$c_ylw" "$c_rst" "$NET_CFG"
 else
+    [ ! -L "$MOUNT_DIR/etc/network/interfaces" ] || rm -f "$MOUNT_DIR/etc/network/interfaces"
     printf '%s\n' "$NET_CFG" > "$MOUNT_DIR/etc/network/interfaces"
     ok "网络配置已写入：$(printf '%s' "$NET_STANZA" | head -n1)"
 fi
@@ -870,9 +875,13 @@ fi
 if [ "$SWAP_MB" -gt 0 ]; then
     info "创建 ${SWAP_MB}MB swap 文件"
     if [ "$DRY_RUN" != "1" ]; then
-        dd if=/dev/zero of="$MOUNT_DIR/swapfile" bs=1M count="$SWAP_MB" status=none
-        chmod 600 "$MOUNT_DIR/swapfile"
-        chroot "$MOUNT_DIR" mkswap /swapfile >/dev/null
+        [ ! -L "$MOUNT_DIR/swapfile" ] || rm -f "$MOUNT_DIR/swapfile"
+        if ! dd if=/dev/zero of="$MOUNT_DIR/swapfile" bs=1M count="$SWAP_MB" status=none \
+                || ! chmod 600 "$MOUNT_DIR/swapfile" \
+                || ! chroot "$MOUNT_DIR" mkswap /swapfile >/dev/null; then
+            rm -f "$MOUNT_DIR/swapfile"
+            die "创建 ${SWAP_MB}MB swap 文件失败（可能磁盘空间不足），请调小 SWAP_MB 后重试"
+        fi
         printf '/swapfile none swap sw 0 0\n' >> "$MOUNT_DIR/etc/fstab"
         ok "swap 已创建并写入 fstab"
     fi
@@ -892,6 +901,7 @@ else
         die "中止，磁盘已改动但未装引导 —— 请勿重启，先排查"
     }
     chroot "$MOUNT_DIR" update-grub >/dev/null 2>&1 || chroot "$MOUNT_DIR" grub-mkconfig -o /boot/grub/grub.cfg
+    [ -s "$MOUNT_DIR/boot/grub/grub.cfg" ] || die "GRUB 配置文件生成失败（/boot/grub/grub.cfg 为空），请勿重启"
     ok "GRUB 已安装到 $DISK"
 fi
 
