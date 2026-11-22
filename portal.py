@@ -8854,8 +8854,13 @@ def prepare(meta_path, port, node_api_key=None):
             if (not node_api_key.isascii()
                     or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in node_api_key)):
                 raise ValueError('node_api_key 不能包含空白、控制字符或非 ASCII 字符')
-    root = Path(meta_path).parent
-    m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    meta_file = Path(meta_path)
+    if meta_file.is_symlink():
+        raise OSError('client_meta.json 不允许为符号链接')
+    if meta_file.lstat().st_size > 1024 * 1024:
+        raise ValueError('client_meta.json 体积超过 1 MiB 上限')
+    root = meta_file.parent
+    m = json.loads(meta_file.read_bytes().decode('utf-8', errors='replace'))
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     master_pw = m.get('auth_password')
@@ -9227,9 +9232,14 @@ def ensure_portal_access(root, meta, data):
     """
     root = Path(root)
     path = root / 'portal-access.json'
+    if path.is_symlink():
+        raise OSError('portal-access.json 不允许为符号链接')
     if path.exists():
         try:
-            access = json.loads(path.read_text(encoding='utf-8'))
+            if path.lstat().st_size <= 1024 * 1024:
+                access = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
+            else:
+                access = None
             uname = access.get('username') if isinstance(access, dict) else None
             upwd = access.get('password') if isinstance(access, dict) else None
             if (isinstance(uname, str) and uname and ':' not in uname
@@ -9264,9 +9274,14 @@ def restore_egress_into_config(root, config_path=None):
     """
     root = Path(root)
     cfg = Path(config_path) if config_path else root / 'config.yaml'
+    pjson = root / 'portal.json'
     try:
-        data = json.loads((root / 'portal.json').read_text(encoding='utf-8'))
-        original = cfg.read_text(encoding='utf-8')
+        if pjson.is_symlink() or cfg.is_symlink():
+            return False
+        if pjson.lstat().st_size > 8 * 1024 * 1024 or cfg.lstat().st_size > 4 * 1024 * 1024:
+            return False
+        data = json.loads(pjson.read_bytes().decode('utf-8', errors='replace'))
+        original = cfg.read_bytes().decode('utf-8', errors='replace')
     except (OSError, ValueError):
         return False
     if not isinstance(data, dict):
@@ -9317,12 +9332,21 @@ def _adopt_locked(meta_path, port, node_api_key=None):
         if (not isinstance(node_api_key, str) or not node_api_key.isascii()
                 or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in node_api_key)):
             raise ValueError('node_api_key 必须是不含空白和控制字符的纯 ASCII 字符串')
-    root = Path(meta_path).parent
-    m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+    meta_file = Path(meta_path)
+    if meta_file.is_symlink():
+        raise OSError('client_meta.json 不允许为符号链接')
+    if meta_file.lstat().st_size > 1024 * 1024:
+        raise ValueError('client_meta.json 体积超过 1 MiB 上限')
+    root = meta_file.parent
+    m = json.loads(meta_file.read_bytes().decode('utf-8', errors='replace'))
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
     path = root / 'portal.json'
-    data = json.loads(path.read_text(encoding='utf-8'))
+    if path.is_symlink():
+        raise OSError('portal.json 不允许为符号链接')
+    if path.lstat().st_size > 8 * 1024 * 1024:
+        raise ValueError('portal.json 体积超过 8 MiB 上限')
+    data = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
     if not isinstance(data, dict):
         raise ValueError('portal.json 顶层必须是 JSON 对象')
     access_path = root / 'portal-access.json'
@@ -9461,9 +9485,11 @@ def recover_xray_service_on_start(data, data_lock, apply_access, suspended,
                   VLESSENC_INBOUND_TAG: vlessenc_clients(data)}
     current = {}
     try:
-        if path.stat().st_size > 4 * 1024 * 1024:
+        if path.is_symlink():
+            raise OSError('xray.json 不允许为符号链接')
+        if path.lstat().st_size > 4 * 1024 * 1024:
             raise ValueError('xray.json too large')
-        config = json.loads(path.read_text(encoding='utf-8'))
+        config = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
         if not isinstance(config, dict):
             raise ValueError('xray.json top level not dict')
         for tag in MANAGED_INBOUND_TAGS:
@@ -9511,6 +9537,12 @@ def repair_missing_api_key(portal_path, data):
     """Keep portal.json and portal-access.json on one API key after repair."""
     portal_path = Path(portal_path)
     access_path = portal_path.parent / 'portal-access.json'
+    if portal_path.is_symlink() or access_path.is_symlink():
+        raise OSError('portal.json 或 portal-access.json 不允许为符号链接')
+    if portal_path.lstat().st_size > 8 * 1024 * 1024:
+        raise ValueError('portal.json 体积超过 8 MiB 上限')
+    if access_path.exists() and access_path.lstat().st_size > 1024 * 1024:
+        raise ValueError('portal-access.json 体积超过 1 MiB 上限')
     old_portal = portal_path.read_bytes()
     old_access = access_path.read_bytes() if access_path.exists() else None
     old_key = data.get('api_key')
@@ -9518,7 +9550,7 @@ def repair_missing_api_key(portal_path, data):
     phase = 'access'
     try:
         if old_access is not None:
-            access = json.loads(old_access.decode('utf-8'))
+            access = json.loads(old_access.decode('utf-8', errors='replace'))
             if not isinstance(access, dict):
                 raise ValueError('portal-access.json 顶层不是 JSON 对象')
             access['api_key'] = new_key
@@ -9587,8 +9619,12 @@ def persist_interrupted_core_job(portal_path, data):
 
 def serve(path):
     portal_path = Path(path)
+    if portal_path.is_symlink():
+        raise OSError('portal.json 不允许为符号链接')
+    if portal_path.lstat().st_size > 8 * 1024 * 1024:
+        raise ValueError('portal.json 体积超过 8 MiB 上限')
     _loaded_bytes = portal_path.read_bytes()
-    data = json.loads(_loaded_bytes.decode('utf-8'))
+    data = json.loads(_loaded_bytes.decode('utf-8', errors='replace'))
     # 本进程最后一次读到 / 写出的 portal.json 摘要，save_data 用它识别 CLI 带外写入。
     disk_state = {'digest': hashlib.sha256(_loaded_bytes).digest()}
     # 必需字段缺失时给出明确中文错误再退出。旧行为是在后面的 data['port']
@@ -10196,7 +10232,10 @@ def serve(path):
         while True:
             try:
                 try:
-                    _raw_cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.is_file() else {}
+                    if cfg_path.is_symlink() or not cfg_path.is_file() or cfg_path.lstat().st_size > 1024 * 1024:
+                        _raw_cfg = {}
+                    else:
+                        _raw_cfg = json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
                 except (OSError, ValueError):
                     _raw_cfg = {}
                 rcfg = _raw_cfg.get('reality') if isinstance(_raw_cfg, dict) else {}
@@ -10453,7 +10492,10 @@ def serve(path):
                     # 但仍然要确认写出来的是合法 JSON：否则恢复整机时 gost 起不来，
                     # 而此前每次操作都报告成功（2026-10-29 修）。
                     try:
-                        json.loads((portal_path.parent / 'gost.yml').read_text(encoding='utf-8'))
+                        _gost_yml = portal_path.parent / 'gost.yml'
+                        if _gost_yml.is_symlink() or _gost_yml.lstat().st_size > 2 * 1024 * 1024:
+                            return False
+                        json.loads(_gost_yml.read_bytes().decode('utf-8', errors='replace'))
                     except (OSError, ValueError):
                         return False
                     return True
@@ -10667,10 +10709,17 @@ def serve(path):
         unit_path = Path('/etc/systemd/system/gost.service')
         # 不是本工具的 gost 一律不碰（2026-11-04 修）：旧实现在新增 / 删除代理时把机主自己
         # 的 gost.service 整份改写成指向 /etc/hysteria/gost.yml，并重启，原有服务全部停掉。
+        if unit_path.is_symlink():
+            return
         if unit_path.exists() and not gost_owned():
             return
         try:
-            current = unit_path.read_text(encoding='utf-8') if unit_path.exists() else ''
+            if unit_path.exists():
+                if unit_path.lstat().st_size > 1024 * 1024:
+                    return
+                current = unit_path.read_bytes().decode('utf-8', errors='replace')
+            else:
+                current = ''
         except (OSError, UnicodeDecodeError):
             return
         needed = ('ExecReload=/bin/kill -HUP $MAINPID',
@@ -10687,7 +10736,7 @@ def serve(path):
             if all(s in current for s in needed):
                 return                               # 只是补回脚本，单元不用动
             tmp_unit = unit_path.with_name(unit_path.name + '.tmp.' + os.urandom(4).hex())
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
             if hasattr(os, 'O_NOFOLLOW'):
                 flags |= os.O_NOFOLLOW
             try:
