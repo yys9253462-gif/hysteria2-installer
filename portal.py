@@ -10461,7 +10461,10 @@ def serve(path):
         "服务器上已装过旧版 gost、unit 却没有自检" 的情况。返回是否写成功。
         """
         tmp_path = None
+        fd = None
         try:
+            if GOST_SELFCHECK_PATH.is_symlink():
+                return False
             GOST_SELFCHECK_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = GOST_SELFCHECK_PATH.with_name(
                 GOST_SELFCHECK_PATH.name + '.tmp.' + os.urandom(4).hex())
@@ -10471,10 +10474,17 @@ def serve(path):
             fd = os.open(str(tmp_path), flags, 0o755)
             try:
                 with os.fdopen(fd, 'wb') as fh:
+                    fd = None
                     fh.write(GOST_SELFCHECK_SCRIPT.encode('utf-8'))
                     fh.flush()
                     os.fsync(fh.fileno())
             except BaseException:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    fd = None
                 try:
                     tmp_path.unlink(missing_ok=True)
                 except OSError:
@@ -10482,9 +10492,23 @@ def serve(path):
                 raise
             os.chmod(str(tmp_path), 0o755)
             os.replace(str(tmp_path), str(GOST_SELFCHECK_PATH))
+            if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+                try:
+                    _dfd = os.open(str(GOST_SELFCHECK_PATH.parent), os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(_dfd)
+                    finally:
+                        os.close(_dfd)
+                except OSError:
+                    pass
             tmp_path = None
             return True
         except OSError as exc:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             if tmp_path is not None:
                 try:
                     tmp_path.unlink(missing_ok=True)
@@ -10496,10 +10520,14 @@ def serve(path):
     def gost_owned():
         """gost 是本工具装的：有所有权标记，且单元指向本工具的配置（与一键安装同一判据）。"""
         unit = Path('/etc/systemd/system/gost.service')
+        marker = Path('/etc/hysteria/.hy2-gost-owned')
         try:
-            return (Path('/etc/hysteria/.hy2-gost-owned').is_file() and unit.is_file()
-                    and 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
-                    in unit.read_text(encoding='utf-8'))
+            if marker.is_symlink() or not marker.is_file() or unit.is_symlink() or not unit.is_file():
+                return False
+            if unit.lstat().st_size > 1024 * 1024:
+                return False
+            return ('ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s'
+                    in unit.read_bytes().decode('utf-8', errors='replace'))
         except (OSError, UnicodeDecodeError):
             return False
 
@@ -10705,8 +10733,10 @@ if __name__ == '__main__':
 
     def awg_read_json(path, default):
         try:
-            if path.exists():
-                return json.loads(path.read_text(encoding='utf-8'))
+            p = Path(path)
+            if p.is_symlink() or not p.is_file() or p.lstat().st_size > 2 * 1024 * 1024:
+                return default
+            return json.loads(p.read_bytes().decode('utf-8', errors='replace'))
         except Exception as exc:
             _log_ignored('read_json', exc)
         return default
@@ -10717,7 +10747,8 @@ if __name__ == '__main__':
     def awg_active():
         try:
             out = subprocess.run(['systemctl', 'is-active', AWG_SVC_NAME],
-                                 capture_output=True, text=True, timeout=3).stdout.strip()
+                                 capture_output=True, text=True,
+                                 encoding='utf-8', errors='replace', timeout=3).stdout.strip()
             return out == 'active'
         except Exception:
             return False
@@ -10780,7 +10811,10 @@ if __name__ == '__main__':
 
     def _local_blob_sha(path):
         try:
-            return _git_blob_sha(Path(path).read_bytes())
+            p = Path(path)
+            if p.is_symlink() or not p.is_file() or p.lstat().st_size > 8 * 1024 * 1024:
+                return None
+            return _git_blob_sha(p.read_bytes())
         except Exception:
             return None
 
@@ -10830,7 +10864,10 @@ if __name__ == '__main__':
         比对取回内容。旧实现直接取 `?ref=main` 且只 grep 一个字符串标记，
         main 被推入恶意提交就会把 hy2-awgctl 刷成攻击者版本并以 root 执行。
         """
-        if not force and Path(AWG_CTL).exists():
+        target_path = Path(AWG_CTL)
+        if target_path.is_symlink():
+            return False
+        if not force and target_path.exists():
             return True
         try:
             ref = resolve_update_ref('main')
@@ -10842,13 +10879,12 @@ if __name__ == '__main__':
             if content is None:
                 return False
             # 内容一致就直接返回，避免无谓改写
-            if force and Path(AWG_CTL).exists():
+            if force and target_path.exists() and not target_path.is_symlink():
                 try:
-                    if Path(AWG_CTL).read_bytes() == content:
+                    if target_path.lstat().st_size <= 4 * 1024 * 1024 and target_path.read_bytes() == content:
                         return True
                 except Exception:
                     pass
-            target_path = Path(AWG_CTL)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(
                 prefix='.hy2-awgctl-', suffix='.sh.tmp', dir=str(target_path.parent))
@@ -10861,6 +10897,15 @@ if __name__ == '__main__':
                     os.fsync(fh.fileno())
                 os.chmod(tmp_name, 0o755)
                 os.replace(tmp_name, str(target_path))
+                if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+                    try:
+                        _dfd = os.open(str(target_path.parent), os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(_dfd)
+                        finally:
+                            os.close(_dfd)
+                    except OSError:
+                        pass
                 replaced = True
             finally:
                 if fd is not None:
@@ -10883,9 +10928,14 @@ if __name__ == '__main__':
         所有调用都用同一把锁串行化：awgctl 的 peer 增删与协议线切换都是
         读-改-写配置，并发执行会丢客户端或撞地址。
         """
+        if Path(AWG_CTL).is_symlink():
+            return 1, '', 'AWG 控制脚本路径不得为符号链接'
+        if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                or timeout != timeout or timeout in (float('inf'), float('-inf')) or timeout <= 0):
+            timeout = 420
         with awg_operation_lock:
-            proc = subprocess.run([AWG_CTL] + args, capture_output=True, text=True,
-                                  timeout=timeout)
+            proc = subprocess.run([AWG_CTL] + list(args), capture_output=True, text=True,
+                                  encoding='utf-8', errors='replace', timeout=timeout)
         return proc.returncode, proc.stdout, proc.stderr
 
     def awg_err_tail(rc, out, err, limit=700):
@@ -10930,7 +10980,7 @@ if __name__ == '__main__':
             _port_val = _raw_port
         elif isinstance(_raw_port, str):
             _ps = _raw_port.strip()
-            if _ps.isascii() and _ps.isdigit() and not _ps.startswith('0') and 1 <= int(_ps) <= 65535:
+            if _ps.isascii() and _ps.isdigit() and len(_ps) <= 5 and not _ps.startswith('0') and 1 <= int(_ps) <= 65535:
                 _port_val = int(_ps)
         clean_peers = []
         for p in peers_raw:
