@@ -670,11 +670,12 @@ function panelVisible(paneId, subId) {
 
 // 顶层标签：默认打开组内第一个子页；也支持 #proxies/awg 这种直达写法。
 function switchTab(tabId, subId) {
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  if (typeof tabId !== 'string' || !/^[a-z0-9_-]+$/i.test(tabId)) return;
   const btn = document.querySelector('[data-tab="' + tabId + '"]');
   const pane = document.getElementById('pane-' + tabId);
   if (!btn || !pane) return;
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
   btn.classList.add('active');
   pane.classList.add('active');
   // 窄屏菜单横滑时，把当前项滚进可见区域（只滚菜单本身，不动页面）。
@@ -684,10 +685,11 @@ function switchTab(tabId, subId) {
   }
   const subs = pane.querySelectorAll('.subtab-btn');
   if (subs.length) {
-    const wanted = subId && pane.querySelector('[data-subtab="' + subId + '"]');
+    const safeSub = (typeof subId === 'string' && /^[a-z0-9_-]+$/i.test(subId)) ? subId : '';
+    const wanted = safeSub && pane.querySelector('[data-subtab="' + safeSub + '"]');
     // 用实际生效的子页写哈希：传入的 subId 不存在时 switchSubtab 会回退到
     // 第一个子页，旧实现却把不存在的 id 写进 URL，刷新后显示与地址不一致。
-    const effective = wanted ? subId : subs[0].dataset.subtab;
+    const effective = wanted ? safeSub : subs[0].dataset.subtab;
     switchSubtab(tabId, effective);
     history.replaceState(null, null, '#' + tabId + '/' + effective);
   } else {
@@ -771,9 +773,14 @@ document.querySelectorAll('[data-copy]').forEach(button => {
       ta.style.position = 'fixed';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
-      ta.select();
-      try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
-      ta.remove();
+      try {
+        ta.select();
+        copied = document.execCommand('copy');
+      } catch (_) {
+        copied = false;
+      } finally {
+        ta.remove();
+      }
     }
     if (copied) {
       if (status) status.textContent = '已复制到剪贴板 ✓';
@@ -1345,8 +1352,15 @@ async function obApi(action, params) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: body,
   });
+  if (res.status === 401) {
+    if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+    throw new Error('登录已失效，请刷新页面重新登录');
+  }
   let json = {};
-  try { json = await res.json(); } catch (_) {}
+  try {
+    const parsed = await res.json();
+    if (parsed && typeof parsed === 'object') json = parsed;
+  } catch (_) {}
   if (!res.ok || !json.ok) throw new Error(json.error || ('请求失败 HTTP ' + res.status));
   if (json.applying) json = Object.assign(json, await waitForEgressApply());
   return json;
@@ -2018,6 +2032,8 @@ if (btnResetRealityKeys) {
 // 旧实现只有 .then 没有 .catch，失败时按钮毫无反应，看起来像点坏了。
 // 失败时退回「选中文本」并提示手动复制（与页面通用 [data-copy] 处理器一致）。
 function copyWithFeedback(text, button, doneText) {
+  if (!button) return;
+  const value = text == null ? '' : String(text);
   // 原文只记第一次（同用户页，2026-11-12 修）：恢复前再点一下会把「已复制 ✓」当成原文。
   const orig = button.dataset.orig || (button.dataset.orig = button.textContent);
   const ok = () => {
@@ -2027,19 +2043,24 @@ function copyWithFeedback(text, button, doneText) {
   };
   const fallback = () => {
     const ta = document.createElement('textarea');
-    ta.value = text;
+    ta.value = value;
     ta.style.position = 'fixed';
     ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select();
     let copied = false;
-    try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
-    ta.remove();
+    document.body.appendChild(ta);
+    try {
+      ta.select();
+      copied = document.execCommand('copy');
+    } catch (_) {
+      copied = false;
+    } finally {
+      ta.remove();
+    }
     if (copied) ok();
     else alert('复制失败，请手动选中后复制');
   };
   if (!navigator.clipboard || !navigator.clipboard.writeText) { fallback(); return; }
-  navigator.clipboard.writeText(text).then(ok).catch(fallback);
+  navigator.clipboard.writeText(value).then(ok).catch(fallback);
 }
 
 if (btnCopyRealityUri) {
@@ -2740,17 +2761,20 @@ document.querySelectorAll('.btn-apply-bbr').forEach(btn => {
 // 无条件刷新；VPS 重启常要 30~90 秒，多半落在浏览器的「无法访问此网站」错误页。
 // 只认 2xx 或 401（会话随重启失效，刷新后重新登录即可）；反代先起来时回的 502 不算恢复。
 async function waitPortalBack(timeoutMs = 300000, intervalMs = 3000) {
+  const maxWait = (typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0) ? timeoutMs : 300000;
+  const stepMs = (typeof intervalMs === 'number' && Number.isFinite(intervalMs) && intervalMs >= 200) ? intervalMs : 3000;
   const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const ctrl = new AbortController();
-    const abortTimer = setTimeout(() => ctrl.abort(), 5000);
+  while (Date.now() - started < maxWait) {
+    const ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
+    const abortTimer = ctrl ? setTimeout(() => ctrl.abort(), 5000) : null;
     try {
-      const res = await fetch(location.pathname + 'traffic-speed',
-        { credentials: 'same-origin', cache: 'no-store', signal: ctrl.signal });
+      const opts = { credentials: 'same-origin', cache: 'no-store' };
+      if (ctrl) opts.signal = ctrl.signal;
+      const res = await fetch(location.pathname + 'traffic-speed', opts);
       if (res.ok || res.status === 401) return true;
     } catch (_) {
-    } finally { clearTimeout(abortTimer); }
-    await new Promise(r => setTimeout(r, intervalMs));
+    } finally { if (abortTimer !== null) clearTimeout(abortTimer); }
+    await new Promise(r => setTimeout(r, stepMs));
   }
   return false;
 }
@@ -2800,7 +2824,6 @@ if (btnRebootServer) {
             back = false;
           }
           if (back) {
-            btnRebootServer.disabled = false;
             location.reload();
             return;
           }
@@ -2834,7 +2857,7 @@ if (btnRebootServer) {
   function render() {
     const q = (search && search.value || '').trim().toLowerCase();
     const st = filter ? filter.value : 'all';
-    const matched = rows.filter(r => (st === 'all' || r.dataset.state === st) && (!q || r.dataset.search.includes(q)));
+    const matched = rows.filter(r => (st === 'all' || r.dataset.state === st) && (!q || (r.dataset.search || '').includes(q)));
     const pages = Math.max(1, Math.ceil(matched.length / PAGE_SIZE));
     if (page > pages) page = pages;
     const start = (page - 1) * PAGE_SIZE;
@@ -4116,9 +4139,14 @@ document.querySelectorAll('[data-copy]').forEach(button => {
       ta.style.position = 'fixed';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
-      ta.select();
-      try { copied = document.execCommand('copy'); } catch (_) { copied = false; }
-      ta.remove();
+      try {
+        ta.select();
+        copied = document.execCommand('copy');
+      } catch (_) {
+        copied = false;
+      } finally {
+        ta.remove();
+      }
     }
     if (copied) {
       button.textContent = '已复制 ✓';
