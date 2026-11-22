@@ -16940,15 +16940,24 @@ fi
 # 旧实现在下载之前就写，下载失败退出后标记留着，之后机主自己装的 wireproxy
 # 会被下次网页安装直接覆盖、被卸载当成本项目的删掉。
 claim_warp_assets() {
+    if [ -L "$WARP_OWNED_MARKER" ]; then
+        echo "WARP 归属标记不允许为符号链接" >&2
+        exit 1
+    fi
     if [ ! -f "$WARP_OWNED_MARKER" ]; then
         (umask 077; : > "$WARP_OWNED_MARKER" && chmod 600 "$WARP_OWNED_MARKER")
     fi
 }
 atomic_write_mode() {
-    local dst="$1" mode="$2" tmp
+    local dst="$1" mode="$2" tmp=""
+    if [ -L "$dst" ]; then
+        echo "${dst} 不允许为符号链接" >&2
+        return 1
+    fi
+    trap 'trap - RETURN; rm -f -- "${tmp:-}"' RETURN
     tmp=$(umask 077; mktemp "${dst}.XXXXXX") || return 1
     if ! cat > "$tmp" || ! chmod "$mode" "$tmp" || ! mv -f "$tmp" "$dst"; then
-        rm -f "$tmp"
+        rm -f -- "$tmp"
         return 1
     fi
 }
@@ -16962,10 +16971,20 @@ case "$ARCH" in
 esac
 
 # ---- 完整性校验辅助（与 install.sh / portal.py 主流程同一套规则）----
-# 从 `<sha256>  <name>` 清单里取唯一匹配摘要；无匹配/多条/畸形 => 失败。
+# 从 `<sha256>  <name>` 清单里取唯一匹配摘要；忽略注释行、要求严格双列 NF==2，无匹配/多条/畸形 => 失败。
 manifest_sha256() {
-    awk -v f="$2" '{n=$2; sub(/^\.\//,"",n); sub(/^\*/,"",n); b=n; sub(/.*\//,"",b);
-                    if (n==f || b==f) print $1}' "$1" | tr 'A-F' 'a-f' | sort -u |
+    awk -v f="$2" '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        NF != 2 { next }
+        {
+            n = $2
+            sub(/^\*/, "", n)
+            while (index(n, "./") == 1) n = substr(n, 3)
+            b = n
+            sub(/.*\//, "", b)
+            if (n == f || b == f) print $1
+        }
+    ' "$1" | tr 'A-F' 'a-f' | sort -u |
     awk 'NR==1{d=$0} END{if (NR==1 && d ~ /^[0-9a-f]{64}$/) print d; else exit 1}'
 }
 verify_sha() {
@@ -16973,12 +16992,16 @@ verify_sha() {
     [[ "$(sha256sum "$1" | awk '{print $1}')" == "$2" ]]
 }
 tar_member() {
-    local listing vlisting m vline n=0 hit=""
+    local listing vlisting m clean vline n=0 hit=""
     listing=$(tar -tzf - <"$2" 2>/dev/null) || return 1
     while IFS= read -r m; do
         m="${m%$'\r'}"
-        case "$m" in /*|..|../*|*/../*|*/..|*\\*) return 2 ;; esac
-        if [[ "${m#./}" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
+        clean="$m"
+        while [[ "$clean" == ./* ]]; do clean="${clean#./}"; done
+        case "$m" in /*|*\\*|*:* ) return 2 ;; esac
+        [[ "$m" =~ [[:cntrl:]] ]] && return 2
+        case "$clean" in ""|/*|..|../*|*/../*|*/.. ) return 2 ;; esac
+        if [[ "$clean" == "$1" ]]; then n=$((n + 1)); hit="$m"; fi
     done <<<"$listing"
     vlisting=$(tar -tvzf - <"$2" 2>/dev/null) || return 1
     while IFS= read -r vline; do
@@ -16989,8 +17012,9 @@ tar_member() {
 }
 
 if [ ! -x "$WGCF_BIN" ]; then
+    [ -L "$WGCF_BIN" ] && { echo "${WGCF_BIN} 不允许为符号链接" >&2; exit 1; }
     log "下载 wgcf 二进制..."
-    RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
+    RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
     if command -v jq >/dev/null 2>&1; then
         TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
     else
@@ -17001,10 +17025,10 @@ if [ ! -x "$WGCF_BIN" ]; then
         VER="2.3.0"
     fi
     WG_DL="wgcf_${VER}_linux_${WG_A}"
-    TD=$(mktemp -d)
+    TD=$(umask 077; mktemp -d)
     trap 'rm -rf "$TD"' EXIT
     # 先取该版本官方 checksums.txt，取不到就放弃（不做无校验下载）。
-    if ! curl -fsSL --max-time 30 --retry 2 -o "${TD}/checksums.txt" \
+    if ! curl -fsSL --max-time 30 --max-filesize=2097152 --retry 2 -o "${TD}/checksums.txt" \
             "https://github.com/ViRb3/wgcf/releases/download/v${VER}/checksums.txt" 2>/dev/null; then
         rm -rf "$TD"; echo "取不到 wgcf v${VER} 的官方 checksums.txt，已放弃安装" >&2; exit 1
     fi
@@ -17012,21 +17036,22 @@ if [ ! -x "$WGCF_BIN" ]; then
     if [ -z "$WANT" ]; then
         rm -rf "$TD"; echo "checksums.txt 中 ${WG_DL} 的摘要缺失或不唯一，已放弃安装" >&2; exit 1
     fi
-    if ! curl -fsSL --max-time 90 -o "${TD}/${WG_DL}" "https://github.com/ViRb3/wgcf/releases/download/v${VER}/${WG_DL}"; then
+    if ! curl -fsSL --max-time 90 --max-filesize=167772160 -o "${TD}/${WG_DL}" "https://github.com/ViRb3/wgcf/releases/download/v${VER}/${WG_DL}"; then
         rm -rf "$TD"; echo "wgcf 下载失败 (v${VER}/${WG_A})" >&2; exit 1
     fi
     if ! verify_sha "${TD}/${WG_DL}" "$WANT"; then
         rm -rf "$TD"; echo "wgcf 校验失败：SHA256 与官方 checksums.txt 不一致" >&2; exit 1
     fi
-    WGCF_STAGE=$(umask 022; mktemp "${WGCF_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
+    WGCF_STAGE=$(umask 077; mktemp "${WGCF_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
     install -m 755 "${TD}/${WG_DL}" "$WGCF_STAGE" || { rm -rf "$TD" "$WGCF_STAGE"; exit 1; }
     rm -rf "$TD"; trap - EXIT
     mv -f "$WGCF_STAGE" "$WGCF_BIN" || { rm -f "$WGCF_STAGE"; exit 1; }
 fi
 
 if [ ! -x "$WP_BIN" ]; then
+    [ -L "$WP_BIN" ] && { echo "${WP_BIN} 不允许为符号链接" >&2; exit 1; }
     log "下载 wireproxy 二进制..."
-    RAW=$(curl -fsSL --max-time 20 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
+    RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
     if command -v jq >/dev/null 2>&1; then
         TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
     else
@@ -17040,9 +17065,9 @@ if [ ! -x "$WP_BIN" ]; then
     # 先清掉上一个临时目录：旧 trap 只认当前的 $TD，直接重新赋值会让
     # wgcf 那次 mktemp 的目录永远留在 /tmp（2026-10-30 修）。
     rm -rf "$TD"
-    TD=$(mktemp -d)
+    TD=$(umask 077; mktemp -d)
     trap 'rm -rf "$TD"' EXIT
-    if ! curl -fsSL --max-time 30 --retry 2 -o "${TD}/checksums.txt" \
+    if ! curl -fsSL --max-time 30 --max-filesize=2097152 --retry 2 -o "${TD}/checksums.txt" \
             "https://github.com/whyvl/wireproxy/releases/download/${TAG}/checksums.txt" 2>/dev/null; then
         rm -rf "$TD"; echo "取不到 wireproxy ${TAG} 的官方 checksums.txt，已放弃安装" >&2; exit 1
     fi
@@ -17050,7 +17075,7 @@ if [ ! -x "$WP_BIN" ]; then
     if [ -z "$WANT" ]; then
         rm -rf "$TD"; echo "checksums.txt 中 ${WP_DL} 的摘要缺失或不唯一，已放弃安装" >&2; exit 1
     fi
-    if ! curl -fsSL --max-time 90 -o "${TD}/${WP_DL}" "https://github.com/whyvl/wireproxy/releases/download/${TAG}/${WP_DL}"; then
+    if ! curl -fsSL --max-time 90 --max-filesize=167772160 -o "${TD}/${WP_DL}" "https://github.com/whyvl/wireproxy/releases/download/${TAG}/${WP_DL}"; then
         rm -rf "$TD"; echo "wireproxy 下载失败 (${TAG}/${WP_A})" >&2; exit 1
     fi
     if ! verify_sha "${TD}/${WP_DL}" "$WANT"; then
@@ -17065,13 +17090,17 @@ if [ ! -x "$WP_BIN" ]; then
     if [ ! -f "${TD}/x/${MEMBER}" ] || [ -L "${TD}/x/${MEMBER}" ]; then
         rm -rf "$TD"; echo "wireproxy 解压成员非法，已放弃安装" >&2; exit 1
     fi
-    WP_STAGE=$(umask 022; mktemp "${WP_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
+    WP_STAGE=$(umask 077; mktemp "${WP_BIN}.new.XXXXXX") || { rm -rf "$TD"; exit 1; }
     install -m 755 "${TD}/x/${MEMBER}" "$WP_STAGE" || { rm -rf "$TD" "$WP_STAGE"; exit 1; }
     rm -rf "$TD"; trap - EXIT
     claim_warp_assets
     mv -f "$WP_STAGE" "$WP_BIN" || { rm -f "$WP_STAGE"; exit 1; }
 fi
 
+if [ -L "$WG_DIR" ] || [ -L "$WGCF_ACCT" ] || [ -L "$WGCF_CONF" ] || [ -L "$WP_CFG" ]; then
+    echo "WireGuard 配置目录或文件不允许为符号链接" >&2
+    exit 1
+fi
 mkdir -p "$WG_DIR"
 chmod 700 "$WG_DIR" 2>/dev/null || true
 if [ ! -f "$WGCF_ACCT" ]; then
@@ -17111,8 +17140,9 @@ WG_EP=$(awk -F'= ' '/^Endpoint/{print $2; exit}' "$WGCF_CONF")
 WG_ADDR=$(awk -F'= ' '/^Address/{print $2; exit}' "$WGCF_CONF" | tr -d '\r')
 [ -n "$WG_ADDR" ] || WG_ADDR="172.16.0.2/32"
 case "$WG_ADDR" in *:*) WG_ALLOWED="0.0.0.0/0, ::/0" ;; *) WG_ALLOWED="0.0.0.0/0" ;; esac
-if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ]; then
-    echo "WireGuard 配置解析失败 (PrivateKey/PublicKey/Endpoint 缺失)" >&2
+if [ -z "$WG_PRIV" ] || [ -z "$WG_PUB" ] || [ -z "$WG_EP" ] \
+        || [[ "$WG_PRIV$WG_PUB$WG_EP$WG_ADDR" =~ [[:cntrl:]] ]]; then
+    echo "WireGuard 配置解析失败 (PrivateKey/PublicKey/Endpoint 缺失或含控制字符)" >&2
     exit 1
 fi
 
@@ -17164,7 +17194,7 @@ systemctl reset-failed wireproxy >/dev/null 2>&1 || true
 systemctl restart wireproxy >/dev/null 2>&1 || true
 sleep 3
 
-if ! curl --proxy "socks5h://${WARP_SOCKS_ADDR}" --silent --fail --max-time 10 https://api4.ipify.org >/dev/null 2>&1; then
+if ! curl --proxy "socks5h://${WARP_SOCKS_ADDR}" --silent --fail --max-time 10 --max-filesize 65536 https://api4.ipify.org >/dev/null 2>&1; then
     echo "wireproxy 已启动但 WARP socks5 探活失败（上游可能受限或被封禁）" >&2
     exit 1
 fi
@@ -17183,7 +17213,7 @@ atomic_write_mode /usr/local/bin/hy2-warp-watchdog.sh 755 <<'WDE'
 #!/usr/bin/env bash
 set -u
 # 两个探测点都不通才重启：只看 ipify 的话，ipify 自己故障会让 wireproxy 每 3 分钟被白白重启一次。
-probe() { curl --proxy socks5h://127.0.0.1:19898 --silent --fail --max-time 6 "$1" >/dev/null 2>&1; }
+probe() { curl --proxy socks5h://127.0.0.1:19898 --silent --fail --max-time 6 --max-filesize 65536 "$1" >/dev/null 2>&1; }
 if ! probe https://api4.ipify.org && ! probe https://www.cloudflare.com/cdn-cgi/trace; then
     logger -t hy2-warp-watchdog "WARP local proxy failed. Restarting wireproxy..."
     systemctl reset-failed wireproxy >/dev/null 2>&1 || true
@@ -17239,7 +17269,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 with warp_apply_lock:
                     hy2_conf = Path('/etc/hysteria/config.yaml')
                     try:
-                        conf_text = hy2_conf.read_text(encoding='utf-8')
+                        if hy2_conf.is_symlink() or not hy2_conf.is_file() or hy2_conf.lstat().st_size > 4 * 1024 * 1024:
+                            conf_text = None
+                        else:
+                            conf_text = hy2_conf.read_bytes().decode('utf-8', errors='replace')
                     except OSError:
                         conf_text = None
                     if conf_text is not None:
