@@ -4850,6 +4850,10 @@ refresh_portal() {
 }
 
 setup_portal() {
+    if [[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%$] ]]; then
+        log_err "HY2_DIR 路径不安全（符号链接或含非法控制/占位字符），拒绝初始化门户。"
+        return 1
+    fi
     # generate_server_config 已在写 config.yaml 之前取好整包；这里只补计量配置
     # （它要读刚写好的 trafficStats.secret），不再取第二次 —— 两次取包可能落到不同提交。
     if [[ "${PORTAL_BUNDLE_PLACED:-0}" == "1" ]]; then
@@ -4859,7 +4863,7 @@ setup_portal() {
     fi
     # 只要求 portal.json：凭据文件缺失时 adopt 会重建一份（保留用户与
     # API Key），不能因为一个文件丢了就把整个用户表推倒重建（2026-10-30 修）。
-    if [[ "${PRESERVE_PORTAL:-0}" == "1" && -f "$HY2_DIR/portal.json" ]]; then
+    if [[ "${PRESERVE_PORTAL:-0}" == "1" && ! -L "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal.json" ]]; then
         # 沿用现有门户：token、门户账号密码、API Key、全部用户与代理服务都保留，
         # Teyir 控制台保存的凭据继续有效（见 portal.py adopt）。
         # 检查返回码：prepare/adopt 失败时若被 set -e 打断，脚本会停在
@@ -4878,14 +4882,19 @@ setup_portal() {
             return 1
         fi
     fi
-    if [[ -L "$HY2_DIR" || "$HY2_DIR" =~ [[:cntrl:]%\$] ]]; then
-        log_err "HY2_DIR 路径不安全（符号链接或含非法控制/占位字符），拒绝写入门户单元。"
-        return 1
-    fi
     if [[ -L /etc/systemd/system/hysteria-portal.service ]]; then
         log_err "/etc/systemd/system/hysteria-portal.service 不允许为符号链接，拒绝写入。"
         return 1
     fi
+    local _pf
+    for _pf in "$HY2_DIR/portal.py" "$HY2_DIR/portal.json" "$HY2_DIR/portal-access.json" "$HY2_META_FILE" "$HY2_CONFIG"; do
+        if [[ ! -L "$_pf" ]]; then
+            :
+        else
+            log_err "关键门户配置文件不允许为符号链接: ${_pf}"
+            return 1
+        fi
+    done
     local _portal_svc_tmp=""
     trap 'trap - RETURN; rm -f -- "${_portal_svc_tmp:-}"' RETURN
     _portal_svc_tmp="$(umask 077; mktemp /etc/systemd/system/hysteria-portal.service.XXXXXX)" || return 1
@@ -5502,8 +5511,12 @@ install_gost() {
     GOST_BIN="/usr/local/bin/gost"
     GOST_CONFIG="${HY2_DIR}/gost.yml"
     GOST_UNIT="/etc/systemd/system/gost.service"
+    if [[ -L "$HY2_DIR" || -L "$GOST_BIN" || -L "$GOST_CONFIG" || -L "$GOST_UNIT" || -L /usr/local/lib/hy2-gost-selfcheck || -L "$HY2_DIR/.hy2-gost-owned" ]]; then
+        log_err "检测到 GOST 目标路径或配置目录为符号链接，已拒绝安装。"
+        return 1
+    fi
     if [[ -e "$GOST_BIN" || -e "$GOST_UNIT" ]]; then
-        if [[ -f "$HY2_DIR/.hy2-gost-owned" && -f "$GOST_UNIT" ]] \
+        if [[ ! -L "$HY2_DIR/.hy2-gost-owned" && -f "$HY2_DIR/.hy2-gost-owned" && ! -L "$GOST_UNIT" && -f "$GOST_UNIT" ]] \
                 && grep -qF 'ExecStart=/usr/local/bin/gost -C /etc/hysteria/gost.yml -R 30s' "$GOST_UNIT"; then
             : # Recognized as an existing installer-managed GOST deployment; allow update.
         else
@@ -5568,6 +5581,7 @@ install_gost() {
         # 同目录临时文件原子替换：避免覆写运行中 gost 二进制报 ETXTBSY，并防止中途失败中断后续恢复。
         _restore_gost_asset() {
             local _bak="$1" _dst="$2" _rb_tmp=""
+            [[ ! -L "$_dst" ]] || return 1
             _rb_tmp="$(umask 077; mktemp "${_dst}.rb.XXXXXX")" || return 1
             if ! cp -p "$_bak" "$_rb_tmp" || ! mv -f "$_rb_tmp" "$_dst"; then
                 rm -f "$_rb_tmp"
@@ -5729,7 +5743,7 @@ EOF
     # (tests/test_portal_gost_reload.py 有断言钉死).
     mkdir -p /usr/local/lib || { _restore_gost_install; return 1; }
     local _selfcheck_tmp=""
-    _selfcheck_tmp="$(mktemp "/usr/local/lib/hy2-gost-selfcheck.XXXXXX")" || {
+    _selfcheck_tmp="$(umask 077; mktemp "/usr/local/lib/hy2-gost-selfcheck.XXXXXX")" || {
         _restore_gost_install
         log_err "GOST 自检脚本临时文件创建失败，已恢复原部署。"
         return 1
