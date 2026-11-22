@@ -31,7 +31,7 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
             raise ValueError('invalid active_users')
         normalized_active = set()
         for item in active_users:
-            if not isinstance(item, str) or not item:
+            if not isinstance(item, str) or not item or any(ord(c) < 32 or ord(c) == 127 for c in item):
                 raise ValueError('invalid active_users')
             normalized_active.add(item)
         active_users = normalized_active
@@ -131,7 +131,10 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
         else:
             recorded = previous['sampled_users']
             if isinstance(recorded, list):
-                sampled_users = {uid for uid in recorded if isinstance(uid, str) and uid}
+                sampled_users = {
+                    uid for uid in recorded
+                    if isinstance(uid, str) and uid and not any(ord(c) < 32 or ord(c) == 127 for c in uid)
+                }
     baseline_sampled = set()
     for uid, pair in clean.items():
         old = cursors.get(uid)
@@ -193,7 +196,8 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
         sources[source]['baseline_at'] = sampled_at
     elif 'baseline_at' in previous:
         prev_bl = previous['baseline_at']
-        if ((isinstance(prev_bl, str) and bool(prev_bl.strip()))
+        if ((isinstance(prev_bl, str) and bool(prev_bl.strip())
+             and not any(ord(c) < 32 or ord(c) == 127 for c in prev_bl))
                 or (isinstance(prev_bl, (int, float)) and not isinstance(prev_bl, bool)
                     and math.isfinite(prev_bl))):
             sources[source]['baseline_at'] = prev_bl

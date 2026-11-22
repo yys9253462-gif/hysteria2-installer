@@ -289,7 +289,10 @@ def _write_private_bytes(target, payload, mode):
             os.fsync(handle.fileno())
     finally:
         if fd is not None:
-            os.close(fd)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     os.chmod(target, mode)
 
 
@@ -339,7 +342,7 @@ def enable_iplimit_routing(config_path, binary, address):
     try:
         _write_private_bytes(candidate, json.dumps(config,indent=2,allow_nan=False).encode('utf-8'), orig_mode)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
-        if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
+        if _read_regular_config_bytes(path)[0] != original:raise RuntimeError('xray config changed concurrently')
         _write_private_bytes(backup_tmp, original, orig_mode)
         os.replace(backup_tmp, backup)
         os.replace(candidate,path);replaced=True
@@ -350,7 +353,7 @@ def enable_iplimit_routing(config_path, binary, address):
             try:
                 probe=subprocess.run([binary,'api','lsrules','--server='+address],capture_output=True,timeout=5)
                 if probe.returncode==0:break
-            except subprocess.TimeoutExpired:
+            except (OSError, subprocess.TimeoutExpired):
                 pass
             time.sleep(0.5)
         else:raise RuntimeError('routing api unavailable after restart')
@@ -416,7 +419,7 @@ def enable_reality_online(config_path, binary, address):
         try:
             _write_private_bytes(candidate, json.dumps(config,indent=2,allow_nan=False).encode('utf-8'), orig_mode)
             subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
-            if path.read_bytes()!=original:raise RuntimeError('xray config changed concurrently')
+            if _read_regular_config_bytes(path)[0] != original:raise RuntimeError('xray config changed concurrently')
             _write_private_bytes(backup_tmp, original, orig_mode)
             os.replace(backup_tmp, backup)
             os.replace(candidate,path);replaced=True
