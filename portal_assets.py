@@ -548,7 +548,7 @@ function showConfirm(options = {}) {
   const previousFocus = document.activeElement;
   modal.classList.add('show');
   confirmOpen = true;
-  (options.isDanger ? cancelBtn : okBtn).focus();
+  try { (options.isDanger ? cancelBtn : okBtn).focus(); } catch (_) {}
 
   return new Promise((resolve) => {
     function cleanup(result) {
@@ -558,7 +558,7 @@ function showConfirm(options = {}) {
       document.removeEventListener('keydown', onKey);
       modal.removeEventListener('click', onBackdrop);
       confirmOpen = false;
-      if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus();
+      try { if (previousFocus && typeof previousFocus.focus === 'function') previousFocus.focus(); } catch (_) {}
       resolve(result);
     }
     function onOk() { cleanup(true); }
@@ -945,6 +945,7 @@ function markWarpRulesFailed() {
 async function checkWarpStatus() {
   if (!warpBadge) return;
   const seq = ++warpStatusSeq;
+  checkWarpStatus._pending = (checkWarpStatus._pending || 0) + 1;
   try {
     const res = await fetch(location.pathname + 'warp-status', { credentials: 'same-origin' });
     if (res.status === 401) { portalSessionExpired = true; if (seq === warpStatusSeq) { markStatusUnknown(warpBadge, '登录已过期'); markWarpRulesFailed(); } return; }
@@ -1001,6 +1002,7 @@ async function checkWarpStatus() {
       }
     }
   } catch (_) { if (seq === warpStatusSeq) { markStatusUnknown(warpBadge); markWarpRulesFailed(); } }
+  finally { checkWarpStatus._pending = Math.max(0, (checkWarpStatus._pending || 1) - 1); }
 }
 
 if (btnToggleWarp) {
@@ -1095,13 +1097,20 @@ document.querySelectorAll('.preset-rule').forEach(el => {
 if (btnResetWarpRules) {
   btnResetWarpRules.addEventListener('click', async () => {
     if (btnResetWarpRules.disabled) return;
-    const confirmed = await showConfirm({
-      title: '重置分流规则',
-      text: '确定重置为系统默认推荐的 AI 域名规则列表吗？手动添加的 WARP 分流域名会被清掉，走其它出站的规则不受影响。',
-      icon: '♻️',
-      confirmText: '重置',
-      isDanger: true
-    });
+    if (btnResetWarpRules._confirming) return;
+    btnResetWarpRules._confirming = true;
+    let confirmed = false;
+    try {
+      confirmed = await showConfirm({
+        title: '重置分流规则',
+        text: '确定重置为系统默认推荐的 AI 域名规则列表吗？手动添加的 WARP 分流域名会被清掉，走其它出站的规则不受影响。',
+        icon: '♻️',
+        confirmText: '重置',
+        isDanger: true
+      });
+    } finally {
+      btnResetWarpRules._confirming = false;
+    }
     if (!confirmed || btnResetWarpRules.disabled) return;
     btnResetWarpRules.disabled = true;
     try {
@@ -1134,7 +1143,7 @@ checkWarpStatus();
 // 网速每 2 秒各请求一次。/warp-status 每次都要 systemctl show、把出站配置重渲染一遍比对，
 // 30 秒一次还要经 WARP 探测出口；/traffic-speed 在 data_lock 内给每个用户算用量摘要，会拖慢鉴权。
 setInterval(() => {
-  if (!document.hidden && !portalSessionExpired && panelVisible('proxies', 'warp')) checkWarpStatus();
+  if (!document.hidden && !portalSessionExpired && !checkWarpStatus._pending && panelVisible('proxies', 'warp')) checkWarpStatus();
 }, 10000);
 
 // ============================================================================
@@ -1418,9 +1427,9 @@ async function loadOutbounds() {
     if (!json || !json.ok) { failure = (json && json.error) || '服务器返回失败'; return; }
     OB_STATE = {
       mode: json.mode || 'rules',
-      outbounds: Array.isArray(json.outbounds) ? json.outbounds : [],
-      rules: Array.isArray(json.rules) ? json.rules : [],
-      builtin: Array.isArray(json.builtin) ? json.builtin : [],
+      outbounds: Array.isArray(json.outbounds) ? json.outbounds.filter(o => o && typeof o === 'object') : [],
+      rules: Array.isArray(json.rules) ? json.rules.filter(r => r && typeof r === 'object') : [],
+      builtin: Array.isArray(json.builtin) ? json.builtin.filter(b => b && typeof b === 'object') : [],
     };
     obSetModeUI(OB_STATE.mode);
     renderOutboundList(OB_STATE.outbounds);
@@ -1842,6 +1851,7 @@ if (obEls.list) {
       window.scrollTo({ top: obEls.list.offsetTop - 120, behavior: 'smooth' });
     } else if (test) {
       e.preventDefault();
+      if (test.disabled) return;
       const kind = test.getAttribute('data-ob-kind');
       const addr = test.getAttribute('data-ob-addr') || '';
       const insecure = test.getAttribute('data-ob-insecure') === 'true';
@@ -1850,8 +1860,13 @@ if (obEls.list) {
         obEls.probeAddr.value = addr;
         obEls.probeAddr.hidden = (kind !== 'socks5' && kind !== 'http');
       }
-      await probeOutbound(kind, addr, insecure);
-      if (obEls.ip) window.scrollTo({ top: obEls.ip.offsetTop - 200, behavior: 'smooth' });
+      test.disabled = true;
+      try {
+        await probeOutbound(kind, addr, insecure);
+        if (obEls.ip) window.scrollTo({ top: obEls.ip.offsetTop - 200, behavior: 'smooth' });
+      } finally {
+        test.disabled = false;
+      }
     }
   });
 }
@@ -2042,13 +2057,20 @@ if (btnToggleReality) {
 if (btnResetRealityKeys) {
   btnResetRealityKeys.addEventListener('click', async () => {
     if (btnResetRealityKeys.disabled) return;
-    const confirmed = await showConfirm({
-      title: '重新生成 Reality 密钥',
-      text: '确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。',
-      icon: '🔑',
-      confirmText: '重新生成',
-      isDanger: true
-    });
+    if (btnResetRealityKeys._confirming) return;
+    btnResetRealityKeys._confirming = true;
+    let confirmed = false;
+    try {
+      confirmed = await showConfirm({
+        title: '重新生成 Reality 密钥',
+        text: '确定要重新生成 Reality 密钥对吗？用户 UUID 不变，但客户端需要重新导入订阅（公钥 pbk 会变）。',
+        icon: '🔑',
+        confirmText: '重新生成',
+        isDanger: true
+      });
+    } finally {
+      btnResetRealityKeys._confirming = false;
+    }
     if (!confirmed || btnResetRealityKeys.disabled) return;
     // 请求期间禁用（2026-11-04 修）：连点会连续重置两次，第一次导出的订阅随即失效。
     btnResetRealityKeys.disabled = true;
@@ -3270,6 +3292,9 @@ async function checkVersions(force = false) {
 
 async function waitForCoreUpgrade() {
   const deadline = Date.now() + 300000;
+  if (portalSessionExpired) {
+    throw new Error('登录已失效，请刷新页面重新登录后查看更新结果');
+  }
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 2000));
     let state;
@@ -4217,18 +4242,25 @@ if (btnAddAwgPeer) {
 if (btnSwitchAwgLine) {
   btnSwitchAwgLine.addEventListener('click', async () => {
     if (btnSwitchAwgLine.disabled) return;
+    if (btnSwitchAwgLine._confirming) return;
     // 只有两条协议线，直接切到另一条（2026-11-13 修，同终端菜单）：旧实现先弹原生输入框让人手打 2 / 3，
     // 打成当前线还要再弹一次「无需切换」。
     const target = awgCurrentLine === '3' ? '2' : '3';
-    const confirmed = await showConfirm({
-      title: '切换 AWG 协议线',
-      text: '确认从 AWG ' + awgCurrentLine + '.x 切换到 AWG ' + target + '.x？\n'
-        + (target === '3' ? 'AWG 3.x 含头部保护与抗行为分析。' : 'AWG 2.x 参数体系稳定。') + '\n'
-        + '切换会重新生成全部混淆参数，所有已发放的客户端配置都会立即失效，必须重新导出。',
-      icon: '⚠️',
-      confirmText: '切换到 AWG ' + target + '.x',
-      isDanger: true
-    });
+    btnSwitchAwgLine._confirming = true;
+    let confirmed = false;
+    try {
+      confirmed = await showConfirm({
+        title: '切换 AWG 协议线',
+        text: '确认从 AWG ' + awgCurrentLine + '.x 切换到 AWG ' + target + '.x？\n'
+          + (target === '3' ? 'AWG 3.x 含头部保护与抗行为分析。' : 'AWG 2.x 参数体系稳定。') + '\n'
+          + '切换会重新生成全部混淆参数，所有已发放的客户端配置都会立即失效，必须重新导出。',
+        icon: '⚠️',
+        confirmText: '切换到 AWG ' + target + '.x',
+        isDanger: true
+      });
+    } finally {
+      btnSwitchAwgLine._confirming = false;
+    }
     if (!confirmed || btnSwitchAwgLine.disabled) return;
     // 请求期间禁用（2026-11-04 修）：第二次提交会再生成一遍混淆参数，中间导出的配置随即失效。
     btnSwitchAwgLine.disabled = true;
@@ -4245,13 +4277,20 @@ if (btnSwitchAwgLine) {
 if (btnUpdateAwg) {
   btnUpdateAwg.addEventListener('click', async () => {
     if (btnUpdateAwg.disabled) return;
-    const confirmed = await showConfirm({
-      title: '更新 AmneziaWG',
-      text: '确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。',
-      icon: '⬆️',
-      confirmText: '开始更新',
-      isWarn: true
-    });
+    if (btnUpdateAwg._confirming) return;
+    btnUpdateAwg._confirming = true;
+    let confirmed = false;
+    try {
+      confirmed = await showConfirm({
+        title: '更新 AmneziaWG',
+        text: '确认更新 AmneziaWG 二进制？协议线与混淆参数保持不变，客户端无需重新导入。',
+        icon: '⬆️',
+        confirmText: '开始更新',
+        isWarn: true
+      });
+    } finally {
+      btnUpdateAwg._confirming = false;
+    }
     if (!confirmed || btnUpdateAwg.disabled) return;
     btnUpdateAwg.disabled = true;
     try {

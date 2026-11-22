@@ -318,7 +318,7 @@ detect_wan_iface() {
     wan="$(ip -4 route show default 2>/dev/null \
         | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
     if [[ -n "$wan" ]]; then
-        if [[ "$wan" == "." || "$wan" == ".." || ! "$wan" =~ ^[A-Za-z0-9._:@-]{1,32}$ ]]; then
+        if [[ "$wan" == "." || "$wan" == ".." || "$wan" == -* || ! "$wan" =~ ^[A-Za-z0-9._:@-]{1,32}$ ]]; then
             log_err "默认出口网卡名非法: ${wan}"
             return 1
         fi
@@ -1393,7 +1393,7 @@ cmd_install() {
 
     # 端口
     local hy2_port=""
-    if [[ -f /etc/hysteria/client_meta.json ]]; then
+    if [[ ! -L /etc/hysteria/client_meta.json && -f /etc/hysteria/client_meta.json ]]; then
         hy2_port="$(jq -r '.listen_port // empty' /etc/hysteria/client_meta.json 2>/dev/null || true)"
     fi
     if [[ -z "$port" ]]; then
@@ -1474,11 +1474,19 @@ cmd_install() {
         log_info "沿用已有混淆参数"
     fi
 
-    # 3.x 头部保护密钥
+    # 3.x 头部保护密钥（若已有密钥被损坏含空白/控制字符，先清空再重新生成）
+    local _cur_hp=""
+    if [[ "$line" == "3" ]]; then
+        _cur_hp="$(meta_get HeaderProtectionKey)"
+        if [[ -n "$_cur_hp" && "$_cur_hp" =~ [[:space:][:cntrl:]] ]]; then
+            meta_set HeaderProtectionKey ""
+        fi
+    fi
     if [[ "$line" == "3" && -z "$(meta_get HeaderProtectionKey)" ]]; then
         local _hp_key
         _hp_key="$(genkey)"
         [[ -n "$_hp_key" ]] || die "生成 3.x 头部保护密钥失败"
+        [[ ! "$_hp_key" =~ [[:space:][:cntrl:]] ]] || die "生成 3.x 头部保护密钥含非法字符"
         meta_set HeaderProtectionKey "$_hp_key"
         log_info "已生成 3.x 头部保护密钥 (HeaderProtectionKey)"
     fi
@@ -1635,7 +1643,7 @@ cmd_uninstall() {
     # 再清掉可能因此变空的厂商级父目录（/etc/amnezia）。
     # 用 rmdir 而不是 rm -rf：只在它确实为空时删除，
     # 万一用户在该目录下还有别的东西（例如官方包的其他组件）不会被误删。
-    rmdir "$(dirname "$AWG_DIR")" 2>/dev/null || true
+    rmdir -- "$(dirname -- "$AWG_DIR")" 2>/dev/null || true
     log_info "已移除配置目录 ${AWG_DIR}"
 
     # 自删控制工具，让「hy2-awgctl uninstall」与菜单里的卸载行为一致
@@ -1646,7 +1654,7 @@ cmd_uninstall() {
     #   2) 仅当运行的确实是【已安装的那份】才删 —— 否则用户从仓库直接跑
     #      ./awgctl.sh uninstall 会把人家仓库里的文件删掉。
     local self
-    self="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    self="$(readlink -f -- "$0" 2>/dev/null || echo "$0")"
     if [[ "$self" == "$AWG_CTL_INSTALLED" ]]; then
         # 关闭继承的锁描述符 fd 9，避免卸载退出后后台子进程仍占住 /run/hy2-awgctl.lock 阻塞后续操作。
         nohup bash -c 'sleep 2; rm -f -- "$1"' _ "$AWG_CTL_INSTALLED" >/dev/null 2>&1 9>&- &
@@ -1665,10 +1673,10 @@ cmd_status() {
     line="$(version_line)"
     port="$(meta_get port)"
 
-    if [[ -f "$AWG_PEERS_FILE" ]]; then
+    if [[ ! -L "$AWG_PEERS_FILE" && -f "$AWG_PEERS_FILE" ]]; then
         peers_count="$(jq -r '[(.peers // []) | if type=="array" then .[] else empty end | select(type=="object")] | length' "$AWG_PEERS_FILE" 2>/dev/null || echo "")"
     fi
-    if [[ -f "$AWG_VERSION_FILE" ]]; then
+    if [[ ! -L "$AWG_VERSION_FILE" && -f "$AWG_VERSION_FILE" ]]; then
         go_tag="$(awk -F= '/^amneziawg-go=/{print $2; exit}' "$AWG_VERSION_FILE" 2>/dev/null || true)"
         tools_tag="$(awk -F= '/^amneziawg-tools=/{print $2; exit}' "$AWG_VERSION_FILE" 2>/dev/null || true)"
     fi

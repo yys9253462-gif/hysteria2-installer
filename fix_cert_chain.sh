@@ -52,11 +52,13 @@ cert_of () {   # 从 config.yaml 取出 tls.cert 路径
              print; exit
          }' "$1"
 }
-n_certs () { local n; n="$(grep -Ec '^-----BEGIN CERTIFICATE-----[[:space:]]*$' "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
+n_certs () { local n; n="$(grep -Ec '^-----BEGIN CERTIFICATE-----[[:space:]]*$' -- "$1" 2>/dev/null)" || true; echo "${n:-0}"; }
 # 证书文件第一张证书（叶证书）的公钥指纹；损坏或无法解析时返回空串，避免对空输入求 sha256 引发假匹配。
 leaf_pub () {
-    local pub h
-    pub="$(openssl x509 -in "$1" -noout -pubkey 2>/dev/null)" || return 1
+    local p="${1:-}" pub h
+    [[ -n "$p" && ! "$p" =~ [[:cntrl:]] ]] || return 1
+    [[ "$p" == -* ]] && p="./$p"
+    pub="$(openssl x509 -in "$p" -noout -pubkey 2>/dev/null)" || return 1
     [[ -n "$pub" ]] || return 1
     h="$(printf '%s\n' "$pub" | openssl sha256 2>/dev/null | awk '{print $NF}')" || return 1
     [[ -n "$h" && "$h" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]] || return 1
@@ -67,10 +69,12 @@ leaf_pub () {
 set_tls_cert () {   # $1=config $2=new path
     local tmp=""
     trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
-    [[ -n "$2" ]] || return 1
+    [[ -n "${1:-}" && "$1" != -* && ! -L "$1" && -f "$1" ]] || return 1
+    [[ -n "${2:-}" ]] || return 1
     case "$2" in
         *'"'*|*'\'*|*$'\n'*|*$'\r'*|*$'\t'*) return 1 ;;
     esac
+    [[ ! "$2" =~ [[:cntrl:]] ]] || return 1
     tmp="$(umask 077 && mktemp "${1}.XXXXXX")" || return 1
     NEW_CERT="$2" awk '
         /^tls:[[:space:]]*(#.*)?$/ {f=1; print; next}
@@ -88,8 +92,9 @@ set_tls_cert () {   # $1=config $2=new path
 restore_config_file () {   # $1=backup $2=target
     local tmp=""
     trap 'trap - RETURN; rm -f "${tmp:-}"' RETURN
+    [[ -n "${1:-}" && -n "${2:-}" && "$2" != -* && ! -L "$2" ]] || return 1
     tmp="$(umask 077 && mktemp "${2}.restore.XXXXXX")" || return 1
-    cp -a "$1" "$tmp" || { rm -f "$tmp"; return 1; }
+    cp -a -- "$1" "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$2" || { rm -f "$tmp"; return 1; }
 }
 # 重启前先清失败计数（2026-11-12 修，与 do_upgrade.sh 同理）：证书出问题时服务常已反复崩溃、
@@ -118,11 +123,13 @@ masq_https_port () {   # $1=config
 # 且只取 CN 本身（2026-11-12 修）。旧实现从 -subject 整行截 CN 之后的全部内容：
 # `CN = a.com, O = X` 截成 `a.com,O=X`；不带 CN 的证书得到空串，退回 localhost 去握手。
 cert_sni () {   # $1=cert
-    local s
-    s="$(openssl x509 -in "$1" -noout -ext subjectAltName 2>/dev/null \
+    local p="${1:-}" s=""
+    [[ -n "$p" && ! "$p" =~ [[:cntrl:]] ]] || return 0
+    [[ "$p" == -* ]] && p="./$p"
+    s="$(openssl x509 -in "$p" -noout -ext subjectAltName 2>/dev/null \
          | grep -o 'DNS:[^,[:space:]]*' | head -n1 | cut -d: -f2)" || true
     if [[ -z "$s" ]]; then
-        s="$(openssl x509 -in "$1" -noout -subject -nameopt multiline 2>/dev/null \
+        s="$(openssl x509 -in "$p" -noout -subject -nameopt multiline 2>/dev/null \
              | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -n1)" || true
     fi
     [[ "$s" == \*.* ]] && s="www.${s#\*.}"
@@ -140,7 +147,7 @@ fi
 CERT_FILE="$(cert_of "$CONFIG")"
 
 if [[ -z "$CERT_FILE" ]]; then
-    if grep -qE '^acme:' "$CONFIG"; then
+    if grep -qE '^acme:' -- "$CONFIG"; then
         ok "配置使用 hysteria 内置 ACME（acme: 段），由服务端自动下发完整链，无需修复。"
     else
         warn "未找到 tls.cert，也没有 acme: 段 —— 请人工确认证书配置。"
@@ -148,7 +155,12 @@ if [[ -z "$CERT_FILE" ]]; then
     exit 0
 fi
 
+if [[ "$CERT_FILE" =~ [[:cntrl:]] ]]; then
+    err "证书路径包含非法控制字符，已中止：$CERT_FILE"
+    exit 1
+fi
 [[ "$CERT_FILE" != /* && ! "$CERT_FILE" =~ ^[A-Za-z]:[/\\] ]] && CERT_FILE="$(dirname "$CONFIG")/${CERT_FILE}"
+[[ "$CERT_FILE" == -* ]] && CERT_FILE="./$CERT_FILE"
 info "当前证书文件：$CERT_FILE"
 [[ -f "$CERT_FILE" && -r "$CERT_FILE" ]] || { err "证书文件不存在或不可读：$CERT_FILE"; exit 1; }
 
@@ -165,7 +177,7 @@ elif [[ "$COUNT" -ge 2 ]]; then
 else
     warn "仅 1 张证书 = 只有叶证书，缺少中间证书。开始查找同目录的 fullchain。"
 
-    DIR="$(dirname "$CERT_FILE")"
+    DIR="$(dirname -- "$CERT_FILE")"
     FULL=""
     # 候选链的叶证书必须就是当前这张（2026-11-04 修）：多域名机器上上级目录的
     # fullchain 可能属于别的域名，旧实现照单全收，服务端随即出示错的证书。

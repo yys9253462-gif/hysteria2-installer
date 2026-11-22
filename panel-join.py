@@ -126,15 +126,43 @@ def meta_host(meta_text):
 
 
 def read(path):
+    # 先用 lstat 快速拦截符号链接与非常规文件（兼顾跨平台与测试桩），
+    # POSIX 下再以 O_NOFOLLOW + fstat 消除 check-then-open 窗口。
     try:
-        st = os.lstat(path)
+        st0 = os.lstat(path)
     except OSError:
         return None
-    if not stat.S_ISREG(st.st_mode):
+    if not stat.S_ISREG(st0.st_mode):
         return None
-    if st.st_size > MAX_CONFIG_BYTES:
+    if st0.st_size > MAX_CONFIG_BYTES:
         print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
         return None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY | nofollow)
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                return None
+            if st.st_size > MAX_CONFIG_BYTES:
+                print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
+                return None
+            with os.fdopen(fd, "rb") as f:
+                fd = None
+                raw = f.read(MAX_CONFIG_BYTES + 1)
+            if len(raw) > MAX_CONFIG_BYTES:
+                print(f"配置文件过大（超过 {MAX_CONFIG_BYTES} 字节），已拒绝读取：{path}", file=sys.stderr)
+                return None
+            return raw.decode("utf-8", errors="replace")
+        except OSError:
+            return None
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
     try:
         with open(path, "rb") as f:
             raw = f.read(MAX_CONFIG_BYTES + 1)
@@ -447,8 +475,13 @@ def main():
         except urllib.error.HTTPError as e:
             try:
                 detail = e.read(4096).decode("utf-8", errors="replace")[:300]
+            except OSError as read_exc:
+                detail = f"(响应体读取失败: {read_exc})"
             finally:
-                e.close()
+                try:
+                    e.close()
+                except OSError:
+                    pass
             print(f"登记失败 HTTP {e.code}: {detail}", file=sys.stderr)
             return 1
         except Exception as e:

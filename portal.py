@@ -25,6 +25,7 @@ import shlex
 import shutil
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -88,6 +89,11 @@ def github_token():
         with _github_token_lock:
             _github_token_cache.update(mtime=None, token='')
         return ''
+    raw_mode = getattr(st, 'st_mode', 0)
+    if stat.S_IFMT(raw_mode) and not stat.S_ISREG(raw_mode):
+        with _github_token_lock:
+            _github_token_cache.update(mtime=None, token='')
+        return ''
     if getattr(st, 'st_size', 0) > 4096:
         with _github_token_lock:
             _github_token_cache.update(mtime=None, token='')
@@ -96,14 +102,14 @@ def github_token():
     stamp = (
         getattr(st, 'st_mtime_ns', st.st_mtime),
         getattr(st, 'st_ctime_ns', getattr(st, 'st_ctime', 0)),
-        getattr(st, 'st_mode', 0),
+        raw_mode,
         getattr(st, 'st_ino', 0),
         getattr(st, 'st_size', 0),
     )
     with _github_token_lock:
         if stamp == _github_token_cache.get('mtime'):
             return _github_token_cache.get('token', '')
-    mode = getattr(st, 'st_mode', 0) & 0o777
+    mode = raw_mode & 0o777
     # 只在 POSIX 上检查：Windows 没有对应的权限位语义，
     # stat() 恒返回 0666，照此判断会让所有 Windows 环境都无法使用 token。
     if os.name == 'posix' and mode and mode & 0o077:
@@ -117,7 +123,10 @@ def github_token():
         if callable(read_bytes):
             value = read_bytes().decode('utf-8', errors='replace').strip()
         else:
-            value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
+            try:
+                value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8', errors='replace').strip()
+            except TypeError:
+                value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
     except (OSError, UnicodeDecodeError):
         value = ''
     # 只接受 token 字符集，防止把换行等注入到请求头里。
@@ -270,7 +279,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.73'
+PORTAL_VERSION = '2.74'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1606,6 +1615,8 @@ def atomic_write_private(path, payload):
                 last = exc
                 time.sleep(0.02)
             if not temp.exists():
+                if path.is_symlink():
+                    raise OSError('目标文件不允许为符号链接，已拒绝回落写入')
                 with open(path, 'wb') as fh:
                     fh.write(payload)
                     fh.flush()
@@ -3055,7 +3066,10 @@ def _read_xray_json(path='/etc/hysteria/xray.json', *, strict=False):
         if callable(read_bytes):
             raw_text = read_bytes().decode('utf-8', errors='replace')
         else:
-            raw_text = p.read_text(encoding='utf-8')
+            try:
+                raw_text = p.read_text(encoding='utf-8', errors='replace')
+            except TypeError:
+                raw_text = p.read_text(encoding='utf-8')
         parsed = json.loads(raw_text)
     except (OSError, ValueError):
         if strict:
@@ -4771,14 +4785,14 @@ def _openssl_sha256_hex(cert_file, timeout=8):
     if not cert_str or cert_str.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in cert_str):
         return ''
     tmp = None
+    fd = None
     out_fh = None
     try:
         fd, tmp = tempfile.mkstemp(prefix='.cert-der-', suffix='.der')
-        os.close(fd)
-        # ⚠️ 用 with 打开目的文件：直接给 stdout=open(...) 会把句柄交给子进程
-        # 且永不关闭，而本函数在页面刷新路径上被反复调用 —— 句柄耗尽后
-        # 门户会开始报 "Too many open files"，整片接口 500。
-        out_fh = open(tmp, 'wb')
+        # 直接用 os.fdopen 接管 mkstemp 句柄，消除先 close 再 open 的 TOCTOU 窗口，
+        # 且确保异常时可靠关闭句柄不致泄漏。
+        out_fh = os.fdopen(fd, 'wb')
+        fd = None
         conv = subprocess.run(['openssl', 'x509', '-in', cert_str, '-outform', 'DER'],
                               stdout=out_fh, stderr=subprocess.PIPE, timeout=timeout)
         out_fh.close()
@@ -4798,6 +4812,11 @@ def _openssl_sha256_hex(cert_file, timeout=8):
         _log_ignored('openssl_sha256', exc)
         return ''
     finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if out_fh is not None:
             try:
                 out_fh.close()
@@ -5458,9 +5477,10 @@ def sync_cert_trust(m, root, meta_path, config_path='/etc/hysteria/config.yaml')
     config_has_acme = False
     try:
         cfg_p = Path(config_path)
-        if cfg_p.is_file() and cfg_p.stat().st_size <= 4 * 1024 * 1024:
-            config_has_acme = bool(re.search(r'^acme:', cfg_p.read_text(encoding='utf-8'), re.M))
-    except (OSError, UnicodeDecodeError):
+        if not cfg_p.is_symlink() and cfg_p.is_file() and cfg_p.lstat().st_size <= 4 * 1024 * 1024:
+            _cfg_text = cfg_p.read_bytes().decode('utf-8', errors='replace')
+            config_has_acme = bool(re.search(r'^acme:', _cfg_text, re.M))
+    except OSError:
         pass
 
     # 证书解析统一走 _resolve_live_cert —— 自愈与界面显示必须是同一张证书，
@@ -12351,7 +12371,8 @@ if __name__ == '__main__':
 
                 # 动态开户 (支持 duration_days, ip_limit, traffic_gb)
                 if sub == 'users/create':
-                    user_id = (params.get('user_id') or ('hy2_' + secrets.token_hex(6))).strip()
+                    user_id = ('' if params.get('user_id') is not None and not isinstance(params.get('user_id'), str)
+                               else ((params.get('user_id') or '') or ('hy2_' + secrets.token_hex(6)))).strip()
                     if not VALID_USER_ID_RE.match(user_id):
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid managed user_id'})
                     if not user_id_shareable(user_id):
@@ -12371,6 +12392,9 @@ if __name__ == '__main__':
                     if pwd != pwd.strip():
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: password must not start or end with whitespace'})
+                    if len(pwd) > 256:
+                        return self.reply_json(400, {'ok': False, 'error':
+                            'Invalid user parameter: password length must be <= 256'})
                     if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: password must not contain control characters'})
@@ -12379,10 +12403,18 @@ if __name__ == '__main__':
                     # 连接被掐断，客户端只看到 "Remote end closed connection"，
                     # 完全看不出是参数问题。这里统一解析并给出 400。
                     try:
-                        days = int(params.get('duration_days', 30))
-                        ip_limit = int(params.get('ip_limit', 0))
-                        traffic_gb = float(params.get('traffic_gb', 0))
-                        expires = int(params.get('expires_at', now_ts + days * 86400))
+                        _raw_days = params.get('duration_days', 30)
+                        _raw_ipl = params.get('ip_limit', 0)
+                        _raw_tgb = params.get('traffic_gb', 0)
+                        _raw_exp = params.get('expires_at')
+                        _raw_lb = params.get('limit_bytes')
+                        _raw_ub = params.get('used_bytes', 0)
+                        if any(isinstance(_v, bool) for _v in (_raw_days, _raw_ipl, _raw_tgb, _raw_exp, _raw_lb, _raw_ub)):
+                            raise ValueError()
+                        days = int(_raw_days)
+                        ip_limit = int(_raw_ipl)
+                        traffic_gb = float(_raw_tgb)
+                        expires = int(_raw_exp) if _raw_exp is not None else int(now_ts + days * 86400)
                     except (ValueError, TypeError, OverflowError):
                         return self.reply_json(400, {'ok': False, 'error':
                             'Invalid user parameter: duration_days / ip_limit / traffic_gb / expires_at must be numeric'})
@@ -12426,6 +12458,11 @@ if __name__ == '__main__':
                     conflict = None
                     durability_uncertain = False
                     password_changed = False
+                    save_err_msg = ''
+                    _missing_meter = object()
+                    previous_record = None
+                    previous_meter = _missing_meter
+                    previous_reality_users = _missing_meter
                     with data_lock:
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
@@ -12501,69 +12538,31 @@ if __name__ == '__main__':
                                 rotate_user_view_key_on_change(existing, record)
                                 password_changed = (isinstance(existing, dict)
                                                     and existing.get('password') != record.get('password'))
+                            previous_record = copy.deepcopy(existing)
+                            previous_meter = (copy.deepcopy(data['usage_meter'])
+                                              if 'usage_meter' in data else _missing_meter)
+                            previous_reality_users = (copy.deepcopy(data['reality_users'])
+                                                      if 'reality_users' in data else _missing_meter)
                             if conflict is None and 'used_bytes' in params:
-                                # 同一共享锁覆盖对账、用户写入和落盘；失败时仅回滚
-                                # 本请求的两个字段。replace 后目录 fsync 失败属于未知
-                                # 落盘状态，save_data 的异常会明确告知调用方需核对。
-                                missing = object()
-                                previous_meter = (copy.deepcopy(data['usage_meter'])
-                                                  if 'usage_meter' in data else missing)
+                                save_err_msg = 'Reconciliation save failed; disk state may require verification'
                                 try:
                                     reconcile_meter_usage(data, user_id, initial_used)
                                     restore_meter_user(data, user_id)
                                     if not isinstance(data.get('users'), dict):
                                         data['users'] = {}
                                     data['users'][user_id] = record
-                                    save_data()
                                 except ValueError:
-                                    if previous_meter is missing:
+                                    if previous_meter is _missing_meter:
                                         data.pop('usage_meter', None)
                                     else:
                                         data['usage_meter'] = previous_meter
                                     conflict = (409, 'Invalid meter ledger; reconciliation not applied')
-                                except AtomicWriteDurabilityError:
-                                    # 文件已替换：保留新值并继续同步协议，随后返回不确定状态。
-                                    durability_uncertain = True
-                                except OSError:
-                                    if existing is None:
-                                        if isinstance(data.get('users'), dict):
-                                            data['users'].pop(user_id, None)
-                                    else:
-                                        if not isinstance(data.get('users'), dict):
-                                            data['users'] = {}
-                                        data['users'][user_id] = existing
-                                    if previous_meter is missing:
-                                        data.pop('usage_meter', None)
-                                    else:
-                                        data['usage_meter'] = previous_meter
-                                    conflict = (503, 'Reconciliation save failed; disk state may require verification')
                             elif conflict is None:
-                                previous_record = copy.deepcopy(existing)
-                                missing = object()
-                                previous_meter = (copy.deepcopy(data['usage_meter'])
-                                                  if 'usage_meter' in data else missing)
+                                save_err_msg = 'User save failed; disk state may require verification'
                                 restore_meter_user(data, user_id)
                                 if not isinstance(data.get('users'), dict):
                                     data['users'] = {}
                                 data['users'][user_id] = record
-                                try:
-                                    save_data()
-                                except AtomicWriteDurabilityError:
-                                    durability_uncertain = True
-                                except OSError:
-                                    if previous_record is None:
-                                        if isinstance(data.get('users'), dict):
-                                            data['users'].pop(user_id, None)
-                                    else:
-                                        if not isinstance(data.get('users'), dict):
-                                            data['users'] = {}
-                                        data['users'][user_id] = previous_record
-                                    if previous_meter is missing:
-                                        data.pop('usage_meter', None)
-                                    else:
-                                        data['usage_meter'] = previous_meter
-                                    reality_registry(data)
-                                    conflict = (503, 'User save failed; disk state may require verification')
                             if conflict is None:
                                 pwd, expires = record['password'], record['expires_at']
                                 ip_limit, limit_bytes = record['ip_limit'], record['limit_bytes']
@@ -12577,6 +12576,30 @@ if __name__ == '__main__':
                     if conflict is not None:
                         # 锁已释放，现在才写响应。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
+                    # 落盘与 fsync 放到 data_lock 外执行，避免慢盘 fsync 阻塞全节点并发 /auth 鉴权。
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        # 文件已替换：保留新值并继续同步协议，随后返回不确定状态。
+                        durability_uncertain = True
+                    except OSError:
+                        with data_lock:
+                            if previous_record is None:
+                                if isinstance(data.get('users'), dict):
+                                    data['users'].pop(user_id, None)
+                            else:
+                                if not isinstance(data.get('users'), dict):
+                                    data['users'] = {}
+                                data['users'][user_id] = previous_record
+                            if previous_meter is _missing_meter:
+                                data.pop('usage_meter', None)
+                            else:
+                                data['usage_meter'] = previous_meter
+                            if previous_reality_users is _missing_meter:
+                                data.pop('reality_users', None)
+                            else:
+                                data['reality_users'] = previous_reality_users
+                        return self.reply_json(503, {'ok': False, 'error': save_err_msg})
                     if not durability_uncertain:
                         regenerate_page()
 
@@ -12661,9 +12684,10 @@ if __name__ == '__main__':
                     try:
                         changes = {}
                         if 'password' in params:
-                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修），且拒绝控制字符。
+                            # 与 users/create 同一判据：纯空白也算空（2026-11-04 修），且拒绝控制字符与超长密码。
                             if (not isinstance(params['password'], str) or not params['password'].strip()
                                     or params['password'] != params['password'].strip()
+                                    or len(params['password']) > 256
                                     or any(ord(ch) < 32 or ord(ch) == 127 for ch in params['password'])):
                                 raise ValueError()
                             changes['password'] = params['password']
@@ -12694,6 +12718,7 @@ if __name__ == '__main__':
                     password_changed = False
                     status_disabled = False
                     result = None
+                    previous = None
                     with data_lock:
                         _raw_users = data.get('users')
                         users_map = _raw_users if isinstance(_raw_users, dict) else {}
@@ -12708,21 +12733,23 @@ if __name__ == '__main__':
                             password_changed = previous.get('password') != u.get('password')
                             status_disabled = u.get('status') == 'disabled'
                             rotate_user_view_key_on_change(previous, u)
-                            try:
-                                save_data()
-                            except AtomicWriteDurabilityError:
-                                durability_uncertain = True
-                            except OSError:
-                                data['users'][user_id] = previous
-                                conflict = (503, 'User update save failed; disk state may require verification')
-                            if conflict is None:
-                                result = {k: copy.deepcopy(v) for k, v in u.items() if k not in ('password', 'view_nonce')}
-                                # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
-                                result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
-                                result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
+                            result = {k: copy.deepcopy(v) for k, v in u.items() if k not in ('password', 'view_nonce')}
+                            # 与 users/list 对齐：同时给 traffic_* 与原始名，任一套都能读到。
+                            result.setdefault('traffic_limit_bytes', result.get('limit_bytes', 0))
+                            result.setdefault('traffic_used_bytes', result.get('used_bytes', 0))
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
+                    # 落盘与 fsync 放到 data_lock 外执行，避免慢盘 fsync 阻塞全节点并发 /auth 鉴权。
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        durability_uncertain = True
+                    except OSError:
+                        with data_lock:
+                            if isinstance(data.get('users'), dict):
+                                data['users'][user_id] = previous
+                        return self.reply_json(503, {'ok': False, 'error': 'User update save failed; disk state may require verification'})
                     if not durability_uncertain:
                         regenerate_page()
                     # 即使同值也重试权威同步；不得因上次写入已落盘而吞掉重载失败。
@@ -12758,6 +12785,7 @@ if __name__ == '__main__':
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid renewal: extend_days must be 1..36500; add_traffic_gb must be finite and 0..1000000'})
                     conflict = None
                     durability_uncertain = False
+                    previous = None
                     with data_lock:
                         _raw_users = data.get('users')
                         u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
@@ -12807,19 +12835,22 @@ if __name__ == '__main__':
                                 # 到期与否由 expires_at 判定，不依赖 status。
                                 previous = copy.deepcopy(u)
                                 u.update(expires_at=new_expiry, limit_bytes=new_limit)
-                                try:
-                                    save_data()
-                                except AtomicWriteDurabilityError:
-                                    durability_uncertain = True
-                                except OSError:
-                                    data['users'][user_id] = previous
-                                    conflict = (503, 'Renewal save failed; disk state may require verification')
                                 exp_at = u['expires_at']
                                 lim_b = u.get('limit_bytes', 0)
                                 status_now = u.get('status', 'active')
                     if conflict is not None:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
+                    # 落盘与 fsync 放到 data_lock 外执行，避免慢盘 fsync 阻塞全节点并发 /auth 鉴权。
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        durability_uncertain = True
+                    except OSError:
+                        with data_lock:
+                            if isinstance(data.get('users'), dict):
+                                data['users'][user_id] = previous
+                        return self.reply_json(503, {'ok': False, 'error': 'Renewal save failed; disk state may require verification'})
                     if not durability_uncertain:
                         regenerate_page()
                     # 续费后立即同步协议客户端：过期用户续费后不必等 5 秒的
@@ -13004,8 +13035,8 @@ if __name__ == '__main__':
                     # 否则会出现"把面板自己锁在门外"的后果。
                     if user_id == MASTER_USER_ID and want != 'active':
                         return self.reply_json(400, {'ok': False, 'error': 'Cannot disable the master account'})
-                    conflict = None
                     durability_uncertain = False
+                    previous = None
                     with data_lock:
                         _raw_users = data.get('users')
                         u = _raw_users.get(user_id) if isinstance(_raw_users, dict) else None
@@ -13017,18 +13048,19 @@ if __name__ == '__main__':
                             before = u.get('status', 'active')
                             u['status'] = want
                             rotate_user_view_key_on_change(previous, u)
-                            try:
-                                save_data()
-                            except AtomicWriteDurabilityError:
-                                durability_uncertain = True
-                            except OSError:
-                                data['users'][user_id] = previous
-                                conflict = (503, 'User status save failed; disk state may require verification')
-                    if conflict is not None:
-                        return self.reply_json(conflict[0], {'ok': False, 'error': conflict[1]})
                     if missing:
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply_json(404, {'ok': False, 'error': 'User not found'})
+                    # 落盘与 fsync 放到 data_lock 外执行，避免慢盘 fsync 阻塞全节点并发 /auth 鉴权。
+                    try:
+                        save_data()
+                    except AtomicWriteDurabilityError:
+                        durability_uncertain = True
+                    except OSError:
+                        with data_lock:
+                            if isinstance(data.get('users'), dict):
+                                data['users'][user_id] = previous
+                        return self.reply_json(503, {'ok': False, 'error': 'User status save failed; disk state may require verification'})
                     if not durability_uncertain:
                         regenerate_page()
                     # ⚠️ 2026-10-04 补：停用/启用必须同步到 xray。
@@ -13472,11 +13504,14 @@ if __name__ == '__main__':
                             changed = True
                         if changed:
                             try:
-                                _dfd = os.open(str(base_dir), os.O_RDONLY)
+                                _dfd = os.open(str(base_dir), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
                                 try:
                                     os.fsync(_dfd)
                                 finally:
-                                    os.close(_dfd)
+                                    try:
+                                        os.close(_dfd)
+                                    except OSError:
+                                        pass
                             except OSError:
                                 pass
                             # 只保留最近 3 **轮**更新留下的备份；本轮的必须护住
@@ -14528,6 +14563,7 @@ if __name__ == '__main__':
                     return self.reply_json(400, {'ok': False, 'error': '未知 WARP 操作'})
 
                 bad_domain = False
+                too_many_rules = False
                 warp_not_installed = False
                 # 文件系统探测放在 data_lock 外执行，避免磁盘抖动时阻塞 /auth 鉴权。
                 warp_installed = warp_backend_installed() if action in ('toggle', 'enable') else True
@@ -14560,6 +14596,8 @@ if __name__ == '__main__':
                         domain = _clean_route_domain(form.get('domain', [''])[0])
                         if not _valid_route_domain(domain):
                             bad_domain = True
+                        elif not any(r['domain'] == domain for r in rules) and len(rules) >= 500:
+                            too_many_rules = True
                         else:
                             rules = [r for r in rules if r['domain'] != domain]
                             rules.append({'domain': domain, 'outbound': 'warp_socks'})
@@ -14571,8 +14609,8 @@ if __name__ == '__main__':
                         rules = [r for r in rules if r['outbound'] not in ('warp', 'warp_socks')]
                         keep = {r['domain'] for r in rules}
                         rules.extend({'domain': d, 'outbound': 'warp_socks'} for d in DEFAULT_WARP_DOMAINS if d not in keep)
-                    # 域名不合法或未安装 WARP 时直接拒绝、不落盘，锁内也不能先写脏规则。
-                    if not bad_domain and not warp_not_installed and (rules or previous_warp_rules_exists):
+                    # 域名不合法、规则超上限或未安装 WARP 时直接拒绝、不落盘，锁内也不能先写脏规则。
+                    if not bad_domain and not too_many_rules and not warp_not_installed and (rules or previous_warp_rules_exists):
                         data['warp_rules'] = rules
                     new_state = bool(data.get('warp_enabled'))
                     current_rules = [r['domain'] for r in rules if r['outbound'] in ('warp', 'warp_socks')]
@@ -14580,6 +14618,8 @@ if __name__ == '__main__':
                 if bad_domain:
                     # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                     return self.reply_json(400, {'ok': False, 'error': '域名格式不正确'})
+                if too_many_rules:
+                    return self.reply_json(400, {'ok': False, 'error': '分流规则数量已达上限（最多 500 条），请先删除不需要的规则'})
                 if warp_not_installed:
                     return self.reply_json(409, {'ok': False, 'error':
                         '本机尚未安装 WARP（wireproxy），请先在「出站分流」里安装 WARP 再开启'})
@@ -16424,11 +16464,14 @@ if __name__ == '__main__':
                         os.chmod(str(tmp_path), 0o644)
                         os.replace(str(tmp_path), str(target_path))
                         try:
-                            dir_fd = os.open(str(target_path.parent), os.O_RDONLY)
+                            dir_fd = os.open(str(target_path.parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
                             try:
                                 os.fsync(dir_fd)
                             finally:
-                                os.close(dir_fd)
+                                try:
+                                    os.close(dir_fd)
+                                except OSError:
+                                    pass
                         except OSError:
                             pass
                     except BaseException:
@@ -16597,6 +16640,8 @@ if __name__ == '__main__':
                     if pwd != pwd.strip() and pwd.strip():
                         return self.reply(400, '密码首尾不能有空白字符'.encode('utf-8'))
                     pwd = pwd.strip() or secrets.token_hex(16)
+                    if len(pwd) > 256:
+                        return self.reply(400, '密码长度不能超过 256 个字符'.encode('utf-8'))
                     if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
                         return self.reply(400, '密码不能包含换行或控制字符'.encode('utf-8'))
                     # 同 REST 通道：非数字或全角数字输入必须回 400，而不是让异常掐断连接。
@@ -18860,6 +18905,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     ok, cleaned, err = validate_outbound(entry)
                     if not ok:
                         return self.reply_json(400, {'ok': False, 'error': err})
+                    too_many_outbounds = False
                     with data_lock:
                         previous_egress = {'custom_outbounds': ('custom_outbounds' in data,
                                                                 copy.deepcopy(data.get('custom_outbounds')))}
@@ -18871,10 +18917,16 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                              if isinstance(outbound, dict) and outbound.get('name') == cleaned['name']),
                             None)
                         if existing_index is None:
-                            outs.append(cleaned)
+                            if len(outs) >= 64:
+                                too_many_outbounds = True
+                            else:
+                                outs.append(cleaned)
                         else:
                             outs[existing_index] = cleaned
-                        data['custom_outbounds'] = outs
+                        if not too_many_outbounds:
+                            data['custom_outbounds'] = outs
+                    if too_many_outbounds:
+                        return self.reply_json(400, {'ok': False, 'error': '自定义出站数量已达上限（最多 64 个），请先删除不需要的出站'})
                     msg = '出站「%s」已保存' % cleaned['name']
                 else:
                     name = (form.get('name', [''])[0] or '').strip()
@@ -18946,6 +18998,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             rule_error = '域名格式不正确'
                         elif not outbound_target_exists(target, _usable_outs):
                             rule_error = '所选出站不存在，请刷新页面后重新选择已配置的出站'
+                        elif not any(r['domain'] == cleaned for r in rules) and len(rules) >= 500:
+                            rule_error = '分流规则数量已达上限（最多 500 条），请先删除不需要的规则'
                         else:
                             rules = [r for r in rules if r['domain'] != cleaned]
                             rules.append({'domain': cleaned, 'outbound': target})

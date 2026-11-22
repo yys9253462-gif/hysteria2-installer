@@ -389,6 +389,7 @@ ok "默认路由已就绪"
 #   所以这里一行一个 echo，短命令，不会截断。
 if ! nslookup github.com >/dev/null 2>&1; then
     warn "DNS 解析失败，写入公共 DNS"
+    [ ! -L /etc/resolv.conf ] || rm -f /etc/resolv.conf
     echo "nameserver 223.5.5.5"   > /etc/resolv.conf
     echo "nameserver 100.100.2.136" >> /etc/resolv.conf
     echo "nameserver 8.8.8.8"    >> /etc/resolv.conf
@@ -456,12 +457,14 @@ fi
 is_whole_disk "$DISK" || die "$DISK 不是整块磁盘（像是分区），请指定整块磁盘，例如 /dev/vda"
 # 之后一律用真实设备名（2026-11-13 修）：/dev/disk/by-id/... 这类链接去对 /proc/mounts 永远对不上，
 # 「正被挂载」这条救援盘特征会漏掉；传给 InstallNET 的也必须是 /dev/vdX 这种写法。
-DISK="$(readlink -f "$DISK" 2>/dev/null || printf '%s' "$DISK")"
+DISK="$(readlink -f -- "$DISK" 2>/dev/null || printf '%s' "$DISK")"
 
-_raw_sectors="$(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null | tr -d '[:space:]')"
+_raw_sectors="$(cat "/sys/block/$(basename -- "$(readlink -f -- "$DISK" 2>/dev/null || printf '%s' "$DISK")")/size" 2>/dev/null | tr -d '[:space:]')"
 case "$_raw_sectors" in
     ''|*[!0-9]*) _raw_sectors=0 ;;
 esac
+_raw_sectors="${_raw_sectors#"${_raw_sectors%%[!0]*}"}"
+[ -n "$_raw_sectors" ] && [ "${#_raw_sectors}" -le 18 ] || _raw_sectors=0
 DISK_SIZE_MB=$((_raw_sectors / 2048))
 ok "目标磁盘：$DISK（约 ${DISK_SIZE_MB} MB）"
 
@@ -693,16 +696,19 @@ installnet_looks_valid() {
 }
 
 download_installnet() {
+    [ -z "${WORKDIR:-}" ] || [ ! -L "$WORKDIR" ] || return 1
     for _u in "$INSTALLNET_URL" "$INSTALLNET_MIRROR"; do
+        [ ! -L "$IN_FILE" ] || rm -f "$IN_FILE"
+        rm -f "$IN_FILE"
+        if command -v curl >/dev/null 2>&1; then
+            # 优先使用支持 --max-filesize 上限的 curl，避免异常超长响应撑爆内存救援盘。
+            ( umask 077; curl -fsSL --max-time 120 --max-filesize 2097152 -o "$IN_FILE" "$_u" ) && installnet_looks_valid && return 0
+        fi
         rm -f "$IN_FILE"
         if command -v wget >/dev/null 2>&1; then
             # 不能 --no-check-certificate：下载的脚本随后以 root 执行并重装整个系统，
             # 跳过证书校验等于把机器交给任何能做中间人的人。
             ( umask 077; wget -qO "$IN_FILE" -T 120 "$_u" ) && installnet_looks_valid && return 0
-        fi
-        rm -f "$IN_FILE"
-        if command -v curl >/dev/null 2>&1; then
-            ( umask 077; curl -fsSL --max-time 120 --max-filesize 2097152 -o "$IN_FILE" "$_u" ) && installnet_looks_valid && return 0
         fi
     done
     rm -f "$IN_FILE"
