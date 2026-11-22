@@ -119,8 +119,8 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
             sampled_users = set(cursors)  # 兼容没有相邻采样元数据的旧状态。
         else:
             recorded = previous['sampled_users']
-            if isinstance(recorded, list) and all(isinstance(uid, str) for uid in recorded):
-                sampled_users = set(recorded)
+            if isinstance(recorded, list):
+                sampled_users = {uid for uid in recorded if isinstance(uid, str) and uid}
     baseline_sampled = set()
     for uid, pair in clean.items():
         old = cursors.get(uid)

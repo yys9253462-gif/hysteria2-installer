@@ -1138,6 +1138,7 @@ const OB_TYPE_LABEL = {
 
 // 🔴 密码绝不显示在列表里（门户有被截图的风险），只显示"已设置"
 function obMetaOf(o) {
+  if (!o || typeof o !== 'object') return '';
   if (o.type === 'socks5') {
     let s = o.addr || '';
     if (o.username) s += ' · 认证 ' + o.username + ':******';
@@ -1156,13 +1157,14 @@ function obEsc(s) {
 
 function renderOutboundList(outs) {
   if (!obEls.list) return;
-  if (obEls.count) obEls.count.textContent = outs.length + ' 个';
-  if (!outs.length) {
+  const list = Array.isArray(outs) ? outs.filter(o => o && typeof o === 'object') : [];
+  if (obEls.count) obEls.count.textContent = list.length + ' 个';
+  if (!list.length) {
     obEls.list.innerHTML = '<span class="ob-empty">还没有自定义出站。'
       + '点右上角「＋ 新增出站」添加一个 SOCKS5 / HTTP 代理，再切到「全局出口」即可让所有流量走它。</span>';
     return;
   }
-  obEls.list.innerHTML = outs.map((o, idx) => {
+  obEls.list.innerHTML = list.map((o, idx) => {
     const t = OB_TYPE_LABEL[o.type] || { label: o.type, cls: '' };
     // 带认证的 SOCKS5 要把账号密码一起带上，与表单里的「测试」同一写法（2026-11-03 修）：
     // 旧写法只发 host:port，需要认证的出站从列表里测永远「探测失败」。
@@ -1172,7 +1174,7 @@ function renderOutboundList(outs) {
     return '<div class="ob-item">'
       + '<div class="ob-item-main">'
       + '<div class="ob-item-name">' + obEsc(o.name)
-      + '<span class="ob-item-type ' + t.cls + '">' + obEsc(t.label) + '</span>'
+      + '<span class="ob-item-type ' + obEsc(t.cls) + '">' + obEsc(t.label) + '</span>'
       + (idx === 0 ? '<span class="ob-item-first" title="全局出口模式下所有流量走这个出站">全局出口</span>' : '')
       + '</div>'
       + '<div class="ob-item-meta">' + obEsc(obMetaOf(o)) + '</div></div>'
@@ -1189,18 +1191,27 @@ function renderOutboundList(outs) {
 function renderOutboundRules(rules, outs, builtin) {
   if (!obEls.rulesList) return;
   const norm = [];
-  (rules || []).forEach(r => {
-    norm.push((r && typeof r === 'object')
-      ? { domain: r.domain, outbound: r.outbound || 'warp_socks' }
-      : { domain: String(r), outbound: 'warp_socks' });
+  (Array.isArray(rules) ? rules : []).forEach(r => {
+    if (r == null) return;
+    if (typeof r === 'object') {
+      const dom = typeof r.domain === 'string' ? r.domain.trim() : '';
+      if (!dom) return;
+      norm.push({ domain: dom, outbound: r.outbound || 'warp_socks' });
+    } else {
+      const dom = String(r).trim();
+      if (!dom) return;
+      norm.push({ domain: dom, outbound: 'warp_socks' });
+    }
   });
   if (obEls.rulesCount) obEls.rulesCount.textContent = norm.length + ' 条';
 
-  const customNames = new Set((outs || []).map(o => o && o.name).filter(Boolean));
+  const safeOuts = Array.isArray(outs) ? outs.filter(o => o && typeof o === 'object') : [];
+  const safeBuiltin = Array.isArray(builtin) ? builtin : [];
+  const customNames = new Set(safeOuts.map(o => o.name).filter(Boolean));
   const builtinTypes = { warp_socks: 'socks5', direct_ipv4: 'direct', warp: 'socks5' };
-  const configured = (builtin || []).filter(name => name && !customNames.has(name))
+  const configured = safeBuiltin.filter(name => typeof name === 'string' && name && !customNames.has(name))
     .map(name => ({ name: name, type: builtinTypes[name] || '' }));
-  const all = configured.concat([{ name: 'direct', type: 'direct' }, { name: 'reject', type: '' }], outs || []);
+  const all = configured.concat([{ name: 'direct', type: 'direct' }, { name: 'reject', type: '' }], safeOuts);
   const seen = new Set(); const uniq = [];
   all.forEach(o => { if (o && o.name && !seen.has(o.name)) { seen.add(o.name); uniq.push(o); } });
 
@@ -2699,6 +2710,7 @@ async function waitPortalBack(timeoutMs = 300000, intervalMs = 3000) {
 
 if (btnRebootServer) {
   btnRebootServer.addEventListener('click', async () => {
+    if (btnRebootServer.disabled) return;
     // 按危险操作处理（2026-11-13 修）：重启期间所有连接都会中断，旧实现焦点停在「确定」，回车就重启。
     const confirmed = await showConfirm({
       title: '安全重启服务器',
@@ -2708,7 +2720,7 @@ if (btnRebootServer) {
       confirmText: '确定立即重启',
       isDanger: true
     });
-    if (!confirmed) return;
+    if (!confirmed || btnRebootServer.disabled) return;
     btnRebootServer.disabled = true;
     btnRebootServer.textContent = '⏳ 重启指令已发送...';
     try {
@@ -2741,6 +2753,7 @@ if (btnRebootServer) {
             back = false;
           }
           if (back) {
+            btnRebootServer.disabled = false;
             location.reload();
             return;
           }
@@ -2862,9 +2875,9 @@ function renderCore(core) {
     row.appendChild(coreEl('b', '', value));
     meta.appendChild(row);
   };
-  line('版本', core.installed ? core.version : '—');
-  line('服务', core.service);
-  line('用于', (core.used_by || []).join('、'));
+  line('版本', core.installed ? (core.version || '未知') : '—');
+  line('服务', core.service || '—');
+  line('用于', Array.isArray(core.used_by) ? core.used_by.join('、') : (typeof core.used_by === 'string' ? core.used_by : ''));
   card.appendChild(meta);
   if (core.note) card.appendChild(coreEl('div', 'core-note', core.note));
 
@@ -2904,7 +2917,7 @@ async function loadCores() {
     coreGrid.textContent = '';
     // 后端异常时 cores 可能不是数组（错误对象/undefined），直接 forEach 会
     // 抛出未处理的 rejection，核心卡片停在「读取中」且没有提示。
-    const cores = Array.isArray(json.cores) ? json.cores : [];
+    const cores = Array.isArray(json.cores) ? json.cores.filter(c => c && typeof c === 'object') : [];
     if (!cores.length) throw new Error('节点没有返回任何核心信息');
     cores.forEach(core => coreGrid.appendChild(renderCore(core)));
   } catch (e) {
@@ -3166,6 +3179,7 @@ async function doUpgrade(target) {
 
 if (btnRecheckUpdate) {
   btnRecheckUpdate.addEventListener('click', async () => {
+    if (btnRecheckUpdate.disabled) return;
     btnRecheckUpdate.disabled = true;
     if (updateStatusMsg) updateStatusMsg.textContent = '正在重新检测...';
     try {
@@ -3215,12 +3229,14 @@ async function pollTrafficSpeed() {
 
     // 累计用量同样实时更新，避免只能刷新页面后看到新值。
     // 小数位与后端 format_bytes 相同（KB 一位、其余两位），刷新前后同一个数字写法不变。
+    const usersMap = (json.users && typeof json.users === 'object' && !Array.isArray(json.users)) ? json.users : null;
     const fmtUsage = value => fmtUnits(value, ['B', 'KB', 'MB', 'GB', 'TB'], [0, 1, 2, 2, 2]);
     const totalUsage = document.getElementById('total-used-bytes');
     if (totalUsage) totalUsage.textContent = fmtUsage(json.total_used_bytes);
     document.querySelectorAll('[data-user-usage]').forEach(el => {
-      const u = (json.users || {})[el.dataset.userUsage];
-      if (!u) return;
+      const uid = el.dataset.userUsage;
+      const u = (usersMap && Object.prototype.hasOwnProperty.call(usersMap, uid)) ? usersMap[uid] : null;
+      if (!u || typeof u !== 'object') return;
       // 首屏由服务端渲染的是 used_bytes，这里保持一致：
       // 计量未就绪时旧实现会把它换成「计量未就绪」，数字凭空消失。
       el.textContent = fmtUsage(u.used_bytes);
@@ -3230,11 +3246,11 @@ async function pollTrafficSpeed() {
     });
 
     // 更新各个用户的实时速率标签
-    if (json.users) {
+    if (usersMap) {
       document.querySelectorAll('[data-user-speed]').forEach(badge => {
         const uid = badge.dataset.userSpeed;
-        const u = json.users[uid];
-        if (u && (u.rx > 0 || u.tx > 0)) {
+        const u = Object.prototype.hasOwnProperty.call(usersMap, uid) ? usersMap[uid] : null;
+        if (u && typeof u === 'object' && ((Number.isFinite(u.rx) && u.rx > 0) || (Number.isFinite(u.tx) && u.tx > 0))) {
           badge.textContent = '↓ ' + fmtSpeed(u.rx) + ' · ↑ ' + fmtSpeed(u.tx);
           badge.className = 'speed-badge active';
         } else {
@@ -4000,7 +4016,7 @@ function toggleSecret(id, btn) {
 // 因此被允许）。
 document.querySelectorAll('.toggle-pwd').forEach(btn => {
   btn.addEventListener('click', () => {
-    const input = btn.parentElement.querySelector('input');
+    const input = btn.parentElement && btn.parentElement.querySelector('input');
     if (input) toggleSecret(input.id, btn);
   });
 });

@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.62'
+PORTAL_VERSION = '2.63'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -634,15 +634,13 @@ def clean_outbounds(outbounds):
 
 
 def _renderable_outbounds(outbounds):
-    """在 clean_outbounds 基础上进一步筛选可安全渲染进 YAML 的出站条目。"""
+    """在 clean_outbounds 基础上进一步筛选可通过校验、可安全渲染进 YAML 的出站条目。"""
     result = []
     for ob in clean_outbounds(outbounds):
-        otype = ob['type']
-        if otype == 'socks5' and not _is_safe_outbound_str(ob.get('addr')):
+        ok, cleaned, _ = validate_outbound(ob)
+        if not ok or not cleaned or cleaned['name'] != ob['name']:
             continue
-        if otype == 'http' and not _is_safe_outbound_str(ob.get('url')):
-            continue
-        result.append(ob)
+        result.append(cleaned)
     return result
 
 
@@ -828,6 +826,8 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     # 传进损坏值：数字会让 `for ... in 7` 抛 TypeError，条目是字符串时
     # `.get` 抛 AttributeError —— 都在「应用配置」路径上。
     outbounds = clean_outbounds(outbounds)
+    if not isinstance(tail_outbound, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', tail_outbound):
+        tail_outbound = 'direct'
     names = [ob['name'] for ob in (outbounds or [])]
     existing = set(_existing_outbound_names() if existing_names is None else existing_names)
     available = set(names) | existing | {'direct', 'reject'}
@@ -843,16 +843,17 @@ def build_acl_block(mode, rules, outbounds, tail_outbound='direct', existing_nam
     # 写时，先加的 google.com → warp 会吞掉后加的 mail.google.com → direct，后者永不生效。
     # sorted 是稳定排序，同层级的规则仍保持添加顺序。
     rules = sorted((r for r in rules if isinstance(r, dict)),
-                   key=lambda r: -str(r.get('domain') or '').strip('.').count('.'))
+                   key=lambda r: -(r.get('domain').strip('.').count('.') if isinstance(r.get('domain'), str) else 0))
     for r in rules:
         if not isinstance(r, dict):
             continue
         raw_dom = r.get('domain')
-        dom = raw_dom.strip().lower() if isinstance(raw_dom, str) else ''
-        if not dom:
+        dom = raw_dom.strip().lower().strip('.') if isinstance(raw_dom, str) else ''
+        if not _valid_route_domain(dom):
             continue
-        target = r.get('outbound') or ''
-        # 出站可能已被用户删除 —— 引用不存在的名字会让 Hysteria 起不来
+        raw_target = r.get('outbound')
+        target = raw_target if isinstance(raw_target, str) else ''
+        # 出站可能已被用户删除或被改坏 —— 引用不存在的名字会让 Hysteria 起不来
         if target not in available:
             target = 'warp_socks' if 'warp_socks' in existing else tail_outbound
         acl.append('    - %s(suffix:%s)' % (target, dom))
@@ -897,7 +898,7 @@ def _valid_route_domain(domain):
 
 def build_warp_acl_config(original, enabled, rules):
     """Render WARP domain ACL over the existing Hysteria config."""
-    text = strip_acl_block(original)
+    text = strip_acl_block(original if isinstance(original, str) else '')
     # rules 可能是数字（旧快照被改坏）：`for r in 7` 抛 TypeError，
     # 而这里是 WARP 开关/应用配置的必经路径。
     rows = rules if isinstance(rules, (list, tuple)) else ()
@@ -923,15 +924,19 @@ def build_warp_acl_config(original, enabled, rules):
         text = text.rstrip('\n') + '\n\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: false\n  tcpPorts: 80,443\n  udpPorts: 443\n'
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
     lines = _acl_head()
+    allowed_targets = set(existing) | {'direct', 'reject'}
     _ordered = sorted(rows if enabled else custom_rules,
-                      key=lambda r: -str(r.get('domain', '') if isinstance(r, dict) else r).strip('.').count('.'))
+                      key=lambda r: -(r.get('domain').strip('.').count('.')
+                                      if isinstance(r, dict) and isinstance(r.get('domain'), str)
+                                      else (r.strip('.').count('.') if isinstance(r, str) else 0)))
     for rule in _ordered:  # 同 build_acl_block：具体域名在前
-        domain = rule.get('domain', '') if isinstance(rule, dict) else rule
-        target = rule.get('outbound') or warp_name if isinstance(rule, dict) else warp_name
-        if target not in set(existing) | {'direct', 'reject'}:
-            target = warp_name
-        domain = str(domain).strip().lower().strip('.')
-        if domain and re.fullmatch(r'[a-z0-9.-]+', domain):
+        raw_dom = rule.get('domain') if isinstance(rule, dict) else rule
+        if not isinstance(raw_dom, str):
+            continue
+        raw_target = rule.get('outbound') if isinstance(rule, dict) else warp_name
+        target = raw_target if isinstance(raw_target, str) and raw_target in allowed_targets else warp_name
+        domain = raw_dom.strip().lower().strip('.')
+        if _valid_route_domain(domain):
             lines.append('    - %s(suffix:%s)' % (target, domain))
     lines.append('    - %s(all)' % tail)
     return text.rstrip('\n') + '\n\n' + '\n'.join(lines) + '\n'
@@ -967,9 +972,15 @@ def normalize_route_rules(rules):
             item = {'domain': item, 'outbound': 'warp_socks'}
         if not isinstance(item, dict):
             continue
-        domain = str(item.get('domain') or '').strip().lower().strip('.')
-        if domain and re.fullmatch(r'[a-z0-9.-]+', domain):
-            result.append({'domain': domain, 'outbound': str(item.get('outbound') or 'warp_socks')})
+        raw_dom = item.get('domain')
+        if not isinstance(raw_dom, str):
+            continue
+        domain = raw_dom.strip().lower().strip('.')
+        if _valid_route_domain(domain):
+            raw_ob = item.get('outbound')
+            ob = (raw_ob.strip() if isinstance(raw_ob, str)
+                  and re.fullmatch(r'[A-Za-z0-9_-]+', raw_ob.strip()) else 'warp_socks')
+            result.append({'domain': domain, 'outbound': ob})
     return result
 
 
@@ -981,6 +992,8 @@ def routing_state(data):
     warp_rules 是数字时 normalize_route_rules 之前就会在 deepcopy 后炸，
     面板拿不到能力清单。
     """
+    if not isinstance(data, dict):
+        data = {}
     rules = data.get('warp_rules')
     if not isinstance(rules, (list, tuple)):
         rules = DEFAULT_WARP_DOMAINS if data.get('warp_enabled') else []
@@ -995,10 +1008,12 @@ def routing_state(data):
 
 
 def render_egress_config(original, state):
+    if not isinstance(state, dict):
+        state = {}
     enabled = bool(state.get('warp_enabled', False))
     # Ensure the WARP transport/sniffer, then render the one shared route table.
     base = strip_acl_block(build_warp_acl_config(original, enabled, []))
-    outs = clean_outbounds(state.get('custom_outbounds', []))
+    outs = _renderable_outbounds(state.get('custom_outbounds', []))
     base = upsert_outbound_block(base, outs)
     existing = outbound_names_in(base)
     tail = 'direct_ipv4' if 'direct_ipv4' in existing else 'direct'
@@ -5435,17 +5450,15 @@ def vmess_clients(data):
 
 
 def protocol_host_sni(cfg, fallback=''):
-    """托管 TLS 协议直链用的 (host, sni)：只认非空字符串，改坏的值退回 fallback（2026-11-06 加）。
+    """托管 TLS 协议直链用的 (host, sni)：只认无控制字符与内部空白的非空字符串，改坏的值退回 fallback（2026-11-06 加）。
 
-    domain / sni 被改成数字、列表或 null 时，旧实现把 123、['d'] 原样拼进 vmess:// /
+    domain / sni 被改成数字、列表、含换行或 null 时，旧实现把 123、['d'] 原样拼进 vmess:// /
     vless:// / anytls:// / tuic://，客户端导入后连一个不存在的地址。
     """
-    def clean(v):
-        return v.strip() if isinstance(v, str) and v.strip() else ''
-    fb = clean(fallback)
-    host = clean(cfg.get('domain')) if isinstance(cfg, dict) else ''
+    fb = _clean_host_scalar(fallback)
+    host = _clean_host_scalar(cfg.get('domain')) if isinstance(cfg, dict) else ''
     host = host or fb
-    sni = (clean(cfg.get('sni')) if isinstance(cfg, dict) else '') or host
+    sni = (_clean_host_scalar(cfg.get('sni')) if isinstance(cfg, dict) else '') or host
     return host, sni
 
 
@@ -5464,10 +5477,17 @@ def vmess_uri_for_user(vcfg, user_id, public_ip, label=None):
     # 与 VLESS-Reality 同一套端口校验：`"abc"` / True / 70000 会生成一条
     # 客户端无法解析的链接（admin 面板仍显示成功）。
     port = _valid_port(vcfg.get('port'))
-    path = vcfg.get('ws_path') or '/'
+    raw_path = vcfg.get('ws_path')
+    if raw_path in (None, ''):
+        path = '/'
+    elif (isinstance(raw_path, str)
+          and not any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_path)):
+        path = raw_path
+    else:
+        path = ''
     if not (host and port and path):
         return ''
-    tag = label or ('VMess-WS-' + str(user_id))
+    tag = label if isinstance(label, str) and label else ('VMess-WS-' + str(user_id))
     payload = {
         'v': '2', 'ps': tag, 'add': str(host), 'port': str(port),
         'id': vmess_uuid_for_user(user_id), 'aid': '0', 'scy': 'auto',
@@ -5633,7 +5653,8 @@ def anytls_uri_for_user(acfg, user_id, label=None):
         return ''
     pwd = anytls_password_for_user(secret, user_id)
     params = urlencode({'sni': _sni})
-    return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(label or ('AnyTLS-' + str(user_id)))}"
+    tag = label if isinstance(label, str) and label else ('AnyTLS-' + str(user_id))
+    return f"anytls://{pwd}@{_host_for_url(host)}:{int(port)}/?{params}#{quote(tag)}"
 
 
 def _restore_config_atomically(config_path, original):
@@ -5860,7 +5881,8 @@ def tuic_uri_for_user(tcfg, user_id, label=None):
     u, pwd = tuic_credentials_for_user(secret, user_id)
     params = urlencode({'sni': _sni, 'alpn': 'h3',
                         'congestion_control': 'bbr', 'udp_relay_mode': 'native'})
-    return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(label or ('TUIC-' + str(user_id)))}"
+    tag = label if isinstance(label, str) and label else ('TUIC-' + str(user_id))
+    return f"tuic://{u}:{pwd}@{_host_for_url(host)}:{int(port)}?{params}#{quote(tag)}"
 
 
 def pick_tuic_port(preferred, blocked, listening=None, own_port_active=False):
@@ -5872,25 +5894,20 @@ def pick_tuic_port(preferred, blocked, listening=None, own_port_active=False):
     listening = _listening_ports() if listening is None else listening
     bad = set()
     for p in blocked or ():
-        try:
-            bad.add(int(p))
-        except (TypeError, ValueError):
-            pass
+        vp = _valid_port(p)
+        if vp:
+            bad.add(vp)
 
     def usable(p, own=False):
-        if isinstance(p, bool):
-            return False
-        try:
-            p = int(p)
-        except (TypeError, ValueError):
-            return False
-        if not 1024 <= p <= 65535 or 20000 <= p <= 40000 or p in bad:
+        vp = _valid_port(p)
+        if not vp or not 1024 <= vp <= 65535 or 20000 <= vp <= 40000 or vp in bad:
             return False
         # 自己的旧端口：重新启用前 sing-box 已停，监听表里残留也不算冲突。
-        return own or p not in listening
+        return own or vp not in listening
 
-    if usable(preferred, own=own_port_active):
-        return int(preferred)
+    pref_port = _valid_port(preferred)
+    if pref_port and usable(pref_port, own=own_port_active):
+        return pref_port
     lo, hi = TUIC_PORT_RANGE
     candidates = list(range(lo, hi + 1))
     random.shuffle(candidates)
@@ -6279,10 +6296,10 @@ def vlessenc_uri_for_user(vcfg, user_id, public_ip, label=None):
     host, _sni = protocol_host_sni(vcfg, public_ip)
     # 同 Reality / VMess：非整数端口会让客户端解析失败。
     port = _valid_port(vcfg.get('port'))
-    enc = vcfg.get('encryption', '')
+    enc = _clean_host_scalar(vcfg.get('encryption'))
     if not (host and port and enc):
         return ''
-    tag = label or ('VLESS-Enc-' + str(user_id))
+    tag = label if isinstance(label, str) and label else ('VLESS-Enc-' + str(user_id))
     params = {'encryption': enc, 'security': 'tls', 'sni': _sni,
               'type': 'tcp', 'headerType': 'none', 'fp': 'chrome'}
     return (f"vless://{reality_uuid_for_user(user_id)}@{_host_for_url(host)}:{port}"
@@ -6312,7 +6329,7 @@ def user_access_denial(info, now=None):
         # bool 是 int 的子类：`limit_bytes: true` 会被当成「1 字节配额」，
         # 用户只要用了 1 字节就被判超额停用，而界面上配额显示成 1 B。
         # JSON 里把字段写成 true 是控制台/旧脚本的常见错误，必须显式拒绝。
-        for field in ('limit_bytes', 'used_bytes'):
+        for field in ('expires_at', 'limit_bytes', 'used_bytes'):
             if isinstance(info.get(field), bool):
                 return 'Invalid user record'
         if expires_at is not None:
@@ -6430,11 +6447,11 @@ def parse_ip_deny(params, now):
 
 def auth_rate_key(client_ip):
     """/auth 限流的分桶键：IPv4 按单个地址，IPv6 按 /64（单台主机通常持有整段 /64，
-    按单地址分桶等于没限）；IPv4 映射地址还原成 IPv4。解析不了的原样截断。"""
+    按单地址分桶等于没限）；IPv4 映射地址还原成 IPv4。解析不了的剥除控制字符后截断，防止日志注入。"""
     try:
         ip = ipaddress.ip_address(client_ip)
-    except ValueError:
-        return str(client_ip)[:64]
+    except (ValueError, TypeError):
+        return re.sub(r'[\x00-\x1f\x7f]', '', str(client_ip))[:64]
     if ip.version == 6:
         if ip.ipv4_mapped:
             return str(ip.ipv4_mapped)
@@ -7604,11 +7621,8 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None, own_act
     blocked = set()
     if extra_blocked:
         for p in extra_blocked:
-            try:
-                iv = int(p)
-            except (TypeError, ValueError, OverflowError):
-                continue
-            if 1 <= iv <= 65535:
+            iv = _valid_port(p)
+            if iv:
                 blocked.add(iv)
 
     def _as_port(v):
@@ -7622,17 +7636,8 @@ def _pick_reality_port(preferred=None, extra_blocked=None, default=None, own_act
         根本猜不到是「配置里存了个坏端口值」。
         这里降级为「忽略这个偏好值」，继续正常选端口。
         """
-        # bool 是 int 的子类（True == 1），配置里出现 true 会被当成端口 1；
-        # 小数会被 int() 静默截断（65535.9 -> 65535）。两者都拒绝（2026-10-25）。
-        if isinstance(v, bool):
-            return 0
-        if isinstance(v, float) and not v.is_integer():
-            return 0
-        try:
-            iv = int(v)
-        except (TypeError, ValueError):
-            return 0
-        return iv if 1 <= iv <= 65535 else 0
+        # 复用 _valid_port：拒绝 bool、非整数浮点、非有限值、全角数字及越界值。
+        return _valid_port(v)
 
     # `pref` 必须在 free() 之前算出来 —— free() 要用它判断
     # 「这个端口是不是 Reality 自己已经在用的」。
@@ -7715,6 +7720,18 @@ def reality_client_params(rcfg):
     return port, sni.strip(), pbk, sid
 
 
+def _clean_host_scalar(value):
+    """清洗主机名/IP 标量：拒绝非字符串及含控制字符或内部空白的脏值。"""
+    if not isinstance(value, str):
+        return ''
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+        return ''
+    text = value.strip()
+    if not text or any(ch.isspace() for ch in text):
+        return ''
+    return text
+
+
 def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     """给某个用户拼他自己的 VLESS-Reality 直链。
 
@@ -7725,12 +7742,13 @@ def reality_uri_for_user(rcfg, user_id, public_ip, label=None):
     # 同 VMess / VLESS-Encryption：非 dict 配置在订阅路径上直接抛
     # AttributeError，用户拿不到任何节点。
     params = reality_client_params(rcfg)
-    if params is None:
+    clean_ip = _clean_host_scalar(public_ip)
+    if params is None or not clean_ip:
         return ''
     port, dest_sni, pub_key, short_id = params
     uid_uuid = reality_uuid_for_user(user_id)
-    tag = label or ('VLESS-Reality-' + str(user_id))
-    return (f"vless://{uid_uuid}@{_host_for_url(public_ip)}:{port}"
+    tag = label if isinstance(label, str) and label else ('VLESS-Reality-' + str(user_id))
+    return (f"vless://{uid_uuid}@{_host_for_url(clean_ip)}:{port}"
             f"?security=reality&encryption=none&pbk={pub_key}"
             f"&headerType=none&fp=chrome&type=tcp&flow=xtls-rprx-vision"
             f"&sni={dest_sni}&sid={short_id}#{quote(tag)}")
@@ -7784,19 +7802,18 @@ def clean_node_identity(m):
     m = m if isinstance(m, dict) else {}
     flag = m.get('is_insecure', False)
     is_insecure = flag is True or (isinstance(flag, str) and flag.strip().lower() == 'true')
-    sn, ip = m.get('server_name'), m.get('public_ip')
-    sn = sn.strip() if isinstance(sn, str) else ''
-    ip = ip.strip() if isinstance(ip, str) else ''
+    sn = _clean_host_scalar(m.get('server_name'))
+    ip = _clean_host_scalar(m.get('public_ip'))
     server_name = sn or ip or 'localhost'
     public_ip = ip or server_name
     return is_insecure, server_name, public_ip, (public_ip if is_insecure else server_name)
 
 
 def clean_hop_range(value):
-    """端口跳跃区间规范成 (起, 止)；格式不对或越界返回 None（按未开启处理）。"""
+    """端口跳跃区间规范成 (起, 止)；格式不对、带前导零或越界返回 None（按未开启处理）。"""
     if not isinstance(value, str):
         return None
-    hit = re.fullmatch(r'\s*([0-9]{1,5})\s*[-:]\s*([0-9]{1,5})\s*', value)
+    hit = re.fullmatch(r'\s*([1-9][0-9]{0,4})\s*[-:]\s*([1-9][0-9]{0,4})\s*', value, re.ASCII)
     if not hit:
         return None
     lo, hi = int(hit.group(1)), int(hit.group(2))
@@ -7922,98 +7939,98 @@ def artifacts(m, auth_override=None, name_override=None, reality=None, user_id=N
     # 握手，VMess 必须真的出示证书。因此只在启用且拿到域名时才追加。
     vmess_proxy = None
     vmess_sing = None
-    if isinstance(vmess, dict) and user_id \
-            and isinstance(vmess.get('domain'), str) and vmess.get('domain').strip() \
-            and _valid_port(vmess.get('port')):
-        v_name = name + '-VMess'
-        v_uuid = vmess_uuid_for_user(user_id)
-        v_host = vmess['domain'].strip()
-        v_sni = vmess.get('sni').strip() if isinstance(vmess.get('sni'), str) and vmess.get('sni').strip() else v_host
-        v_path = vmess.get('ws_path') if isinstance(vmess.get('ws_path'), str) and vmess.get('ws_path') else '/'
+    if isinstance(vmess, dict) and user_id:
+        v_host = _clean_host_scalar(vmess.get('domain'))
         v_port = _valid_port(vmess.get('port'))
-        vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
-                           port=v_port, uuid=v_uuid, alterId=0,
-                           cipher='auto', udp=True, tls=True, servername=v_sni,
-                           network='ws', **{'ws-opts': {'path': v_path,
-                                                        'headers': {'Host': v_sni}}},
-                           **{'client-fingerprint': 'chrome'})
-        vmess_sing = dict(type='vmess', tag=v_name, server=v_host,
-                          server_port=v_port, uuid=v_uuid,
-                          security='auto', alter_id=0,
-                          transport=dict(type='ws', path=v_path,
-                                         headers={'Host': v_sni}),
-                          tls=dict(enabled=True, server_name=v_sni,
-                                   utls=dict(enabled=True, fingerprint='chrome')))
+        raw_v_path = vmess.get('ws_path')
+        if raw_v_path in (None, ''):
+            v_path = '/'
+        elif (isinstance(raw_v_path, str)
+              and not any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_v_path)):
+            v_path = raw_v_path
+        else:
+            v_path = ''
+        if v_host and v_port and v_path:
+            v_name = name + '-VMess'
+            v_uuid = vmess_uuid_for_user(user_id)
+            v_sni = _clean_host_scalar(vmess.get('sni')) or v_host
+            vmess_proxy = dict(name=v_name, type='vmess', server=v_host,
+                               port=v_port, uuid=v_uuid, alterId=0,
+                               cipher='auto', udp=True, tls=True, servername=v_sni,
+                               network='ws', **{'ws-opts': {'path': v_path,
+                                                            'headers': {'Host': v_sni}}},
+                               **{'client-fingerprint': 'chrome'})
+            vmess_sing = dict(type='vmess', tag=v_name, server=v_host,
+                              server_port=v_port, uuid=v_uuid,
+                              security='auto', alter_id=0,
+                              transport=dict(type='ws', path=v_path,
+                                             headers={'Host': v_sni}),
+                              tls=dict(enabled=True, server_name=v_sni,
+                                       utls=dict(enabled=True, fingerprint='chrome')))
 
     # ---- VLESS Encryption（可选）----
     # 同样是 TCP + 自有证书，但比 VMess 多了后量子密钥交换。
     vlessenc_proxy = None
     vlessenc_sing = None
-    if isinstance(vlessenc, dict) and user_id \
-            and isinstance(vlessenc.get('domain'), str) and vlessenc.get('domain').strip() \
-            and _valid_port(vlessenc.get('port')) \
-            and isinstance(vlessenc.get('encryption'), str) and vlessenc.get('encryption').strip():
-        e_name = name + '-VLESS-Enc'
-        e_uuid = reality_uuid_for_user(user_id)
-        e_host = vlessenc['domain'].strip()
-        e_sni = (vlessenc.get('sni').strip()
-                 if isinstance(vlessenc.get('sni'), str) and vlessenc.get('sni').strip() else e_host)
-        e_enc = vlessenc['encryption'].strip()
+    if isinstance(vlessenc, dict) and user_id:
+        e_host = _clean_host_scalar(vlessenc.get('domain'))
         e_port = _valid_port(vlessenc.get('port'))
-        vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
-                              port=e_port, uuid=e_uuid, udp=True,
-                              tls=True, servername=e_sni, network='tcp',
-                              encryption=e_enc,
-                              **{'client-fingerprint': 'chrome'})
-        # sing-box 的 VLESS 出站没有 encryption（那是 Xray 独有的）：带上它，
-        # sing-box 1.14.4 报 unknown field，整份 sing-box.json 加载失败，连 Hy2
-        # 节点一起用不了；去掉它又连不上 VLESS Encryption 入站。所以 sing-box
-        # 订阅里不下发这一条（2026-11-03 修，SE 上用真 sing-box check 确认）。
-        vlessenc_sing = None
+        e_enc = _clean_host_scalar(vlessenc.get('encryption'))
+        if e_host and e_port and e_enc:
+            e_name = name + '-VLESS-Enc'
+            e_uuid = reality_uuid_for_user(user_id)
+            e_sni = _clean_host_scalar(vlessenc.get('sni')) or e_host
+            vlessenc_proxy = dict(name=e_name, type='vless', server=e_host,
+                                  port=e_port, uuid=e_uuid, udp=True,
+                                  tls=True, servername=e_sni, network='tcp',
+                                  encryption=e_enc,
+                                  **{'client-fingerprint': 'chrome'})
+            # sing-box 的 VLESS 出站没有 encryption（那是 Xray 独有的）：带上它，
+            # sing-box 1.14.4 报 unknown field，整份 sing-box.json 加载失败，连 Hy2
+            # 节点一起用不了；去掉它又连不上 VLESS Encryption 入站。所以 sing-box
+            # 订阅里不下发这一条（2026-11-03 修，SE 上用真 sing-box check 确认）。
+            vlessenc_sing = None
 
     # ---- AnyTLS（可选，2026-10-28 加）----
     # TCP + 自有证书，由 sing-box 承载；UDP 走客户端的 UDP-over-TCP。
     anytls_proxy = None
     anytls_sing = None
-    if isinstance(anytls, dict) and user_id \
-            and isinstance(anytls.get('domain'), str) and anytls.get('domain').strip() \
-            and _valid_port(anytls.get('port')) \
-            and isinstance(anytls.get('secret'), str) and anytls.get('secret'):
-        a_name = name + '-AnyTLS'
-        a_host = anytls['domain'].strip()
-        a_sni = (anytls.get('sni').strip()
-                 if isinstance(anytls.get('sni'), str) and anytls.get('sni').strip() else a_host)
-        a_pwd = anytls_password_for_user(anytls['secret'], user_id)
+    if isinstance(anytls, dict) and user_id:
+        a_host = _clean_host_scalar(anytls.get('domain'))
         a_port = _valid_port(anytls.get('port'))
-        anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
-                            port=a_port, password=a_pwd, udp=True,
-                            sni=a_sni, **{'client-fingerprint': 'chrome'})
-        anytls_sing = dict(type='anytls', tag=a_name, server=a_host,
-                           server_port=a_port, password=a_pwd,
-                           tls=dict(enabled=True, server_name=a_sni,
-                                    utls=dict(enabled=True, fingerprint='chrome')))
+        a_secret = anytls.get('secret')
+        if a_host and a_port and isinstance(a_secret, str) and a_secret:
+            a_name = name + '-AnyTLS'
+            a_sni = _clean_host_scalar(anytls.get('sni')) or a_host
+            a_pwd = anytls_password_for_user(a_secret, user_id)
+            anytls_proxy = dict(name=a_name, type='anytls', server=a_host,
+                                port=a_port, password=a_pwd, udp=True,
+                                sni=a_sni, **{'client-fingerprint': 'chrome'})
+            anytls_sing = dict(type='anytls', tag=a_name, server=a_host,
+                               server_port=a_port, password=a_pwd,
+                               tls=dict(enabled=True, server_name=a_sni,
+                                        utls=dict(enabled=True, fingerprint='chrome')))
 
     # ---- TUIC v5（可选，2026-10-31 加）----
     # QUIC（UDP）+ 自有证书，由 sing-box 承载。
     tuic_proxy = None
     tuic_sing = None
-    if isinstance(tuic, dict) and user_id \
-            and isinstance(tuic.get('domain'), str) and tuic.get('domain').strip() \
-            and _valid_port(tuic.get('port')) and isinstance(tuic.get('secret'), str) and tuic.get('secret'):
-        t_name = name + '-TUIC'
-        t_host = tuic['domain'].strip()
-        t_sni = (tuic.get('sni').strip()
-                 if isinstance(tuic.get('sni'), str) and tuic.get('sni').strip() else t_host)
-        t_uuid, t_pwd = tuic_credentials_for_user(tuic['secret'], user_id)
+    if isinstance(tuic, dict) and user_id:
+        t_host = _clean_host_scalar(tuic.get('domain'))
         t_port = _valid_port(tuic.get('port'))
-        tuic_proxy = dict(name=t_name, type='tuic', server=t_host, port=t_port,
-                          uuid=t_uuid, password=t_pwd, alpn=['h3'], sni=t_sni,
-                          udp=True, **{'congestion-controller': 'bbr',
-                                       'udp-relay-mode': 'native'})
-        tuic_sing = dict(type='tuic', tag=t_name, server=t_host, server_port=t_port,
-                         uuid=t_uuid, password=t_pwd, congestion_control='bbr',
-                         udp_relay_mode='native',
-                         tls=dict(enabled=True, server_name=t_sni, alpn=['h3']))
+        t_secret = tuic.get('secret')
+        if t_host and t_port and isinstance(t_secret, str) and t_secret:
+            t_name = name + '-TUIC'
+            t_sni = _clean_host_scalar(tuic.get('sni')) or t_host
+            t_uuid, t_pwd = tuic_credentials_for_user(t_secret, user_id)
+            tuic_proxy = dict(name=t_name, type='tuic', server=t_host, port=t_port,
+                              uuid=t_uuid, password=t_pwd, alpn=['h3'], sni=t_sni,
+                              udp=True, **{'congestion-controller': 'bbr',
+                                           'udp-relay-mode': 'native'})
+            tuic_sing = dict(type='tuic', tag=t_name, server=t_host, server_port=t_port,
+                             uuid=t_uuid, password=t_pwd, congestion_control='bbr',
+                             udp_relay_mode='native',
+                             tls=dict(enabled=True, server_name=t_sni, alpn=['h3']))
 
     proxies = [proxy] + ([reality_proxy] if reality_proxy else []) + \
               ([vmess_proxy] if vmess_proxy else []) + \
@@ -8101,6 +8118,9 @@ def prepare(meta_path, port, node_api_key=None):
     m = json.loads(Path(meta_path).read_text(encoding='utf-8'))
     if not isinstance(m, dict):
         raise ValueError('client_meta.json 顶层必须是 JSON 对象')
+    master_pw = m.get('auth_password')
+    if not isinstance(master_pw, str) or not master_pw.strip():
+        raise ValueError('client_meta.json 缺少有效的 auth_password')
     # 先修信任模型（cert_type/server_name/is_insecure/pin），再对齐 pin。
     # 顺序不能反：sync_pin 依赖 is_insecure 判断 pin 该不该留，而 is_insecure
     # 本身可能正漂移着（自签证书被换成正式证书后仍是 true）。
@@ -8115,7 +8135,7 @@ def prepare(meta_path, port, node_api_key=None):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                             capture_output=True, timeout=20)
-        qr_svg = qr.stdout if qr.returncode == 0 else b''
+        qr_svg = qr.stdout if (qr.returncode == 0 and b'<svg' in qr.stdout) else b''
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
@@ -8169,7 +8189,7 @@ def qr_svg_for(uri, timeout=20):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                             input=str(uri).encode(), capture_output=True, timeout=timeout)
-        if qr.returncode == 0 and qr.stdout:
+        if qr.returncode == 0 and qr.stdout and b'<svg' in qr.stdout:
             return qr.stdout.decode('utf-8', 'replace')
     except Exception as exc:
         _log_ignored('qr_refresh', exc)  # 保留旧图，别把框清空
@@ -8374,10 +8394,29 @@ def merge_cli_owned_state(data, disk):
     """把 adopt / refresh 写到磁盘的键并进运行中门户的内存 data（原地修改）。
 
     只取 CLI 负责的键与机主的密码 / 到期时间；用户、用量、代理服务仍以内存为准。
+    关键键做类型守卫，避免磁盘上被改坏的空值/非字符串覆写运行中正常状态。
     """
+    if not isinstance(data, dict) or not isinstance(disk, dict):
+        return
     for key in CLI_OWNED_PORTAL_KEYS:
-        if key in disk:
-            data[key] = disk[key]
+        if key not in disk:
+            continue
+        val = disk[key]
+        if key == 'port':
+            valid_p = _valid_port(val)
+            if not valid_p:
+                continue
+            data[key] = valid_p
+        elif key in ('auth_hash', 'session_secret', 'api_key'):
+            if not isinstance(val, str) or not val:
+                continue
+            data[key] = val
+        elif key == 'session_epoch':
+            if isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                continue
+            data[key] = val
+        else:
+            data[key] = val
     disk_users = disk.get('users')
     disk_master = disk_users.get(MASTER_USER_ID) if isinstance(disk_users, dict) else None
     users = data.get('users')
@@ -8403,7 +8442,9 @@ def ensure_portal_access(root, meta, data):
     if path.exists():
         try:
             access = json.loads(path.read_text(encoding='utf-8'))
-            if isinstance(access, dict):
+            if (isinstance(access, dict)
+                    and isinstance(access.get('username'), str) and access['username']
+                    and isinstance(access.get('password'), str) and access['password']):
                 return access, False
         except (OSError, ValueError):
             pass
@@ -8439,7 +8480,7 @@ def restore_egress_into_config(root, config_path=None):
         return False
     state = routing_state(data)
     # 没保存过任何有效出口设置就不动：渲染总会顺带重排 ACL 头部，不该无故改写刚生成的配置。
-    has_outbounds = bool(clean_outbounds(state['custom_outbounds']))
+    has_outbounds = bool(_renderable_outbounds(state['custom_outbounds']))
     has_rules = bool(normalize_route_rules(state['warp_rules']))
     if not (state['warp_enabled'] or has_outbounds or has_rules
             or (state['outbound_mode'] == 'global' and has_outbounds)):
@@ -8476,14 +8517,9 @@ def adopt(meta_path, port, node_api_key=None):
 
 
 def _adopt_locked(meta_path, port, node_api_key=None):
-    if isinstance(port, bool):
-        raise ValueError('门户端口不能是布尔值')
-    try:
-        port_int = int(port)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError('门户端口必须是整数') from exc
-    if not (1 <= port_int <= 65535):
-        raise ValueError('门户端口必须在 1-65535 之间')
+    port_int = _valid_port(port)
+    if not port_int:
+        raise ValueError('门户端口必须是 1-65535 的整数')
     if node_api_key is not None and node_api_key != '':
         if (not isinstance(node_api_key, str) or not node_api_key.isascii()
                 or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in node_api_key)):
@@ -10891,11 +10927,22 @@ if __name__ == '__main__':
                     self.close_connection = True
 
         def do_POST(self):
-            try:
-                body_length = int(self.headers.get('Content-Length', 0))
-            except (ValueError, TypeError):
+            _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+            if _cl_vals is not None:
+                if len(_cl_vals) > 1:
+                    return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+                _raw_cl = _cl_vals[0] if _cl_vals else '0'
+            else:
+                _raw_cl = self.headers.get('Content-Length', '0')
+            if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                _raw_cl = str(_raw_cl)
+            if not isinstance(_raw_cl, str):
                 return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
-            if not 0 <= body_length <= 1024 * 1024:
+            _raw_cl_s = _raw_cl.strip()
+            if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+            body_length = int(_raw_cl_s)
+            if body_length > 1024 * 1024:
                 return self.reply_json(413, {'ok': False, 'error': 'Request body exceeds 1 MiB'})
             # 1. Hysteria 2 本地 HTTP 动态鉴权、实时流量统计与 IP 限额拦截端点
             #
@@ -10938,8 +10985,20 @@ if __name__ == '__main__':
                     raw_addr = client_addr.strip()
                     client_ip = ''
                     if raw_addr:
-                        if raw_addr.startswith('[') and ']' in raw_addr:
-                            client_ip = raw_addr[1:raw_addr.index(']')]
+                        if raw_addr.startswith('['):
+                            if ']' not in raw_addr:
+                                raise ValueError('unclosed bracket addr')
+                            _close_idx = raw_addr.index(']')
+                            client_ip = raw_addr[1:_close_idx]
+                            _suffix = raw_addr[_close_idx + 1:]
+                            if _suffix:
+                                if not _suffix.startswith(':'):
+                                    raise ValueError('invalid bracket addr suffix')
+                                _port_s = _suffix[1:]
+                                if (not _port_s or not _port_s.isascii() or not _port_s.isdigit()
+                                        or (len(_port_s) > 1 and _port_s.startswith('0'))
+                                        or not (1 <= int(_port_s) <= 65535)):
+                                    raise ValueError('invalid bracket addr port')
                         else:
                             try:
                                 # 先直接解析裸 IPv4 / 裸 IPv6，避免 rsplit(':') 截断无端口 IPv6。
@@ -15601,6 +15660,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self._h_api_unlock_check()
                 if sub == 'capabilities':
                     # 节点能力总览（2026-10-04 加）。
+                    # 续期连接死线，避免多个 systemctl/sysctl/sing-box 子进程串行探测触顶超时。
+                    if hasattr(self, '_extend_deadline'):
+                        self._extend_deadline(45)
                     #
                     # 为什么需要：主面板要一眼知道「这台节点有什么、什么版本、
                     # 什么开着」。此前这些信息散在 /reality-status、/bbr-status、
@@ -15677,6 +15739,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     vlessenc_port = _valid_port(d_snap['vlessenc'].get('port'))
                     anytls_port = _valid_port(d_snap['anytls'].get('port'))
                     tuic_port = _valid_port(d_snap['tuic'].get('port'))
+                    vmess_domain = _clean_host_scalar(d_snap['vmess'].get('domain'))
+                    vmess_ws_path = _clean_host_scalar(d_snap['vmess'].get('ws_path'))
+                    vmess_sni = _clean_host_scalar(d_snap['vmess'].get('sni'))
+                    vlessenc_domain = _clean_host_scalar(d_snap['vlessenc'].get('domain'))
+                    vlessenc_sni = _clean_host_scalar(d_snap['vlessenc'].get('sni'))
+                    anytls_domain = _clean_host_scalar(d_snap['anytls'].get('domain'))
+                    anytls_sni = _clean_host_scalar(d_snap['anytls'].get('sni'))
+                    tuic_domain = _clean_host_scalar(d_snap['tuic'].get('domain'))
+                    tuic_sni = _clean_host_scalar(d_snap['tuic'].get('sni'))
+                    _hop_tuple = clean_hop_range(m.get('hop_port_range'))
+                    _hop_text = ('%d-%d' % _hop_tuple) if _hop_tuple else ''
 
                     # 节点门户自身版本：流式扫描 __file__ 命中 PORTAL_VERSION 即停，
                     # 避免旧版 [:80] 截断漏掉定义及整文件读入内存；不可读时回落模块常量。
@@ -15738,15 +15811,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 {
                                     'installed': _bin('xray'),
                                     'active': d_snap['vmess_inbound'],
-                                    'configured': bool(d_snap['vmess'].get('domain')),
+                                    'configured': bool(vmess_domain),
                                 },
                                 **({'port': vmess_port} if vmess_port else {}),
-                                **({'domain': d_snap['vmess']['domain']}
-                                   if d_snap['vmess'].get('domain') else {}),
-                                **({'ws_path': d_snap['vmess']['ws_path']}
-                                   if d_snap['vmess'].get('ws_path') else {}),
-                                **({'sni': d_snap['vmess']['sni']}
-                                   if d_snap['vmess'].get('sni') else {}),
+                                **({'domain': vmess_domain} if vmess_domain else {}),
+                                **({'ws_path': vmess_ws_path} if vmess_ws_path else {}),
+                                **({'sni': vmess_sni} if vmess_sni else {}),
                             ),
                             # VLESS Encryption：同样只暴露客户端需要的参数，
                             # decryption（服务端私钥）绝不出现在这里。
@@ -15754,13 +15824,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                 {
                                     'installed': _bin('xray'),
                                     'active': d_snap['vlessenc_inbound'],
-                                    'configured': bool(d_snap['vlessenc'].get('domain')),
+                                    'configured': bool(vlessenc_domain),
                                 },
                                 **({'port': vlessenc_port} if vlessenc_port else {}),
-                                **({'domain': d_snap['vlessenc']['domain']}
-                                   if d_snap['vlessenc'].get('domain') else {}),
-                                **({'sni': d_snap['vlessenc']['sni']}
-                                   if d_snap['vlessenc'].get('sni') else {}),
+                                **({'domain': vlessenc_domain} if vlessenc_domain else {}),
+                                **({'sni': vlessenc_sni} if vlessenc_sni else {}),
                             ),
                             # AnyTLS（2026-10-29 补）：由独立的 sing-box 进程承载，
                             # 所以 installed 看 sing-box、active 看 hy2-anytls 服务。
@@ -15773,13 +15841,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     # 配置被删/损坏但进程还在时误报能力可用。
                                     'active': _active_anytls_config() is not None
                                               and _svc_active(ANYTLS_SERVICE),
-                                    'configured': bool(d_snap['anytls'].get('domain')),
+                                    'configured': bool(anytls_domain),
                                 },
                                 **({'port': anytls_port} if anytls_port else {}),
-                                **({'domain': d_snap['anytls']['domain']}
-                                   if d_snap['anytls'].get('domain') else {}),
-                                **({'sni': d_snap['anytls']['sni']}
-                                   if d_snap['anytls'].get('sni') else {}),
+                                **({'domain': anytls_domain} if anytls_domain else {}),
+                                **({'sni': anytls_sni} if anytls_sni else {}),
                             ),
                             # TUIC（2026-10-31 加）：同样由 sing-box 承载，端口为 UDP。
                             'tuic': dict(
@@ -15787,13 +15853,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     'installed': singbox_installed,
                                     'active': _active_tuic_config() is not None
                                               and _svc_active(TUIC_SERVICE),
-                                    'configured': bool(d_snap['tuic'].get('domain')),
+                                    'configured': bool(tuic_domain),
                                 },
                                 **({'port': tuic_port} if tuic_port else {}),
-                                **({'domain': d_snap['tuic']['domain']}
-                                   if d_snap['tuic'].get('domain') else {}),
-                                **({'sni': d_snap['tuic']['sni']}
-                                   if d_snap['tuic'].get('sni') else {}),
+                                **({'domain': tuic_domain} if tuic_domain else {}),
+                                **({'sni': tuic_sni} if tuic_sni else {}),
                             ),
                         },
                         'extras': {
@@ -15815,10 +15879,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             'cert': _cert_summary(meta_path.parent, m),
                         },
                         'node': {
-                            'public_ip': m.get('public_ip', ''),
-                            'server_name': m.get('server_name', ''),
+                            'public_ip': _clean_host_scalar(m.get('public_ip')),
+                            'server_name': _clean_host_scalar(m.get('server_name')),
                             'is_insecure': clean_node_identity(m)[0],
-                            'hop_port_range': m.get('hop_port_range', ''),
+                            'hop_port_range': _hop_text,
                             'users_count': d_snap['users_count'],
                         },
                     })
@@ -16751,7 +16815,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 四档，丢一个包就跳 33%。10 包间隔 1 秒约 11 秒，超时给 20 秒。
                 proc = subprocess.run(
                     ['ping', '-n', '-c', '10', '-W', '2', host],
-                    capture_output=True, text=True, timeout=20,
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=20,
                     env={**os.environ, 'LC_ALL': 'C', 'LANG': 'C'})
             except Exception:
                 return None, None
@@ -16761,15 +16825,19 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             m = re.search(r'([0-9]+(?:\.[0-9]+)?)%\s*packet loss', out)
             if m:
                 try:
-                    loss = min(100.0, max(0.0, float(m.group(1))))
+                    val = float(m.group(1))
+                    if math.isfinite(val):
+                        loss = min(100.0, max(0.0, val))
                 except ValueError:
                     loss = None
 
             avg = None
-            m = re.search(r'=\s*([0-9.]+)/([0-9.]+)/[0-9.]+', out)
+            m = re.search(r'=\s*[0-9]+(?:\.[0-9]+)?/([0-9]+(?:\.[0-9]+)?)/[0-9]+(?:\.[0-9]+)?', out)
             if m:
                 try:
-                    avg = min(60000.0, max(0.0, float(m.group(2))))
+                    val = float(m.group(1))
+                    if math.isfinite(val):
+                        avg = min(60000.0, max(0.0, val))
                 except ValueError:
                     avg = None
             return avg, loss

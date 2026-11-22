@@ -1661,9 +1661,16 @@ nginx_reload_checked() {
 
 setup_cert_via_nginx() {
     local domain="$1" email="$2"
+    local _nginx_tmp=""
+    trap 'rm -f "${_nginx_tmp:-}"' RETURN
     # 调用方用 $(...) 取 "cert|key"：日志与 acme.sh 输出全部改走 stderr，
     # 只有最后那一行结果写到 fd 3（原 stdout）。
     exec 3>&1 1>&2
+    if [[ -z "$domain" || ${#domain} -gt 253 \
+            || ! "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+        log_err "借 Nginx 签发拒绝非法域名: ${domain}"
+        return 1
+    fi
     command -v nginx >/dev/null 2>&1 || return 1
     [[ "$(port_owner tcp 80)" == *nginx* ]] || { log_warn "TCP 80 不是 Nginx 在监听，无法借 Nginx 签发。"; return 1; }
     if ! nginx -t >/dev/null 2>&1; then
@@ -1692,9 +1699,9 @@ setup_cert_via_nginx() {
         log_step "为 ${domain} 新增只响应 ACME 验证路径的 Nginx 配置: ${conf}"
         mkdir -p "$HY2_ACME_WEBROOT/.well-known/acme-challenge"
         chmod 755 "$HY2_ACME_WEBROOT" "$HY2_ACME_WEBROOT/.well-known" "$HY2_ACME_WEBROOT/.well-known/acme-challenge"
-        local listen6="    listen [::]:80;" _nginx_tmp=""
+        local listen6="    listen [::]:80;"
         [[ -f /proc/net/if_inet6 ]] || listen6=""
-        _nginx_tmp="$(mktemp "${conf}.XXXXXX")" || {
+        _nginx_tmp="$(umask 077; mktemp "${conf}.XXXXXX")" || {
             log_warn "无法为 ${conf} 创建临时文件，跳过自动建站。"
             return 1
         }
@@ -1766,7 +1773,8 @@ EOF
     mkdir -p "$HY2_CERT_DIR"
     if ! (umask 077; "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
-            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null); then
+            --reloadcmd "systemctl try-restart hysteria-server xray hy2-anytls hy2-tuic gost" >/dev/null) \
+            || [[ ! -s "$out_cert" || ! -s "$out_key" ]]; then
         # 与签发失败同样撤掉本次新增的验证配置（2026-11-03 修）：旧实现直接 return，
         # 留下一个没有归属标记的 server 块 —— Nginx 继续为该域名回 404，下次运行
         # 撞上「无法确认归属」永久走不通，卸载也认不出它。
@@ -1774,7 +1782,7 @@ EOF
             rm -f "$conf"
             nginx_reload_checked || true
         fi
-        log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败。"
+        log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败或目标文件为空。"
         return 1
     fi
     chmod 600 "$out_key"
@@ -1806,6 +1814,11 @@ setup_cert_via_dns_api() {
     # 只有最后那一行结果写到 fd 3（原 stdout）。此前日志混进结果，CERT_FILE
     # 会变成「一大段日志 + 路径」，Hysteria 读不到证书（2026-10-29 修）。
     exec 3>&1 1>&2
+    if [[ -z "$domain" || ${#domain} -gt 253 \
+            || ! "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+        log_err "DNS API 签发拒绝非法域名: ${domain}"
+        return 1
+    fi
 
     # 🔴🔴 必须【先选凭据、后装 acme.sh】。
     # 旧顺序是「先装 acme.sh → 再看有没有凭据」，两个后果：
@@ -1880,8 +1893,8 @@ setup_cert_via_dns_api() {
 
     # acme.sh 的输出布局：$HOME/.acme.sh/<domain>_ecc/
     local certdir="$HOME/.acme.sh/${domain}_ecc"
-    if [[ ! -s "$certdir/fullchain.cer" ]]; then
-        log_err "acme.sh 未产出 fullchain.cer，请检查上方报错。"
+    if [[ ! -s "$certdir/fullchain.cer" || ! -s "$certdir/${domain}.key" ]]; then
+        log_err "acme.sh 未产出完整的 fullchain.cer 与私钥，请检查上方报错。"
         return 1
     fi
     # 与 Nginx HTTP-01 路径一致：安装到 Hysteria 稳定读取的证书路径，
@@ -2217,6 +2230,10 @@ setup_ports_and_obfs() {
         read -rsp "请输入机主账号连接密码 [回车自动生成]: " AUTH_PASSWORD || true; echo
         AUTH_PASSWORD=${AUTH_PASSWORD:-$RANDOM_PASS}
     fi
+    if [[ "$AUTH_PASSWORD" =~ [[:cntrl:]] ]]; then
+        log_err "认证密码不能包含换行或控制字符，已中止安装。"
+        return 1
+    fi
 
     # 运行模式：本项目只提供商城版（Agent）节点。
     # 这里不再询问模式，只沿用/生成节点通信 API Key。已装机时**必须**沿用旧 Key，
@@ -2236,6 +2253,10 @@ setup_ports_and_obfs() {
         read -rsp "请设置节点通信 API Key [回车自动生成]: " NODE_API_KEY || true; echo
         NODE_API_KEY=${NODE_API_KEY:-$RANDOM_API_KEY}
         log_info "已生成新的节点通信 API Key。"
+    fi
+    if [[ ! "$NODE_API_KEY" =~ ^[!-~]+$ ]]; then
+        log_err "NODE_API_KEY 必须是不含空白和控制字符的纯 ASCII 字符串，已中止安装。"
+        return 1
     fi
 
     # ⚠️ 主监听端口占用检测（2026-10-09 修）：
@@ -2523,11 +2544,12 @@ select_subscription_port() {
     fi
     HY2_SUB_PORT=$(python3 - "$HY2_DIR/portal.json" <<'PYPORT'
 import json, socket, secrets, sys
-RESERVED = {8443, 19898, 22, 80, 443, 40000, 56195}
+RESERVED = {8443, 19898, 19996, 19997, 22, 80, 443, 40000, 56195}
 # 门户托管协议记下的端口也要避开（2026-11-04 修）：协议此刻停着时 bind 能成功，
 # 订阅端口占了它的位置，之后再启用该协议就撞车。
 try:
-    _data = json.load(open(sys.argv[1], encoding='utf-8'))
+    with open(sys.argv[1], encoding='utf-8') as _fh:
+        _data = json.load(_fh)
 except (OSError, ValueError):
     _data = {}
 if isinstance(_data, dict):
@@ -2535,23 +2557,27 @@ if isinstance(_data, dict):
         _sec = _data.get(_key)
         if isinstance(_sec, dict):
             _p = _sec.get('port')
-            if isinstance(_p, int) and not isinstance(_p, bool):
+            if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
                 RESERVED.add(_p)
             elif isinstance(_p, str):
                 _ps = _p.strip()
                 if _ps.isascii() and _ps.isdigit():
-                    RESERVED.add(int(_ps))
+                    _pi = int(_ps)
+                    if 1 <= _pi <= 65535:
+                        RESERVED.add(_pi)
     _proxies = _data.get('proxy_services')
     if isinstance(_proxies, list):
         for _item in _proxies:
             if isinstance(_item, dict):
                 _p = _item.get('port')
-                if isinstance(_p, int) and not isinstance(_p, bool):
+                if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
                     RESERVED.add(_p)
                 elif isinstance(_p, str):
                     _ps = _p.strip()
                     if _ps.isascii() and _ps.isdigit():
-                        RESERVED.add(int(_ps))
+                        _pi = int(_ps)
+                        if 1 <= _pi <= 65535:
+                            RESERVED.add(_pi)
 for _ in range(100):
     port = 10000 + secrets.randbelow(50000)
     if port in RESERVED or 20000 <= port <= 40000:
@@ -2576,17 +2602,43 @@ PYPORT
         log_err "请释放部分端口后重试，或检查 python3 是否已安装。"
         return 1
     fi
-    # 本地端口必须避开刚选中的订阅端口：上一个 bind 成功后 socket 已关闭，
-    # 内核完全可能把同一个端口再分给 127.0.0.1 的绑定。那样 Hysteria 的
-    # masquerade 与门户会抢同一个端口，装完直接起不来（2026-10-29 修）。
-    PORTAL_LOCAL_PORT=$(python3 - "${HY2_SUB_PORT}" <<'PYPORT'
-import socket, sys
-avoid = {int(sys.argv[1])} if sys.argv[1].isdigit() else set()
-for _ in range(20):
+    # 本地端口必须避开刚选中的订阅端口、计量/WARP 回环端口、跳跃区间与已登记托管协议端口：
+    # 内核 bind(0) 可能分到这些端口，导致门户与 masquerade/计量/托管协议互抢端口起不来。
+    PORTAL_LOCAL_PORT=$(python3 -I - "${HY2_SUB_PORT}" "$HY2_DIR/portal.json" <<'PYPORT'
+import json, socket, sys
+avoid = {8443, 19898, 19996, 19997, 22, 80, 443, 40000, 56195}
+if len(sys.argv) > 1 and sys.argv[1].isascii() and sys.argv[1].isdigit():
+    avoid.add(int(sys.argv[1]))
+if len(sys.argv) > 2:
+    try:
+        with open(sys.argv[2], encoding='utf-8') as _fh:
+            _data = json.load(_fh)
+    except (OSError, ValueError):
+        _data = {}
+    if isinstance(_data, dict):
+        def _add_avoid(_p):
+            if isinstance(_p, int) and not isinstance(_p, bool) and 1 <= _p <= 65535:
+                avoid.add(_p)
+            elif isinstance(_p, str):
+                _s = _p.strip()
+                if _s.isascii() and _s.isdigit():
+                    _pi = int(_s)
+                    if 1 <= _pi <= 65535:
+                        avoid.add(_pi)
+        for _key in ('reality_config', 'vmess_config', 'vlessenc_config', 'anytls_config', 'tuic_config'):
+            _sec = _data.get(_key)
+            if isinstance(_sec, dict):
+                _add_avoid(_sec.get('port'))
+        _proxies = _data.get('proxy_services')
+        if isinstance(_proxies, list):
+            for _item in _proxies:
+                if isinstance(_item, dict):
+                    _add_avoid(_item.get('port'))
+for _ in range(100):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
-    if port not in avoid:
+    if port not in avoid and not (20000 <= port <= 40000):
         print(port)
         break
 else:
@@ -3572,14 +3624,19 @@ setup_systemd() {
     fi
     
     # 系统内核网络与 UDP 缓冲优化 (BUGFIX #13: 同时持久化到 /etc/sysctl.d/)
-    # 共享路径已有非本安装器文件时禁止覆盖；卸载也只会移除 marker 所属文件。
+    # 共享路径已有非本安装器文件或符号链接时禁止覆盖；卸载也只会移除 marker 所属文件。
+    if [[ -L /etc/sysctl.d/99-hysteria2.conf ]]; then
+        log_err "/etc/sysctl.d/99-hysteria2.conf 是符号链接，拒绝写入。"
+        return 1
+    fi
     if [[ -e /etc/sysctl.d/99-hysteria2.conf ]] \
             && ! grep -qF '(由 hysteria2-installer 自动生成)' /etc/sysctl.d/99-hysteria2.conf; then
         log_err "/etc/sysctl.d/99-hysteria2.conf 已存在且不属于本安装器，拒绝覆盖。"
         return 1
     fi
     local _sysctl_tmp="" _svc_tmp="" _dropin_tmp=""
-    _sysctl_tmp="$(mktemp /etc/sysctl.d/99-hysteria2.conf.XXXXXX)" || return 1
+    trap 'rm -f "${_sysctl_tmp:-}" "${_svc_tmp:-}" "${_dropin_tmp:-}"' RETURN
+    _sysctl_tmp="$(umask 077; mktemp /etc/sysctl.d/99-hysteria2.conf.XXXXXX)" || return 1
     if ! cat > "$_sysctl_tmp" <<EOF
 # Hysteria 2 内核网络与 UDP 缓冲调优 (由 hysteria2-installer 自动生成)
 net.core.rmem_max = 8388608
@@ -3678,23 +3735,23 @@ enabled_protocol_ports() {
     if [[ -f "$xray" ]]; then
         jq -r '{"vless-reality-in": "VLESS-Reality", "vmess-ws-in": "VMess", "vless-enc-in": "VLESS-Enc"} as $n
             | .inbounds[]? | select(type == "object" and (.tag | type) == "string" and $n[.tag] != null)
-            | select((.port | type) == "number") | "TCP \(.port) \($n[.tag])"' "$xray" 2>/dev/null || true
+            | select((.port | type) == "number" and (.port | floor) == .port and .port >= 1 and .port <= 65535) | "TCP \(.port) \($n[.tag])"' "$xray" 2>/dev/null || true
     fi
     if [[ -f "$portal" ]]; then
         if [[ -f "$HY2_DIR/anytls.json" ]]; then
-            jq -r '.anytls_config | select(type == "object" and .enabled == true) | .port | numbers | "TCP \(.) AnyTLS"' \
+            jq -r '.anytls_config | select(type == "object" and .enabled == true) | .port | numbers | select(floor == . and . >= 1 and . <= 65535) | "TCP \(.) AnyTLS"' \
                 "$portal" 2>/dev/null || true
         fi
         if [[ -f "$HY2_DIR/tuic.json" ]]; then
-            jq -r '.tuic_config | select(type == "object" and .enabled == true) | .port | numbers | "UDP \(.) TUIC"' \
+            jq -r '.tuic_config | select(type == "object" and .enabled == true) | .port | numbers | select(floor == . and . >= 1 and . <= 65535) | "UDP \(.) TUIC"' \
                 "$portal" 2>/dev/null || true
         fi
         jq -r '(.proxy_services // []) | if type == "array" then .[] else empty end | select(type == "object")
-            | (.port | numbers) as $p | "TCP \($p) 入站代理（\(.type // "proxy")）"' "$portal" 2>/dev/null || true
+            | (.port | numbers | select(floor == . and . >= 1 and . <= 65535)) as $p | "TCP \($p) 入站代理（\(.type // "proxy")）"' "$portal" 2>/dev/null || true
     fi
     if [[ -f "$AWG_CONFIG" ]]; then
         awg_port="$(sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\)[[:space:]]*$/\1/p' "$AWG_CONFIG" | head -n 1)"
-        if [[ -n "$awg_port" ]]; then echo "UDP ${awg_port} AmneziaWG"; fi
+        if [[ "$awg_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$awg_port <= 65535 )); then echo "UDP ${awg_port} AmneziaWG"; fi
     fi
 }
 
@@ -4550,7 +4607,11 @@ EOF
 #      续期是 rename 替换，PathChanged 必然命中），做到「换完即修」。
 # 执行体是一个只调 `portal.py selfheal` 的脚本：幂等，无漂移时零写入。
 setup_cert_selfheal() {
-    cat > /usr/local/bin/hy2-cert-selfheal.sh <<'EOCS' || return 1
+    local _sh_script_tmp="" _sh_svc_tmp="" _sh_tmr_tmp="" _sh_pth_tmp=""
+    trap 'rm -f "${_sh_script_tmp:-}" "${_sh_svc_tmp:-}" "${_sh_tmr_tmp:-}" "${_sh_pth_tmp:-}"' RETURN
+    _sh_script_tmp="$(umask 077; mktemp /usr/local/bin/hy2-cert-selfheal.sh.XXXXXX)" || return 1
+    {
+        cat > "$_sh_script_tmp" <<'EOCS'
 #!/usr/bin/env bash
 # 证书信任模型自愈：以 config.yaml 实际使用的证书为唯一事实来源，
 # 幂等修正 client_meta.json 的 cert_type/server_name/is_insecure/pin_sha256。
@@ -4576,10 +4637,12 @@ fi
 unset _out
 exit 0
 EOCS
-    chmod 755 /usr/local/bin/hy2-cert-selfheal.sh || return 1
+    } && chmod 755 "$_sh_script_tmp" && mv -f "$_sh_script_tmp" /usr/local/bin/hy2-cert-selfheal.sh || {
+        rm -f "$_sh_script_tmp"
+        return 1
+    }
 
-    local _sh_svc_tmp="" _sh_tmr_tmp="" _sh_pth_tmp=""
-    _sh_svc_tmp="$(mktemp /etc/systemd/system/hy2-cert-selfheal.service.XXXXXX)" || return 1
+    _sh_svc_tmp="$(umask 077; mktemp /etc/systemd/system/hy2-cert-selfheal.service.XXXXXX)" || return 1
     {
         cat > "$_sh_svc_tmp" <<'EOCU'
 [Unit]
