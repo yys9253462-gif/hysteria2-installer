@@ -7179,11 +7179,31 @@ def _valid_stats_secret(secret):
             and not any(ord(ch) < 32 or ord(ch) == 127 for ch in secret))
 
 
+class _NoRedirectStatsHandler(urllib.request.HTTPRedirectHandler):
+    """回环统计接口严禁跟随 3xx 重定向，防止把 Authorization 统计密钥发往非预期地址。"""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+_ORIG_URLLIB_URLOPEN = urllib.request.urlopen
+
+
+def _open_loopback_stats(req, timeout=4):
+    """发送回环统计接口请求：生产环境禁用 3xx 重定向，测试打桩 urlopen 时自动兼容。"""
+    if urllib.request.urlopen is not _ORIG_URLLIB_URLOPEN:
+        return urllib.request.urlopen(req, timeout=timeout)
+    opener = urllib.request.build_opener(_NoRedirectStatsHandler)
+    return opener.open(req, timeout=timeout)
+
+
 def kick_hy2_users(root, uids):
     """让 Hy2 核心断开这些用户的全部会话（被拦 IP 断开后重连会在 /auth 被拒，放行的设备会自动重连）。"""
     cfg_path = Path(root) / 'usage-meter-config.json'
     try:
-        cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+        if cfg_path.is_symlink() or not cfg_path.is_file() or cfg_path.lstat().st_size > 1024 * 1024:
+            cfg = {}
+        else:
+            cfg = json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
     except (OSError, ValueError):
         cfg = {}
     # 配置文件可能被截断/手工改坏：hysteria 段是字符串、缺 secret 时
@@ -7204,7 +7224,7 @@ def kick_hy2_users(root, uids):
         return False
     req = urllib.request.Request(url + '/kick', data=json.dumps(clean_uids).encode(),
                                  headers={'Authorization': secret, 'Content-Type': 'application/json'})
-    with urllib.request.urlopen(req, timeout=4):
+    with _open_loopback_stats(req, timeout=4):
         pass
     return True
 
@@ -7778,7 +7798,10 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
                         if not user_access_allowed(info)})
     cfg_path = root / 'usage-meter-config.json'
     try:
-        cfg = json.loads(cfg_path.read_text(encoding='utf-8')) if cfg_path.exists() else {}
+        if cfg_path.is_symlink() or not cfg_path.is_file() or cfg_path.lstat().st_size > 1024 * 1024:
+            cfg = {}
+        else:
+            cfg = json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
     except (OSError, ValueError):
         cfg = {}
     if blocked:
@@ -7797,7 +7820,7 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
         def request_stats(path, payload=None):
             req = urllib.request.Request(url + path, data=json.dumps(payload).encode() if payload is not None else None,
                                          headers={'Authorization': secret, 'Content-Type':'application/json'})
-            with urllib.request.urlopen(req, timeout=4) as response:
+            with _open_loopback_stats(req, timeout=4) as response:
                 raw=_read_bounded_bytes(response, 4 * 1024 * 1024)
             return json.loads(raw) if raw.strip() else {}
         def _online_count(online_map, uid):
@@ -7848,6 +7871,8 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
                 if any(_online_count(online, uid) > 0 for uid in active):
                     raise RuntimeError('Hy2 sessions still present after revocation')
     xj=root/'xray.json'
+    if xj.is_symlink():
+        raise OSError('xray.json 不允许为符号链接，无法确认撤销')
     if not xj.exists():
         # A running Xray keeps its last loaded config in memory after the file is
         # deleted. Do not acknowledge a pending revoke merely because the disk copy
@@ -7855,8 +7880,10 @@ def _enforce_node_access_xray_hy2(root, snapshot, force_ids=(), apply_lock=None)
         if blocked and _systemd_state('xray') == 'active':
             raise RuntimeError('cannot confirm Xray revocation: xray.json missing while Xray is active')
         return True
+    if xj.lstat().st_size > 4 * 1024 * 1024:
+        raise ValueError('xray.json 超过 4 MiB 上限，无法确认撤销')
     original=xj.read_bytes()
-    xcfg=json.loads(original)
+    xcfg=json.loads(original.decode('utf-8', errors='replace'))
     # 运行中的 Xray 可能仍加载旧配置；损坏的磁盘配置不能证明没有入站。
     if not isinstance(xcfg, dict) or ('inbounds' in xcfg and not isinstance(xcfg['inbounds'], list)):
         raise ValueError('invalid Xray configuration; cannot confirm revocation')
@@ -7897,9 +7924,13 @@ def _apply_xray_access_snapshot(root, xj, snapshot, blocked, cfg_path, meter_con
 
 def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, meter_config,
                                        force_ids, wanted_by_tag):
+    if xj.is_symlink():
+        raise OSError('xray.json 不允许为符号链接，无法确认撤销')
+    if xj.lstat().st_size > 4 * 1024 * 1024:
+        raise ValueError('xray.json 超过 4 MiB 上限，无法确认撤销')
     original=xj.read_bytes()
     orig_mode=xj.stat().st_mode & 0o777
-    xcfg=json.loads(original)
+    xcfg=json.loads(original.decode('utf-8', errors='replace'))
     # wanted_by_tag 是锁外读 xray.json 时算的；拿到锁之前可能有协议被停用、
     # 入站被删（2026-11-03 修）。旧实现照旧 tag 集合取下标：找不到时下标是 -1，
     # clients 被写进**最后一个入站**（通常是计量的 usage-meter-api-in），
@@ -7911,7 +7942,7 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
     if not wanted_by_tag:
         return True
     signature=hashlib.sha256(json.dumps(wanted_by_tag,sort_keys=True).encode()).hexdigest()
-    epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
+    epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,errors='replace',timeout=4,check=True).stdout.strip()
     current={}
     for tag in wanted_by_tag:
         inbound_settings=xcfg['inbounds'][managed_inbound_index(xcfg,tag)[0]].get('settings')
@@ -7933,24 +7964,29 @@ def _apply_xray_access_snapshot_locked(root, xj, snapshot, blocked, cfg_path, me
     reality_cfg=meter_config.get('reality') if isinstance(meter_config, dict) else None
     reality_cfg=reality_cfg if isinstance(reality_cfg, dict) else {}
     raw_binary=reality_cfg.get('binary')
-    binary=raw_binary.strip() if isinstance(raw_binary, str) and raw_binary.strip() else '/usr/local/bin/xray'
+    if (isinstance(raw_binary, str) and raw_binary.strip()
+            and not raw_binary.strip().startswith('-')
+            and not any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_binary)):
+        binary=raw_binary.strip()
+    else:
+        binary='/usr/local/bin/xray'
     replaced=False
     try:
-        _write_private_bytes(candidate, json.dumps(xcfg,indent=2).encode('utf-8'), orig_mode, call_path_chmod=True)
+        _write_private_bytes(candidate, json.dumps(xcfg,indent=2,allow_nan=False).encode('utf-8'), orig_mode, call_path_chmod=True)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
-        if xj.read_bytes()!=original:
+        if xj.is_symlink() or xj.lstat().st_size > 4 * 1024 * 1024 or xj.read_bytes()!=original:
             raise RuntimeError('Xray configuration changed concurrently; retry')
         _write_private_bytes(last_good_tmp, original, orig_mode)
         os.replace(last_good_tmp, last_good)
         candidate.replace(xj); replaced=True
-        state=subprocess.run(['systemctl','is-active','xray'],capture_output=True,text=True,timeout=4).stdout.strip()
+        state=subprocess.run(['systemctl','is-active','xray'],capture_output=True,text=True,errors='replace',timeout=4).stdout.strip()
         if state in ('inactive','failed'):
             _ACCESS_APPLIED[str(root)]=(signature,epoch)
             return True
         subprocess.run(['systemctl','reset-failed','xray'],capture_output=True,timeout=4,check=True)
         subprocess.run(['systemctl','restart','xray'],capture_output=True,timeout=12,check=True)
         subprocess.run(['systemctl','is-active','--quiet','xray'],capture_output=True,timeout=4,check=True)
-        epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,timeout=4,check=True).stdout.strip()
+        epoch=subprocess.run(['systemctl','show','xray','--property=InvocationID','--value'],capture_output=True,text=True,errors='replace',timeout=4,check=True).stdout.strip()
         if not epoch:raise RuntimeError('missing Reality runtime epoch')
         _ACCESS_APPLIED[str(root)]=(signature,epoch)
         return True
