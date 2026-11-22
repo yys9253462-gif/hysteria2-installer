@@ -723,22 +723,26 @@ def strip_managed_outbounds(cfg_text):
         return ''
     lines = cfg_text.split('\n')
     out = []
+    in_outbounds = False
     skipping = False
     for line in lines:
-        m = _OUTBOUND_NAME_LINE_RE.match(line)
-        if m:
-            name = _yaml_name_value(m.group(1))
-            # 内建出站：不跳过，继续保留
-            skipping = name not in builtin
-            if skipping:
-                continue
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#') and line[:1] not in (' ', '\t'):
+            in_outbounds = bool(re.match(r'^outbounds:\s*(?:\[\s*\]\s*)?(?:#.*)?$', line))
+            skipping = False
             out.append(line)
             continue
-        if skipping:
-            # 出站项的字段都是缩进的；遇到顶格行说明这一项结束了
-            if line.strip() and line[:1] not in (' ', '\t'):
-                skipping = False
-            else:
+        if in_outbounds:
+            m = _OUTBOUND_NAME_LINE_RE.match(line)
+            if m:
+                name = _yaml_name_value(m.group(1))
+                # 内建出站：不跳过，继续保留
+                skipping = name not in builtin
+                if skipping:
+                    continue
+                out.append(line)
+                continue
+            if skipping:
                 continue
         out.append(line)
     return '\n'.join(out)
@@ -777,12 +781,13 @@ def add_private_network_guard(config):
     outbounds = config.setdefault('outbounds', [])
     if not isinstance(outbounds, list):
         outbounds = config['outbounds'] = []
-    if not outbounds:
-        outbounds.append({'protocol': 'freedom', 'tag': 'direct'})
-    if not any(isinstance(o, dict) and o.get('tag') == XRAY_BLOCK_OUTBOUND_TAG
-               for o in outbounds):
-        # 黑洞必须排在 freedom 之后，否则会变成默认出站，把正常流量也吞掉。
-        outbounds.append({'protocol': 'blackhole', 'tag': XRAY_BLOCK_OUTBOUND_TAG})
+    # 过滤非 dict 脏出站并移除所有旧的 block-private，确保它绝不落在首位吞掉正常流量。
+    clean_outs = [o for o in outbounds
+                  if isinstance(o, dict) and o.get('tag') != XRAY_BLOCK_OUTBOUND_TAG]
+    if not clean_outs:
+        clean_outs.append({'protocol': 'freedom', 'tag': 'direct'})
+    clean_outs.append({'protocol': 'blackhole', 'tag': XRAY_BLOCK_OUTBOUND_TAG})
+    config['outbounds'] = clean_outs
     routing = config.setdefault('routing', {})
     if not isinstance(routing, dict):
         routing = config['routing'] = {}
@@ -807,7 +812,8 @@ def add_private_network_guard(config):
     api_section = config.get('api')
     api_tag = api_section.get('tag') if isinstance(api_section, dict) else None
     api_rules = [r for r in rules if isinstance(r, dict) and api_tag and r.get('outboundTag') == api_tag]
-    others = [r for r in rules if r != guard and r not in api_rules]
+    others = [r for r in rules
+              if r not in api_rules and not (isinstance(r, dict) and r.get('outboundTag') == XRAY_BLOCK_OUTBOUND_TAG)]
     routing['rules'] = api_rules + [guard] + others
     return config
 
@@ -1202,7 +1208,9 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
 
     proxy_url = ''
     if kind == 'socks5' and addr:
-        raw_addr = str(addr)
+        if not isinstance(addr, str):
+            return ''
+        raw_addr = addr
         if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_addr):
             return ''
         lower = raw_addr.lower()
@@ -1217,7 +1225,9 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
             return ''
         proxy_url = 'socks5h://' + raw_addr
     elif kind == 'http' and addr:
-        raw_addr = str(addr)
+        if not isinstance(addr, str):
+            return ''
+        raw_addr = addr
         if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7f for ch in raw_addr):
             return ''
         lower = raw_addr.lower()
@@ -1252,7 +1262,8 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
         if proxy_insecure:
             args.append('--proxy-insecure')
         args.append('https://api4.ipify.org?format=json')
-        run_kwargs = {'capture_output': True, 'text': True, 'timeout': seconds + 2}
+        run_kwargs = {'capture_output': True, 'text': True, 'encoding': 'utf-8',
+                      'errors': 'replace', 'timeout': seconds + 2}
         if stdin_cfg is not None:
             run_kwargs['input'] = stdin_cfg
         proc = subprocess.run(args, **run_kwargs)
@@ -1260,10 +1271,14 @@ def detect_outbound_ip(kind='auto', addr='', timeout=6, proxy_insecure=False):
             return ''
         payload = proc.stdout.strip()
         try:
-            result = json.loads(payload).get('ip', '')
+            parsed = json.loads(payload)
+            result = parsed.get('ip', '') if isinstance(parsed, dict) else ''
         except (ValueError, AttributeError):
             result = payload
-        return str(ipaddress.ip_address(result))
+        # ipaddress.ip_address 会把整数（如 123）接受成 0.0.0.123，必须限定只收字符串。
+        if not isinstance(result, str) or not result.strip():
+            return ''
+        return str(ipaddress.ip_address(result.strip()))
     except Exception:
         return ''
 
@@ -1329,8 +1344,15 @@ def _unreachable_outbounds(outs, timeout=2):
     「应用出站配置」路径上 —— 一条坏条目会让整个保存动作失败，报错还只说
     「应用失败」。逐条跳过非 dict，和 clean_outbounds 保持同一口径。
     """
+    if not isinstance(outs, (list, tuple)):
+        return []
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        probe_timeout = 2.0
+    else:
+        probe_timeout = min(30.0, float(timeout))
     dead = []
-    for ob in outs or []:
+    for ob in outs:
         if not isinstance(ob, dict):
             continue
         name = ob.get('name')
@@ -1343,10 +1365,9 @@ def _unreachable_outbounds(outs, timeout=2):
                 raw_host, raw_port = target.rsplit(':', 1)
                 if raw_host.startswith('[') and raw_host.endswith(']'):
                     raw_host = raw_host[1:-1]
-                try:
-                    host, port = raw_host, int(raw_port)
-                except ValueError:
+                if not re.fullmatch(r'[1-9][0-9]{0,4}', raw_port, re.ASCII):
                     continue
+                host, port = raw_host, int(raw_port)
         elif ob.get('type') == 'http':
             url = ob.get('url')
             if isinstance(url, str) and url.strip():
@@ -1360,7 +1381,7 @@ def _unreachable_outbounds(outs, timeout=2):
             continue
         sock = None
         try:
-            sock = socket.create_connection((host, port), timeout=timeout)
+            sock = socket.create_connection((host, port), timeout=probe_timeout)
         except Exception:
             dead.append(name)
         finally:
@@ -1384,6 +1405,8 @@ def _rollback_outbounds(cfg, original):
          让面板能告诉用户"需要手动干预"，而不是静默留一个坏服务。
     """
     state = 'unknown'
+    if not isinstance(original, str):
+        return state
     try:
         # 原子写回并保持 0600 私有权限，避免断电半写或权限退化泄露混淆与鉴权密码。
         atomic_write_private(cfg, original.encode('utf-8'))
@@ -1392,9 +1415,14 @@ def _rollback_outbounds(cfg, original):
         #    后果是「回滚也失败」，用户彻底没救（真实事故）。
         _restart_hy2()
         for _i in range(10):
-            state = subprocess.run(['systemctl', 'is-active', 'hysteria-server'],
-                                   capture_output=True, text=True,
-                                   timeout=8).stdout.strip()
+            try:
+                state = subprocess.run(['systemctl', 'is-active', 'hysteria-server'],
+                                       capture_output=True, text=True,
+                                       encoding='utf-8', errors='replace',
+                                       timeout=8).stdout.strip()
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                _log_ignored('wait_service_poll', exc)
+                state = 'unknown'
             if state in ('active', 'failed', 'inactive'):
                 break
             time.sleep(1)
@@ -18196,6 +18224,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             seconds = float(seconds)
             if not (seconds > 0 and seconds < float('inf')):
                 return
+            seconds = min(seconds, 3600.0)
             with self.deadline_lock:
                 if request in self.deadlines:
                     self.deadlines[request] = max(self.deadlines[request],
@@ -18232,7 +18261,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 self.deadlines[request] = time.monotonic() + 30
             try:
                 super().process_request(request, address)
-            except Exception:
+            except BaseException:
                 with self.deadline_lock:
                     self.deadlines.pop(request, None)
                     heavy = self._heavy.pop(request, False)
