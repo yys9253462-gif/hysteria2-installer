@@ -601,8 +601,18 @@ async function submitUserForm(form) {
       location.reload();
       return;
     }
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      alert('登录已过期，请刷新页面重新登录');
+      return;
+    }
     const text = (await res.text()).trim();
-    alert(text || ('操作失败（HTTP ' + res.status + '）'));
+    let msg = '';
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === 'object' && typeof parsed.error === 'string') msg = parsed.error;
+    } catch (_) {}
+    alert(msg || (text ? text.slice(0, 200) : ('操作失败（HTTP ' + res.status + '）')));
   } catch (e) {
     alert('请求异常: ' + e.message);
   } finally {
@@ -1473,7 +1483,7 @@ function obParseLink(raw) {
   if (!s) return null;
   const okPort = (p) => {
     const n = Number(p);
-    return /^\d{1,5}$/.test(p) && n >= 1 && n <= 65535;
+    return /^[1-9]\d{0,4}$/.test(p) && n >= 1 && n <= 65535;
   };
   let m = s.match(/^(?:socks5h?|socks):\/\/(?:([^:@\/\s]*)(?::([^@\/\s]*))?@)?(\[[0-9a-fA-F:]+\]|[^\/:@\s[\]]+):(\d{1,5})\/?(?:[?#].*)?$/i);
   if (m && okPort(m[4])) {
@@ -1505,7 +1515,10 @@ function obSuggestName(type, host) {
   base = base.replace(/_+$/, '').slice(0, 32);
   const taken = new Set(Array.from(document.querySelectorAll('[data-ob-edit]')).map(b => b.dataset.obEdit));
   let name = base, n = 2;
-  while (taken.has(name)) name = base.slice(0, 29) + '_' + (n++);
+  while (taken.has(name)) {
+    const suffix = '_' + (n++);
+    name = base.slice(0, Math.max(1, 32 - suffix.length)) + suffix;
+  }
   return name;
 }
 
@@ -1515,7 +1528,7 @@ function obAutoName() {
   let host = '';
   if (t === 'socks5' && obEls.socksAddr) host = obEls.socksAddr.value.trim().replace(/:\d+$/, '');
   else if (t === 'http' && obEls.httpUrl) {
-    const m = obEls.httpUrl.value.trim().match(/^https?:\/\/(?:[^@\/\s]*@)?([^\/:@\s]+)/i);
+    const m = obEls.httpUrl.value.trim().match(/^https?:\/\/(?:[^@\/\s]*@)?(\[[0-9a-fA-F:]+\]|[^\/:@\s]+)/i);
     host = m ? m[1] : '';
   }
   obEls.name.value = t === 'direct' ? 'direct_local' : (host ? obSuggestName(t, host) : '');
@@ -1567,14 +1580,15 @@ async function obTestForm() {
   const t = obEls.type ? obEls.type.value : 'socks5';
   let kind = t, addr = '';
   if (t === 'socks5') {
-    const a = obEls.socksAddr.value.trim();
-    const am = a.match(/^(?:\[[0-9a-fA-F:]+\]|[^\s:[\]]+):(\d{1,5})$/);
+    const a = obEls.socksAddr ? obEls.socksAddr.value.trim() : '';
+    const am = a.match(/^(?:\[[0-9a-fA-F:]+\]|[^\s:[\]]+):([1-9]\d{0,4})$/);
     const port = am ? Number(am[1]) : 0;
-    if (!am || port < 1 || port > 65535) { obMsg('SOCKS5 地址格式应为 host:port（端口 1-65535）', 'err'); return; }
-    const u = obEls.socksUser.value.trim(), pw = obEls.socksPass.value.trim();
+    if (!am || port < 1 || port > 65535) { obMsg('SOCKS5 地址格式应为 host:port（端口 1-65535，不含前导零）', 'err'); return; }
+    const u = obEls.socksUser ? obEls.socksUser.value.trim() : '';
+    const pw = obEls.socksPass ? obEls.socksPass.value.trim() : '';
     addr = (u || pw) ? encodeURIComponent(u) + ':' + encodeURIComponent(pw) + '@' + a : a;
   } else if (t === 'http') {
-    addr = obEls.httpUrl.value.trim();
+    addr = obEls.httpUrl ? obEls.httpUrl.value.trim() : '';
     if (!/^https?:\/\/\S+$/i.test(addr)) { obMsg('HTTP 代理地址应以 http:// 或 https:// 开头', 'err'); return; }
   } else {
     kind = 'direct';
@@ -3154,12 +3168,13 @@ async function doUpgrade(target) {
   if (doUpgrade._busy) return;
   const names = { core: 'Hysteria 2 官方核心', portal: '控制面板自身', awg: 'AmneziaWG 引擎' };
   const btns = { core: btnUpdateCore, portal: btnUpdatePortal, awg: btnUpdateAwgEngine };
+  if (!Object.prototype.hasOwnProperty.call(names, target)) return;
   const btn = btns[target];
   const custom = target === 'core' && coreVerDisplay?.textContent.includes('+');
   // SCRIPT 是 Python 原始字符串：换行写 \n。写成 \\n 到 JS 里是字面的反斜杠加 n，弹窗上显示「\n」（2026-11-13 修）。
   const confirmed = await showConfirm({
-    title: '升级 ' + (names[target] || target),
-    text: '确定要升级 ' + (names[target] || target) + ' 吗？' + (custom ? '\n当前含定制补丁，升级官方核心会替换补丁。' : ''),
+    title: '升级 ' + names[target],
+    text: '确定要升级 ' + names[target] + ' 吗？' + (custom ? '\n当前含定制补丁，升级官方核心会替换补丁。' : ''),
     icon: '⬆️',
     confirmText: '开始升级',
     isDanger: custom,
@@ -3167,6 +3182,7 @@ async function doUpgrade(target) {
   });
   if (!confirmed || doUpgrade._busy) return;
   doUpgrade._busy = true;
+  let reloading = false;
   if (btn) { btn.disabled = true; btn.textContent = '升级中...'; }
   if (updateStatusMsg) updateStatusMsg.textContent = '正在下载并应用更新，请稍候...';
   try {
@@ -3192,10 +3208,12 @@ async function doUpgrade(target) {
         await new Promise(resolve => setTimeout(resolve, 3000));
         const back = await waitPortalBack();
         if (updateStatusMsg) updateStatusMsg.textContent = back ? '面板已恢复，正在刷新...' : '面板长时间未恢复，请稍后手动刷新页面';
+        reloading = Boolean(back);
         if (back) { location.reload(); return; }
         if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
         return;
       }
+      reloading = true;
       if (updateStatusMsg) updateStatusMsg.textContent = msg + '，5 秒后自动刷新页面...';
       setTimeout(() => location.reload(), 5000);
     } else {
@@ -3210,7 +3228,7 @@ async function doUpgrade(target) {
     if (updateStatusMsg) updateStatusMsg.textContent = errMsg;
     if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
   } finally {
-    doUpgrade._busy = false;
+    if (!reloading) doUpgrade._busy = false;
   }
 }
 
