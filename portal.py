@@ -76,10 +76,19 @@ _github_token_lock = threading.Lock()
 
 
 def github_token():
-    """读取 token（按元信息快照缓存，含权限位与 ctime）；文件不存在、权限过宽或格式不对时返回空串。"""
+    """读取 token（按元信息快照缓存，含权限位与 ctime）；文件不存在、符号链接、过大、权限过宽或格式不对时返回空串。"""
     try:
+        is_sym = getattr(GITHUB_TOKEN_FILE, 'is_symlink', None)
+        if callable(is_sym) and is_sym():
+            with _github_token_lock:
+                _github_token_cache.update(mtime=None, token='')
+            return ''
         st = GITHUB_TOKEN_FILE.stat()
     except OSError:
+        with _github_token_lock:
+            _github_token_cache.update(mtime=None, token='')
+        return ''
+    if getattr(st, 'st_size', 0) > 4096:
         with _github_token_lock:
             _github_token_cache.update(mtime=None, token='')
         return ''
@@ -104,8 +113,12 @@ def github_token():
             _github_token_cache.update(mtime=stamp, token='')
         return ''
     try:
-        value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
-    except OSError:
+        read_bytes = getattr(GITHUB_TOKEN_FILE, 'read_bytes', None)
+        if callable(read_bytes):
+            value = read_bytes().decode('utf-8', errors='replace').strip()
+        else:
+            value = GITHUB_TOKEN_FILE.read_text(encoding='utf-8').strip()
+    except (OSError, UnicodeDecodeError):
         value = ''
     # 只接受 token 字符集，防止把换行等注入到请求头里。
     valid = value if re.fullmatch(r'[A-Za-z0-9_]{20,255}', value) else ''
@@ -2449,9 +2462,15 @@ def _unit_failure_hint(unit, lines=6):
     真因（端口被占、证书读不到、ACL 引用不存在）。这里统一取一次，
     任何「restart 了但没起来」的地方都能复用；取不到就返回空串，绝不再抛。
     """
+    if (not isinstance(unit, str) or not unit or unit.startswith('-')
+            or len(unit) > 128
+            or any(ord(ch) < 32 or ord(ch) == 127 or ch.isspace() for ch in unit)):
+        return ''
+    safe_lines = lines if (isinstance(lines, int) and not isinstance(lines, bool) and 1 <= lines <= 50) else 6
     try:
-        out = subprocess.run(['journalctl', '-u', unit, '-n', str(lines), '--no-pager',
-                              '-o', 'cat'], capture_output=True, text=True, timeout=5)
+        out = subprocess.run(['journalctl', '-u', unit, '-n', str(safe_lines), '--no-pager',
+                              '-o', 'cat'], capture_output=True, text=True,
+                             encoding='utf-8', errors='replace', timeout=5)
         tail = [line.strip() for line in (out.stdout or '').splitlines() if line.strip()]
     except Exception:
         return ''
@@ -2491,23 +2510,33 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
         raise ValueError('Xray 可执行文件路径无效')
     candidate_payload = json.dumps(config, indent=2, allow_nan=False).encode('utf-8')
     path = Path(config_path)
-    original = path.read_bytes() if path.exists() else None
-    mode = (path.stat().st_mode & 0o777) or 0o600 if path.exists() else 0o600
+    if path.is_symlink():
+        raise RuntimeError('Xray 配置文件不得为符号链接，已拒绝更新')
+    if path.exists():
+        if path.lstat().st_size > 4 * 1024 * 1024:
+            raise RuntimeError('原 Xray 配置文件过大（超过 4 MiB），已拒绝覆盖')
+        original = path.read_bytes()
+        mode = (path.stat().st_mode & 0o777) or 0o600
+    else:
+        original = None
+        mode = 0o600
     candidate = path.with_name(path.name + '.portal-candidate.json')
     try:
         was_active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
-                                    text=True, timeout=5).stdout.strip() == 'active'
+                                    text=True, encoding='utf-8', errors='replace', timeout=5).stdout.strip() == 'active'
     except (OSError, subprocess.SubprocessError) as probe_exc:
         _log_ignored('xray_transaction_probe_active', probe_exc)
         was_active = False
     try:
         was_enabled = subprocess.run(['systemctl', 'is-enabled', 'xray'], capture_output=True,
-                                     text=True, timeout=5).stdout.strip() == 'enabled'
+                                     text=True, encoding='utf-8', errors='replace', timeout=5).stdout.strip() == 'enabled'
     except (OSError, subprocess.SubprocessError) as probe_exc:
         _log_ignored('xray_transaction_probe_enabled', probe_exc)
         was_enabled = False
 
     def _write_priv(target, payload, file_mode):
+        if Path(target).is_symlink():
+            raise OSError('candidate path must not be a symlink: %s' % target)
         file_mode = (file_mode & 0o777) or 0o600
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         if hasattr(os, 'O_NOFOLLOW'):
@@ -2523,14 +2552,18 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                 os.fsync(handle.fileno())
         finally:
             if fd is not None:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         target.chmod(file_mode)
 
     replaced = False
     try:
         _write_priv(candidate, candidate_payload, mode)
         test = subprocess.run([binary, 'run', '-test', '-c', str(candidate)],
-                              capture_output=True, text=True, timeout=10)
+                              capture_output=True, text=True,
+                              encoding='utf-8', errors='replace', timeout=10)
         if test.returncode != 0:
             # 🔴 2026-10-31：旧实现把 xray run -test 的输出整段丢弃，只回一句
             # 「配置预检失败」。而真正的原因（端口被占、UUID 非法、reality 的
@@ -2543,6 +2576,15 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
             raise RuntimeError('Xray 配置预检失败，原配置未更改' +
                                ('：' + ' | '.join(line[:160] for line in tail) if tail else ''))
         os.replace(candidate, path)
+        if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+            try:
+                _dfd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(_dfd)
+                finally:
+                    os.close(_dfd)
+            except OSError:
+                pass
         replaced = True
         if restart:
             try:
@@ -2551,7 +2593,7 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                 _log_ignored('xray_transaction_reset_failed', rf_exc)
             started = subprocess.run(['systemctl', 'restart', 'xray'], capture_output=True, timeout=15)
             active = subprocess.run(['systemctl', 'is-active', 'xray'], capture_output=True,
-                                    text=True, timeout=5).stdout.strip()
+                                    text=True, encoding='utf-8', errors='replace', timeout=5).stdout.strip()
             if started.returncode != 0 or active != 'active':
                 raise RuntimeError('Xray 启动失败，已恢复原配置' + _unit_failure_hint('xray'))
             # Existing installations may already be intentionally disabled. Callers
@@ -2559,7 +2601,8 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
             # reconciliation preserves the service's original enable state.
             if enable:
                 enabled = subprocess.run(['systemctl', 'enable', 'xray'],
-                                         capture_output=True, text=True, timeout=15)
+                                         capture_output=True, text=True,
+                                         encoding='utf-8', errors='replace', timeout=15)
                 if enabled.returncode != 0:
                     raise RuntimeError('Xray 自启动设置失败: %s' %
                                        ((enabled.stderr or '').strip()[-240:] or
@@ -2572,6 +2615,15 @@ def apply_xray_config_transaction(config, config_path='/etc/hysteria/xray.json',
                 else:
                     _write_priv(candidate, original, mode)
                     os.replace(candidate, path)
+                if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+                    try:
+                        _dfd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(_dfd)
+                        finally:
+                            os.close(_dfd)
+                    except OSError:
+                        pass
             except OSError as rb_exc:
                 _log_ignored('xray_transaction_rollback_file', rb_exc)
             try:
@@ -2893,7 +2945,7 @@ def meta_display_host(m):
 
 
 def read_meta_file(meta_path):
-    """读取 client_meta.json；文件损坏时返回空 dict 而不是抛异常。
+    """读取 client_meta.json；文件损坏、符号链接或体积超限时返回空 dict 而不是抛异常。
 
     🔴 2026-10-25 修：此前有 14 处直接 `json.loads(meta_path.read_text())`，
     文件被截断或手工改坏时抛 JSONDecodeError。regenerate_page 几乎在每次
@@ -2904,7 +2956,10 @@ def read_meta_file(meta_path):
     闭包里的名字不在作用域内。
     """
     try:
-        meta = json.loads(Path(meta_path).read_text(encoding='utf-8'))
+        path = Path(meta_path)
+        if path.is_symlink() or not path.is_file() or path.lstat().st_size > 1024 * 1024:
+            raise ValueError('client metadata file invalid or oversized')
+        meta = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
         if not isinstance(meta, dict):
             raise ValueError('client metadata must be a JSON object')
         return meta
@@ -2914,17 +2969,22 @@ def read_meta_file(meta_path):
 
 
 def read_access_file(access_path):
-    """读取 portal-access.json（门户账号 / 密码）；缺失或损坏时返回空 dict。
+    """读取 portal-access.json（门户账号 / 密码）；缺失、符号链接、过大或损坏时返回空 dict。
 
     🔴 2026-11-03 修：regenerate_page 与首页渲染直接 json.loads，文件被截断（磁盘满）
     或写成 [] 时抛 ValueError / AttributeError，于是每次打开管理页都失败，只能手修文件。
     refresh 路径早就会经 ensure_portal_access 重建它，这两处读取也必须容错。
     """
     path = Path(access_path)
+    if path.is_symlink():
+        print('[portal] portal-access.json unreadable: symlink', file=sys.stderr)
+        return {}
     if not path.exists():
         return {}
     try:
-        access = json.loads(path.read_text(encoding='utf-8'))
+        if not path.is_file() or path.lstat().st_size > 1024 * 1024:
+            raise ValueError('portal access file invalid or oversized')
+        access = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
         if not isinstance(access, dict):
             raise ValueError('portal access must be a JSON object')
         return access
