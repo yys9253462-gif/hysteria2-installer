@@ -10125,19 +10125,39 @@ if __name__ == '__main__':
         line = str(meta.get('line', '3') or '3')
         if line not in ('2', '3'):
             line = '3'
+        _clean_scalar = lambda v: (
+            v.strip()
+            if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+            else ''
+        )
+        _clean_created = lambda v: (
+            v.strip()
+            if isinstance(v, str) and not any(ord(c) < 32 or ord(c) == 127 for c in v)
+            else (v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else '')
+        )
+        _port_val = _valid_port(meta.get('port'))
+        clean_peers = []
+        for p in peers_raw:
+            _pname = _clean_scalar(p.get('name'))
+            if not _pname:
+                continue
+            clean_peers.append({
+                'name': _pname,
+                'address': _clean_scalar(p.get('address')),
+                'endpoint': _clean_scalar(p.get('endpoint')),
+                'created_at': _clean_created(p.get('created_at')),
+            })
         return {
             'ok': True,
             'installed': awg_installed(),
             'active': awg_active(),
             'line': line,
-            'port': str(meta.get('port', '') or ''),
-            'endpoint': str(meta.get('endpoint', '') or ''),
-            'peer_count': len(peers_raw),
+            'port': str(_port_val) if _port_val else '',
+            'endpoint': _clean_scalar(meta.get('endpoint')),
+            'peer_count': len(clean_peers),
             'ctl': Path(AWG_CTL).exists(),
             # 注意：只回传非敏感字段，私钥与预共享密钥绝不下发到前端
-            'peers': [{'name': p.get('name', ''), 'address': p.get('address', ''),
-                       'endpoint': p.get('endpoint', ''),
-                       'created_at': p.get('created_at', '')} for p in peers_raw],
+            'peers': clean_peers,
         }
 
     def _active_reality_config():
@@ -10698,7 +10718,18 @@ if __name__ == '__main__':
             return verify_session(self.headers.get('Cookie', ''))
 
         def reply_json(self, code, payload):
-            body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+            try:
+                body = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode('utf-8')
+            except ValueError:
+                def _scrub(obj):
+                    if isinstance(obj, float):
+                        return obj if math.isfinite(obj) else None
+                    if isinstance(obj, dict):
+                        return {k: _scrub(v) for k, v in obj.items()}
+                    if isinstance(obj, (list, tuple)):
+                        return [_scrub(v) for v in obj]
+                    return obj
+                body = json.dumps(_scrub(payload), ensure_ascii=False, allow_nan=False).encode('utf-8')
             self.send_response(code)
             self._responded = True
             self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -17502,6 +17533,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """GET /warp-status 的处理逻辑（从 do_GET 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(30)
             with data_lock:
                 state = routing_state(data)
                 enabled = state['warp_enabled']
@@ -17537,7 +17570,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             except Exception:
                 applied = False
             with data_lock:
-                apply_error = data.get('egress_apply_error') or data.get('warp_apply_error', '')
+                _raw_err = data.get('egress_apply_error') or data.get('warp_apply_error', '')
+                apply_error = (
+                    _raw_err.strip()
+                    if isinstance(_raw_err, str) and not any(ord(c) < 32 or ord(c) == 127 for c in _raw_err)
+                    else ''
+                )
                 applying = bool(data.get('egress_applying') or data.get('warp_applying'))
             return self.reply_json(200, {
                 'ok': True,
@@ -17561,6 +17599,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(30)
             try:
                 meta = read_meta_file(meta_path)
             except Exception:
@@ -17575,7 +17615,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             # 与门户实际下发给客户端的 sni 对照：不一致说明又发生了漂移
             # （自愈单元没装 / 装的是旧版 / 证书刚换还没跑到）。
             live_sn = ''
-            meta_sn = str(info.get('server_name') or '')
+            _raw_meta_sn = info.get('server_name')
+            meta_sn = _raw_meta_sn.strip() if isinstance(_raw_meta_sn, str) else ''
             _raw_sans = info.get('sans')
             _clean_sans = [s for s in (_raw_sans if isinstance(_raw_sans, (list, tuple)) else [])
                            if isinstance(s, str)]
@@ -17611,7 +17652,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             self.send_header('Content-Type', mime)
             self.send_header('Content-Length', str(len(body)))
             for _name, _value in extra_headers:
-                self.send_header(_name, _value)
+                if not isinstance(_name, str) or not _name or any(ch in _name for ch in ('\r', '\n', '\x00', ':')):
+                    continue
+                _safe_val = str(_value).replace('\r', '').replace('\n', '').replace('\x00', '')
+                self.send_header(_name, _safe_val)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('X-Frame-Options', 'DENY')
