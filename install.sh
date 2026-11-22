@@ -6325,9 +6325,10 @@ uninstall_all() {
         # 尚未写 owner marker 的配置，同时检查模板特征，绝不按文件名前缀盲删。
         local nginx_conf nginx_domain nginx_removed=0
         for nginx_conf in /etc/nginx/conf.d/hy2-acme-*.conf; do
-            [[ -f "$nginx_conf" ]] || continue
+            [[ -f "$nginx_conf" && ! -L "$nginx_conf" ]] || continue
             nginx_domain="${nginx_conf##*/hy2-acme-}"
             nginx_domain="${nginx_domain%.conf}"
+            [[ "$nginx_domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || continue
             if grep -qF "由 hysteria2-installer 生成：只用于 Let's Encrypt 签发与续期 ${nginx_domain}" "$nginx_conf" \
                     && grep -qF "server_name ${nginx_domain};" "$nginx_conf" \
                     && grep -qF 'root /var/lib/hy2-acme-webroot;' "$nginx_conf" \
@@ -6367,7 +6368,7 @@ uninstall_all() {
         fi
         # 仅删除首次安装时存在 marker 的安装器资产；旧版没有 marker 时保留，避免误删用户文件。
         if [[ -f "$HY2_DIR/.hy2-installer-owned" \
-                && -f /etc/sysctl.d/99-hysteria2.conf ]] \
+                && -f /etc/sysctl.d/99-hysteria2.conf && ! -L /etc/sysctl.d/99-hysteria2.conf ]] \
                 && grep -qF '(由 hysteria2-installer 自动生成)' /etc/sysctl.d/99-hysteria2.conf; then
             rm -f /etc/sysctl.d/99-hysteria2.conf
         fi
@@ -6375,7 +6376,7 @@ uninstall_all() {
         # portal.py BBR_FILE_MARKER）。没有标记的是旧版门户或用户自己写的，保留。
         local bbr_file
         for bbr_file in /etc/modules-load.d/bbr.conf /etc/sysctl.d/99-bbr.conf; do
-            if [[ -f "$bbr_file" ]] && [[ "$(head -n 1 "$bbr_file")" == '# 由 hysteria2-installer 门户生成（BBR）' ]]; then
+            if [[ -f "$bbr_file" && ! -L "$bbr_file" ]] && [[ "$(head -n 1 "$bbr_file")" == '# 由 hysteria2-installer 门户生成（BBR）' ]]; then
                 rm -f "$bbr_file"
             fi
         done
@@ -6556,11 +6557,12 @@ flow_update_core() {
     check_arch || return 1
     require_installed || return 1
     # 与门户终端升级共享同一锁，串行保护备份、替换、重启和回滚整个事务。
-    local update_lock_fd
+    local update_lock_fd="" rollback_file=""
+    trap 'trap - RETURN; [[ -n "${rollback_file:-}" ]] && rm -f "$rollback_file"; [[ -n "${update_lock_fd:-}" ]] && exec {update_lock_fd}>&- 2>/dev/null || true' RETURN
     exec {update_lock_fd}>"${HY2_DIR}/.core-operation.lock" || {
+        update_lock_fd=""
         log_err "无法创建核心升级锁。"; return 1; }
     if ! flock -n "$update_lock_fd"; then
-        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "另一个核心升级正在运行，请稍后重试。"
         return 1
     fi
@@ -6570,38 +6572,32 @@ flow_update_core() {
     local _current_version
     _current_version="$("$HY2_BIN" version 2>/dev/null | awk -F': *' '/^Version:/{print $2; exit}')" || _current_version=""
     if [[ "$_current_version" == *+* && "${HY2_ALLOW_CUSTOM_CORE_REPLACE:-0}" != "1" ]]; then
-        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "当前核心是定制版本（${_current_version}），官方核心会覆盖它的补丁，已放弃更新。"
         log_err "确需换成官方核心，请先 export HY2_ALLOW_CUSTOM_CORE_REPLACE=1 再执行。"
         return 1
     fi
-    local rollback_file
     rollback_file="$(umask 077; mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
-        exec {update_lock_fd}>&- 2>/dev/null || true
+        rollback_file=""
         log_err "创建核心备份失败，现有二进制未改动。"; return 1; }
     if ! cp -p "$HY2_BIN" "$rollback_file"; then
-        rm -f "$rollback_file"
-        exec {update_lock_fd}>&- 2>/dev/null || true
         log_err "备份核心失败，已放弃更新，现有二进制未改动。"
         return 1
     fi
     if ! install_binary; then
-        rm -f "$rollback_file"
-        exec {update_lock_fd}>&- 2>/dev/null || true
         return 1
     fi
     if traffic_suspended; then
-        rm -f "$rollback_file"
-        exec {update_lock_fd}>&- 2>/dev/null || true
         log_warn "核心已更新；节点正因流量超额被 Teyir 停用，暂不重启，恢复时会自动用上新核心。"
         return 0
     fi
     if ! restart_service; then
         if ! mv -f "$rollback_file" "$HY2_BIN"; then
-            exec {update_lock_fd}>&- 2>/dev/null || true
-            log_err "新版本启动失败，回滚失败；本次旧核心保留在 ${rollback_file}。"
+            local keep_rollback="$rollback_file"
+            rollback_file=""
+            log_err "新版本启动失败，回滚失败；本次旧核心保留在 ${keep_rollback}。"
             return 1
         fi
+        rollback_file=""
         # 再次检查 suspended，避免恢复旧核心时绕过刚生效的停用状态。
         if traffic_suspended; then
             log_err "新版本启动失败，已恢复本次旧核心；节点已停用，暂不重启。"
@@ -6610,11 +6606,10 @@ flow_update_core() {
         else
             log_err "新版本启动失败，已回滚到本次旧版本。"
         fi
-        exec {update_lock_fd}>&- 2>/dev/null || true
         return 1
     fi
     rm -f "$rollback_file"
-    exec {update_lock_fd}>&- 2>/dev/null || true
+    rollback_file=""
 }
 
 flow_reconfigure() {
@@ -6662,14 +6657,14 @@ close_replaced_ports() {
     local old_udp="$1" old_tcp="$2" in_use
     # gost 代理服务的端口也算在用（2026-11-06 补）：它们同样由门户放行，被换掉的订阅端口
     # 恰好与某条代理同号时不能把那条代理的放行一起收回。
-    in_use="$(jq -r 'def pnum: if type=="number" then . elif type=="string" and test("^[0-9]+$") then tonumber else empty end;
+    in_use="$(jq -r 'def pnum: if type=="number" and floor == . and . >= 1 and . <= 65535 then . elif type=="string" and test("^[1-9][0-9]{0,4}$") then (tonumber | select(. >= 1 and . <= 65535)) else empty end;
         ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
         | map(select(type == "object") | .port | pnum))
         + ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | pnum) else [] end)
         | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
     _close_one() {   # $1=port $2=proto
         is_valid_port "$1" || return 0
-        grep -qx "$1" <<<"$in_use" && return 0
+        grep -qxF "$1" <<<"$in_use" && return 0
         if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
             ufw delete allow "$1/$2" >/dev/null 2>&1 || true
         fi
@@ -6706,7 +6701,7 @@ close_installer_ports() {
         if is_valid_port "$lo" && is_valid_port "$hi" && (( 10#$lo <= 10#$hi )); then _fw_close "$range" udp; fi
     fi
     tcp_ports="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
-    tcp_ports+=$'\n'"$(jq -r --argjson px "$with_proxies" 'def pnum: if type=="number" then . elif type=="string" and test("^[0-9]+$") then tonumber else empty end;
+    tcp_ports+=$'\n'"$(jq -r --argjson px "$with_proxies" 'def pnum: if type=="number" and floor == . and . >= 1 and . <= 65535 then . elif type=="string" and test("^[1-9][0-9]{0,4}$") then (tonumber | select(. >= 1 and . <= 65535)) else empty end;
         ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config] | map(select(type == "object") | .port | pnum))
         + (if $px == 1 then ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | pnum) else [] end) else [] end)
         | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
@@ -6715,7 +6710,7 @@ close_installer_ports() {
         [[ "$p" == 80 || "$p" == 443 ]] && continue
         _fw_close "$p" tcp
     done < <(printf '%s\n' "$tcp_ports" | sort -u)
-    p="$(jq -r 'def pnum: if type=="number" then . elif type=="string" and test("^[0-9]+$") then tonumber else empty end;
+    p="$(jq -r 'def pnum: if type=="number" and floor == . and . >= 1 and . <= 65535 then . elif type=="string" and test("^[1-9][0-9]{0,4}$") then (tonumber | select(. >= 1 and . <= 65535)) else empty end;
         .tuic_config | if type == "object" then (.port | pnum) else empty end' "$HY2_DIR/portal.json" 2>/dev/null || true)"
     if is_valid_port "$p"; then _fw_close "$p" udp; fi
     if [[ "$fwd_on" == 1 ]]; then firewall-cmd --reload >/dev/null 2>&1 || true; fi
