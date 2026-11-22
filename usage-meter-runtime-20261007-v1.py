@@ -351,21 +351,20 @@ class PortalMeter:
                         # 回滚内存会使下一轮重复累计。保留新状态并标记不健康。
                         if getattr(save_error, 'replaced', False):
                             raise
-                        with self.lock:
-                            # 锁外写盘期间用户可能已被删除、停用或重新创建。只撤销
-                            # 本次仍未被改动的计量字段，不能用旧快照替换整张用户表。
-                            for uid, user, before, after in user_changes:
-                                if _users_view(self.data).get(uid) is not user:
+                        # 当前仍处于上方 with self.lock 块内，不得再次获取 self.lock（否则非可重入锁直接死锁）。
+                        # 只撤销本次仍未被改动的计量字段，不能用旧快照替换整张用户表。
+                        for uid, user, before, after in user_changes:
+                            if _users_view(self.data).get(uid) is not user:
+                                continue
+                            for key, value in after.items():
+                                if key not in user or user[key] != value:
                                     continue
-                                for key, value in after.items():
-                                    if key not in user or user[key] != value:
-                                        continue
-                                    if key in before: user[key]=before[key]
-                                    else: user.pop(key, None)
-                            if self.data.get('usage_meter') is meter:
-                                _rollback_sample(meter,old if isinstance(old,dict) else {},applied_meter)
-                                if old is None and not meter:
-                                    self.data.pop('usage_meter',None)
+                                if key in before: user[key]=before[key]
+                                else: user.pop(key, None)
+                        if self.data.get('usage_meter') is meter:
+                            _rollback_sample(meter,old if isinstance(old,dict) else {},applied_meter)
+                            if old is None and not meter:
+                                self.data.pop('usage_meter',None)
                         raise
                 with self.lock:
                     self.failed_sources.discard(source)
@@ -422,7 +421,7 @@ class PortalMeter:
     def summary(self, uid):
         with self.lock:
             online_counts, online_sampled_at = self.online_counts, self.online_sampled_at
-            m=self.data.get('usage_meter',{})
+            m=self.data.get('usage_meter',{}) if isinstance(self.data, dict) else {}
             if not isinstance(m, dict):
                 m={}
             health=m.get('health')
@@ -438,6 +437,8 @@ class PortalMeter:
             safe_uid = uid if isinstance(uid, str) else None
             user=_users_view(self.data).get(safe_uid,{}) if safe_uid is not None else {}
             legacy=user.get('legacy_auth_value',user.get('used_bytes',0)) if isinstance(user,dict) else None
+            if isinstance(legacy, float) and not math.isfinite(legacy):
+                legacy = None
             now_ts=time.time()
             live_fresh=(isinstance(self.live_snapshot, dict)
                         and isinstance(self.live_snapshot.get('users'), dict)
@@ -484,7 +485,7 @@ class PortalMeter:
         热路径改用本方法：不做任何 deepcopy，只读标量。
         """
         with self.lock:
-            m=self.data.get('usage_meter',{})
+            m=self.data.get('usage_meter',{}) if isinstance(self.data, dict) else {}
             if not isinstance(m, dict):
                 m={}
             health=m.get('health')
@@ -525,5 +526,5 @@ def from_file(data,lock,save,path,on_speed=None):
         raise ValueError('usage meter config must be a regular file')
     if st.st_size > 2 * 1024 * 1024:
         raise ValueError('usage meter config too large')
-    config=json.loads(cfg_path.read_text(encoding='utf-8'))
+    config=json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
     return PortalMeter(data,lock,save,config,on_speed=on_speed)

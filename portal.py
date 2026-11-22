@@ -196,8 +196,13 @@ def sysctl_conf_overrides(wanted, path='/etc/sysctl.conf'):
     systemd-sysctl 按文件名排序加载，99-sysctl.conf（指向 /etc/sysctl.conf）排在
     99-bbr.conf 之后，同一个键以它为准。
     """
+    if not isinstance(wanted, dict) or not wanted:
+        return []
     try:
-        text = Path(path).read_text(encoding='utf-8', errors='replace')
+        p = Path(path)
+        if not p.is_file() or p.stat().st_size > 2 * 1024 * 1024:
+            return []
+        text = p.read_bytes().decode('utf-8', errors='replace')
     except OSError:
         return []
     found = []
@@ -252,7 +257,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.70'
+PORTAL_VERSION = '2.71'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -282,13 +287,37 @@ def _unlock_read(resp, limit):
     return raw[:limit].decode('utf-8', 'replace')
 
 
+class _UnlockHttpOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """仅允许重定向至 http/https 的安全重定向处理器，拦截 ftp/file 等非 HTTP 协议跳转。"""
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        parsed = urlsplit(str(newurl))
+        if (parsed.scheme not in ('http', 'https') or not parsed.hostname
+                or any(ord(c) < 32 or ord(c) == 127 for c in str(newurl))):
+            raise urllib.error.HTTPError(newurl, code, 'blocked non-http redirect', headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_ORIG_PORTAL_URLOPEN = urllib.request.urlopen
+_UNLOCK_HTTP_OPENER = urllib.request.build_opener(_UnlockHttpOnlyRedirectHandler())
+
+
 def _unlock_fetch(url, timeout=8, limit=400000):
     """返回 (status_code, final_url, body_text)。HTTP 错误码也正常返回，网络错误抛异常。"""
-    if not isinstance(url, str) or urlsplit(url).scheme not in ('http', 'https'):
+    if (not isinstance(url, str) or any(ord(c) < 32 or ord(c) == 127 for c in url)):
         raise ValueError('unsupported unlock url scheme')
+    parsed = urlsplit(url)
+    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+        raise ValueError('unsupported unlock url scheme')
+    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout) or timeout <= 0):
+        raise ValueError('invalid unlock timeout')
     req = urllib.request.Request(url, headers={'User-Agent': _UNLOCK_UA, 'Accept-Language': 'en-US,en;q=0.9'})
+    _open_fn = (_UNLOCK_HTTP_OPENER.open if urllib.request.urlopen is _ORIG_PORTAL_URLOPEN
+                else urllib.request.urlopen)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _open_fn(req, timeout=timeout) as resp:
             return resp.status, resp.geturl(), _unlock_read(resp, limit)
     except urllib.error.HTTPError as e:
         try:
@@ -1142,7 +1171,12 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
     """Apply WARP rules transactionally; success requires a new active process."""
     cfg = Path(config_path)
     try:
-        original = cfg.read_text(encoding='utf-8')
+        if cfg.is_symlink():
+            return False, '读取 Hysteria 配置失败: 配置文件不允许为符号链接'
+        _cfg_st = cfg.lstat()
+        if _cfg_st.st_size > 4 * 1024 * 1024:
+            return False, '读取 Hysteria 配置失败: 配置文件超过 4 MiB 上限'
+        original = cfg.read_bytes().decode('utf-8', errors='replace')
     except Exception as exc:
         return False, '读取 Hysteria 配置失败: %s' % exc
     with data_lock:
@@ -1183,7 +1217,10 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
                 except OSError:
                     pass
             if os.path.exists(tmp):
-                os.unlink(tmp)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         # 整机流量超额停用期间不能启动服务，但配置应当落盘并视为成功 ——
         # 旧实现继续等 active，12 秒后必然「应用失败、已回滚」，
         # 于是停用期间任何 WARP/出站改动都保存不了（2026-10-30 修）。
@@ -1195,7 +1232,7 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
             after = _hy2_runtime_identity()
             if after[0] == 'active' and after[1] not in ('', '0') and after != before:
                 time.sleep(1)
-                if _hy2_runtime_identity() == after and cfg.read_text(encoding='utf-8') == rendered:
+                if _hy2_runtime_identity() == after and cfg.read_bytes().decode('utf-8', errors='replace') == rendered:
                     return True, ''
             if after[0] in ('failed', 'inactive'):
                 break
@@ -1610,6 +1647,12 @@ def portal_update_restart_prefix():
 
 def portal_start_update(restart_prefix, script, lock_fd, ready_timeout=10):
     """只有持锁子脚本就绪才交接；失败时关闭 go 管道，禁止稍后再执行重启。"""
+    if (isinstance(ready_timeout, bool)
+            or not isinstance(ready_timeout, (int, float))
+            or ready_timeout != ready_timeout
+            or ready_timeout in (float('inf'), float('-inf'))
+            or ready_timeout <= 0):
+        ready_timeout = 10
     if lock_fd is None:  # Windows 开发环境没有 POSIX fd 继承。
         return subprocess.Popen(restart_prefix + [script], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, start_new_session=True)
@@ -1646,7 +1689,10 @@ def portal_start_update(restart_prefix, script, lock_fd, ready_timeout=10):
     finally:
         for fd in (ready_r, ready_w, go_r, go_w):
             if fd is not None:
-                os.close(fd)
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
 
 def _prune_portal_backups(directory, keep=3, protected=()):
@@ -2086,6 +2132,11 @@ def _require_disk_space(path, need_bytes):
 
 def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/etc/hysteria/core-backups', allow_custom=False):
     binary = Path(binary)
+    backup_root = Path(backup_dir)
+    if binary.is_symlink():
+        raise RuntimeError('核心二进制路径不得为符号链接，已拒绝更新')
+    if backup_root.is_symlink():
+        raise RuntimeError('核心备份目录不得为符号链接，已拒绝更新')
     current = subprocess.run([str(binary), 'version'], capture_output=True, text=True,
                              encoding='utf-8', errors='replace', timeout=5).stdout
     current_line = next((line.split(':', 1)[1].strip() for line in current.splitlines() if line.strip().startswith('Version:')), '')
@@ -2138,6 +2189,8 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                     headers={'User-Agent': 'hysteria2-installer'})
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     final = resp.geturl() or ''
+                if urlsplit(final).scheme not in ('https', 'http'):
+                    final = ''
                 m = re.search(r'/app/(v[0-9][^/]*)/' + re.escape(asset) + r'$', final)
                 # 下载站只给裸版本号，而 GitHub 的 release tag 是 `app/vX.Y.Z`；
                 # 不补前缀拼出的 hashes.txt / 资产 URL 实测 404，回退路径会永远失败。
@@ -2180,6 +2233,15 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         shutil.copy2(binary, backup)
         before = _hy2_runtime_identity()
         os.replace(candidate, binary)
+        if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+            try:
+                _dfd = os.open(str(binary.parent), os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(_dfd)
+                finally:
+                    os.close(_dfd)
+            except OSError:
+                pass
         replaced = True
         if _unit_suspended('hysteria-server'):
             # 整机流量超额停用中（2026-11-03 修，与 install.sh 的核心更新一致）：
@@ -2208,6 +2270,15 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
                     os.fsync(rb_fh.fileno())
                 rb_tmp.chmod(0o755)
                 os.replace(rb_tmp, binary)
+                if hasattr(os, 'O_DIRECTORY') and hasattr(os, 'fsync'):
+                    try:
+                        _dfd = os.open(str(binary.parent), os.O_RDONLY | os.O_DIRECTORY)
+                        try:
+                            os.fsync(_dfd)
+                        finally:
+                            os.close(_dfd)
+                    except OSError:
+                        pass
                 rb_tmp = None
             except Exception as rb_exc:
                 _log_ignored('upgrade_core_rollback_replace', rb_exc)
@@ -2241,7 +2312,11 @@ def portal_state_lock_path(directory='/etc/hysteria'):
 @contextlib.contextmanager
 def portal_state_file_lock(directory='/etc/hysteria'):
     """Serialize portal state writes across threads/processes, reentrant per thread."""
-    path = portal_state_lock_path(directory).resolve()
+    raw_path = portal_state_lock_path(directory)
+    if raw_path.is_symlink():
+        raise OSError('portal state lock path must not be a symlink: %s' % raw_path)
+    # 仅解析父目录规范路径，绝不对锁文件本身 resolve()，否则会提前解引符号链接绕过 O_NOFOLLOW。
+    path = raw_path.parent.resolve() / raw_path.name
     with _portal_state_lock_guard:
         thread_lock = _portal_state_locks.setdefault(path, threading.RLock())
     thread_lock.acquire()
@@ -2268,10 +2343,16 @@ def portal_state_file_lock(directory='/etc/hysteria'):
         finally:
             held.pop(path, None)
             if fcntl is not None:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
     finally:
         if lock_fd is not None:
-            os.close(lock_fd)
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
         thread_lock.release()
 
 
@@ -5966,15 +6047,24 @@ def _restore_config_atomically(config_path, original):
             os.fsync(stream.fileno())
         os.replace(temp_path, config_path)
         if hasattr(os, 'O_DIRECTORY'):
-            dir_fd = os.open(config_path.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
+                dir_fd = os.open(config_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
     except BaseException:
         if fd is not None:
-            os.close(fd)
-        temp_path.unlink(missing_ok=True)
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
 
 
@@ -5984,9 +6074,19 @@ def apply_anytls_config(config, config_path, restart=True, run=subprocess.run,
 
     调用方必须持有对应协议的 apply 锁（AnyTLS / TUIC 共用此函数，service 区分单元）。
     """
+    if (not isinstance(service, str) or not service.strip() or service.strip().startswith('-')
+            or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in service)):
+        raise ValueError('invalid sing-box service name')
     config_path = Path(config_path)
-    original = config_path.read_bytes() if config_path.exists() else None
-    candidate = config_path.with_name(config_path.stem + '.candidate.json')
+    if config_path.is_symlink():
+        raise ValueError('sing-box 配置文件不允许为符号链接')
+    if config_path.exists():
+        if config_path.lstat().st_size > 4 * 1024 * 1024:
+            raise ValueError('sing-box 原配置文件超过 4 MiB 上限')
+        original = config_path.read_bytes()
+    else:
+        original = None
+    candidate = config_path.with_name(f'.{config_path.stem}.candidate.{secrets.token_hex(4)}.json')
     replaced = False
     try:
         _write_private_bytes(
@@ -6068,7 +6168,11 @@ def sync_anytls_users(root, snapshot, apply=None, service_active=None, force_ids
         # 一个坏文件就让开户/续费/停用/删除全部返回 503，报错还写成
         # "Reality sync failed"，完全指不到真正的文件。
         try:
-            config = json.loads(path.read_text(encoding='utf-8'))
+            if path.is_symlink():
+                raise OSError('symlink not allowed')
+            if path.lstat().st_size > 4 * 1024 * 1024:
+                raise ValueError('AnyTLS 配置超过 4 MiB 上限')
+            config = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
         except (OSError, ValueError) as exc:
             raise RuntimeError('AnyTLS configuration unreadable; cannot confirm user sync') from exc
         wanted = anytls_users(snapshot)
@@ -6248,7 +6352,11 @@ def sync_tuic_users(root, snapshot, apply=None, service_active=None, force_ids=(
                 raise RuntimeError('TUIC configuration missing while service is active; cannot confirm user sync')
             return False
         try:
-            config = json.loads(path.read_text(encoding='utf-8'))
+            if path.is_symlink():
+                raise OSError('symlink not allowed')
+            if path.lstat().st_size > 4 * 1024 * 1024:
+                raise ValueError('TUIC 配置超过 4 MiB 上限')
+            config = json.loads(path.read_bytes().decode('utf-8', errors='replace'))
         except (OSError, ValueError) as exc:
             raise RuntimeError('TUIC configuration unreadable; cannot confirm user sync') from exc
         wanted = tuic_users(snapshot)
@@ -7395,10 +7503,11 @@ def firewall_port(port, proto='tcp', open_=True):
     try:
         handled = False
         if shutil.which('ufw'):
-            status = subprocess.run(['ufw', 'status'], capture_output=True, text=True, timeout=10)
+            status = subprocess.run(['ufw', 'status'], capture_output=True, text=True,
+                                    encoding='utf-8', errors='replace', timeout=10)
             if status.returncode != 0:
                 return False
-            if status.stdout.startswith('Status: active'):
+            if any(ln.startswith('Status: active') for ln in status.stdout.splitlines()):
                 cmd = ['ufw', 'allow', spec] if open_ else ['ufw', 'delete', 'allow', spec]
                 result = subprocess.run(cmd, capture_output=True, timeout=15)
                 if result.returncode != 0:
@@ -7422,7 +7531,8 @@ def firewall_port(port, proto='tcp', open_=True):
             if target:
                 fam, tbl, chain = target
                 listed = subprocess.run(['nft', '-a', 'list', 'chain', fam, tbl, chain],
-                                        capture_output=True, text=True, timeout=5)
+                                        capture_output=True, text=True,
+                                        encoding='utf-8', errors='replace', timeout=5)
                 if listed.returncode != 0:
                     return False
                 matched = [ln for ln in listed.stdout.splitlines()
@@ -7773,7 +7883,11 @@ def apply_xray_config_with_meter(config, config_path, meter_cfg_path, portal_dir
     """
     config_path = Path(config_path)
     if meter_cfg_path.exists():
-        raw_meter = json.loads(meter_cfg_path.read_text(encoding='utf-8'))
+        if meter_cfg_path.is_symlink():
+            raise ValueError('计量配置文件不允许为符号链接')
+        if meter_cfg_path.lstat().st_size > 1024 * 1024:
+            raise ValueError('计量配置文件超过 1 MiB 上限')
+        raw_meter = json.loads(meter_cfg_path.read_bytes().decode('utf-8', errors='replace'))
         meter = raw_meter.get('reality') if isinstance(raw_meter, dict) else None
         meter = meter if isinstance(meter, dict) else {}
         address = meter.get('address', '')
@@ -7781,7 +7895,8 @@ def apply_xray_config_with_meter(config, config_path, meter_cfg_path, portal_dir
             if not isinstance(address, str) or not address.startswith('127.0.0.1:'):
                 raise ValueError('统计接口必须为回环地址')
             port_text = address.rsplit(':', 1)[1]
-            if not (port_text.isascii() and port_text.isdigit()):
+            if not (port_text.isascii() and port_text.isdigit() and 1 <= len(port_text) <= 5
+                    and not port_text.startswith('0')):
                 raise ValueError('统计接口端口非法')
             stats_port = int(port_text)
             if not 1 <= stats_port <= 65535:
@@ -7958,7 +8073,7 @@ def _listening_ports_detail():
     for flag in ('-lntH', '-lunH'):
         try:
             result = subprocess.run(['ss', flag], capture_output=True, text=True,
-                                    timeout=5)
+                                    encoding='utf-8', errors='replace', timeout=5)
         except Exception:
             continue
         if result.returncode != 0:
@@ -7973,8 +8088,10 @@ def _listening_ports_detail():
             if ':' not in addr:
                 continue
             tail = addr.rsplit(':', 1)[1]
-            if tail.isdigit():
-                ports.add(int(tail))
+            if tail.isascii() and tail.isdigit():
+                port_num = int(tail)
+                if 1 <= port_num <= 65535:
+                    ports.add(port_num)
     return ports, ok
 
 
@@ -11128,13 +11245,8 @@ if __name__ == '__main__':
                 # 导致「看起来成功、实际没配置」。抛异常让**所有**调用点
                 # 统一走各自的错误分支，不会有人悄悄拿到 None 当成功用。
                 raise RuntimeError(port_reason)
-            # 端口发生了变更才提示。旧端口可能是非法值（字符串/越界），
-            # 这里同样要容错 —— 别让一个坏的历史值把日志行本身搞崩。
-            try:
-                _old_port = int(rcfg_old.get('port'))
-            except (TypeError, ValueError):
-                _old_port = 0
-            if _old_port and _old_port != listen_port:
+            # 端口发生了变更才提示；复用上方经 _valid_port 校验的 old_port 防止非法/非有限值崩溃。
+            if old_port and old_port != listen_port:
                 print('[portal] Reality 端口变更: %s' % port_reason,
                       file=sys.stderr)
 
@@ -11193,32 +11305,48 @@ if __name__ == '__main__':
                 # 并清掉待撤销记录，再写旧快照就把他加回 Reality，且不会再被撤销。
                 with data_lock:
                     desired_inbound['settings']['clients'] = reality_clients(data)
-                previous_xray_bytes = xray_path.read_bytes() if xray_path.exists() else None
-                previous_xray = json.loads(previous_xray_bytes) if previous_xray_bytes is not None else None
-                previous_service_state = _systemd_service_snapshot('xray')
+                if xray_path.is_symlink():
+                    raise RuntimeError('xray.json 不允许为符号链接')
                 if xray_path.exists():
+                    if xray_path.lstat().st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('xray.json 超过 4 MiB 上限')
+                    previous_xray_bytes = xray_path.read_bytes()
+                    previous_xray = json.loads(previous_xray_bytes.decode('utf-8', errors='replace'))
+                    if not isinstance(previous_xray, dict):
+                        raise ValueError('xray.json 顶层必须为 JSON 对象')
+                else:
+                    previous_xray_bytes = None
+                    previous_xray = None
+                previous_service_state = _systemd_service_snapshot('xray')
+                if previous_xray is not None:
                     # 只按 tag 替换 Reality 自己那一条；VMess 入站、统计 api 入站、
                     # routing、outbounds 一律原样保留。旧版无 tag 的 Reality 由
                     # managed_inbound_index 的 legacy 匹配接住，写入时补上 tag。
-                    previous = json.loads(xray_path.read_text(encoding='utf-8'))
-                    xray_json = upsert_managed_inbound(previous, REALITY_INBOUND_TAG, desired_inbound)
+                    xray_json = upsert_managed_inbound(copy.deepcopy(previous_xray), REALITY_INBOUND_TAG, desired_inbound)
 
                 # 重生成 Reality 配置时保留计量能力；仅添加回环 StatsService。
                 # add_stats 是幂等的，且**不改任何 clients**（有断言兜底），
                 # 所以 VMess / VLESS Encryption 入站及其 clients 不会被它重置。
                 _meter_config_path = portal_path.parent / 'usage-meter-config.json'
                 if _meter_config_path.exists():
-                    _meter_config = json.loads(_meter_config_path.read_text(encoding='utf-8'))
-                    _meter_reality = _meter_config.get('reality')
-                    if _meter_reality:
-                        _address = _meter_reality['address']
-                        if not _address.startswith('127.0.0.1:'):
+                    if _meter_config_path.is_symlink() or _meter_config_path.lstat().st_size > 1024 * 1024:
+                        raise RuntimeError('计量配置文件非法或超过 1 MiB 上限')
+                    _meter_config = json.loads(_meter_config_path.read_bytes().decode('utf-8', errors='replace'))
+                    _meter_reality = _meter_config.get('reality') if isinstance(_meter_config, dict) else None
+                    if isinstance(_meter_reality, dict):
+                        _address = _meter_reality.get('address')
+                        if not isinstance(_address, str) or not _address.startswith('127.0.0.1:'):
                             raise ValueError('统计接口必须为回环地址')
+                        _stats_port = _valid_port(_address.rsplit(':', 1)[1])
+                        if not _stats_port:
+                            raise ValueError('统计接口端口不合法')
                         _stats_path = Path(__file__).parent / 'usage-meter-xray-config-20261007-v1.py'
                         _stats_spec = importlib.util.spec_from_file_location('portal_stats_cfg', _stats_path)
+                        if _stats_spec is None or _stats_spec.loader is None:
+                            raise RuntimeError('无法加载计量配置模块')
                         _stats_mod = importlib.util.module_from_spec(_stats_spec)
                         _stats_spec.loader.exec_module(_stats_mod)
-                        xray_json = _stats_mod.add_stats(xray_json, int(_address.rsplit(':', 1)[1]))
+                        xray_json = _stats_mod.add_stats(xray_json, _stats_port)
                 # 统一补内网 / 云元数据拦截（Reality 入站同样适用）。
                 xray_json = add_private_network_guard(xray_json)
                 # 流量超额停用期间只落配置、不重启，否则等于替 Reality 解除了停用。
@@ -12772,7 +12900,11 @@ if __name__ == '__main__':
                     self._extend_deadline(60)
                     cfg_path = portal_path.parent / 'usage-meter-config.json'
                     try:
-                        raw_meter_cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+                        if cfg_path.is_symlink():
+                            raise OSError('配置文件不允许为符号链接')
+                        if cfg_path.lstat().st_size > 1024 * 1024:
+                            raise ValueError('配置文件超过 1 MiB 上限')
+                        raw_meter_cfg = json.loads(cfg_path.read_bytes().decode('utf-8', errors='replace'))
                     except (OSError, ValueError) as exc:
                         return self.reply_json(500, {'ok': False,
                             'error': '读取 usage-meter-config.json 失败：%s' % exc})
@@ -12859,8 +12991,11 @@ if __name__ == '__main__':
                     created = []
                     changed = False
                     try:
+                        _nf_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
                         for fname, content in fetched:
                             dest = base_dir / fname
+                            if dest.is_symlink():
+                                raise OSError('目标门户文件不允许为符号链接: %s' % fname)
                             try:
                                 if dest.read_bytes() == content:
                                     continue          # 内容一致就不动它
@@ -12880,16 +13015,27 @@ if __name__ == '__main__':
                                 old_bytes = dest.read_bytes()
                                 old_mode = dest.stat().st_mode & 0o777
                                 bak_tmp = dest.with_name('%s.bak-tmp-%s' % (dest.name, os.urandom(4).hex()))
+                                _bfd = None
                                 try:
-                                    with open(bak_tmp, 'wb') as bfh:
+                                    _bfd = os.open(str(bak_tmp), _nf_flags, old_mode or 0o600)
+                                    with os.fdopen(_bfd, 'wb') as bfh:
+                                        _bfd = None
                                         bfh.write(old_bytes)
                                         bfh.flush()
                                         os.fsync(bfh.fileno())
                                     os.chmod(bak_tmp, old_mode)
                                     os.replace(bak_tmp, str(bak))
                                 finally:
-                                    if bak_tmp.exists():
-                                        bak_tmp.unlink(missing_ok=True)
+                                    if _bfd is not None:
+                                        try:
+                                            os.close(_bfd)
+                                        except OSError:
+                                            pass
+                                    try:
+                                        if bak_tmp.exists():
+                                            bak_tmp.unlink(missing_ok=True)
+                                    except OSError:
+                                        pass
                                 backups.append((dest, bak))
                             else:
                                 created.append(dest)
@@ -12897,18 +13043,37 @@ if __name__ == '__main__':
                             # （或一次更新 + 一次手工 cp）会互相写坏同一个文件，
                             # 随后 os.replace 把半截内容变成 root 运行的面板代码。
                             tmp = dest.with_name('%s.new-%s' % (dest.name, stamp))
+                            _tfd = None
                             try:
-                                with open(tmp, 'wb') as fh:
+                                _tfd = os.open(str(tmp), _nf_flags, 0o644)
+                                with os.fdopen(_tfd, 'wb') as fh:
+                                    _tfd = None
                                     fh.write(content)
                                     fh.flush()
                                     os.fsync(fh.fileno())
                                 os.chmod(tmp, 0o644)
                                 os.replace(tmp, str(dest))
                             finally:
-                                if tmp.exists():
-                                    tmp.unlink(missing_ok=True)
+                                if _tfd is not None:
+                                    try:
+                                        os.close(_tfd)
+                                    except OSError:
+                                        pass
+                                try:
+                                    if tmp.exists():
+                                        tmp.unlink(missing_ok=True)
+                                except OSError:
+                                    pass
                             changed = True
                         if changed:
+                            try:
+                                _dfd = os.open(str(base_dir), os.O_RDONLY)
+                                try:
+                                    os.fsync(_dfd)
+                                finally:
+                                    os.close(_dfd)
+                            except OSError:
+                                pass
                             # 只保留最近 3 **轮**更新留下的备份；本轮的必须护住
                             # （protected），否则回滚时找不到上一版。
                             _prune_portal_backups(base_dir,
@@ -12922,15 +13087,19 @@ if __name__ == '__main__':
                             portal_start_update(restart_prefix, restart_script, update_lock_fd)
                     except Exception as e:
                         # 出错就把已替换的经同目录临时文件原子恢复回去，绝不留下半新半旧或半截文件
+                        _rb_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
                         for dest, bak in backups:
                             rb_tmp = None
+                            _rfd = None
                             try:
                                 bak_path = Path(bak)
                                 bak_bytes = bak_path.read_bytes()
                                 bak_mode = bak_path.stat().st_mode & 0o777
                                 rb_tmp = Path(dest).with_name(
                                     '%s.rb-%s' % (Path(dest).name, os.urandom(4).hex()))
-                                with open(rb_tmp, 'wb') as rfh:
+                                _rfd = os.open(str(rb_tmp), _rb_flags, bak_mode or 0o600)
+                                with os.fdopen(_rfd, 'wb') as rfh:
+                                    _rfd = None
                                     rfh.write(bak_bytes)
                                     rfh.flush()
                                     os.fsync(rfh.fileno())
@@ -12938,8 +13107,16 @@ if __name__ == '__main__':
                                 os.replace(rb_tmp, str(dest))
                                 rb_tmp = None
                             except Exception as exc:
+                                if _rfd is not None:
+                                    try:
+                                        os.close(_rfd)
+                                    except OSError:
+                                        pass
                                 if rb_tmp is not None:
-                                    rb_tmp.unlink(missing_ok=True)
+                                    try:
+                                        rb_tmp.unlink(missing_ok=True)
+                                    except OSError:
+                                        pass
                                 _log_ignored('portal_update.rollback', exc)
                         for dest in created:
                             try:
@@ -14229,14 +14406,17 @@ if __name__ == '__main__':
                 raise RuntimeError('找不到可用 TLS 证书，%s 需要先配置证书' % protocol)
             if self_signed:
                 raise RuntimeError('当前为自签证书，%s 客户端无法校验；请先配置域名证书' % protocol)
-            validity = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout',
+            cert_path_str = str(cert_file)
+            if cert_path_str.startswith('-') or any(ord(c) < 32 or ord(c) == 127 for c in cert_path_str):
+                raise RuntimeError('证书路径不合法，%s 不能启用' % protocol)
+            validity = subprocess.run(['openssl', 'x509', '-in', cert_path_str, '-noout',
                                        '-checkend', '0'], capture_output=True,
-                                      text=True, timeout=5)
+                                      text=True, encoding='utf-8', errors='replace', timeout=5)
             if validity.returncode != 0:
                 raise RuntimeError('证书已过期或无效，%s 不能启用' % protocol)
-            starts = subprocess.run(['openssl', 'x509', '-in', str(cert_file), '-noout',
+            starts = subprocess.run(['openssl', 'x509', '-in', cert_path_str, '-noout',
                                      '-startdate'], capture_output=True,
-                                    text=True, timeout=5)
+                                    text=True, encoding='utf-8', errors='replace', timeout=5)
             if starts.returncode != 0 or not starts.stdout.startswith('notBefore='):
                 raise RuntimeError('无法读取证书生效时间，%s 不能启用' % protocol)
             try:
@@ -14261,10 +14441,14 @@ if __name__ == '__main__':
             # 只给叶证书时握手会报 x509: certificate signed by unknown authority。
             # 安装器 _accept_cert_pair 有同样的判据，门户这边此前漏了。
             try:
-                pem_text = Path(cert_file).read_text(encoding='utf-8', errors='ignore')
+                _cf_obj = Path(cert_file)
+                if _cf_obj.stat().st_size > 4 * 1024 * 1024:
+                    raise RuntimeError('证书 %s 体积超过 4 MiB 上限，%s 不能启用' % (cert_file, protocol))
+                pem_text = _cf_obj.read_bytes().decode('utf-8', errors='ignore')
             except OSError:
                 pem_text = ''
-            if pem_text.count('BEGIN CERTIFICATE') < 2:
+            _cert_blocks = sum(1 for _ln in pem_text.splitlines() if _ln.strip() == '-----BEGIN CERTIFICATE-----')
+            if _cert_blocks < 2:
                 raise RuntimeError(
                     '证书 %s 只有叶证书、缺少中间证书链；客户端会报 unknown authority。'
                     '请使用 fullchain 或包含完整链的证书文件' % cert_file)
@@ -14309,7 +14493,9 @@ if __name__ == '__main__':
             with data_lock:
                 _data_now = dict(data)
             blocked = managed_reserved_ports(m, _data_now, _cfg_now, exclude_key='vmess_config', keep_disabled=True)
-            blocked.add(reality_port)
+            _rp_valid = _valid_port(reality_port)
+            if _rp_valid:
+                blocked.add(_rp_valid)
             listen_port, reason = _pick_reality_port(
                 preferred=old.get('port'), default=2087,
                 extra_blocked=blocked,
@@ -14345,8 +14531,16 @@ if __name__ == '__main__':
                 was_active = _systemd_state('xray') == 'active'
                 with data_lock:
                     inbound['settings']['clients'] = vmess_clients(data)
-                original_config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                                   if xray_path.exists() else None)
+                if xray_path.is_symlink():
+                    raise RuntimeError('xray.json 不允许为符号链接')
+                if xray_path.exists():
+                    if xray_path.lstat().st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('xray.json 超过 4 MiB 上限')
+                    original_config = json.loads(xray_path.read_bytes().decode('utf-8', errors='replace'))
+                    if not isinstance(original_config, dict):
+                        raise ValueError('xray.json 顶层必须为 JSON 对象')
+                else:
+                    original_config = None
                 config = (copy.deepcopy(original_config) if original_config is not None else
                           {'log': {'loglevel': 'warning'},
                            'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]})
@@ -14411,11 +14605,13 @@ if __name__ == '__main__':
             with data_lock:
                 old = dict(config_section(data, 'vlessenc_config'))
                 blocked_ports = {
-                    m.get('listen_port'), m.get('subscription_port'),
-                    # config_section 清洗（2026-11-06 修）：配置段被改成字符串 / 列表时旧写法
-                    # 抛 AttributeError，VLESS Encryption 每次启用都失败。
-                    config_section(data, 'reality_config').get('port'),
-                    config_section(data, 'vmess_config').get('port'),
+                    _valid_port(_cand_p) or None
+                    for _cand_p in (
+                        m.get('listen_port'),
+                        m.get('subscription_port'),
+                        config_section(data, 'reality_config').get('port'),
+                        config_section(data, 'vmess_config').get('port'),
+                    )
                 }
             try:
                 _xp_cfg = Path('/etc/hysteria/xray.json')
@@ -14436,7 +14632,8 @@ if __name__ == '__main__':
                 raise RuntimeError(reason)
             decryption = old.get('decryption', '')
             encryption = old.get('encryption', '')
-            if not (decryption and encryption):
+            if not (isinstance(decryption, str) and decryption and not any(ord(c) < 32 or ord(c) == 127 for c in decryption)
+                    and isinstance(encryption, str) and encryption and not any(ord(c) < 32 or ord(c) == 127 for c in encryption)):
                 decryption, encryption = generate_vless_encryption_pair()
             with data_lock:
                 clients = vlessenc_clients(data)
@@ -14465,8 +14662,16 @@ if __name__ == '__main__':
                 was_active = _systemd_state('xray') == 'active'
                 with data_lock:
                     inbound['settings']['clients'] = vlessenc_clients(data)
-                original_config = (json.loads(xray_path.read_text(encoding='utf-8'))
-                                   if xray_path.exists() else None)
+                if xray_path.is_symlink():
+                    raise RuntimeError('xray.json 不允许为符号链接')
+                if xray_path.exists():
+                    if xray_path.lstat().st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('xray.json 超过 4 MiB 上限')
+                    original_config = json.loads(xray_path.read_bytes().decode('utf-8', errors='replace'))
+                    if not isinstance(original_config, dict):
+                        raise ValueError('xray.json 顶层必须为 JSON 对象')
+                else:
+                    original_config = None
                 config = (copy.deepcopy(original_config) if original_config is not None else
                           {'log': {'loglevel': 'warning'},
                            'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]})
@@ -15003,8 +15208,12 @@ if __name__ == '__main__':
                 own_active=_systemd_state(ANYTLS_SERVICE) == 'active')
             if not listen_port:
                 raise RuntimeError(reason)
+            _old_secret = old.get('secret') if (
+                isinstance(old.get('secret'), str) and old.get('secret').strip()
+                and not any(ord(c) < 32 or ord(c) == 127 for c in old.get('secret'))
+            ) else ''
             new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
-                       'secret': old.get('secret') or secrets.token_hex(32)}
+                       'secret': _old_secret or secrets.token_hex(32)}
             unit_path = Path('/etc/systemd/system/%s.service' % ANYTLS_SERVICE)
             with anytls_apply_lock:
                 # 用户表在协议锁内取（2026-11-04 修）：旧实现在锁外取，期间撤销流程同步完
@@ -15014,10 +15223,16 @@ if __name__ == '__main__':
                     preview = dict(data)
                     preview['anytls_config'] = new_cfg
                     users = anytls_users(preview)
-                previous_unit = unit_path.read_bytes() if unit_path.exists() else None
+                if unit_path.is_symlink():
+                    raise RuntimeError('AnyTLS 服务单元不允许为符号链接')
+                previous_unit = unit_path.read_bytes() if (unit_path.exists() and unit_path.lstat().st_size <= 1024 * 1024) else None
                 unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                 unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
                 cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
+                if cfg_path.is_symlink():
+                    raise RuntimeError('anytls.json 不允许为符号链接')
+                if cfg_path.exists() and cfg_path.lstat().st_size > 4 * 1024 * 1024:
+                    raise RuntimeError('anytls.json 超过 4 MiB 上限')
                 previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                 try:
@@ -18047,7 +18262,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 mode = state['outbound_mode']
                 rules = [r for r in state['warp_rules'] if isinstance(r, (str, dict))]
                 applying = bool(data.get('egress_applying'))
-                error = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
+                _raw_err = data.get('egress_apply_error') or data.get('outbound_apply_error', '')
+                error = (re.sub(r'[\x00-\x1f\x7f]', ' ', _raw_err).strip()[:300]
+                         if isinstance(_raw_err, str) else '')
             try:
                 _cfg_p = Path('/etc/hysteria/config.yaml')
                 _cfg_st = _cfg_p.lstat()

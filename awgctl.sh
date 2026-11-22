@@ -148,6 +148,7 @@ service_active() {
 
 awg_transaction_snapshot() {
     local path index=0 state_file
+    [[ ! -L "$AWG_DIR" ]] || { log_err "${AWG_DIR} 为符号链接，拒绝建立回滚快照"; return 1; }
     AWG_TRANSACTION_DIR="$(umask 077; mktemp -d "${TMPDIR:-/tmp}/hy2-awg-transaction.XXXXXX")" || return 1
     chmod 700 "$AWG_TRANSACTION_DIR" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
     AWG_TRANSACTION_DIR_MODE=0
@@ -159,7 +160,7 @@ awg_transaction_snapshot() {
     fi
     for path in "$AWG_META_FILE" "$AWG_CONFIG" "$AWG_PEERS_FILE" "$AWG_SERVICE"; do
         if [[ -e "$path" ]]; then
-            cp -a "$path" "$AWG_TRANSACTION_DIR/$index" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+            cp -a -- "$path" "$AWG_TRANSACTION_DIR/$index" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
             : > "$AWG_TRANSACTION_DIR/$index.present" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
         fi
         index=$((index + 1))
@@ -167,7 +168,7 @@ awg_transaction_snapshot() {
     index=4
     for path in "$AWG_VERSION_FILE" "$AWG_GO_BIN" "$AWG_BIN" "$AWG_QUICK_BIN"; do
         if [[ -e "$path" ]]; then
-            cp -a "$path" "$AWG_TRANSACTION_DIR/bin.$index" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
+            cp -a -- "$path" "$AWG_TRANSACTION_DIR/bin.$index" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
             : > "$AWG_TRANSACTION_DIR/bin.$index.present" || { rm -rf "$AWG_TRANSACTION_DIR"; AWG_TRANSACTION_DIR=""; return 1; }
         fi
         index=$((index + 1))
@@ -230,7 +231,7 @@ awg_transaction_restore() {
         if [[ -f "$AWG_TRANSACTION_DIR/$index.present" ]]; then
             awg_atomic_copy_file "$AWG_TRANSACTION_DIR/$index" "$path" || return 1
         else
-            rm -f "$path" || return 1
+            rm -f -- "$path" || return 1
         fi
         index=$((index + 1))
     done
@@ -247,7 +248,7 @@ awg_transaction_restore() {
         if [[ -f "$AWG_TRANSACTION_DIR/bin.$index.present" ]]; then
             awg_atomic_copy_file "$AWG_TRANSACTION_DIR/bin.$index" "$path" || return 1
         else
-            rm -f "$path" || return 1
+            rm -f -- "$path" || return 1
         fi
         index=$((index + 1))
     done
@@ -928,28 +929,48 @@ allow_firewall() {
         return 1
     fi
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        ufw allow "${port}/udp" >/dev/null 2>&1 || true
-        log_info "已放行 UFW: ${port}/udp"
+        if ufw allow "${port}/udp" >/dev/null 2>&1; then
+            log_info "已放行 UFW: ${port}/udp"
+        else
+            log_warn "UFW 放行 ${port}/udp 失败，请手工核查防火墙规则"
+        fi
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-        log_info "已放行 firewalld: ${port}/udp"
+        local _fw_rc=0
+        firewall-cmd --add-port="${port}/udp" --permanent >/dev/null 2>&1 \
+            && firewall-cmd --reload >/dev/null 2>&1 || _fw_rc=$?
+        if (( _fw_rc == 0 )); then
+            log_info "已放行 firewalld: ${port}/udp"
+        else
+            log_warn "firewalld 放行 ${port}/udp 失败，请手工核查防火墙规则"
+        fi
     fi
     return 0
 }
 
 revoke_firewall() {
-    local port="$1"
+    local port="$1" revoked=0
     [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port >= 1 && 10#$port <= 65535 )) || return 0
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+        if ufw delete allow "${port}/udp" >/dev/null 2>&1; then
+            revoked=1
+        else
+            log_warn "UFW 收回 ${port}/udp 失败，请手工核查防火墙规则"
+        fi
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active firewalld >/dev/null 2>&1; then
-        firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
+        local _fw_rc=0
+        firewall-cmd --remove-port="${port}/udp" --permanent >/dev/null 2>&1 \
+            && firewall-cmd --reload >/dev/null 2>&1 || _fw_rc=$?
+        if (( _fw_rc == 0 )); then
+            revoked=1
+        else
+            log_warn "firewalld 收回 ${port}/udp 失败，请手工核查防火墙规则"
+        fi
     fi
-    log_info "已收回旧端口 ${port}/udp 的防火墙放行"
+    if [[ "$revoked" == "1" ]]; then
+        log_info "已收回旧端口 ${port}/udp 的防火墙放行"
+    fi
     return 0
 }
 
@@ -1226,11 +1247,13 @@ cmd_client_conf() {
     require_jq
     is_installed || die "AmneziaWG 尚未安装。"
     [[ -n "$name" ]] || die "用法: hy2-awgctl client-conf <名称> [--endpoint HOST]"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] || die "客户端名称不合法（仅允许字母/数字/点/下划线/短横，1-32 字符）: ${name}"
     peer_exists "$name" || die "客户端不存在: ${name}"
 
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
-            'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)) // empty' "$AWG_PEERS_FILE")"
+            'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)) // empty' "$AWG_PEERS_FILE" 2>/dev/null)" \
+            || die "客户端列表无法解析：${AWG_PEERS_FILE}"
     fi
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
@@ -1680,10 +1703,18 @@ cmd_update() {
                 meta_set H3 "$AWG_H3"; meta_set H4 "$AWG_H4"
             fi
         fi
+        local _cur_hp=""
+        if [[ "$line" == "3" ]]; then
+            _cur_hp="$(meta_get HeaderProtectionKey)"
+            if [[ -n "$_cur_hp" && "$_cur_hp" =~ [[:space:][:cntrl:]] ]]; then
+                meta_set HeaderProtectionKey ""
+            fi
+        fi
         if [[ "$line" == "3" && -z "$(meta_get HeaderProtectionKey)" ]]; then
             local _hp_key
             _hp_key="$(genkey)"
             [[ -n "$_hp_key" ]] || die "生成 3.x 头部保护密钥失败"
+            [[ ! "$_hp_key" =~ [[:space:][:cntrl:]] ]] || die "生成 3.x 头部保护密钥含非法字符"
             meta_set HeaderProtectionKey "$_hp_key"
         fi
         render_server_config
@@ -1742,6 +1773,7 @@ cmd_qr() {
     local name="${1:-}" endpoint="${2:-}"
     is_installed || die "AmneziaWG 尚未安装。"
     [[ -n "$name" ]] || die "用法: hy2-awgctl qr <名称> [--endpoint HOST]"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] || die "客户端名称不合法（仅允许字母/数字/点/下划线/短横，1-32 字符）: ${name}"
     if ! command -v qrencode >/dev/null 2>&1; then
         die "缺少 qrencode，请先安装：apt-get install -y qrencode"
     fi
@@ -1751,7 +1783,8 @@ cmd_qr() {
     peer_exists "$name" || die "客户端不存在: ${name}"
     if [[ -z "$endpoint" ]]; then
         endpoint="$(jq -r --arg n "$name" \
-            'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)) // empty' "$AWG_PEERS_FILE")"
+            'first((.peers // []) | if type=="array" then .[] else empty end | select(type=="object" and .name==$n) | (.endpoint | if type=="string" and length>0 then . else empty end)) // empty' "$AWG_PEERS_FILE" 2>/dev/null)" \
+            || die "客户端列表无法解析：${AWG_PEERS_FILE}"
     fi
     [[ -n "$endpoint" ]] || endpoint="$(meta_get endpoint)"
     [[ -n "$endpoint" ]] || die "未指定连接地址，请加 --endpoint <域名或公网IP>"
@@ -1873,7 +1906,13 @@ main() {
             parse_name_endpoint "$@"
             ;;
         peer-del)
+            [[ $# -eq 1 ]] || die "用法: hy2-awgctl peer-del <名称>"
             [[ -n "${1:-}" ]] || die "用法: hy2-awgctl peer-del <名称>"
+            ;;
+        peer-list)
+            if [[ $# -gt 1 ]] || [[ $# -eq 1 && "$1" != "--json" ]]; then
+                die "用法: hy2-awgctl peer-list [--json]"
+            fi
             ;;
     esac
 
