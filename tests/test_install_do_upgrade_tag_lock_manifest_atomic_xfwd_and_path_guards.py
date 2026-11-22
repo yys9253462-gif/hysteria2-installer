@@ -39,8 +39,10 @@ class TestInstallDoUpgradeGuardsBatch60(unittest.TestCase):
         self.assertIn('--max-filesize 2097152', body)
         self.assertIn('--max-filesize 104857600', body)
         self.assertIn('--max-filesize 10485760', body)
-        self.assertNotIn('sed -i -E \'s/^([[:space:]]+)rewriteHost:', body,
-                         '不得再对 config.yaml 使用非原子 sed -i 写入 xForwarded')
+        self.assertNotIn('xForwarded: true/\' "$HY2_DIR/config.yaml"', body,
+                         '不得直接对生产 config.yaml 就地 sed -i 写入 xForwarded')
+        self.assertIn('xForwarded: true/\' "$_xfwd_tmp"', body,
+                      'xForwarded 必须先在同目录临时副本上改写再原子 mv 替换')
         self.assertIn('.config.yaml.xfwd.XXXXXX', body)
 
     def test_do_upgrade_hashes_awk_rejects_comments_extra_cols_and_strips_multi_dot_slash(self):
@@ -74,7 +76,7 @@ class TestInstallDoUpgradeGuardsBatch60(unittest.TestCase):
     def test_do_upgrade_portal_sets_cleanup_trap_and_sanitizes_path_changed(self):
         """do_upgrade.sh portal 必须注册 _bundle_dir/_bundle_map EXIT 清理陷阱并拦 _cwd 换行注入。"""
         body = _extract_do_upgrade()
-        self.assertIn('trap \'rm -rf "${_bundle_dir:-}" "${_bundle_map:-}"\' EXIT', body)
+        self.assertIn('trap \'_rc=$?; rm -f "${_bundle_map:-}"; [[ $_rc -ne 0 ]] && rm -rf "${_bundle_dir:-}"\' EXIT', body)
         self.assertIn('[[ "$_cwd" == *$', body, '写入 PathChanged 前必须拦截换行/回车控制字符')
 
 

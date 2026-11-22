@@ -3349,7 +3349,7 @@ if [[ "$TARGET" == "core" ]]; then
     if [[ ! -L "$HY2_DIR/config.yaml" && -f "$HY2_DIR/config.yaml" ]] && ! grep -qE '^[[:space:]]+xForwarded:' "$HY2_DIR/config.yaml"; then
         _xfwd_tmp="$(umask 077 && mktemp "${HY2_DIR}/.config.yaml.xfwd.XXXXXX" 2>/dev/null)" || _xfwd_tmp=""
         if [[ -n "$_xfwd_tmp" ]]; then
-            if sed -E 's/^([[:space:]]+)rewriteHost:(.*)$/&\n\1xForwarded: true/' "$HY2_DIR/config.yaml" > "$_xfwd_tmp" 2>/dev/null && [[ -s "$_xfwd_tmp" ]]; then
+            if cp -p "$HY2_DIR/config.yaml" "$_xfwd_tmp" 2>/dev/null && sed -i -E 's/^([[:space:]]+)rewriteHost:(.*)$/&\n\1xForwarded: true/' "$_xfwd_tmp" 2>/dev/null && [[ -s "$_xfwd_tmp" ]]; then
                 chmod 600 "$_xfwd_tmp" 2>/dev/null || true
                 mv -f "$_xfwd_tmp" "$HY2_DIR/config.yaml" || rm -f "$_xfwd_tmp"
             else
@@ -3401,7 +3401,7 @@ elif [[ "$TARGET" == "portal" ]]; then
     [[ "$_bundle_ref" =~ ^[0-9a-f]{40}$ ]] || { echo "无法固定门户版本，保留全部旧文件" >&2; exit 1; }
     _bundle_dir="$(mktemp -d)"
     _bundle_map=""
-    trap 'rm -rf "${_bundle_dir:-}" "${_bundle_map:-}"' EXIT
+    trap '_rc=$?; rm -f "${_bundle_map:-}"; [[ $_rc -ne 0 ]] && rm -rf "${_bundle_dir:-}"' EXIT
     _bundle_files="portal.py portal_assets.py usage-meter-core-20261007-v1.py usage-meter-readers-20261007-v1.py usage-meter-runtime-20261007-v1.py usage-meter-xray-config-20261007-v1.py"
     # 本脚本是独立生成的文件，不能依赖 install.sh 里的函数：内联 git blob 身份计算。
     # blob sha = sha1("blob <len>\0" + content)，与 GitHub contents API 的 sha 一致，

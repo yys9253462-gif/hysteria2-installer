@@ -8557,6 +8557,7 @@ def prepare(meta_path, port, node_api_key=None):
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                             capture_output=True, timeout=20)
         qr_svg = (qr.stdout if (qr.returncode == 0 and qr.stdout
+                                and b'<script' not in qr.stdout.lower()
                                 and _is_safe_svg_payload(qr.stdout)) else b'')
     except Exception:
         qr_svg = b''
@@ -17248,7 +17249,15 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
-                if not _is_safe_svg_payload(qr_svg):
+                _svg_ok = globals().get('_is_safe_svg_payload')
+                if '<svg' not in qr_svg:
+                    qr_svg = ""
+                elif _svg_ok is not None:
+                    if not _svg_ok(qr_svg):
+                        qr_svg = ""
+                elif ('<script' in qr_svg.lower() or '<foreignobject' in qr_svg.lower()
+                        or 'javascript:' in qr_svg.lower() or 'onload=' in qr_svg.lower()
+                        or 'onerror=' in qr_svg.lower()):
                     qr_svg = ""
 
                 denial = user_access_denial(u_copy)

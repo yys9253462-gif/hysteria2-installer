@@ -75,9 +75,8 @@ class TestPortalAssetsWarpBbrUpgradeProxy401AndReentryGuards(unittest.TestCase):
         du_end = s.index('if (btnRecheckUpdate)', du_start)
         du_block = s[du_start:du_end]
         self.assertIn('res.status === 401', du_block)
-        portal_start = du_block.index("if (target === 'portal')")
-        portal_end = du_block.index("if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }", portal_start)
-        self.assertIn('reloading = true;', du_block[portal_start:portal_end])
+        self.assertIn('if (doUpgrade._busy) return;', du_block)
+        self.assertIn('reloading = true;', du_block)
 
         lp_start = s.index('async function loadProxyServices()')
         lp_end = s.index('loadProxyServices();', lp_start)

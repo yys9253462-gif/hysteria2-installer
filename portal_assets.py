@@ -3284,7 +3284,6 @@ async function doUpgrade(target) {
         await new Promise(resolve => setTimeout(resolve, 3000));
         const back = await waitPortalBack();
         if (updateStatusMsg) updateStatusMsg.textContent = back ? '面板已恢复，正在刷新...' : '面板长时间未恢复，请稍后手动刷新页面';
-        if (back) reloading = true;
         if (back) { location.reload(); return; }
         if (btn) { btn.disabled = false; btn.textContent = '重试升级'; }
         return;
