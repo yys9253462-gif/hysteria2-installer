@@ -1353,7 +1353,11 @@ async function waitForEgressApply() {
     let json;
     try {
       const res = await fetch(location.pathname + 'outbounds/list', {credentials:'same-origin'});
-      if (res.status === 401 || (typeof portalSessionExpired !== 'undefined' && portalSessionExpired)) {
+      if (res.status === 401) {
+        if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+        throw new Error('登录已失效，请重新登录');
+      }
+      if (typeof portalSessionExpired !== 'undefined' && portalSessionExpired) {
         throw new Error('登录已失效，请重新登录');
       }
       if (!res.ok) continue;
@@ -1403,6 +1407,11 @@ async function loadOutbounds() {
     const res = await fetch(location.pathname + 'outbounds/list',
       { credentials: 'same-origin' });
     if (seq !== loadOutbounds._seq) return;
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      failure = '登录已过期，请刷新页面重新登录';
+      return;
+    }
     if (!res.ok) { failure = 'HTTP ' + res.status; return; }
     const json = await res.json();
     if (seq !== loadOutbounds._seq) return;
@@ -1585,9 +1594,9 @@ function obApplyQuick() {
   const raw = obEls.quick.value;
   const r = obParseLink(raw);
   if (!raw.trim()) {
-    if (!obEls.quickBox.hidden) {
+    if (obEls.quickBox && !obEls.quickBox.hidden) {
       obEls.quickBox.className = 'ob-field ob-quick';
-      obEls.quickHint.textContent = OB_QUICK_HINT;
+      if (obEls.quickHint) obEls.quickHint.textContent = OB_QUICK_HINT;
     }
     return;
   }
@@ -1601,22 +1610,22 @@ function obApplyQuick() {
     if (obEls.httpInsecure) obEls.httpInsecure.checked = false;
     obTypeSwitch();
     obAutoName();
-    obEls.quickBox.className = 'ob-field ob-quick err';
-    obEls.quickHint.textContent = '没认出这个格式，请直接在下方逐项填写';
+    if (obEls.quickBox) obEls.quickBox.className = 'ob-field ob-quick err';
+    if (obEls.quickHint) obEls.quickHint.textContent = '没认出这个格式，请直接在下方逐项填写';
     return;
   }
   if (obEls.type) obEls.type.value = r.type;
   if (r.type === 'socks5') {
-    obEls.socksAddr.value = r.addr;
-    obEls.socksUser.value = r.user || '';
-    obEls.socksPass.value = r.pass || '';
+    if (obEls.socksAddr) obEls.socksAddr.value = r.addr;
+    if (obEls.socksUser) obEls.socksUser.value = r.user || '';
+    if (obEls.socksPass) obEls.socksPass.value = r.pass || '';
   } else {
-    obEls.httpUrl.value = r.url;
+    if (obEls.httpUrl) obEls.httpUrl.value = r.url;
   }
   obTypeSwitch();
   obAutoName();
-  obEls.quickBox.className = 'ob-field ob-quick ok';
-  obEls.quickHint.textContent = '✓ 已识别为 ' + (r.type === 'http' ? 'HTTP 代理' : 'SOCKS5 代理')
+  if (obEls.quickBox) obEls.quickBox.className = 'ob-field ob-quick ok';
+  if (obEls.quickHint) obEls.quickHint.textContent = '✓ 已识别为 ' + (r.type === 'http' ? 'HTTP 代理' : 'SOCKS5 代理')
     + (r.user ? '（带认证）' : '') + '，可点「测试连通」确认后再保存';
 }
 
@@ -1649,15 +1658,20 @@ async function obTestForm() {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
     });
+    if (res.status === 401) {
+      if (typeof portalSessionExpired !== 'undefined') portalSessionExpired = true;
+      throw new Error('登录已失效，请刷新页面重新登录');
+    }
     let json = null;
     try { json = await res.json(); } catch (_) { json = null; }
     if (res.ok === false || !json || !json.ok) {
       throw new Error((json && json.error) || ('测试失败（HTTP ' + res.status + '）'));
     }
-    if (json.ip) obMsg('✓ 连通，出口 IP：' + json.ip, 'ok');
+    const probedIp = (typeof json.ip === 'string') ? json.ip.trim() : '';
+    if (probedIp) obMsg('✓ 连通，出口 IP：' + probedIp, 'ok');
     else obMsg('✗ 连不通：请检查地址、端口与认证信息', 'err');
   } catch (e) {
-    obMsg('测试失败：' + (e.message || e), 'err');
+    obMsg('测试失败：' + (e && e.message ? e.message : e), 'err');
   } finally {
     if (obEls.btnTest) obEls.btnTest.disabled = false;
   }
@@ -1676,7 +1690,7 @@ if (obEls.quick) {
 }
 [obEls.socksAddr, obEls.httpUrl].forEach(el => { if (el) el.addEventListener('input', obAutoName); });
 if (obEls.name) obEls.name.addEventListener('input', () => { obNameAuto = !obEls.name.value.trim(); });
-if (obEls.btnEye) obEls.btnEye.addEventListener('click', () => obShowPass(obEls.socksPass.type === 'password'));
+if (obEls.btnEye) obEls.btnEye.addEventListener('click', () => { if (obEls.socksPass) obShowPass(obEls.socksPass.type === 'password'); });
 if (obEls.btnTest) obEls.btnTest.addEventListener('click', obTestForm);
 if (obEls.btnClose) obEls.btnClose.addEventListener('click', () => obResetForm());
 if (obEls.formCard) {
@@ -4092,8 +4106,8 @@ function renderAwgPeers(peers) {
       b.disabled = true;
       try {
         const json = await awgPost('manage-amneziawg', { action: 'peer_del', name: n });
-        if (json.ok) { showToast('已删除客户端 ' + n, 'success'); loadAwgState(); }
-        else { alert(json.error || '删除失败'); }
+        if (json && json.ok) { showToast('已删除客户端 ' + n, 'success'); loadAwgState(); }
+        else { alert((json && json.error) || '删除失败'); }
       } catch (err) {
         alert('删除失败: ' + (err && err.message ? err.message : err));
       } finally { b.disabled = false; }
@@ -4126,8 +4140,8 @@ if (btnDoInstallAwg) {
     btnDoInstallAwg.textContent = '⏳ 安装中，请稍候...';
     try {
       const json = await awgPost('install-amneziawg', { line: line, endpoint: endpoint });
-      if (json.ok) { showToast(json.message || '安装完成', 'success'); loadAwgState(); }
-      else { alert(json.error || '安装失败'); }
+      if (json && json.ok) { showToast(json.message || '安装完成', 'success'); loadAwgState(); }
+      else { alert((json && json.error) || '安装失败'); }
     } catch (err) {
       alert('安装失败: ' + (err && err.message ? err.message : err));
     } finally {
@@ -4196,8 +4210,8 @@ if (btnSwitchAwgLine) {
     btnSwitchAwgLine.disabled = true;
     try {
       const json = await awgPost('manage-amneziawg', { action: 'set_line', line: target });
-      if (json.ok) { showToast(json.message || '已切换协议线', 'success'); loadAwgState(); }
-      else { alert(json.error || '切换失败'); }
+      if (json && json.ok) { showToast(json.message || '已切换协议线', 'success'); loadAwgState(); }
+      else { alert((json && json.error) || '切换失败'); }
     } catch (err) {
       alert('切换失败: ' + (err && err.message ? err.message : err));
     } finally { btnSwitchAwgLine.disabled = false; }
@@ -4218,8 +4232,8 @@ if (btnUpdateAwg) {
     btnUpdateAwg.disabled = true;
     try {
       const json = await awgPost('manage-amneziawg', { action: 'update' });
-      if (json.ok) { showToast(json.message || '更新完成', 'success'); loadAwgState(); }
-      else { alert(json.error || '更新失败'); }
+      if (json && json.ok) { showToast(json.message || '更新完成', 'success'); loadAwgState(); }
+      else { alert((json && json.error) || '更新失败'); }
     } catch (err) {
       alert('更新失败: ' + (err && err.message ? err.message : err));
     } finally { btnUpdateAwg.disabled = false; }
@@ -4264,44 +4278,50 @@ document.querySelectorAll('.toggle-pwd').forEach(btn => {
 USER_SCRIPT = r"""
 document.querySelectorAll('[data-copy]').forEach(button => {
   button.addEventListener('click', async () => {
+    if (button.dataset.copyBusy === '1') return;
     const field = document.getElementById(button.dataset.copy);
     if (!field) return;
-    const val = field.value || field.textContent || '';
-    // 原文只在第一次点击时记下（2026-11-12 修）：旧实现每次都读当前文字，恢复前再点一下，
-    // 「已复制 ✓」/「已选中，请按 Ctrl+C」就被当成原文，按钮永远停在那句话上。
-    const orig = button.dataset.orig || (button.dataset.orig = button.textContent);
-    // 同管理页（2026-11-06 修）：http 下 navigator.clipboard 不存在，旧实现静默失败，
-    // 按钮不变也没有提示。先试 execCommand 兜底，都不行再选中并明确告诉用户按 Ctrl+C。
-    let copied = false;
+    button.dataset.copyBusy = '1';
     try {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(val);
-        copied = true;
-      }
-    } catch (_) { copied = false; }
-    if (!copied) {
-      const ta = document.createElement('textarea');
-      ta.value = val;
-      ta.style.position = 'fixed';
-      ta.style.opacity = '0';
-      document.body.appendChild(ta);
+      const val = field.value || field.textContent || '';
+      // 原文只在第一次点击时记下（2026-11-12 修）：旧实现每次都读当前文字，恢复前再点一下，
+      // 「已复制 ✓」/「已选中，请按 Ctrl+C」就被当成原文，按钮永远停在那句话上。
+      const orig = button.dataset.orig || (button.dataset.orig = button.textContent);
+      // 同管理页（2026-11-06 修）：http 下 navigator.clipboard 不存在，旧实现静默失败，
+      // 按钮不变也没有提示。先试 execCommand 兜底，都不行再选中并明确告诉用户按 Ctrl+C。
+      let copied = false;
       try {
-        ta.select();
-        copied = document.execCommand('copy');
-      } catch (_) {
-        copied = false;
-      } finally {
-        ta.remove();
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(val);
+          copied = true;
+        }
+      } catch (_) { copied = false; }
+      if (!copied) {
+        const ta = document.createElement('textarea');
+        ta.value = val;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        try {
+          ta.select();
+          copied = document.execCommand('copy');
+        } catch (_) {
+          copied = false;
+        } finally {
+          ta.remove();
+        }
       }
+      if (copied) {
+        button.textContent = '已复制 ✓';
+      } else {
+        if (field.select) { field.focus(); field.select(); }
+        button.textContent = '已选中，请按 Ctrl+C';
+      }
+      clearTimeout(button._restoreTimer);
+      button._restoreTimer = setTimeout(() => { button.textContent = orig; }, copied ? 1800 : 4000);
+    } finally {
+      button.dataset.copyBusy = '';
     }
-    if (copied) {
-      button.textContent = '已复制 ✓';
-    } else {
-      if (field.select) { field.focus(); field.select(); }
-      button.textContent = '已选中，请按 Ctrl+C';
-    }
-    clearTimeout(button._restoreTimer);
-    button._restoreTimer = setTimeout(() => { button.textContent = orig; }, copied ? 1800 : 4000);
   });
 });
 """
