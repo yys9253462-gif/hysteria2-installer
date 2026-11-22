@@ -14315,7 +14315,7 @@ if __name__ == '__main__':
                 # 端口若由用户指定，提前拦掉非 ASCII 数字及会与 Hysteria2/TUIC 冲突的取值
                 port_num = None
                 if port:
-                    if not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535):
+                    if not re.fullmatch(r'[1-9][0-9]{0,4}', port) or not (1 <= int(port) <= 65535):
                         return self.reply_json(400, {'ok': False, 'error': '端口必须是 1-65535 的数字'})
                     port_num = int(port)
                     if 20000 <= port_num <= 40000:
@@ -14328,10 +14328,14 @@ if __name__ == '__main__':
                         hy2_listen = _valid_port(m_now.get('listen_port'))
                         if hy2_listen and port_num == hy2_listen:
                             return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 已被 Hysteria2 主监听端口占用，请更换其它 UDP 端口'})
-                        hop_range = str(m_now.get('hop_port_range') or '').strip()
-                        hop_match = re.fullmatch(r'([0-9]{1,5})-([0-9]{1,5})', hop_range)
-                        if hop_match:
-                            hs, he = int(hop_match.group(1)), int(hop_match.group(2))
+                        try:
+                            _hop_pair = clean_hop_range(m_now.get('hop_port_range'))
+                        except NameError:
+                            hop_range = str(m_now.get('hop_port_range') or '').strip()
+                            hop_match = re.fullmatch(r'([1-9][0-9]{0,4})-([1-9][0-9]{0,4})', hop_range)
+                            _hop_pair = (int(hop_match.group(1)), int(hop_match.group(2))) if hop_match else None
+                        if _hop_pair:
+                            hs, he = _hop_pair
                             if 1 <= hs <= he <= 65535 and hs <= port_num <= he:
                                 return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 落在当前 Hysteria2 端口跳跃区间 {hs}-{he} 内，请更换其它 UDP 端口'})
                     try:
@@ -14392,6 +14396,8 @@ if __name__ == '__main__':
                 action = (form.get('action', [''])[0] or '').strip()
 
                 if action == 'state':
+                    if hasattr(self, '_extend_deadline'):
+                        self._extend_deadline(30)
                     return self.reply_json(200, awg_state())
 
                 # 先校验动作名再检查安装状态 —— 否则未知动作会拿到
@@ -15399,7 +15405,10 @@ if __name__ == '__main__':
                 try:
                     out = subprocess.run([binary] + args, capture_output=True, text=True, errors='replace', timeout=5)
                     m = re.search(pattern, (out.stdout or '') + (out.stderr or ''))
-                    return m.group(1) if m else '已安装'
+                    if not m:
+                        return '已安装'
+                    clean_v = ''.join(ch for ch in m.group(1) if ord(ch) >= 32 and ord(ch) != 127).strip()[:64]
+                    return clean_v or '已安装'
                 except Exception:
                     return '已安装'
 
@@ -19146,7 +19155,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             try:
                 _wcfg_p = Path('/etc/hysteria/config.yaml')
                 _wcfg_st = _wcfg_p.lstat()
-                if _wcfg_p.is_symlink() or not _wcfg_p.is_file() or _wcfg_st.st_size > 4 * 1024 * 1024:
+                if not stat.S_ISREG(_wcfg_st.st_mode) or _wcfg_st.st_size > 4 * 1024 * 1024:
                     raise ValueError('config.yaml 非法或过大')
                 cfg_text = _wcfg_p.read_bytes().decode('utf-8', errors='replace')
                 applied = cfg_text == render_egress_config(cfg_text, state)
@@ -19226,6 +19235,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """GET /awg-state 的处理逻辑（从 do_GET 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(30)
             return self.reply_json(200, awg_state())
 
         # 默认带 charset（2026-11-04 修）：网页表单的错误回复是中文 UTF-8，旧默认值没写
@@ -19233,12 +19244,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         def reply(self, code, body, mime='text/plain; charset=utf-8', www_auth=False, extra_headers=()):
             self.send_response(code)
             self._responded = True
-            self.send_header('Content-Type', mime)
+            safe_mime = ''.join(ch for ch in str(mime) if ord(ch) >= 32 and ord(ch) != 127) or 'text/plain; charset=utf-8'
+            self.send_header('Content-Type', safe_mime)
             self.send_header('Content-Length', str(len(body)))
             for _name, _value in extra_headers:
-                if not isinstance(_name, str) or not _name or any(ch in _name for ch in ('\r', '\n', '\x00', ':')):
+                if not isinstance(_name, str) or not _name or any(ord(ch) <= 32 or ord(ch) == 127 or ch == ':' for ch in _name):
                     continue
-                _safe_val = str(_value).replace('\r', '').replace('\n', '').replace('\x00', '')
+                _safe_val = ''.join(ch for ch in str(_value) if ord(ch) >= 32 and ord(ch) != 127)
                 self.send_header(_name, _safe_val)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
