@@ -3802,10 +3802,23 @@ EOUG
 setup_systemd() {
     log_step "配置 systemd 系统守护服务: ${HY2_SERVICE}..."
     mkdir -p "$HY2_DIR"
-    if [[ ! -e "$HY2_DIR/.hy2-installer-owned" ]]; then
-        : > "$HY2_DIR/.hy2-installer-owned"
-        chmod 600 "$HY2_DIR/.hy2-installer-owned"
+    if [[ -L "$HY2_DIR/.hy2-installer-owned" ]]; then
+        log_err "${HY2_DIR}/.hy2-installer-owned 是符号链接，拒绝写入。"
+        return 1
     fi
+    if [[ ! -e "$HY2_DIR/.hy2-installer-owned" ]]; then
+        (umask 077; : > "$HY2_DIR/.hy2-installer-owned" && chmod 600 "$HY2_DIR/.hy2-installer-owned") || return 1
+    fi
+    if [[ -L "$HY2_SERVICE" ]]; then
+        log_err "${HY2_SERVICE} 是符号链接，拒绝写入。"
+        return 1
+    fi
+    local _unit_v
+    for _unit_v in "$HY2_DIR" "$HY2_BIN" "$HY2_CONFIG" "$HY2_SERVICE" "$HY2_LOG_DROPIN"; do
+        case "$_unit_v" in
+            *$'\n'*|*$'\r'*) log_err "systemd 服务路径含非法换行字符，已中止。"; return 1 ;;
+        esac
+    done
     
     # 系统内核网络与 UDP 缓冲优化 (BUGFIX #13: 同时持久化到 /etc/sysctl.d/)
     # 共享路径已有非本安装器文件或符号链接时禁止覆盖；卸载也只会移除 marker 所属文件。
@@ -3842,7 +3855,7 @@ EOF
     fi
     sysctl -p /etc/sysctl.d/99-hysteria2.conf >/dev/null 2>&1 || true
     
-    _svc_tmp="$(mktemp "${HY2_SERVICE}.XXXXXX")" || return 1
+    _svc_tmp="$(umask 077; mktemp "${HY2_SERVICE}.XXXXXX")" || return 1
     if ! cat > "$_svc_tmp" <<EOF
 [Unit]
 Description=Hysteria 2 Server Service
@@ -3883,8 +3896,12 @@ EOF
         *) log_warn "HY2_LOG_LEVEL=${HY2_LOG_LEVEL} 不受支持，改用 info"; HY2_LOG_LEVEL=info ;;
     esac
     if [[ -n "$HY2_LOG_LEVEL_EXPLICIT" || ! -f "$HY2_LOG_DROPIN" ]]; then
+        if [[ -L "$HY2_LOG_DROPIN" ]]; then
+            log_err "${HY2_LOG_DROPIN} 是符号链接，拒绝写入。"
+            return 1
+        fi
         mkdir -p "${HY2_LOG_DROPIN%/*}"
-        _dropin_tmp="$(mktemp "${HY2_LOG_DROPIN}.XXXXXX")" || return 1
+        _dropin_tmp="$(umask 077; mktemp "${HY2_LOG_DROPIN}.XXXXXX")" || return 1
         {
             cat > "$_dropin_tmp" <<EOF
 # 由 hysteria2-installer 生成：Hysteria 服务端日志级别（debug|info|warn|error）
@@ -4370,13 +4387,17 @@ import fcntl, os, pathlib, shutil, sys, tempfile
 
 dest, stage = map(pathlib.Path, sys.argv[1:3])
 files = sys.argv[3:]
-# 与终端/Web 更新共享锁，覆盖备份、发布与失败恢复。文件不能删除。
-lock = open(dest / '.portal-update.lock', 'a+b')
+# 与终端/Web 更新共享锁，覆盖备份、发布与失败恢复。文件不能删除，并拒符号链接跟随。
+_lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+_lock_fd = os.open(str(dest / '.portal-update.lock'), _lock_flags, 0o600)
+lock = os.fdopen(_lock_fd, 'a+b')
 try:
     fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 except BlockingIOError:
     sys.exit('另一个门户更新正在发布或验证，请稍后重试')
 backup_root = dest / 'backups'
+if backup_root.is_symlink():
+    sys.exit('门户备份目录不允许为符号链接')
 backup_root.mkdir(mode=0o700, exist_ok=True)
 backup = pathlib.Path(tempfile.mkdtemp(prefix='portal-bundle-', dir=backup_root))
 existing = {f: (dest / f).exists() for f in files}
@@ -4441,18 +4462,29 @@ portal_write_meter_config() {
     _meter_secret="$(traffic_stats_secret "$HY2_CONFIG")"
     if [[ -z "$_meter_secret" ]]; then
         log_warn "config.yaml 缺 trafficStats 段，正在幂等补写以满足真实计量..."
-        if [[ -z "${METER_SECRET:-}" ]]; then
-            METER_SECRET="$(openssl rand -hex 16)"
+        local _meter_secret_cand="${METER_SECRET:-}"
+        if [[ -z "$_meter_secret_cand" ]]; then
+            _meter_secret_cand="$(openssl rand -hex 16)"
         fi
+        if [[ ! "$_meter_secret_cand" =~ ^[A-Za-z0-9._-]{8,128}$ ]]; then
+            log_err "METER_SECRET 包含非法字符或长度不合法，已中止写入 config.yaml。"
+            return 1
+        fi
+        METER_SECRET="$_meter_secret_cand"
         # 不追加到文件末尾：其他段的位置不影响 hysteria 解析，但保持可读性插入到
         # masquerade 之前；若找不到锚点则追加到末尾（hysteria 对顶层键顺序不敏感）。
         python3 -I - "$HY2_CONFIG" "$METER_SECRET" <<'PYEOF'
 import io, os, re, secrets, stat, sys
 path, secret = sys.argv[1], sys.argv[2]
+if not re.fullmatch(r'[A-Za-z0-9._-]{8,128}', secret):
+    sys.exit('invalid trafficStats secret')
 if os.path.islink(path):
     sys.exit('refusing to write symlink config.yaml')
-st_mode = stat.S_IMODE(os.stat(path).st_mode)
-s = io.open(path, encoding='utf-8').read()
+st_info = os.lstat(path)
+if st_info.st_size > 4 * 1024 * 1024:
+    sys.exit('config.yaml exceeds 4 MiB limit')
+st_mode = stat.S_IMODE(st_info.st_mode)
+s = io.open(path, encoding='utf-8', errors='replace').read()
 block = ("\n# 真实计量：/traffic 只读端点，供 usage-meter 采集。必须回环监听，\n"
          "# 且 secret 与 usage-meter-config.json 的 hysteria.secret 逐字符一致。\n"
          "trafficStats:\n  listen: 127.0.0.1:19996\n  secret: %s\n" % secret)
@@ -4518,7 +4550,8 @@ PYEOF
         log_err "拒绝以静默降级的方式继续安装（界面会永远显示「未开始计量」）。"
         return 1
     fi
-    local _meter_tmp
+    local _meter_tmp=""
+    trap 'trap - RETURN; rm -f "${_meter_tmp:-}"' RETURN
     _meter_tmp="$(umask 077; mktemp "${dest_dir}/usage-meter-config.json.tmp.XXXXXX")" || return 1
     if ! printf '%s' "$_meter_secret" | python3 -I -c 'import json, os, sys
 secret = sys.stdin.read()
@@ -4532,8 +4565,7 @@ with open(sys.argv[1], "wb") as fh:
         unset _meter_secret
         return 1
     fi
-    chmod 600 "$_meter_tmp"
-    if ! mv -f "$_meter_tmp" "${dest_dir}/usage-meter-config.json"; then
+    if ! chmod 600 "$_meter_tmp" || ! mv -f "$_meter_tmp" "${dest_dir}/usage-meter-config.json"; then
         rm -f "$_meter_tmp"
         unset _meter_secret
         return 1
@@ -5410,7 +5442,11 @@ install_gost() {
     [[ -f "$HY2_DIR/gost-cert/key.pem" ]] && { had_key=1; _backup_gost_asset "$HY2_DIR/gost-cert/key.pem" old_key || return 1; }
     log_info "目标版本: ${GOST_LATEST} (${GOST_ASSET})"
     log_step "下载并解压 gost 二进制..."
-    TMP_DIR=$(umask 077; mktemp -d)
+    TMP_DIR=$(umask 077; mktemp -d) || {
+        rm -f "$old_gost" "$old_unit" "$old_check" "$old_owner" "$old_config" "$old_cert" "$old_key"
+        log_err "创建 gost 临时目录失败，已放弃安装。"
+        return 1
+    }
     _restore_gost_install() {
         # 同目录临时文件原子替换：避免覆写运行中 gost 二进制报 ETXTBSY，并防止中途失败中断后续恢复。
         _restore_gost_asset() {
@@ -5518,13 +5554,23 @@ install_gost() {
         return 1
     fi
 
-    # 生成 HTTPS 代理专用自签证书 (若不存在)
+    # 生成 HTTPS 代理专用自签证书 (若任一文件缺失则补生成配对证书，拒绝符号链接)
     GOST_CERT_DIR="${HY2_DIR}/gost-cert"
-    if ! mkdir -p "$GOST_CERT_DIR"; then
+    if [[ -L "$GOST_CERT_DIR" ]]; then
+        _restore_gost_install
+        log_err "${GOST_CERT_DIR} 是符号链接，拒绝写入 GOST 证书。"
+        return 1
+    fi
+    if ! mkdir -p "$GOST_CERT_DIR" || ! chmod 700 "$GOST_CERT_DIR"; then
         _restore_gost_install
         return 1
     fi
-    if [[ ! -f "$GOST_CERT_DIR/cert.pem" ]]; then
+    if [[ -L "$GOST_CERT_DIR/cert.pem" || -L "$GOST_CERT_DIR/key.pem" ]]; then
+        _restore_gost_install
+        log_err "GOST 证书或私钥路径为符号链接，已中止并恢复原部署。"
+        return 1
+    fi
+    if [[ ! -f "$GOST_CERT_DIR/cert.pem" || ! -f "$GOST_CERT_DIR/key.pem" ]]; then
         if ! (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
                 -keyout "$GOST_CERT_DIR/key.pem" -out "$GOST_CERT_DIR/cert.pem" \
                 -days 3650 -subj "/CN=gost-proxy" >/dev/null 2>&1); then
