@@ -2151,15 +2151,18 @@ setup_acme_certificate() {
                 log_step "检测到 Nginx，尝试借 Nginx 完成 HTTP-01 验证签发..."
                 _ngres=0
                 _ngpair="$(setup_cert_via_nginx "$SERVER_NAME" "$ACME_EMAIL")" || _ngres=$?
-                if [[ $_ngres -eq 0 && -n "$_ngpair" ]]; then
-                    CERT_TYPE="custom"
-                    CERT_FILE="${_ngpair%%|*}"
-                    KEY_FILE="${_ngpair#*|}"
-                    IS_INSECURE="false"
-                    # SERVER_NAME 已是真实域名（见 setup_acme_certificate 开头）。
-                    log_info "已使用借 Nginx 签发的正式证书: ${CERT_FILE}"
-                    log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
-                    return 0
+                if [[ $_ngres -eq 0 && "$_ngpair" == *"|"* ]]; then
+                    local _ng_c="${_ngpair%%|*}" _ng_k="${_ngpair#*|}"
+                    if [[ -n "$_ng_c" && -n "$_ng_k" && -s "$_ng_c" && -s "$_ng_k" ]]; then
+                        CERT_TYPE="custom"
+                        CERT_FILE="$_ng_c"
+                        KEY_FILE="$_ng_k"
+                        IS_INSECURE="false"
+                        # SERVER_NAME 已是真实域名（见 setup_acme_certificate 开头）。
+                        log_info "已使用借 Nginx 签发的正式证书: ${CERT_FILE}"
+                        log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
+                        return 0
+                    fi
                 fi
                 log_warn "借 Nginx 签发未成功，继续尝试 DNS API。"
             fi
@@ -2174,18 +2177,21 @@ setup_acme_certificate() {
         log_step "借反代签发未成功，改用 DNS API 签发（不占用任何端口）..."
         _dnsres=0
         _dnspair="$(setup_cert_via_dns_api "$SERVER_NAME")" || _dnsres=$?
-        if [[ $_dnsres -eq 0 && -n "$_dnspair" ]]; then
-            CERT_TYPE="custom"
-            CERT_FILE="${_dnspair%%|*}"
-            KEY_FILE="${_dnspair#*|}"
-            IS_INSECURE="false"
-            # SERVER_NAME 已是真实域名（见 setup_acme_certificate 开头）。
-            log_info "已使用 DNS API 签发的正式证书: ${CERT_FILE}"
-            log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
-            log_info "续期：acme.sh --cron 需常驻，建议 crontab -e 加入："
-            log_info "  ${HOME}/.acme.sh/acme.sh --cron --home ${HOME}/.acme.sh > /dev/null 2>&1"
-            log_info "证书将安装到 Hysteria 固定读取路径，acme.sh 续期后会自动重启相关服务。"
-            return 0
+        if [[ $_dnsres -eq 0 && "$_dnspair" == *"|"* ]]; then
+            local _dns_c="${_dnspair%%|*}" _dns_k="${_dnspair#*|}"
+            if [[ -n "$_dns_c" && -n "$_dns_k" && -s "$_dns_c" && -s "$_dns_k" ]]; then
+                CERT_TYPE="custom"
+                CERT_FILE="$_dns_c"
+                KEY_FILE="$_dns_k"
+                IS_INSECURE="false"
+                # SERVER_NAME 已是真实域名（见 setup_acme_certificate 开头）。
+                log_info "已使用 DNS API 签发的正式证书: ${CERT_FILE}"
+                log_info "SNI: ${SERVER_NAME}（客户端无需再开跳过证书校验）"
+                log_info "续期：acme.sh --cron 需常驻，建议 crontab -e 加入："
+                log_info "  ${HOME}/.acme.sh/acme.sh --cron --home ${HOME}/.acme.sh > /dev/null 2>&1"
+                log_info "证书将安装到 Hysteria 固定读取路径，acme.sh 续期后会自动重启相关服务。"
+                return 0
+            fi
         elif [[ $_dnsres -eq 2 ]]; then
             log_err "============================================================"
             log_err " 无法自动签发正式证书：缺少 DNS API 凭据"
@@ -2223,7 +2229,7 @@ setup_acme_certificate() {
             fi
         fi
         # 只有用户明确同意才落到这里 => 生成自签
-        generate_self_signed_cert
+        generate_self_signed_cert || return 1
         return 0
     fi
 
@@ -2540,13 +2546,17 @@ setup_system_firewall() {
             # 用 read 拆分而不是 set --，避免覆盖函数自身的位置参数（$1/$2/$3）。
             local nft_fam nft_tbl nft_chain
             read -r nft_fam nft_tbl nft_chain <<<"$nft_input"
+            if [[ ! "$nft_fam" =~ ^[A-Za-z0-9_.-]+$ || ! "$nft_tbl" =~ ^[A-Za-z0-9_.-]+$ || ! "$nft_chain" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+                continue
+            fi
             # 幂等判据必须**逐条规则**判断。旧实现只在「主 UDP 端口已放行」时
             # 整体跳过，于是 TCP 订阅端口、端口跳跃区间、ACME 的 80 都不会补 ——
             # 重装后订阅端口重新随机时面板公网打不开，日志却写着「已跳过」
-            # （2026-10-29 修）。用「数字边界」正则避免 14617 命中 146170。
+            # （2026-10-29 修）。用「数字边界」正则避免 14617 命中 146170，
+            # 且必须匹配含 accept 的放行规则，防止把已有的 drop/reject 误判为已放行。
             local _nft_rules _changed=0
             _nft_rules="$(nft list chain "$nft_fam" "$nft_tbl" "$nft_chain" 2>/dev/null)"
-            _nft_has() { grep -qE "(^|[[:space:]])$1[[:space:]]+dport[[:space:]]+$2([[:space:]]|$)" <<<"$3"; }
+            _nft_has() { grep -qE "(^|[[:space:]])$1[[:space:]]+dport[[:space:]]+$2[[:space:]].*accept([[:space:]]|;|$)" <<<"$3"; }
             _nft_ensure() {   # $1=proto $2=dport 表达式 $3=规则列表
                 _nft_has "$1" "$2" "$3" && return 0
                 # Insert before existing terminal drops; appending an accept after
@@ -6527,7 +6537,7 @@ uninstall_all() {
         local acme_cert acme_domain acme_bin="$HOME/.acme.sh/acme.sh"
         if [[ -x "$acme_bin" ]]; then
             for acme_cert in "$HY2_CERT_DIR"/acme-*.crt; do
-                [[ -f "$acme_cert" ]] || continue
+                [[ -f "$acme_cert" && ! -L "$acme_cert" ]] || continue
                 acme_domain="${acme_cert##*/acme-}"
                 acme_domain="${acme_domain%.crt}"
                 is_valid_domain "$acme_domain" || continue
@@ -6549,7 +6559,7 @@ uninstall_all() {
         # portal.py BBR_FILE_MARKER）。没有标记的是旧版门户或用户自己写的，保留。
         local bbr_file
         for bbr_file in /etc/modules-load.d/bbr.conf /etc/sysctl.d/99-bbr.conf; do
-            if [[ -f "$bbr_file" && ! -L "$bbr_file" ]] && [[ "$(head -n 1 "$bbr_file")" == '# 由 hysteria2-installer 门户生成（BBR）' ]]; then
+            if [[ -f "$bbr_file" && ! -L "$bbr_file" ]] && [[ "$(head -n 1 "$bbr_file" 2>/dev/null || true)" == '# 由 hysteria2-installer 门户生成（BBR）' ]]; then
                 rm -f "$bbr_file"
             fi
         done
@@ -6566,6 +6576,16 @@ uninstall_all() {
         log_step "清理二进制与配置目录..."
         rm -f "$HY2_BIN"
         # 保留持锁 inode：删除它后并发安装器可能新建另一个锁文件并越过当前卸载。
+        # 防误删守卫：拒绝空串、根目录、顶层系统目录与含 .. 的路径。
+        local _bs='\'
+        local _hy2_clean="${HY2_DIR:-}"
+        while [[ "$_hy2_clean" == */ && "$_hy2_clean" != "/" ]]; do _hy2_clean="${_hy2_clean%/}"; done
+        if [[ -z "$_hy2_clean" || "$_hy2_clean" == "/" || "$_hy2_clean" == */.. || "$_hy2_clean" == */../* \
+                || "$_hy2_clean" == *"${_bs}..${_bs}"* || "$_hy2_clean" == *"${_bs}.." \
+                || ! ( "$_hy2_clean" =~ ^/[^/]+/[^/]+ || "$_hy2_clean" =~ ^[A-Za-z]:[/\\][^/\\]+[/\\].+ ) ]]; then
+            log_err "拒绝清理非法目录 HY2_DIR='${HY2_DIR:-}'。"
+            return 1
+        fi
         local hy2_path
         for hy2_path in "$HY2_DIR"/* "$HY2_DIR"/.[!.]* "$HY2_DIR"/..?*; do
             [[ -e "$hy2_path" || -L "$hy2_path" ]] || continue
@@ -6603,7 +6623,14 @@ uninstall_all() {
                 # 控制工具不可用时的兜底清理，保证不留下半截状态
                 systemctl disable --now amneziawg-server 2>/dev/null || true
                 rm -f "$AWG_SERVICE"
-                rm -rf "$AWG_DIR"
+                local _awg_clean="${AWG_DIR:-}"
+                while [[ "$_awg_clean" == */ && "$_awg_clean" != "/" ]]; do _awg_clean="${_awg_clean%/}"; done
+                if [[ -n "$_awg_clean" && "$_awg_clean" != "/" && "$_awg_clean" != */.. && "$_awg_clean" != */../* \
+                        && ( "$_awg_clean" =~ ^/[^/]+/[^/]+ || "$_awg_clean" =~ ^[A-Za-z]:[/\\][^/\\]+[/\\].+ ) ]]; then
+                    rm -rf "$AWG_DIR"
+                else
+                    log_err "拒绝清理非法目录 AWG_DIR='${AWG_DIR:-}'。"
+                fi
                 systemctl daemon-reload 2>/dev/null || true
             fi
             if [[ "$awg_uninstall_failed" == 1 ]]; then
