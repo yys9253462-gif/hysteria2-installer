@@ -4173,8 +4173,10 @@ def _extra_link_boxes(extra_links):
     """
     parts = []
     for i, item in enumerate(extra_links or ()):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
         label, link = item[0], item[1]
-        if not isinstance(link, str) or not link:
+        if not isinstance(label, str) or not label or not isinstance(link, str) or not link:
             continue
         box_id = 'u-extra-uri-%d' % i
         # 带上二维码（2026-11-13 加）：客户常在电脑上开分享页、用手机扫码导入，UDP 不通时要的恰恰是
@@ -4183,7 +4185,7 @@ def _extra_link_boxes(extra_links):
         qr_html = ('<details style="margin-top:6px"><summary style="font-size:12px;color:var(--muted)">'
                    '显示 %s 二维码（手机扫码导入）</summary><div class="qr-frame" style="max-width:220px;'
                    'margin:8px 0">%s</div></details>' % (html.escape(label), qr)
-                   if isinstance(qr, str) and '<svg' in qr else '')
+                   if isinstance(qr, str) and '<svg' in qr and '<script' not in qr.lower() else '')
         parts.append(
             '<div style="margin-top:14px"><p class="note" style="margin-bottom:4px">%s 直链（UDP 不通时用）</p>'
             '<textarea id="%s" class="link" aria-label="%s 直链" readonly>%s</textarea>'
@@ -4195,8 +4197,9 @@ def _extra_link_boxes(extra_links):
 
 def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None,
                    extra_links=()):
-    # 数据被改坏时（字符串用量、非法到期时间）不能让客户页面 500：
+    # 数据被改坏时（非字典或字符串用量、非法到期时间）不能让客户页面 500：
     # 这几个值直接来自 portal.json（2026-10-30 修）。
+    uinfo = uinfo if isinstance(uinfo, dict) else {}
     used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
     limit_bytes = _safe_int(uinfo.get("limit_bytes") or 0)
     # 与 user_access_allowed 同源：徽标直接取自 user_access_denial。
@@ -16106,12 +16109,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     reason = share_unavailable_reason(u_copy)
                     return self.reply(403, share_unavailable_html(reason).encode('utf-8'),
                                       'text/html; charset=utf-8')
+                if action_file not in ('', 'clash.yaml', 'sing-box.json', 'qr.svg'):
+                    return self.reply(404, b'Not found')
 
                 m = read_meta_file(meta_path)
-                # meta 损坏（含非字符串或纯空白 server_name/public_ip）时 artifacts 会退回 localhost，
-                # 生成一条永远连不上的链接却返回 200，这里只接受清洗后的非空字符串身份。
-                _raw_sn = m.get('server_name').strip() if isinstance(m.get('server_name'), str) else ''
-                _raw_ip = m.get('public_ip').strip() if isinstance(m.get('public_ip'), str) else ''
+                # meta 损坏（含非字符串、纯空白或含控制字符的 server_name/public_ip）时 artifacts 会退回 localhost，
+                # 生成一条永远连不上的链接却返回 200，这里直接经 _clean_host_scalar 校验原始身份非空。
+                _raw_sn = _clean_host_scalar(m.get('server_name'))
+                _raw_ip = _clean_host_scalar(m.get('public_ip'))
                 if not (_raw_sn or _raw_ip):
                     return self.reply(503, share_unavailable_html(
                         '节点元信息缺失或损坏，请联系管理员检查 client_meta.json').encode('utf-8'),
@@ -16122,7 +16127,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 低配机 + 多人同时打开分享页时会在 30 秒整被 watch_deadlines
                 # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
                 # 与其它带子进程的端点一致：先续期再干活。
-                self._extend_deadline(60)
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(60)
                 # 密码缺失/被改坏时不能生成链接：空密码会拼出
                 # `hysteria2://@host`，客户端导入即失败，页面却显示成功。
                 pwd = u_copy.get('password')
@@ -16150,15 +16156,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
                     except Exception:
                         qr_bytes = b''
-                    if b'<svg' not in qr_bytes:
+                    if b'<svg' not in qr_bytes or b'<script' in qr_bytes.lower():
                         qr_bytes = QR_UNAVAILABLE_SVG.encode('utf-8')
                     return self.reply(200, qr_bytes, 'image/svg+xml')
                 elif action_file == '':
                     try:
-                        qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
+                        qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                     except Exception:
                         qr_svg = ''
                     if '<svg' not in qr_svg:
+                        qr_svg = ''
+                    elif '<script' in qr_svg.lower():
                         qr_svg = ''
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
@@ -16238,7 +16246,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(404, {'ok': False, 'error': '该用户不存在（可能已被删除），请刷新页面'})
 
                 m = read_meta_file(meta_path)
-                _, _raw_sn, _raw_ip, _ = clean_node_identity(m)
+                _raw_sn = _clean_host_scalar(m.get('server_name'))
+                _raw_ip = _clean_host_scalar(m.get('public_ip'))
                 if not (_raw_sn or _raw_ip):
                     return self.reply_json(503, {'ok': False,
                         'error': '节点元信息缺失或损坏，请联系管理员检查 client_meta.json'})
@@ -16246,7 +16255,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not isinstance(pwd, str) or not pwd:
                     return self.reply_json(503, {'ok': False,
                         'error': '该账号的密码为空或已损坏，请先重置密码再导出配置'})
-                self._extend_deadline(30)
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(30)
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
@@ -16256,17 +16266,30 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     tuic=_served_singbox_config(_active_tuic_config(), TUIC_SERVICE))
                 qr_svg = ""
                 try:
-                    qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
+                    qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
                 if '<svg' not in qr_svg:
                     qr_svg = ""
+                elif '<script' in qr_svg.lower():
+                    qr_svg = ""
 
                 denial = user_access_denial(u_copy)
+                _raw_note = u_copy.get('note')
+                _clean_note = re.sub(r'[\x00-\x1f\x7f]', ' ', _raw_note).strip() if isinstance(_raw_note, str) else ''
+                _raw_exp = u_copy.get('expires_at')
+                if isinstance(_raw_exp, bool) or _raw_exp is None:
+                    _clean_exp = None
+                elif isinstance(_raw_exp, (int, float)) and math.isfinite(_raw_exp):
+                    _clean_exp = int(_raw_exp)
+                elif isinstance(_raw_exp, str) and _raw_exp.strip().isascii() and _raw_exp.strip().isdigit():
+                    _clean_exp = int(_raw_exp.strip())
+                else:
+                    _clean_exp = None
                 return self.reply_json(200, {
                     'ok': True,
                     'user_id': target_uid,
-                    'note': u_copy.get('note', ''),
+                    'note': _clean_note,
                     'uri': uri,
                     # 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）
                     'extra_links': [{'label': label, 'uri': link} for label, link
@@ -16277,7 +16300,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 缺失 = 永久，必须原样回 None（2026-11-03 修）：旧实现兜底成 0，
                     # 前端弹窗按 `=== null` 判永久，于是永久用户显示成 1970-01-01 到期；
                     # 而 0 在本项目里恰恰表示「已过期」。
-                    'expires_at': u_copy.get('expires_at'),
+                    'expires_at': _clean_exp,
                     'expires_text': _expiry_text(u_copy.get('expires_at')),
                     # 与用户表 / 分享页同一套显示规则（2026-11-04 修）：ip_limit=true 实际
                     # 不限却显示「true IP」；用量字段被改坏时弹窗显示 NaN B。
