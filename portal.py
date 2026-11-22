@@ -221,7 +221,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.63'
+PORTAL_VERSION = '2.64'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -1086,7 +1086,7 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
         return False, '读取 Hysteria 配置失败: %s' % exc
     with data_lock:
         state = routing_state(data)
-        if state['outbound_mode'] == 'global' and not clean_outbounds(state['custom_outbounds']):
+        if state['outbound_mode'] == 'global' and not _renderable_outbounds(state['custom_outbounds']):
             data['outbound_mode'] = 'rules'
             state['outbound_mode'] = 'rules'
     rendered = render_egress_config(original, state)
@@ -1107,11 +1107,14 @@ def apply_egress_config(data, data_lock, config_path='/etc/hysteria/config.yaml'
             os.replace(tmp, cfg)
             replaced = True
             if hasattr(os, 'O_DIRECTORY'):
-                dir_fd = os.open(cfg.parent, os.O_RDONLY | os.O_DIRECTORY)
                 try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
+                    dir_fd = os.open(cfg.parent, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except OSError:
+                    pass
         finally:
             if fd is not None:
                 try:
@@ -4173,8 +4176,10 @@ def _extra_link_boxes(extra_links):
     """
     parts = []
     for i, item in enumerate(extra_links or ()):
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
         label, link = item[0], item[1]
-        if not isinstance(link, str) or not link:
+        if not isinstance(label, str) or not label or not isinstance(link, str) or not link:
             continue
         box_id = 'u-extra-uri-%d' % i
         # 带上二维码（2026-11-13 加）：客户常在电脑上开分享页、用手机扫码导入，UDP 不通时要的恰恰是
@@ -4183,7 +4188,7 @@ def _extra_link_boxes(extra_links):
         qr_html = ('<details style="margin-top:6px"><summary style="font-size:12px;color:var(--muted)">'
                    '显示 %s 二维码（手机扫码导入）</summary><div class="qr-frame" style="max-width:220px;'
                    'margin:8px 0">%s</div></details>' % (html.escape(label), qr)
-                   if isinstance(qr, str) and '<svg' in qr else '')
+                   if isinstance(qr, str) and '<svg' in qr and '<script' not in qr.lower() else '')
         parts.append(
             '<div style="margin-top:14px"><p class="note" style="margin-bottom:4px">%s 直链（UDP 不通时用）</p>'
             '<textarea id="%s" class="link" aria-label="%s 直链" readonly>%s</textarea>'
@@ -4195,8 +4200,9 @@ def _extra_link_boxes(extra_links):
 
 def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, clash, sing, qr_svg, token, user_key, sub_port=None,
                    extra_links=()):
-    # 数据被改坏时（字符串用量、非法到期时间）不能让客户页面 500：
+    # 数据被改坏时（非字典或字符串用量、非法到期时间）不能让客户页面 500：
     # 这几个值直接来自 portal.json（2026-10-30 修）。
+    uinfo = uinfo if isinstance(uinfo, dict) else {}
     used_bytes = _safe_int(uinfo.get("used_bytes") or 0)
     limit_bytes = _safe_int(uinfo.get("limit_bytes") or 0)
     # 与 user_access_allowed 同源：徽标直接取自 user_access_denial。
@@ -10963,8 +10969,22 @@ if __name__ == '__main__':
                     return self.reply_json(200, {'ok': False, 'msg': 'Forbidden'})
                 # 先解析出客户端地址再限流：限流按来源分桶（H4，2026-11-02）。
                 try:
-                    length = int(self.headers.get('Content-Length', 0))
-                    if length < 0 or length > 65536:
+                    _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                    if _cl_vals is not None:
+                        if len(_cl_vals) > 1:
+                            raise ValueError('duplicate auth content-length')
+                        _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                    else:
+                        _raw_cl = self.headers.get('Content-Length', '0')
+                    if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                        _raw_cl = str(_raw_cl)
+                    if not isinstance(_raw_cl, str):
+                        raise ValueError('invalid auth content-length')
+                    _raw_cl_s = _raw_cl.strip()
+                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                        raise ValueError('invalid auth content-length')
+                    length = int(_raw_cl_s)
+                    if length > 65536:
                         raise ValueError('invalid auth content-length')
                     body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                     req_data = json.loads(body)
@@ -11105,8 +11125,22 @@ if __name__ == '__main__':
                     return self.reply_json(401, {'ok': False, 'error': 'Unauthorized API key'})
 
                 try:
-                    length = int(self.headers.get('Content-Length', 0))
-                    if length < 0 or length > 1048576:
+                    _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                    if _cl_vals is not None:
+                        if len(_cl_vals) > 1:
+                            return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+                        _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                    else:
+                        _raw_cl = self.headers.get('Content-Length', '0')
+                    if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                        _raw_cl = str(_raw_cl)
+                    if not isinstance(_raw_cl, str):
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+                    _raw_cl_s = _raw_cl.strip()
+                    if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                        return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
+                    length = int(_raw_cl_s)
+                    if length > 1048576:
                         return self.reply_json(400, {'ok': False, 'error': 'Invalid Content-Length'})
                     body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '{}'
                     params = json.loads(body)
@@ -11224,7 +11258,8 @@ if __name__ == '__main__':
                     # active 同理：旧实现校验了却始终写 status=active，
                     # 控制台传 {"active": false} 开户会拿到 200 但用户照样能连。
                     want_active = params.get('active', True)
-                    note = str(params.get('note', '')).strip()[:200]
+                    _raw_note = params.get('note')
+                    note = ('' if _raw_note is None else re.sub(r'[\x00-\x1f\x7f]', ' ', str(_raw_note))).strip()[:200]
 
                     # 🔴 判定必须在锁内、回包必须在锁外：data_lock 是全局锁，
                     # /auth 每个新连接都要拿它；在锁内写 socket（慢客户端/缓冲区满
@@ -11273,10 +11308,14 @@ if __name__ == '__main__':
                                 # （2026-10-29 修：旧实现无条件保留旧 status/用量，
                                 # 控制台对账时传 active=false 或 limit_bytes 会被静默忽略）。
                                 if 'used_bytes' not in params:
-                                    try:
-                                        record['used_bytes'] = int(existing.get('used_bytes') or 0)
-                                    except (TypeError, ValueError):
+                                    _old_used = existing.get('used_bytes')
+                                    if isinstance(_old_used, bool):
                                         record['used_bytes'] = 0
+                                    else:
+                                        try:
+                                            record['used_bytes'] = max(0, int(_old_used or 0))
+                                        except (TypeError, ValueError, OverflowError):
+                                            record['used_bytes'] = 0
                                 record['created_at'] = existing.get('created_at', now_ts)
                                 if 'legacy_auth_value' in existing:
                                     record['legacy_auth_value'] = existing['legacy_auth_value']
@@ -11287,9 +11326,16 @@ if __name__ == '__main__':
                                     if ((param not in params and not (param == 'traffic_gb' and 'limit_bytes' in params))
                                             or (param == 'password' and not params.get(param))):
                                         record[field] = existing.get(field, record[field])
-                                # traffic_gb 与 limit_bytes 都没传时才沿用旧配额。
+                                # traffic_gb 与 limit_bytes 都没传时才沿用旧配额，损坏非数值时回退 0。
                                 if 'traffic_gb' not in params and 'limit_bytes' not in params:
-                                    record['limit_bytes'] = existing.get('limit_bytes', record['limit_bytes'])
+                                    _old_lim = existing.get('limit_bytes')
+                                    if isinstance(_old_lim, bool):
+                                        record['limit_bytes'] = 0
+                                    else:
+                                        try:
+                                            record['limit_bytes'] = max(0, int(_old_lim or 0))
+                                        except (TypeError, ValueError, OverflowError):
+                                            record['limit_bytes'] = 0
                                 if 'duration_days' not in params and 'expires_at' not in params:
                                     record['expires_at'] = existing.get('expires_at', record['expires_at'])
                             if existing is not None:
@@ -11539,7 +11585,7 @@ if __name__ == '__main__':
                             raise ValueError()
                         days = int(raw_days)
                         raw_traffic = params.get('add_traffic_gb', 0)
-                        if isinstance(raw_traffic, bool):
+                        if isinstance(raw_traffic, bool) or (isinstance(raw_traffic, str) and not raw_traffic.isascii()):
                             raise ValueError()
                         add_traffic_gb = float(raw_traffic)
                         if not 1 <= days <= 36500 or not math.isfinite(add_traffic_gb) or not 0 <= add_traffic_gb <= 1000000:
@@ -11704,10 +11750,12 @@ if __name__ == '__main__':
                             ip_tracker.pop(user_id, None)
                             speed_tracker.pop(user_id, None)
                             reality_registry(data)
+                    durability_uncertain = False
                     try:
                         save_data()
                     except AtomicWriteDurabilityError:
-                        raise
+                        # 文件已替换但目录 fsync 失败：仍须立即执行 apply_access 踢人撤权，并返回可重试 503。
+                        durability_uncertain = True
                     except OSError:
                         with data_lock:
                             if previous_had_user:
@@ -11751,9 +11799,13 @@ if __name__ == '__main__':
                         return self.reply_json(503, {'ok': False,
                             'error': 'User deletion was not saved; no access changes were applied'})
                     deleted = previous_had_user
-                    regenerate_page()
+                    if not durability_uncertain:
+                        regenerate_page()
                     if not apply_access([user_id]):
                         return self.reply_json(503, {'ok': False, 'error': 'Access revocation pending; retry required'})
+                    if durability_uncertain:
+                        return self.reply_json(503, {'ok': False,
+                            'error': 'User deletion saved but durability uncertain; verify and retry'})
                     return self.reply_json(200, {'ok': True, 'access_revoked': True, 'message': 'User deleted' if deleted else 'User already absent; revocation confirmed'})
 
                 elif sub == 'users/set_status':
@@ -12029,11 +12081,22 @@ if __name__ == '__main__':
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             update_lock_fd = None
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -12509,11 +12572,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '')
                 params = {key: values[0] for key, values in form.items()}
@@ -12839,11 +12913,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -12918,11 +13003,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -13109,11 +13205,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -13181,7 +13288,8 @@ if __name__ == '__main__':
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
-                    raise
+                    return self.reply_json(503, {'ok': False,
+                        'error': 'WARP 设置已落盘，但目录持久化同步不确定，请刷新页面核对后重试'})
                 except OSError:
                     with data_lock:
                         if previous_warp_state_exists:
@@ -13275,11 +13383,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -13705,11 +13824,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -13910,11 +14040,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
@@ -13981,11 +14122,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 name = parse_qs(body).get('name', [''])[0]
@@ -14199,11 +14351,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
@@ -14435,11 +14598,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 action = parse_qs(body).get('action', ['toggle'])[0]
@@ -14572,11 +14746,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -14718,11 +14903,22 @@ if __name__ == '__main__':
 
         def _set_bbr_locked(self):
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else '')
                 ver = form.get('version', ['v1'])[0].lower()
@@ -14764,12 +14960,22 @@ if __name__ == '__main__':
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     tmp_path = target_path.with_name(target_path.name + '.tmp.' + secrets.token_hex(4))
                     try:
-                        with open(tmp_path, 'wb') as fh:
+                        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+                        fd = os.open(str(tmp_path), flags, 0o644)
+                        with os.fdopen(fd, 'wb') as fh:
                             fh.write(raw_bytes)
                             fh.flush()
                             os.fsync(fh.fileno())
                         os.chmod(str(tmp_path), 0o644)
                         os.replace(str(tmp_path), str(target_path))
+                        try:
+                            dir_fd = os.open(str(target_path.parent), os.O_RDONLY)
+                            try:
+                                os.fsync(dir_fd)
+                            finally:
+                                os.close(dir_fd)
+                        except OSError:
+                            pass
                     except BaseException:
                         tmp_path.unlink(missing_ok=True)
                         raise
@@ -14816,7 +15022,8 @@ if __name__ == '__main__':
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
-                    raise
+                    return self.reply_json(503, {'ok': False,
+                        'error': 'BBR 已应用，但状态持久化确认不确定，请稍后刷新核对'})
                 except OSError:
                     # 先还原内存目标版本，再逐项隔离恢复文件与运行参数，避免某次 sysctl 超时导致内存残留脏版本。
                     with data_lock:
@@ -14874,11 +15081,22 @@ if __name__ == '__main__':
             if not self.is_authenticated():
                 return self.reply(401, '登录已失效，请刷新页面重新登录'.encode('utf-8'))
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply(400, '请求体长度不合法'.encode('utf-8'))
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply(400, '请求体长度不合法'.encode('utf-8'))
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply(400, '请求体长度不合法'.encode('utf-8'))
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -14921,11 +15139,18 @@ if __name__ == '__main__':
                     pwd = pwd.strip() or secrets.token_hex(16)
                     if any(ord(ch) < 32 or ord(ch) == 127 for ch in pwd):
                         return self.reply(400, '密码不能包含换行或控制字符'.encode('utf-8'))
-                    # 同 REST 通道：非数字输入必须回 400，而不是让异常掐断连接。
+                    # 同 REST 通道：非数字或全角数字输入必须回 400，而不是让异常掐断连接。
                     try:
-                        days = int(form.get('duration_days', ['30'])[0] or 30)
-                        ip_limit = int(form.get('ip_limit', ['0'])[0] or 0)
-                        traffic_gb = float(form.get('traffic_gb', ['0'])[0] or 0)
+                        _raw_days = (form.get('duration_days', ['30'])[0] or '30').strip()
+                        _raw_ipl = (form.get('ip_limit', ['0'])[0] or '0').strip()
+                        _raw_tgb = (form.get('traffic_gb', ['0'])[0] or '0').strip()
+                        if (not _raw_days.isascii() or not _raw_days.isdigit()
+                                or not _raw_ipl.isascii() or not _raw_ipl.isdigit()
+                                or not _raw_tgb.isascii()):
+                            raise ValueError()
+                        days = int(_raw_days)
+                        ip_limit = int(_raw_ipl)
+                        traffic_gb = float(_raw_tgb)
                     except (ValueError, TypeError, OverflowError):
                         return self.reply(400, QUOTA_RANGE_ERROR)
                     # 上限 1e6 GB：没有上限时超大值会在 int() 处抛 OverflowError。
@@ -14934,7 +15159,7 @@ if __name__ == '__main__':
                             or not 0 <= traffic_gb <= 1000000):
                         return self.reply(400, QUOTA_RANGE_ERROR)
                     limit_bytes = int(traffic_gb * (1024**3)) if traffic_gb > 0 else 0
-                    note = form.get('note', [''])[0].strip()[:200]
+                    note = re.sub(r'[\x00-\x1f\x7f]', ' ', form.get('note', [''])[0]).strip()[:200]
                     # 🔴 2026-10-09 修：原来是无条件赋值，同名 id 会被**静默覆盖** ——
                     # 密码被改、used_bytes 归零（已购/已用流量凭空消失）、有效期重算，
                     # 而用户拿到的是 200 成功响应。API 那条路径有 create_only 守卫，
@@ -14952,12 +15177,16 @@ if __name__ == '__main__':
                         if existing is not None:
                             _pw = existing.get('password')
                             tail = _pw[-4:] if isinstance(_pw, str) else ''
-                            # 数据被改坏时 int('x') 会抛 ValueError，这里只影响
+                            # 数据被改坏时 int('x') / int(inf) 会抛异常，这里只影响
                             # 一条提示文案，不值得让整个 409 变成 500（2026-10-30 修）。
-                            try:
-                                _used = int(existing.get('used_bytes') or 0)
-                            except (TypeError, ValueError):
+                            _raw_used = existing.get('used_bytes')
+                            if isinstance(_raw_used, bool):
                                 _used = 0
+                            else:
+                                try:
+                                    _used = max(0, int(_raw_used or 0))
+                                except (TypeError, ValueError, OverflowError):
+                                    _used = 0
                             used_gb = round(_used / (1024 ** 3), 2)
                             conflict = ('exists', tail, used_gb)
                         elif password_taken(data['users'], pwd, user_id):
@@ -15023,8 +15252,9 @@ if __name__ == '__main__':
                             previous_ip = copy.deepcopy(ip_tracker.get(user_id)) if user_id in ip_tracker else None
                             previous_speed = copy.deepcopy(speed_tracker.get(user_id)) if user_id in speed_tracker else None
                             previous_deny = copy.deepcopy(global_ip_deny.get(user_id)) if user_id in global_ip_deny else None
-                            data['_pending_revocations']=sorted(pending_revocations(data) | {user_id})
-                            data['users'].pop(user_id, None)
+                            data['_pending_revocations'] = sorted(pending_revocations(data) | {user_id})
+                            if isinstance(data.get('users'), dict):
+                                data['users'].pop(user_id, None)
                             # 已删用户的累计用量不再有人读，留着只会让 portal.json 越写越大。
                             # 计数器游标不能删：服务没重启时同名用户再出现会被重复计数；
                             # 服务重启换 epoch 时 usage-meter-core 会自然丢弃它们。
@@ -15040,10 +15270,12 @@ if __name__ == '__main__':
                         # 锁内只判定；回包放在锁外，避免慢客户端阻塞 /auth。
                         return self.reply(404, '该用户已不存在（可能已在别处删除），请刷新页面'.encode('utf-8'))
 
+                durability_uncertain = False
                 try:
                     save_data()
                 except AtomicWriteDurabilityError:
-                    raise
+                    # 文件已替换但目录 fsync 失败：仍须执行协议同步/撤权，并返回明确 503。
+                    durability_uncertain = True
                 except OSError:
                     with data_lock:
                         if previous_had_user:
@@ -15091,7 +15323,7 @@ if __name__ == '__main__':
                     raise
                 if not self._sync_reality_clients():
                     with data_lock:
-                        if action == 'delete':
+                        if action == 'delete' or durability_uncertain:
                             revoked_pending = True
                         else:
                             revoked_pending = False
@@ -15102,8 +15334,9 @@ if __name__ == '__main__':
                                 data.setdefault('users', {})[user_id] = previous_user
                     if revoked_pending:
                         # 锁外重建页面并持久化：用户已删仅待断开连接，页面状态须与最新 users 对齐。
-                        regenerate_page()
-                        return self.reply(503, '用户已删除，但节点上的旧连接还没确认断开，后台会自动重试；请稍后刷新页面确认'
+                        if not durability_uncertain:
+                            regenerate_page()
+                        return self.reply(503, '用户操作已落盘，但节点状态同步尚未确认，后台会自动重试；请稍后刷新页面确认'
                                           .encode('utf-8'))
                     try:
                         save_data()
@@ -15111,6 +15344,8 @@ if __name__ == '__main__':
                         _log_ignored('manage_user_rollback_save', rb_exc)
                     return self.reply(503, 'Reality 同步失败，用户操作已撤销，请检查服务后重试'.encode('utf-8'))
 
+                if durability_uncertain:
+                    return self.reply(503, '用户操作已提交，但持久化目录同步不确定，请刷新页面核对状态'.encode('utf-8'))
                 regenerate_page()
                 self.send_response(302)
                 self._responded = True
@@ -15135,8 +15370,22 @@ if __name__ == '__main__':
         def _h_post_login(self, prefix):
             """POST /login 的处理逻辑（从 do_POST 机械搬移而来）。"""
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                if length < 0 or length > 4096:
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply(400, b'Bad request')
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
+                    return self.reply(400, b'Bad request')
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply(400, b'Bad request')
+                length = int(_raw_cl_s)
+                if length > 4096:
                     return self.reply(400, b'Bad request')
                 body = self.rfile.read(length).decode('utf-8', errors='ignore') if length > 0 else ''
                 params = parse_qs(body)
@@ -16024,12 +16273,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     reason = share_unavailable_reason(u_copy)
                     return self.reply(403, share_unavailable_html(reason).encode('utf-8'),
                                       'text/html; charset=utf-8')
+                if action_file not in ('', 'clash.yaml', 'sing-box.json', 'qr.svg'):
+                    return self.reply(404, b'Not found')
 
                 m = read_meta_file(meta_path)
-                # meta 损坏（含非字符串或纯空白 server_name/public_ip）时 artifacts 会退回 localhost，
-                # 生成一条永远连不上的链接却返回 200，这里只接受清洗后的非空字符串身份。
-                _raw_sn = m.get('server_name').strip() if isinstance(m.get('server_name'), str) else ''
-                _raw_ip = m.get('public_ip').strip() if isinstance(m.get('public_ip'), str) else ''
+                # meta 损坏（含非字符串、纯空白或含控制字符的 server_name/public_ip）时 artifacts 会退回 localhost，
+                # 生成一条永远连不上的链接却返回 200，这里直接经 _clean_host_scalar 校验原始身份非空。
+                _raw_sn = _clean_host_scalar(m.get('server_name'))
+                _raw_ip = _clean_host_scalar(m.get('public_ip'))
                 if not (_raw_sn or _raw_ip):
                     return self.reply(503, share_unavailable_html(
                         '节点元信息缺失或损坏，请联系管理员检查 client_meta.json').encode('utf-8'),
@@ -16040,7 +16291,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 # 低配机 + 多人同时打开分享页时会在 30 秒整被 watch_deadlines
                 # 掐断，用户看到 "Empty reply from server"，日志只有 BrokenPipe。
                 # 与其它带子进程的端点一致：先续期再干活。
-                self._extend_deadline(60)
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(60)
                 # 密码缺失/被改坏时不能生成链接：空密码会拼出
                 # `hysteria2://@host`，客户端导入即失败，页面却显示成功。
                 pwd = u_copy.get('password')
@@ -16068,15 +16320,17 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_bytes = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout
                     except Exception:
                         qr_bytes = b''
-                    if b'<svg' not in qr_bytes:
+                    if b'<svg' not in qr_bytes or b'<script' in qr_bytes.lower():
                         qr_bytes = QR_UNAVAILABLE_SVG.encode('utf-8')
                     return self.reply(200, qr_bytes, 'image/svg+xml')
                 elif action_file == '':
                     try:
-                        qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
+                        qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                     except Exception:
                         qr_svg = ''
                     if '<svg' not in qr_svg:
+                        qr_svg = ''
+                    elif '<script' in qr_svg.lower():
                         qr_svg = ''
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
@@ -16156,7 +16410,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     return self.reply_json(404, {'ok': False, 'error': '该用户不存在（可能已被删除），请刷新页面'})
 
                 m = read_meta_file(meta_path)
-                _, _raw_sn, _raw_ip, _ = clean_node_identity(m)
+                _raw_sn = _clean_host_scalar(m.get('server_name'))
+                _raw_ip = _clean_host_scalar(m.get('public_ip'))
                 if not (_raw_sn or _raw_ip):
                     return self.reply_json(503, {'ok': False,
                         'error': '节点元信息缺失或损坏，请联系管理员检查 client_meta.json'})
@@ -16164,7 +16419,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 if not isinstance(pwd, str) or not pwd:
                     return self.reply_json(503, {'ok': False,
                         'error': '该账号的密码为空或已损坏，请先重置密码再导出配置'})
-                self._extend_deadline(30)
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(30)
                 uri, clash_yaml, sing_json = artifacts(
                     m, auth_override=pwd, name_override=f"Hy2-{target_uid}",
                     reality=_active_reality_config(), user_id=target_uid,
@@ -16174,17 +16430,30 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     tuic=_served_singbox_config(_active_tuic_config(), TUIC_SERVICE))
                 qr_svg = ""
                 try:
-                    qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8')
+                    qr_svg = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(), capture_output=True, check=True, timeout=10).stdout.decode('utf-8', errors='replace')
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
                 if '<svg' not in qr_svg:
                     qr_svg = ""
+                elif '<script' in qr_svg.lower():
+                    qr_svg = ""
 
                 denial = user_access_denial(u_copy)
+                _raw_note = u_copy.get('note')
+                _clean_note = re.sub(r'[\x00-\x1f\x7f]', ' ', _raw_note).strip() if isinstance(_raw_note, str) else ''
+                _raw_exp = u_copy.get('expires_at')
+                if isinstance(_raw_exp, bool) or _raw_exp is None:
+                    _clean_exp = None
+                elif isinstance(_raw_exp, (int, float)) and math.isfinite(_raw_exp):
+                    _clean_exp = int(_raw_exp)
+                elif isinstance(_raw_exp, str) and _raw_exp.strip().isascii() and _raw_exp.strip().isdigit():
+                    _clean_exp = int(_raw_exp.strip())
+                else:
+                    _clean_exp = None
                 return self.reply_json(200, {
                     'ok': True,
                     'user_id': target_uid,
-                    'note': u_copy.get('note', ''),
+                    'note': _clean_note,
                     'uri': uri,
                     # 其它已启用协议的直链，与客户分享页一致（2026-11-13 加）
                     'extra_links': [{'label': label, 'uri': link} for label, link
@@ -16195,7 +16464,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 缺失 = 永久，必须原样回 None（2026-11-03 修）：旧实现兜底成 0，
                     # 前端弹窗按 `=== null` 判永久，于是永久用户显示成 1970-01-01 到期；
                     # 而 0 在本项目里恰恰表示「已过期」。
-                    'expires_at': u_copy.get('expires_at'),
+                    'expires_at': _clean_exp,
                     'expires_text': _expiry_text(u_copy.get('expires_at')),
                     # 与用户表 / 分享页同一套显示规则（2026-11-04 修）：ip_limit=true 实际
                     # 不限却显示「true IP」；用量字段被改坏时弹窗显示 NaN B。
@@ -16955,8 +17224,22 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                length = int(self.headers.get('Content-Length', 0))
-                if not 0 <= length <= 8192:
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
+                    return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '探测请求无效，请刷新页面后重试'})
+                length = int(_raw_cl_s)
+                if length > 8192:
                     return self.reply_json(413, {'ok': False, 'error': '探测请求过大，请刷新页面后重试'})
                 form = parse_qs(self.rfile.read(length).decode('utf-8', errors='replace'))
             except (ValueError, TypeError, OSError):
@@ -16969,7 +17252,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if kind in ('socks5', 'http') and not addr:
                 return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
-            self._extend_deadline(45)
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(45)
             ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
             if kind == 'warp' and not ip:
                 # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
@@ -16981,11 +17265,22 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
             try:
-                try:
-                    length = int(self.headers.get('Content-Length', 0))
-                except (TypeError, ValueError):
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
-                if length < 0 or length > 65536:
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                length = int(_raw_cl_s)
+                if length > 65536:
                     return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
                 body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
                 form = parse_qs(body)
@@ -17052,8 +17347,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             previous_egress = {key: (key in data, copy.deepcopy(data.get(key))) for key in
                                                ('custom_outbounds', 'warp_rules', 'outbound_mode')}
                             data['custom_outbounds'] = [o for o in outs if o.get('name') != name]
-                            # 删光最后一个自定义出站时同步切回按域名分流，避免持久化留下 global + 空出站。
-                            if not data['custom_outbounds'] and data.get('outbound_mode') == 'global':
+                            # 删光最后一个可渲染自定义出站时同步切回按域名分流，避免持久化留下 global + 无可用出站。
+                            _remain_valid = [o for o in clean_outbounds(data['custom_outbounds']) if validate_outbound(o)[0]]
+                            if not _remain_valid and data.get('outbound_mode') == 'global':
                                 data['outbound_mode'] = 'rules'
                             # 🔴 必须同步清理引用它的分流规则，否则 ACL 里会留下
                             #    不存在的出站名 ⇒ Hysteria 启动失败（且用户毫无察觉）。
@@ -17074,6 +17370,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 no_valid_outbounds = False
                 with data_lock:
                     valid_outs = clean_outbounds(routing_state(data)['custom_outbounds'])
+                    valid_outs = [o for o in valid_outs if validate_outbound(o)[0]]
                     if mode == 'global' and not valid_outs:
                         no_valid_outbounds = True
                     else:
@@ -17098,9 +17395,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     if action == 'rule-add':
                         cleaned = _clean_route_domain(dom)
                         target = (form.get('outbound', ['warp_socks'])[0] or 'warp_socks').strip()
+                        _usable_outs = [o for o in clean_outbounds(state['custom_outbounds']) if validate_outbound(o)[0]]
                         if not _valid_route_domain(cleaned):
                             rule_error = '域名格式不正确'
-                        elif not outbound_target_exists(target, state['custom_outbounds']):
+                        elif not outbound_target_exists(target, _usable_outs):
                             rule_error = '所选出站不存在，请刷新页面后重新选择已配置的出站'
                         else:
                             rules = [r for r in rules if r['domain'] != cleaned]
@@ -17123,7 +17421,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             try:
                 save_data()
             except AtomicWriteDurabilityError:
-                raise
+                return self.reply_json(503, {'ok': False,
+                    'error': '出站设置已落盘，但目录持久化同步不确定，请刷新页面核对后重试'})
             except OSError as exc:
                 with data_lock:
                     for key, (existed, value) in previous_egress.items():
@@ -17143,7 +17442,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 state = routing_state(data)
                 enabled = state['warp_enabled']
                 rules = [r['domain'] for r in normalize_route_rules(state['warp_rules']) if r['outbound'] in ('warp', 'warp_socks')]
-                overridden = state['outbound_mode'] == 'global' and bool(clean_outbounds(state['custom_outbounds']))
+                overridden = state['outbound_mode'] == 'global' and bool(_renderable_outbounds(clean_outbounds(state['custom_outbounds'])))
             # 统一到 wgcf + wireproxy(127.0.0.1:19898)；同时兼容尚未升级、
             # 仍跑官方 cloudflare-warp(127.0.0.1:40000) 的旧节点，避免误报「未安装」
             is_installed = warp_backend_installed()
