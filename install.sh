@@ -653,12 +653,12 @@ is_valid_domain() {
     [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
 }
 
-# ACME 通知邮箱：本地部分只放行常见安全字符，域名部分同 is_valid_domain（不区分大小写）。
+# ACME 通知邮箱：本地部分只放行常见安全字符且禁止以 - 开头（防选项注入），域名部分同 is_valid_domain。
 is_valid_email() {
     local e="$1" local_part domain
     [[ "$e" == *@* && "$e" != *@*@* ]] || return 1
     local_part="${e%@*}"; domain="$(printf '%s' "${e#*@}" | tr 'A-Z' 'a-z')"
-    [[ "$local_part" =~ ^[A-Za-z0-9._%+-]{1,64}$ ]] && is_valid_domain "$domain"
+    [[ "$local_part" =~ ^[A-Za-z0-9._%+][A-Za-z0-9._%+-]{0,63}$ ]] && is_valid_domain "$domain"
 }
 
 # ==============================================================================
@@ -779,57 +779,72 @@ get_public_ip() {
     # 每个源的回答先清洗、验形状再采用（2026-11-04 修）：旧实现只要第一个源返回
     # 非空内容就不再试下一个，ipify 回一张 502 / 运营商劫持页时安装直接报
     # 「无法获取公网 IP」，后面两个好用的源根本没机会。
-    local _ip_src _ip_answer
+    local _ip_src _ip_answer _octet _decimal _normalized _first_octet _bad_reason="" _last_rejected=""
     PUBLIC_IP=""
     for _ip_src in https://api.ipify.org https://icanhazip.com https://ipinfo.io/ip; do
         _ip_answer="$(curl -4 -s --max-time 5 "$_ip_src" 2>/dev/null || true)"
         _ip_answer="$(printf '%s' "$_ip_answer" | tr -d '[:space:]')"
-        if [[ "$_ip_answer" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            PUBLIC_IP="$_ip_answer"
-            break
+        [[ "$_ip_answer" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || continue
+        # 每一段必须在 0-255 内：正则只验形状，999.999.999.999 也能通过。
+        _normalized=""
+        _first_octet=-1
+        for _octet in ${_ip_answer//./ }; do
+            # 显式十进制，避免 008 报八进制错误；规范化后再做地址范围判断。
+            _decimal=$((10#${_octet}))
+            if (( _decimal > 255 )); then
+                _normalized=""
+                _bad_reason="range"
+                _last_rejected="$_ip_answer"
+                break
+            fi
+            (( _first_octet < 0 )) && _first_octet=$_decimal
+            _normalized+="${_normalized:+.}${_decimal}"
+        done
+        [[ -n "$_normalized" ]] || continue
+        # 回环、私有、CGNAT、基准网以及多播/保留段（>=224）均不能作为公网地址；
+        # 单一源返回这类地址时继续尝试下一个源，避免被局部劫持或异常源拖死。
+        if (( _first_octet >= 224 )); then
+            _bad_reason="private"
+            _last_rejected="$_normalized"
+            continue
         fi
+        case "$_normalized" in
+            127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|0.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|198.1[89].*)
+                _bad_reason="private"
+                _last_rejected="$_normalized"
+                continue
+                ;;
+        esac
+        PUBLIC_IP="$_normalized"
+        return 0
     done
-    if ! [[ "$PUBLIC_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        log_err "无法获取本机公网 IP（已尝试 api.ipify.org / icanhazip.com / ipinfo.io）。"
-        log_err "常见原因：服务器没有公网出口、出口被防火墙拦截、或 DNS 异常。"
-        log_err "若这台机器本就在 NAT 后面，请确认已配置端口转发，或改用 Cloudflare WARP 出口。"
+    if [[ "$_bad_reason" == "private" ]]; then
+        PUBLIC_IP="$_last_rejected"
+        log_err "取到的「公网 IP」是回环、私有或保留地址（${PUBLIC_IP}），不能用于对外服务。"
+        log_err "若这台机器确实有公网出口，请检查出口网络/代理设置；"
+        log_err "若本就在 NAT 后面，请确认已配置端口转发，或改用 Cloudflare WARP 出口。"
         return 1
     fi
-    # ⚠️ 回环/私有地址必须显式拒绝（2026-10-09 补）：上面那个正则只验「像不像 IPv4」，
-    # 而 127.0.0.1 / 10.x / 192.168.x 全都合法通过 —— 于是某些出口（本地代理、
-    # docker0、SSRF 跳转）会把回环地址当成公网 IP 写进 client_meta.json，
-    # 生成的订阅与二维码指向 127.0.0.1，客户端永远连不上。
-    # 之前是靠 `echo "127.0.0.1"` 兜底，现在兜底没了，这条检查是最后一道闸。
-    # 每一段必须在 0-255 内：正则只验形状，999.999.999.999 也能通过。
-    local _octet _decimal _normalized=""
-    for _octet in ${PUBLIC_IP//./ }; do
-        # 显式十进制，避免 008 报八进制错误；规范化后再做地址范围判断。
-        _decimal=$((10#${_octet}))
-        if (( _decimal > 255 )); then
-            log_err "取到的「公网 IP」不是合法地址（${PUBLIC_IP}）。"
-            return 1
-        fi
-        _normalized+="${_normalized:+.}${_decimal}"
-    done
-    PUBLIC_IP="$_normalized"
-    case "$PUBLIC_IP" in
-        # CGNAT 为 100.64.0.0/10，基准测试网为 198.18.0.0/15。
-        127.*|10.*|192.168.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*|0.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|198.1[89].*)
-            log_err "取到的「公网 IP」是回环或私有地址（${PUBLIC_IP}），不能用于对外服务。"
-            log_err "若这台机器确实有公网出口，请检查出口网络/代理设置；"
-            log_err "若本就在 NAT 后面，请确认已配置端口转发，或改用 Cloudflare WARP 出口。"
-            return 1
-            ;;
-    esac
-    return 0
+    if [[ "$_bad_reason" == "range" ]]; then
+        PUBLIC_IP="$_last_rejected"
+        log_err "取到的「公网 IP」不是合法地址（${PUBLIC_IP}）。"
+        return 1
+    fi
+    log_err "无法获取本机公网 IP（已尝试 api.ipify.org / icanhazip.com / ipinfo.io）。"
+    log_err "常见原因：服务器没有公网出口、出口被防火墙拦截、或 DNS 异常。"
+    log_err "若这台机器本就在 NAT 后面，请确认已配置端口转发，或改用 Cloudflare WARP 出口。"
+    return 1
 }
 
 # 解析域名 A/AAAA 记录(三重后备: getent -> dig -> nslookup + 系统解析器)
 # 输出: 第一行 stdout 为 DNS 返回的 IPv4 列表(空格分隔); 失败则返回非 0 且 stdout 为空。
 resolve_domain_ips() {
-    local domain="$1" ips=""
+    local domain="${1:-}" ips=""
+    if [[ -z "$domain" || "$domain" == -* || "$domain" =~ [[:space:][:cntrl:]] ]]; then
+        return 1
+    fi
     # 1) getent (glibc NSS, 走 /etc/resolv.conf)
-    ips=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+    ips=$(getent ahostsv4 -- "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
     if [[ -z "$ips" ]] && command -v dig >/dev/null 2>&1; then
         ips=$(dig +short +time=3 +tries=2 A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ')
     fi
@@ -837,7 +852,7 @@ resolve_domain_ips() {
         ips=$(nslookup -timeout=3 "$domain" 2>/dev/null | awk '/^Address: /{print $2}' | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ')
     fi
     if [[ -z "$ips" ]] && command -v host >/dev/null 2>&1; then
-        ips=$(host -W 3 "$domain" 2>/dev/null | awk '/has address/{print $NF}' | sort -u | tr '\n' ' ')
+        ips=$(host -W 3 -- "$domain" 2>/dev/null | awk '/has address/{print $NF}' | sort -u | tr '\n' ' ')
     fi
     # 4) 最后兜底: 用 python3 走系统解析器(总有一个能用)
     if [[ -z "$ips" ]] && command -v python3 >/dev/null 2>&1; then
@@ -1295,15 +1310,15 @@ select_local_certificate() {
     else
         read -rp "请选择证书编号: " choice || true   # EOF 时走下面的无效选择分支
     fi
-    [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#certs[@]} )) || { log_err "无效选择。"; return 1; }
-    cert="${certs[$((choice-1))]%%|*}"; key="${certs[$((choice-1))]#*|}"
+    [[ "$choice" =~ ^[1-9][0-9]{0,5}$ ]] && (( 10#$choice >= 1 && 10#$choice <= ${#certs[@]} )) || { log_err "无效选择。"; return 1; }
+    cert="${certs[$((10#$choice-1))]%%|*}"; key="${certs[$((10#$choice-1))]#*|}"
     CERT_TYPE="custom"; CERT_FILE="$cert"; KEY_FILE="$key"; IS_INSECURE="false"
     # SNI 能直接从证书 SAN/CN 推出来时不必再问（无人值守路径的关键）。
     if [[ -z "${SERVER_NAME:-}" ]]; then
         # 跳过通配符名字（2026-11-04 修）：*.example.com 不能当 SNI，写进订阅后客户端
         # 发出非法主机名、TLS 校验失败。只有通配符时走下面的提问。
         SERVER_NAME="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[A-Za-z0-9*._-]+' | sed 's/^DNS://' | grep -v '^\*' | head -1)"
-        [[ -z "$SERVER_NAME" ]] && SERVER_NAME="$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed -n 's/.*CN *= *\([^,]*\).*/\1/p' | grep -v '^\*')"
+        [[ -z "$SERVER_NAME" ]] && SERVER_NAME="$(openssl x509 -in "$cert" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | grep -v '^\*' | head -1)"
     fi
     if [[ -z "${SERVER_NAME:-}" ]]; then
         read -rp "请输入证书绑定的域名 (SNI): " SERVER_NAME || true
@@ -1324,13 +1339,22 @@ select_local_certificate() {
 #    而 `ss -t` 传错会让 ss 直接报错退出、被 2>/dev/null 吞掉，
 #    结果是"明明被占却报空闲"—— 静默失败最危险，必须用 grep 兜底。
 port_owner() {
-    local proto="$1" port="$2" flag line pname
+    local proto="${1:-}" port="${2:-}" flag line pname
     case "$proto" in
         tcp) flag="-tlnp" ;;
         udp) flag="-ulnp" ;;
         *)   return 0 ;;
     esac
-    line="$(ss -H $flag 2>/dev/null | grep -E "[:.]${port}[[:space:]]" | head -1)"
+    # 内联端口合法性校验：禁止正则元字符与越界端口，避免把任意行误判为占用。
+    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port <= 65535 )) || return 0
+    # 仅精确比对第 4 列（Local Address:Port）末尾端口号，不误命中远端地址或进程参数。
+    line="$(ss -H $flag 2>/dev/null | awk -v p="$port" '
+        {
+            addr = $4
+            sub(/^.*[:.]/, "", addr)
+            if (addr == p) { print; exit }
+        }
+    ')"
     # 再用 python3 bind 兜底：ss 解析不出来时以实际能否绑定为准
     if [[ -z "$line" ]] && command -v python3 >/dev/null 2>&1; then
         if python3 -c '
@@ -4701,7 +4725,8 @@ setup_portal() {
         fi
     fi
     local _portal_svc_tmp=""
-    _portal_svc_tmp="$(mktemp /etc/systemd/system/hysteria-portal.service.XXXXXX)" || return 1
+    trap 'trap - RETURN; rm -f "${_portal_svc_tmp:-}"' RETURN
+    _portal_svc_tmp="$(umask 077; mktemp /etc/systemd/system/hysteria-portal.service.XXXXXX)" || return 1
     {
         cat > "$_portal_svc_tmp" <<EOF
 [Unit]
@@ -4826,14 +4851,14 @@ EOCT
     local cert_watch_dir="$HY2_CERT_DIR"
     local _cc
     _cc="$(config_tls_cert "$HY2_CONFIG")"
-    if [[ -n "$_cc" ]]; then
+    if [[ -n "$_cc" && ! "$_cc" =~ [[:cntrl:]] ]]; then
         if [[ "$_cc" != /* ]]; then
             cert_watch_dir="$(dirname "${HY2_DIR}/${_cc}")"
         else
             cert_watch_dir="$(dirname "$_cc")"
         fi
     fi
-    [[ -d "$cert_watch_dir" ]] || cert_watch_dir="$HY2_CERT_DIR"
+    [[ -d "$cert_watch_dir" && ! "$cert_watch_dir" =~ [[:cntrl:]] ]] || cert_watch_dir="$HY2_CERT_DIR"
 
     _sh_pth_tmp="$(mktemp /etc/systemd/system/hy2-cert-selfheal.path.XXXXXX)" || return 1
     {
