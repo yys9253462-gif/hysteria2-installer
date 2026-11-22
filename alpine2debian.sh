@@ -230,10 +230,11 @@ case "$DEBIAN_SUITE" in
     ''|*[!A-Za-z0-9._-]*|-*|.*) die "DEBIAN_SUITE 含非法字符（当前：$DEBIAN_SUITE）" ;;
 esac
 case "$HOSTNAME" in
-    ''|*[!A-Za-z0-9.-]*|-*|.*) die "HOSTNAME 含非法字符（当前：$HOSTNAME）" ;;
+    ''|*[!A-Za-z0-9.-]*|-*|.*|*..*|*-|*.) die "HOSTNAME 含非法字符（当前：$HOSTNAME）" ;;
 esac
+[ "${#HOSTNAME}" -le 63 ] || die "HOSTNAME 长度不能超过 63 字节（当前：${#HOSTNAME}）"
 case "$TIMEZONE" in
-    ''|/*|*..*|*[!A-Za-z0-9_/+.-]*) die "TIMEZONE 含非法字符或路径穿越（当前：$TIMEZONE）" ;;
+    ''|-*|/*|*..*|*[!A-Za-z0-9_/+.-]*) die "TIMEZONE 含非法字符或路径穿越（当前：$TIMEZONE）" ;;
 esac
 for _url_val in "$MIRROR" "$SECURITY_MIRROR"; do
     case "$_url_val" in
@@ -277,13 +278,15 @@ fi
 is_whole_disk "$DISK" || die "$DISK 不是整块磁盘（像是分区），请指定整块磁盘，例如 /dev/vda"
 # 之后一律用真实设备名（2026-11-13 修）：--disk 给 /dev/disk/by-id/... 链接时，分区名按「盘名 + 1 / p1」
 # 推出来的是不存在的路径 —— 分区表已经写完、到格式化这步才失败，盘上数据没了、系统也没装上。
-DISK="$(readlink -f "$DISK" 2>/dev/null || printf '%s' "$DISK")"
+DISK="$(readlink -f -- "$DISK" 2>/dev/null || printf '%s' "$DISK")"
 ok "目标磁盘：$DISK"
 
-_raw_sectors="$(cat "/sys/block/$(basename "$(readlink -f "$DISK")")/size" 2>/dev/null | tr -d '[:space:]')"
+_raw_sectors="$(cat "/sys/block/$(basename -- "$(readlink -f -- "$DISK" 2>/dev/null || printf '%s' "$DISK")")/size" 2>/dev/null | tr -d '[:space:]')"
 case "$_raw_sectors" in
     ''|*[!0-9]*) _raw_sectors=0 ;;
 esac
+_raw_sectors="${_raw_sectors#"${_raw_sectors%%[!0]*}"}"
+[ -n "$_raw_sectors" ] && [ "${#_raw_sectors}" -le 18 ] || _raw_sectors=0
 DISK_SIZE_MB=$((_raw_sectors / 2048))
 if [ "$DISK_SIZE_MB" -gt 0 ]; then
     ok "磁盘容量：约 ${DISK_SIZE_MB} MB"
@@ -355,7 +358,7 @@ fi
 # 确保 DNS 可用（否则 apk / debootstrap 都会失败）
 if ! nslookup "$DNS_HOST" >/dev/null 2>&1 && ! getent hosts "$DNS_HOST" >/dev/null 2>&1; then
     warn "DNS 解析失败，写入公共 DNS 后重试"
-    run sh -c 'printf "nameserver 223.5.5.5\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
+    run sh -c '[ ! -L /etc/resolv.conf ] || rm -f /etc/resolv.conf; printf "nameserver 223.5.5.5\nnameserver 8.8.8.8\n" > /etc/resolv.conf'
 fi
 
 # ── 第 3 步：抽取网络配置（★ 防失联的关键）─────────────────────────────
@@ -786,9 +789,11 @@ apt-get install -y --no-install-recommends \\
     wget \\
     tzdata
 
-# 时区
-ln -snf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
-echo "${TIMEZONE}" > /etc/timezone
+# 时区（先确认 zoneinfo 存在，避免创建悬空 /etc/localtime 符号链接）
+if [ -f "/usr/share/zoneinfo/${TIMEZONE}" ]; then
+    ln -snf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+    echo "${TIMEZONE}" > /etc/timezone
+fi
 
 # 主机名
 echo "${HOSTNAME}" > /etc/hostname
@@ -882,6 +887,7 @@ if [ "$SWAP_MB" -gt 0 ]; then
             rm -f "$MOUNT_DIR/swapfile"
             die "创建 ${SWAP_MB}MB swap 文件失败（可能磁盘空间不足），请调小 SWAP_MB 后重试"
         fi
+        [ ! -L "$MOUNT_DIR/etc/fstab" ] || die "$MOUNT_DIR/etc/fstab 为符号链接，已拒绝追加 swap 条目"
         printf '/swapfile none swap sw 0 0\n' >> "$MOUNT_DIR/etc/fstab"
         ok "swap 已创建并写入 fstab"
     fi
