@@ -204,6 +204,26 @@ def _is_safe_svg_payload(raw, max_bytes=2 * 1024 * 1024):
     return True
 
 
+_QR_SVG_LEADING_PROLOG_RE = re.compile(
+    r'^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)+',
+    re.IGNORECASE,
+)
+
+
+def _normalize_qr_svg(raw, max_bytes=2 * 1024 * 1024):
+    """规范化二维码矢量图：剥离前导声明与生成器注释，并校验以根标签开头且不含危险脚本。"""
+    if not _is_safe_svg_payload(raw, max_bytes=max_bytes):
+        return ''
+    text = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else raw
+    cleaned = text.lstrip('\ufeff').strip()
+    cleaned = _QR_SVG_LEADING_PROLOG_RE.sub('', cleaned).strip()
+    if not re.match(r'^<svg(?:\s|>|/)', cleaned, re.IGNORECASE):
+        return ''
+    if not _is_safe_svg_payload(cleaned, max_bytes=max_bytes):
+        return ''
+    return cleaned
+
+
 def _safe_cookie_path_token(token):
     """构造安全的 Cookie Path，剔除分号、空白与换行等注入字符。"""
     if not isinstance(token, str):
@@ -4583,10 +4603,11 @@ def _extra_link_boxes(extra_links):
         # 带上二维码（2026-11-13 加）：客户常在电脑上开分享页、用手机扫码导入，UDP 不通时要的恰恰是
         # 这些备用节点，旧页面只给文字。只嵌 qrencode 生成的 SVG（与 Hy2 二维码同一来源）。
         qr = item[2] if len(item) > 2 else ''
+        qr_clean = _normalize_qr_svg(qr) if isinstance(qr, str) else ''
         qr_html = ('<details style="margin-top:6px"><summary style="font-size:12px;color:var(--muted)">'
                    '显示 %s 二维码（手机扫码导入）</summary><div class="qr-frame" style="max-width:220px;'
-                   'margin:8px 0">%s</div></details>' % (html.escape(label), qr)
-                   if isinstance(qr, str) and '<svg' in qr and '<script' not in qr.lower() else '')
+                   'margin:8px 0">%s</div></details>' % (html.escape(label), qr_clean)
+                   if qr_clean else '')
         parts.append(
             '<div style="margin-top:14px"><p class="note" style="margin-bottom:4px">%s 直链（UDP 不通时用）</p>'
             '<textarea id="%s" class="link" aria-label="%s 直链" readonly>%s</textarea>'
@@ -4644,13 +4665,10 @@ def user_page_html(server_name, host, listen_port, obfs_badge, uid, uinfo, uri, 
     # sing-box 也给订阅链接（2026-11-13 加）：SFA / SFI 用「远程配置」填链接即可自动更新，
     # 响应头本来就带更新间隔；旧页面只给整段 JSON 和下载，节点换端口后客户得重新导入。
     sing_sub_url = f"https://{_host_for_url(host)}:{sub_port}/{token_str}/u/{uid_url}/sing-box.json?k={user_key_str}"
-    # 生成不出二维码或含危险脚本/事件属性时说清楚（2026-11-13 修）：严禁内联不受信任的 SVG 脚本。
-    qr_safe = (
-        isinstance(qr_svg, str)
-        and re.match(r'^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b', qr_svg.strip(), re.I) is not None
-        and re.search(r'<script\b|<foreignObject\b|\bon[a-z]+\s*=', qr_svg, re.I) is None
-    )
-    qr_block = (qr_svg if qr_safe
+    # 生成不出二维码或含危险脚本/事件属性时说清楚：统一剥离前导声明与生成器注释后再内嵌，
+    # 避免二维码工具默认注释触发开头校验误判，同时严禁内联不受信任的脚本与事件属性。
+    qr_clean = _normalize_qr_svg(qr_svg) if isinstance(qr_svg, str) else ''
+    qr_block = (qr_clean if qr_clean
                 else '<p class="hint">%s</p>' % html.escape(QR_UNAVAILABLE_TEXT))
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>个人专属连接 · {html.escape(uid)}</title><style>{STYLE}</style></head><body><main style="max-width:860px">
@@ -8928,9 +8946,11 @@ def prepare(meta_path, port, node_api_key=None):
     try:
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'], input=uri.encode(),
                             capture_output=True, timeout=20)
-        qr_svg = (qr.stdout if (qr.returncode == 0 and qr.stdout
-                                and b'<script' not in qr.stdout.lower()
-                                and _is_safe_svg_payload(qr.stdout)) else b'')
+        qr_norm = (_normalize_qr_svg(qr.stdout)
+                   if (qr.returncode == 0 and qr.stdout
+                       and b'<script' not in qr.stdout.lower()
+                       and _is_safe_svg_payload(qr.stdout)) else '')
+        qr_svg = qr_norm.encode('utf-8')
     except Exception:
         qr_svg = b''
     user, password, token = secrets.token_hex(8), secrets.token_urlsafe(32), secrets.token_hex(32)
@@ -8985,7 +9005,9 @@ def qr_svg_for(uri, timeout=20):
         qr = subprocess.run(['qrencode', '-t', 'SVG', '-o', '-'],
                             input=str(uri).encode(), capture_output=True, timeout=timeout)
         if qr.returncode == 0 and qr.stdout and _is_safe_svg_payload(qr.stdout):
-            return qr.stdout.decode('utf-8', 'replace')
+            cleaned = _normalize_qr_svg(qr.stdout)
+            if cleaned:
+                return cleaned
     except Exception as exc:
         _log_ignored('qr_refresh', exc)  # 保留旧图，别把框清空
     return None
@@ -13869,6 +13891,10 @@ if __name__ == '__main__':
                                     or '<script' in _low_qr or '<foreignobject' in _low_qr
                                     or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
                                 qr_svg = ''
+                        if qr_svg:
+                            _norm_svg = globals().get('_normalize_qr_svg')
+                            if _norm_svg is not None:
+                                qr_svg = _norm_svg(qr_svg)
                 except Exception as exc:
                     _log_ignored('qr_svg', exc)
                 return 200, dict(entry, ok=True, applied=True, host=host, url=uri, qr=qr_svg,
@@ -15336,6 +15362,10 @@ if __name__ == '__main__':
                                     or '<script' in _low_qr or '<foreignobject' in _low_qr
                                     or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
                                 qr_svg = ''
+                        if qr_svg:
+                            _norm_svg = globals().get('_normalize_qr_svg')
+                            if _norm_svg is not None:
+                                qr_svg = _norm_svg(qr_svg)
                 except Exception as exc:
                     _log_ignored('vmess_qr', exc)
             return self.reply_json(200, {
@@ -15909,6 +15939,10 @@ if __name__ == '__main__':
                                     or '<script' in _low_qr or '<foreignobject' in _low_qr
                                     or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
                                 qr_svg = ''
+                        if qr_svg:
+                            _norm_svg = globals().get('_normalize_qr_svg')
+                            if _norm_svg is not None:
+                                qr_svg = _norm_svg(qr_svg)
                 except Exception as exc:
                     _log_ignored('anytls_qr', exc)
             return self.reply_json(200, {
@@ -16195,6 +16229,10 @@ if __name__ == '__main__':
                                     or '<script' in _low_qr or '<foreignobject' in _low_qr
                                     or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
                                 qr_svg = ''
+                        if qr_svg:
+                            _norm_svg = globals().get('_normalize_qr_svg')
+                            if _norm_svg is not None:
+                                qr_svg = _norm_svg(qr_svg)
                 except Exception as exc:
                     _log_ignored('tuic_qr', exc)
             return self.reply_json(200, {
@@ -16356,6 +16394,10 @@ if __name__ == '__main__':
                                     or '<script' in _low_qr or '<foreignobject' in _low_qr
                                     or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
                                 qr_svg = ''
+                        if qr_svg:
+                            _norm_svg = globals().get('_normalize_qr_svg')
+                            if _norm_svg is not None:
+                                qr_svg = _norm_svg(qr_svg)
                 except Exception as exc:
                     _log_ignored('vlessenc_qr', exc)
             return self.reply_json(200, {
@@ -17092,7 +17134,7 @@ tar_member() {
 if [ ! -x "$WGCF_BIN" ]; then
     [ -L "$WGCF_BIN" ] && { echo "${WGCF_BIN} 不允许为符号链接" >&2; exit 1; }
     log "下载 wgcf 二进制..."
-    RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
+    RAW=$(curl -fsSL --max-time 20 --max-filesize 2097152 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
     if command -v jq >/dev/null 2>&1; then
         TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
     else
@@ -17106,7 +17148,7 @@ if [ ! -x "$WGCF_BIN" ]; then
     TD=$(umask 077; mktemp -d)
     trap 'rm -rf "$TD"' EXIT
     # 先取该版本官方 checksums.txt，取不到就放弃（不做无校验下载）。
-    if ! curl -fsSL --max-time 30 --max-filesize=2097152 --retry 2 -o "${TD}/checksums.txt" \
+    if ! curl -fsSL --max-time 30 --max-filesize 2097152 --retry 2 -o "${TD}/checksums.txt" \
             "https://github.com/ViRb3/wgcf/releases/download/v${VER}/checksums.txt" 2>/dev/null; then
         rm -rf "$TD"; echo "取不到 wgcf v${VER} 的官方 checksums.txt，已放弃安装" >&2; exit 1
     fi
@@ -17114,7 +17156,7 @@ if [ ! -x "$WGCF_BIN" ]; then
     if [ -z "$WANT" ]; then
         rm -rf "$TD"; echo "checksums.txt 中 ${WG_DL} 的摘要缺失或不唯一，已放弃安装" >&2; exit 1
     fi
-    if ! curl -fsSL --max-time 90 --max-filesize=167772160 -o "${TD}/${WG_DL}" "https://github.com/ViRb3/wgcf/releases/download/v${VER}/${WG_DL}"; then
+    if ! curl -fsSL --max-time 90 --max-filesize 167772160 -o "${TD}/${WG_DL}" "https://github.com/ViRb3/wgcf/releases/download/v${VER}/${WG_DL}"; then
         rm -rf "$TD"; echo "wgcf 下载失败 (v${VER}/${WG_A})" >&2; exit 1
     fi
     if ! verify_sha "${TD}/${WG_DL}" "$WANT"; then
@@ -17129,7 +17171,7 @@ fi
 if [ ! -x "$WP_BIN" ]; then
     [ -L "$WP_BIN" ] && { echo "${WP_BIN} 不允许为符号链接" >&2; exit 1; }
     log "下载 wireproxy 二进制..."
-    RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
+    RAW=$(curl -fsSL --max-time 20 --max-filesize 2097152 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
     if command -v jq >/dev/null 2>&1; then
         TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
     else
@@ -17145,7 +17187,7 @@ if [ ! -x "$WP_BIN" ]; then
     rm -rf "$TD"
     TD=$(umask 077; mktemp -d)
     trap 'rm -rf "$TD"' EXIT
-    if ! curl -fsSL --max-time 30 --max-filesize=2097152 --retry 2 -o "${TD}/checksums.txt" \
+    if ! curl -fsSL --max-time 30 --max-filesize 2097152 --retry 2 -o "${TD}/checksums.txt" \
             "https://github.com/whyvl/wireproxy/releases/download/${TAG}/checksums.txt" 2>/dev/null; then
         rm -rf "$TD"; echo "取不到 wireproxy ${TAG} 的官方 checksums.txt，已放弃安装" >&2; exit 1
     fi
@@ -17153,7 +17195,7 @@ if [ ! -x "$WP_BIN" ]; then
     if [ -z "$WANT" ]; then
         rm -rf "$TD"; echo "checksums.txt 中 ${WP_DL} 的摘要缺失或不唯一，已放弃安装" >&2; exit 1
     fi
-    if ! curl -fsSL --max-time 90 --max-filesize=167772160 -o "${TD}/${WP_DL}" "https://github.com/whyvl/wireproxy/releases/download/${TAG}/${WP_DL}"; then
+    if ! curl -fsSL --max-time 90 --max-filesize 167772160 -o "${TD}/${WP_DL}" "https://github.com/whyvl/wireproxy/releases/download/${TAG}/${WP_DL}"; then
         rm -rf "$TD"; echo "wireproxy 下载失败 (${TAG}/${WP_A})" >&2; exit 1
     fi
     if ! verify_sha "${TD}/${WP_DL}" "$WANT"; then
@@ -17876,6 +17918,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_bytes = b''
                     if not _is_safe_svg_payload(qr_bytes):
                         qr_bytes = QR_UNAVAILABLE_SVG.encode('utf-8')
+                    else:
+                        _norm_svg = globals().get('_normalize_qr_svg')
+                        if _norm_svg is not None:
+                            _norm_qr = _norm_svg(qr_bytes)
+                            qr_bytes = (_norm_qr or QR_UNAVAILABLE_SVG).encode('utf-8')
                     return self.reply(200, qr_bytes, 'image/svg+xml')
                 elif action_file == '':
                     try:
@@ -17884,6 +17931,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         qr_svg = ''
                     if not _is_safe_svg_payload(qr_svg):
                         qr_svg = ''
+                    elif globals().get('_normalize_qr_svg') is not None:
+                        qr_svg = globals()['_normalize_qr_svg'](qr_svg)
                     # 与管理页 / 订阅同一套清洗（2026-11-06 修）：server_name 为数字、public_ip 为 null
                     # 时旧实现在 html.escape 处抛异常，每个客户的分享页都 500。
                     _insecure, server_name, _pub_clean, host = clean_node_identity(m)
@@ -17995,6 +18044,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         or 'javascript:' in qr_svg.lower() or 'onload=' in qr_svg.lower()
                         or 'onerror=' in qr_svg.lower()):
                     qr_svg = ""
+                if qr_svg:
+                    _norm_svg = globals().get('_normalize_qr_svg')
+                    if _norm_svg is not None:
+                        qr_svg = _norm_svg(qr_svg)
 
                 denial = user_access_denial(u_copy)
                 _raw_note = u_copy.get('note')
@@ -18126,6 +18179,12 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                       .encode('utf-8'))
                 if not _is_safe_svg_payload(qr_bytes):
                     return self.reply(500, '二维码内容异常，请改用「下载配置」导入'.encode('utf-8'))
+                _norm_svg = globals().get('_normalize_qr_svg')
+                if _norm_svg is not None:
+                    _norm_qr = _norm_svg(qr_bytes)
+                    if not _norm_qr:
+                        return self.reply(500, '二维码内容异常，请改用「下载配置」导入'.encode('utf-8'))
+                    qr_bytes = _norm_qr.encode('utf-8')
                 return self.reply(200, qr_bytes, 'image/svg+xml')
 
             if not self.is_authenticated():
@@ -18502,6 +18561,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                                     or '<script' in _low_qr or '<foreignobject' in _low_qr
                                     or 'javascript:' in _low_qr or 'onload=' in _low_qr or 'onerror=' in _low_qr):
                                 qr_svg = ''
+                        if qr_svg:
+                            _norm_svg = globals().get('_normalize_qr_svg')
+                            if _norm_svg is not None:
+                                qr_svg = _norm_svg(qr_svg)
                 except Exception:
                     qr_svg = ''
 

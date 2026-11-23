@@ -22,9 +22,10 @@ echo "（从 install.sh 读到 PORTAL_FILES = $PORTAL_FILES）"
 echo "（从 install.sh 读到 METER_FILES  = $METER_FILES）"
 echo
 
-# 门户取文件现在还要比对 git blob 身份（2026-10-27），这三个辅助函数一并摘出来。
+# 门户取文件现在还要比对对象哈希身份（2026-10-27），这三个辅助函数一并摘出来。
+# 同时抽取网络请求鉴权包装函数，使工作流注入的只读令牌生效，避免共享出口触发匿名限流。
 # 计量配置 2026-11-03 拆成 portal_write_meter_config（portal_ensure_py 末尾调用）。
-for fn in hy2_git_blob_sha portal_remote_blob_shas portal_verify_blobs \
+for fn in curl hy2_git_blob_sha portal_remote_blob_shas portal_verify_blobs \
           portal_files_ok portal_fetch_files portal_fetch_py portal_ensure_py \
           portal_write_meter_config traffic_stats_secret; do
     eval "$(sed -n "/^${fn}() {/,/^}/p" install.sh)"
@@ -34,6 +35,11 @@ log_err()  { echo "  [ERR] $*"; }
 log_info() { echo "  [INF] $*"; }
 log_warn() { echo "  [WRN] $*"; }
 HY2_DIR="$(mktemp -d)"
+trap 'rm -rf "${HY2_DIR:-}"' EXIT
+HY2_GITHUB_TOKEN_FILE="${HY2_GITHUB_TOKEN_FILE:-${HY2_DIR}/github-token}"
+if [[ ! -f "$HY2_GITHUB_TOKEN_FILE" && -n "${GITHUB_TOKEN:-}" ]]; then
+    (umask 077 && printf '%s\n' "$GITHUB_TOKEN" > "$HY2_GITHUB_TOKEN_FILE")
+fi
 # portal_ensure_py 会读 HY2_CONFIG 取trafficStats secret（写计量配置用）；
 # 该变量在 install.sh 头部定义，摘函数时没带进来，set -u 下会直接报unbound。
 HY2_CONFIG="${HY2_DIR}/config.yaml"

@@ -47,7 +47,7 @@ main{max-width:1160px;margin:auto;padding:32px 28px 48px}.topbar{display:flex;ju
 /* 卡片与网格 */
 .layout{display:grid;grid-template-columns:320px minmax(0,1fr);gap:22px;align-items:start}
 .card{background:#fff;border:1px solid var(--line);border-radius:20px;padding:24px;box-shadow:0 5px 22px #183f3505}
-.qr-card{text-align:center}.qr-frame{background:#fff;border:1px solid var(--line);border-radius:16px;padding:14px;margin:20px 0}.qr-frame img{display:block;width:100%;height:auto}
+.qr-card{text-align:center}.qr-frame{background:#fff;border:1px solid var(--line);border-radius:16px;padding:14px;margin:20px 0}.qr-frame img{display:block;width:100%;height:auto}.qr-frame svg{display:block;max-width:100%;height:auto;margin:0 auto}
 .hint{font-size:12px}.tags{display:flex;gap:6px;justify-content:center;flex-wrap:wrap;margin-top:18px}.tag{background:#f0f5f4;color:#526a70;border-radius:6px;padding:3px 8px;font-size:11px}
 .stack{display:grid;gap:18px}.card-head{display:flex;gap:14px;align-items:center;margin-bottom:16px}.step{display:grid;place-items:center;flex:0 0 38px;height:38px;border-radius:11px;background:#e8f4f0;color:var(--accent);font-weight:750}.card-head p{font-size:12px}
 textarea{display:block;width:100%;min-width:0;border:1px solid var(--line);background:#f7faf9;border-radius:12px;padding:14px;color:#35545c;font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;resize:vertical;overflow-wrap:anywhere}
@@ -1997,7 +1997,7 @@ async function checkRealityStatus() {
       // 没有新二维码时清空旧的（2026-11-04 修，与 VMess 一致）：重置密钥后 qrencode 超时
       // 返回空，旧二维码留在页面上，里面还是旧 pbk，扫了连不上。同时校验只渲染合法 SVG。
       if (realityQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)*<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         realityQrBox.innerHTML = _qr;
       }
       if (realitySniVal) realitySniVal.textContent = (cfg.sni || 'www.apple.com') + ':' + (cfg.port || 443);
@@ -2194,7 +2194,7 @@ async function checkVmessStatus() {
       if (vmessContentBox) vmessContentBox.style.display = 'block';
       if (vmessUriVal) vmessUriVal.value = cfg.uri || '';
       if (vmessQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)*<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         vmessQrBox.innerHTML = _qr;
       }
       if (vmessDomainVal) vmessDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
@@ -2305,7 +2305,7 @@ async function checkVlessencStatus() {
       if (vlessencContentBox) vlessencContentBox.style.display = 'block';
       if (vlessencUriVal) vlessencUriVal.value = cfg.uri || '';
       if (vlessencQrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)*<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         vlessencQrBox.innerHTML = _qr;
       }
       if (vlessencDomainVal) vlessencDomainVal.textContent = (cfg.domain || '-') + (cfg.sni && cfg.sni !== cfg.domain ? ' / ' + cfg.sni : '');
@@ -2410,7 +2410,7 @@ async function checkAnytlsStatus() {
       if (anytlsUriVal) anytlsUriVal.value = cfg.uri || '';
       const qrBox = document.getElementById('anytls-qr-box');
       if (qrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)*<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         qrBox.innerHTML = _qr;
       }
       const domainEl = document.getElementById('anytls-domain-val');
@@ -2515,7 +2515,7 @@ async function checkTuicStatus() {
       if (tuicUriVal) tuicUriVal.value = cfg.uri || '';
       const qrBox = document.getElementById('tuic-qr-box');
       if (qrBox) {
-        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
+        const _qr = (typeof cfg.qr_svg === 'string' && /^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)*<svg\b/i.test(cfg.qr_svg.trim()) && !/<script\b/i.test(cfg.qr_svg) && !/<foreignObject\b/i.test(cfg.qr_svg) && !/javascript\s*:/i.test(cfg.qr_svg) && !/\bon[a-z]+\s*=/i.test(cfg.qr_svg)) ? cfg.qr_svg : '';
         qrBox.innerHTML = _qr;
       }
       const domainEl = document.getElementById('tuic-domain-val');
@@ -3560,7 +3560,7 @@ function showProxyResult(data) {
 
   if (resPQr) {
     // 没生成出二维码、非 SVG 或含 script/foreignObject/事件/javascript: 时必须覆盖掉初始「生成中...」或旧二维码，避免扫码连错代理或脚本注入。
-    resPQr.innerHTML = (typeof data.qr === 'string' && data.qr.includes('<svg') && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(data.qr.trim()) && !/<script/i.test(data.qr) && !/<foreignObject\b/i.test(data.qr) && !/\bon[a-z]+\s*=/i.test(data.qr) && !/javascript\s*:/i.test(data.qr))
+    resPQr.innerHTML = (typeof data.qr === 'string' && data.qr.includes('<svg') && /^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)*<svg\b/i.test(data.qr.trim()) && !/<script/i.test(data.qr) && !/<foreignObject\b/i.test(data.qr) && !/\bon[a-z]+\s*=/i.test(data.qr) && !/javascript\s*:/i.test(data.qr))
       ? data.qr
       : '<p style="color:var(--muted);font-size:12px;margin:0;text-align:center">二维码生成失败（服务器可能未安装 qrencode），请复制右侧代理链接导入</p>';
   }
@@ -3928,7 +3928,7 @@ document.querySelectorAll('.btn-user-connect').forEach(btn => {
         <div class="user-connect-grid">
           <div style="text-align:center;background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px">
             <div style="font-size:12px;font-weight:700;color:var(--ink);margin-bottom:8px">专属二维码扫码导入</div>
-            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg') && /^(?:<\?xml[\s\S]*?\?>\s*)?<svg\b/i.test(json.qr_svg.trim()) && !/<script/i.test(json.qr_svg) && !/<foreignObject\b/i.test(json.qr_svg) && !/\bon[a-z]+\s*=/i.test(json.qr_svg) && !/javascript\s*:/i.test(json.qr_svg)) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
+            <div class="qr-frame" style="margin:0 auto;max-width:210px;padding:8px">${(typeof json.qr_svg === 'string' && json.qr_svg.includes('<svg') && /^(?:(?:<\?xml[\s\S]*?\?>|<!--[\s\S]*?-->)\s*)*<svg\b/i.test(json.qr_svg.trim()) && !/<script/i.test(json.qr_svg) && !/<foreignObject\b/i.test(json.qr_svg) && !/\bon[a-z]+\s*=/i.test(json.qr_svg) && !/javascript\s*:/i.test(json.qr_svg)) ? json.qr_svg : '<p style="color:var(--muted)">二维码生成失败（服务器可能未安装 qrencode），请复制节点直链导入</p>'}</div>
             <div style="font-size:11px;color:var(--muted);margin-top:8px">Shadowrocket / v2rayNG / Nekobox</div>
           </div>
           <div style="display:flex;flex-direction:column;gap:12px">

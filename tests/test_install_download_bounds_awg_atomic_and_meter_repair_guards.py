@@ -50,7 +50,7 @@ class InstallDownloadBoundsAwgAtomicAndMeterRepairGuardsTests(unittest.TestCase)
     def test_install_binary_bounds_download_and_uses_umask_return_cleanup(self):
         """install_binary 必须带 --max-filesize、umask 077 与 RETURN 清理陷阱。"""
         body = _extract_fn('install_binary')
-        self.assertIn('--max-filesize=', body, 'install_binary 下载必须限制最大体积防止写爆磁盘')
+        self.assertIn('--max-filesize ', body, 'install_binary 下载必须限制最大体积防止写爆磁盘')
         self.assertIn('umask 077; mktemp -d', body, 'install_binary 临时目录必须使用 umask 077 创建')
         self.assertRegex(body, r"trap\s+'.*'\s+RETURN", 'install_binary 必须注册 RETURN 清理临时文件')
 
@@ -58,7 +58,7 @@ class InstallDownloadBoundsAwgAtomicAndMeterRepairGuardsTests(unittest.TestCase)
         """portal_fetch_files / portal_remote_blob_shas / portal_fetch_py 必须全部带 --max-filesize 上限。"""
         for fn_name in ('portal_fetch_files', 'portal_remote_blob_shas', 'portal_fetch_py'):
             body = _extract_fn(fn_name)
-            self.assertIn('--max-filesize=', body, f'{fn_name} 必须对 curl 施加 --max-filesize 限制')
+            self.assertIn('--max-filesize ', body, f'{fn_name} 必须对 curl 施加 --max-filesize 限制')
         self.assertRegex(_extract_fn('portal_remote_blob_shas'), r"trap\s+'.*'\s+RETURN",
                          'portal_remote_blob_shas 必须注册 RETURN 清理临时 json')
 
@@ -66,7 +66,7 @@ class InstallDownloadBoundsAwgAtomicAndMeterRepairGuardsTests(unittest.TestCase)
     def test_awg_fetch_ctl_replaces_target_atomically_and_handles_non_dict_json(self):
         """awg_fetch_ctl 必须通过同目录暂存原子替换目标文件，且面对非对象 JSON 返回不得崩溃。"""
         body = _extract_fn('awg_fetch_ctl')
-        self.assertIn('--max-filesize=', body, 'awg_fetch_ctl 必须限制下载体积')
+        self.assertIn('--max-filesize ', body, 'awg_fetch_ctl 必须限制下载体积')
         self.assertIn('mv -f "$staged" "$out"', body, 'awg_fetch_ctl 必须先写同目录暂存再 mv -f 原子替换 $out')
         self.assertIn('umask 077; mktemp', body, 'awg_fetch_ctl 临时文件必须使用 umask 077')
         self.assertIn('umask 077; mktemp', _extract_fn('awg_ensure_ctl'),
