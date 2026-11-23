@@ -83,7 +83,7 @@ jobs:
           echo "目标: amneziawg-go $TAG → $GOARCH${GOARM:+ GOARM=$GOARM}"
 
       - name: 检出 amneziawg-go
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: amnezia-vpn/amneziawg-go
           ref: ${{ steps.meta.outputs.tag }}
@@ -143,7 +143,7 @@ jobs:
         arch: [amd64, arm64, armv7]
     steps:
       - name: 检出 amneziawg-tools
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: amnezia-vpn/amneziawg-tools
           ref: ${{ env.AWG_TOOLS_TAG }}
@@ -212,7 +212,7 @@ jobs:
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
     steps:
       - name: 检出本仓库（取 CHANGELOG 说明用）
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 下载全部产物
         uses: actions/download-artifact@v4

@@ -57,7 +57,7 @@ curl() {
     for _a in "$@"; do
         case "$_a" in
             https://api.github.com/*)
-                [[ -f "$HY2_GITHUB_TOKEN_FILE" && -r "$HY2_GITHUB_TOKEN_FILE" ]] && _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
+                [[ -n "${HY2_GITHUB_TOKEN_FILE:-}" && ! -L "$HY2_GITHUB_TOKEN_FILE" && -f "$HY2_GITHUB_TOKEN_FILE" && -r "$HY2_GITHUB_TOKEN_FILE" ]] && _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
                 break ;;
         esac
     done
@@ -996,7 +996,7 @@ install_binary() {
     # 永远执行不到 —— 实测 api.github.com 不可达时 exit=6 直接死掉。
     # 而「api.github.com 被墙/限流」恰恰是本工具用户最常见的处境，
     # 为此专门写的 download.hysteria.network 直链回退形同虚设。
-    LATEST_TAG=$(curl -s --max-time 10 --max-filesize=2097152 https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || LATEST_TAG=""
+    LATEST_TAG=$(curl -s --max-time 10 --max-filesize 2097152 https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || LATEST_TAG=""
 
     local asset_arch asset tmpdir="" staged="" expected got
     trap 'trap - RETURN; rm -rf -- "${tmpdir:-}" "${staged:-}"' RETURN
@@ -1011,7 +1011,7 @@ install_binary() {
         # 用固定版本目录而不是 `latest/`：`latest` 是浮动指针，下载与取摘要之间
         # 可能已经切换版本，导致摘要与资产对不上（或更糟：对上了另一个版本）。
         local resolved
-        resolved="$(curl -fsSIL --max-time 20 --max-redirs 5 --max-filesize=2097152 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
+        resolved="$(curl -fsSIL --max-time 20 --max-redirs 5 --max-filesize 2097152 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
             awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)" || resolved=""
         if [[ "$resolved" =~ /app/(v[0-9][^/]*)/${asset}$ ]]; then
             # 下载站只给出裸版本号（v2.13.0），而 GitHub 的 release tag 是
@@ -1043,7 +1043,7 @@ install_binary() {
         return 1
     fi
 
-    if ! curl -fL --progress-bar --max-time 300 --max-filesize=209715200 \
+    if ! curl -fL --progress-bar --max-time 300 --max-filesize 209715200 \
             "https://github.com/apernet/hysteria/releases/download/${LATEST_TAG}/${asset}" \
             -o "${tmpdir}/${asset}"; then
         rm -rf "$tmpdir"
@@ -4222,13 +4222,13 @@ portal_fetch_files() {
     # 计量文件与门户文件同源同生命周期，一起拉、一起失败
     for f in $PORTAL_FILES $METER_FILES; do
         if [[ "$mode" == "api" ]]; then
-            if ! curl -fsSL --max-time 30 --max-filesize=16777216 -H "Accept: application/vnd.github.raw" \
+            if ! curl -fsSL --max-time 30 --max-filesize 16777216 -H "Accept: application/vnd.github.raw" \
                  "${base}/${f}?ref=${PORTAL_FETCH_REF}" -o "${dir}/${f}" 2>/dev/null; then
                 PORTAL_FETCH_FILES_ERR="下载 ${f} 失败"
                 return 1
             fi
         else
-            if ! curl -fsSL --max-time 30 --max-filesize=16777216 "${base}/${f}" -o "${dir}/${f}" 2>/dev/null; then
+            if ! curl -fsSL --max-time 30 --max-filesize 16777216 "${base}/${f}" -o "${dir}/${f}" 2>/dev/null; then
                 PORTAL_FETCH_FILES_ERR="下载 ${f} 失败"
                 return 1
             fi
@@ -4237,20 +4237,18 @@ portal_fetch_files() {
     return 0
 }
 
-# 取某个 commit 下仓库根目录各文件的 git blob 身份，输出 "name sha" 每行一条。
-# 一次目录列表请求即可拿到全部文件（contents API 的 JSON 里就带 sha），
-# 比逐文件请求省额度。取不到返回 1 —— 调用方必须 fail-closed。
+# 取某个提交下仓库根目录各文件的对象哈希身份，输出 "文件名 哈希" 每行一条。
+# 优先走目录列表接口一次取回全部哈希；若匿名接口被限流或不可用，则自动回退至同源官方
+# 固定提交源码归档包（不计匿名接口额度），在内存中安全计算同等对象哈希。
+# 两个官方源都取不到时返回 1 —— 调用方必须闭环拒放。
 portal_remote_blob_shas() {
-    local ref="${1:-}" json=""
-    trap 'trap - RETURN; rm -f "${json:-}"' RETURN
+    local ref="${1:-}" json="" tarball="" out=""
+    trap 'trap - RETURN; rm -f "${json:-}" "${tarball:-}"' RETURN
     [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || return 1
     json="$(umask 077; mktemp)" || return 1
-    if ! curl -fsSL --max-time 20 --max-filesize=4194304 -H "Accept: application/vnd.github+json" \
+    if curl -fsSL --max-time 20 --max-filesize 4194304 -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${AWG_REPO}/contents/?ref=${ref}" -o "$json" 2>/dev/null; then
-        rm -f "$json"
-        return 1
-    fi
-    python3 -c '
+        out="$(python3 -I -c '
 import json, re, sys
 try:
     items = json.load(open(sys.argv[1], encoding="utf-8"))
@@ -4265,9 +4263,67 @@ for it in items:
     name, sha = it.get("name"), it.get("sha")
     if isinstance(name, str) and name and not any(c.isspace() for c in name) and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha):
         rows.append(name + " " + sha)
+if not rows:
+    sys.exit(1)
 print("\n".join(rows))
-' "$json" || { rm -f "$json"; return 1; }
+' "$json" 2>/dev/null)" || out=""
+        if [[ -n "$out" ]]; then
+            rm -f "$json"
+            printf '%s\n' "$out"
+            return 0
+        fi
+    fi
     rm -f "$json"
+    json=""
+
+    # 匿名接口触发限流（每出口地址每小时 60 次）时的官方同源回退：
+    # 拉取固定提交源码归档包并在内存中计算对象哈希，不落盘解压、不信任第三方镜像。
+    tarball="$(umask 077; mktemp)" || return 1
+    if ! curl -fsSL --max-time 30 --max-filesize 16777216 \
+            "https://github.com/${AWG_REPO}/archive/${ref}.tar.gz" -o "$tarball" 2>/dev/null; then
+        rm -f "$tarball"
+        return 1
+    fi
+    out="$(python3 -I -c '
+import hashlib, re, sys, tarfile
+max_member = 8 * 1024 * 1024
+rows = []
+seen = set()
+top_dirs = set()
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile() or m.size < 0 or m.size > max_member:
+                continue
+            rel = m.name[2:] if m.name.startswith("./") else m.name
+            parts = rel.split("/")
+            if len(parts) != 2:
+                continue
+            top, name = parts[0], parts[1]
+            if not top or top in (".", "..") or not name or name in (".", "..") or any(c.isspace() for c in name):
+                continue
+            top_dirs.add(top)
+            if len(top_dirs) > 1 or name in seen:
+                sys.exit(1)
+            seen.add(name)
+            fh = tf.extractfile(m)
+            if fh is None:
+                continue
+            raw = fh.read(max_member + 1)
+            if len(raw) > max_member:
+                continue
+            sha = hashlib.sha1(("blob %d\0" % len(raw)).encode("ascii") + raw).hexdigest()
+            if re.fullmatch(r"[0-9a-f]{40}", sha):
+                rows.append(name + " " + sha)
+except Exception:
+    sys.exit(1)
+if not rows:
+    sys.exit(1)
+print("\n".join(rows))
+' "$tarball" 2>/dev/null)" || { rm -f "$tarball"; return 1; }
+    rm -f "$tarball"
+    [[ -n "$out" ]] || return 1
+    printf '%s\n' "$out"
     return 0
 }
 
@@ -4305,7 +4361,7 @@ portal_fetch_py() {
     # 先问 GitHub API；它被限流（匿名每 IP 60 次/小时，共享 IP 极常见）时
     # 退回 jsDelivr 的 resolved 接口 —— 同样给出 main 对应的**具体 commit**，
     # 于是「锁定一次提交、三源取同一份」的保证不变，又不会因为限流装不上。
-    PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 --max-filesize=2097152 "https://api.github.com/repos/${repo}/commits/main" 2>/dev/null |
+    PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 --max-filesize 2097152 "https://api.github.com/repos/${repo}/commits/main" 2>/dev/null |
         python3 -I -c 'import json,re,sys
 try:
     obj=json.load(sys.stdin)
@@ -4316,7 +4372,7 @@ assert isinstance(s, str) and re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/
         # 次选：仓库的 commits Atom feed。它由 github.com 直接提供、不计 API 额度，
         # 且条目里带完整 40 位 commit —— 一样能锁定到具体提交。
         # （jsDelivr 的 resolved 接口对分支名返回 null，不能用作回退。）
-        PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 --max-filesize=2097152 "https://github.com/${repo}/commits/main.atom" 2>/dev/null |
+        PORTAL_FETCH_REF="$(curl -fsSL --max-time 15 --max-filesize 2097152 "https://github.com/${repo}/commits/main.atom" 2>/dev/null |
             python3 -I -c 'import re,sys
 m=re.search(r"/commit/([0-9a-f]{40})", sys.stdin.read())
 assert m; print(m.group(1))' 2>/dev/null)" || PORTAL_FETCH_REF=""
@@ -4336,11 +4392,12 @@ assert m; print(m.group(1))' 2>/dev/null)" || PORTAL_FETCH_REF=""
     #    只要内容里含 marker 且语法合法，就会被写成 root 运行的面板代码。
     local PORTAL_BLOBS
     if ! PORTAL_BLOBS="$(portal_remote_blob_shas "$PORTAL_FETCH_REF")" || [[ -z "$PORTAL_BLOBS" ]]; then
-        # 拿不到预期身份就无从核对，三个源一律不采信（fail-closed）。
-        # 归为"网络/身份获取类"而不是"校验类"：本地校验逻辑并没有跑过。
-        PORTAL_FETCH_ERR="  [GitHub API] 无法取得 ${PORTAL_FETCH_REF:0:7} 的文件身份（contents API）"$'\n'
+        # 拿不到预期身份就无从核对，三个源一律不采信（闭环拒放）。
+        # 归为「网络与身份获取类」而不是「校验类」：本地校验逻辑并没有跑过。
+        PORTAL_FETCH_ERR="  [GitHub API] 无法取得 ${PORTAL_FETCH_REF:0:7} 的文件身份（目录接口与官方归档均失败，可能是匿名接口被限流）"$'\n'
         PORTAL_FETCH_ERR+="  [jsDelivr] 缺少可核对的预期文件身份，未下载"$'\n'
         PORTAL_FETCH_ERR+="  [raw.githubusercontent] 缺少可核对的预期文件身份，未下载"$'\n'
+        PORTAL_FETCH_ERR+="（提示：把只读令牌放到 /etc/hysteria/github-token 可解除接口限流）"
         return 1
     fi
     # spec 格式：名称|base|模式
@@ -5149,7 +5206,7 @@ install_warp_local_proxy() {
     if [[ ! -x "$WGCF_BIN" ]]; then
         log_step "下载 wgcf 二进制..."
         # 动态探测最新 release + asset 名 (避免硬编码版本号失效)
-        RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
+        RAW=$(curl -fsSL --max-time 20 --max-filesize 2097152 https://api.github.com/repos/ViRb3/wgcf/releases/latest 2>/dev/null || true)
         if command -v jq >/dev/null 2>&1; then
             WGCF_TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
         else
@@ -5170,7 +5227,7 @@ install_warp_local_proxy() {
             log_err "取不到 wgcf v${WGCF_VER} 的官方 checksums.txt（或其中没有 ${WGCF_DL}），已放弃安装。"
             return 1
         fi
-        if ! curl -fsSL --max-time 120 --max-filesize=167772160 -o "${TMP_DIR}/${WGCF_DL}" "$WGCF_URL"; then
+        if ! curl -fsSL --max-time 120 --max-filesize 167772160 -o "${TMP_DIR}/${WGCF_DL}" "$WGCF_URL"; then
             rm -rf "$TMP_DIR"
             log_err "wgcf 下载失败 ($WGCF_URL), 请检查网络或版本号"
             return 1
@@ -5207,7 +5264,7 @@ install_warp_local_proxy() {
             return 1
         fi
         log_step "下载 wireproxy 二进制..."
-        RAW=$(curl -fsSL --max-time 20 --max-filesize=2097152 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
+        RAW=$(curl -fsSL --max-time 20 --max-filesize 2097152 https://api.github.com/repos/whyvl/wireproxy/releases/latest 2>/dev/null || true)
         if command -v jq >/dev/null 2>&1; then
             WP_TAG=$(printf '%s' "$RAW" | jq -r '.tag_name // empty' 2>/dev/null || true)
         else
@@ -5232,7 +5289,7 @@ install_warp_local_proxy() {
             log_err "取不到 wireproxy ${WP_TAG} 的官方 checksums.txt（或其中没有 ${WP_ASSET}），已放弃安装。"
             return 1
         fi
-        if ! curl -fsSL --max-time 120 --max-filesize=167772160 -o "${TMP_DIR}/${WP_ASSET}" "$WP_URL"; then
+        if ! curl -fsSL --max-time 120 --max-filesize 167772160 -o "${TMP_DIR}/${WP_ASSET}" "$WP_URL"; then
             rm -rf "$TMP_DIR"
             log_err "wireproxy 下载失败 ($WP_URL)"
             return 1
@@ -5528,7 +5585,7 @@ install_gost() {
     # 获取最新版本
     # ⚠️ 同样要 `|| GOST_LATEST=""`：api.github.com 不可达时 curl 失败会让
     # set -e 直接终止，下面的兜底版本号永远用不上（与 install_binary 同一个坑）。
-    GOST_LATEST=$(curl -s --max-time 15 --max-filesize=2097152 https://api.github.com/repos/go-gost/gost/releases/latest | jq -r '.tag_name // empty') || GOST_LATEST=""
+    GOST_LATEST=$(curl -s --max-time 15 --max-filesize 2097152 https://api.github.com/repos/go-gost/gost/releases/latest | jq -r '.tag_name // empty') || GOST_LATEST=""
     if [[ -z "$GOST_LATEST" || "$GOST_LATEST" == "null" || "$GOST_LATEST" == *..* || ! "$GOST_LATEST" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
         GOST_LATEST="v3.3.0"
     fi
@@ -5621,7 +5678,7 @@ install_gost() {
         log_err "取不到 gost ${GOST_LATEST} 的官方 checksums.txt（或其中没有 ${GOST_ASSET_NAME}），已放弃安装。"
         return 1
     fi
-    if ! curl -fL --progress-bar --max-time 300 --max-filesize=167772160 -o "$TMP_DIR/$GOST_ASSET_NAME" "$DOWNLOAD_URL"; then
+    if ! curl -fL --progress-bar --max-time 300 --max-filesize 167772160 -o "$TMP_DIR/$GOST_ASSET_NAME" "$DOWNLOAD_URL"; then
         rm -rf "$TMP_DIR"
         _finish_gost_install
         log_err "gost 下载失败，请检查网络连接。"
@@ -5964,7 +6021,7 @@ awg_fetch_ctl() {
     trap 'trap - RETURN; [[ -n "${tmp:-}" ]] && rm -f -- "$tmp"; [[ -n "${staged:-}" ]] && rm -f -- "$staged"' RETURN
 
     # 只解析一次，三个源都读同一快照；解析失败就放弃，绝不回退到浮动 main。
-    ref="$(curl -fsSL --max-time 15 --max-filesize=2097152 "https://api.github.com/repos/${AWG_REPO}/commits/main" 2>/dev/null |
+    ref="$(curl -fsSL --max-time 15 --max-filesize 2097152 "https://api.github.com/repos/${AWG_REPO}/commits/main" 2>/dev/null |
         python3 -I -c 'import json,re,sys
 obj=json.load(sys.stdin)
 s=obj.get("sha","") if isinstance(obj, dict) else ""
@@ -5975,7 +6032,7 @@ assert isinstance(s, str) and re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/
     fi
 
     # 预期 blob 身份：走 contents API 的 JSON（只回一个 sha，不用下载内容）。
-    expected="$(curl -fsSL --max-time 15 --max-filesize=2097152 -H "Accept: application/vnd.github+json" \
+    expected="$(curl -fsSL --max-time 15 --max-filesize 2097152 -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${AWG_REPO}/contents/awgctl.sh?ref=${ref}" 2>/dev/null |
         python3 -I -c 'import json,re,sys
 obj=json.load(sys.stdin)
@@ -5995,7 +6052,7 @@ assert isinstance(s, str) and re.fullmatch("[0-9a-f]{40}", s); print(s)' 2>/dev/
     local url got
     for url in "${sources[@]}"; do
         : > "$tmp"
-        if ! curl -fsSL --max-time 30 --max-filesize=4194304 -H "Accept: application/vnd.github.raw" "$url" -o "$tmp" 2>/dev/null; then
+        if ! curl -fsSL --max-time 30 --max-filesize 4194304 -H "Accept: application/vnd.github.raw" "$url" -o "$tmp" 2>/dev/null; then
             continue
         fi
         [[ -s "$tmp" ]] && grep -q 'hy2-awgctl' "$tmp" 2>/dev/null || continue

@@ -41,7 +41,7 @@ class InstallBinaryTarSafeCertReuseAndTeyirAccessGuardsTests(unittest.TestCase):
         """install_binary 须拒绝符号链接 HY2_BIN 并为下载站回落探测限制最大重定向与体积。"""
         fn = _extract_fn('install_binary')
         self.assertIn('[[ -L "$HY2_BIN" ]]', fn)
-        self.assertIn('--max-redirs 5 --max-filesize=2097152', fn)
+        self.assertIn('--max-redirs 5 --max-filesize 2097152', fn)
         self.assertIn('mv -f -- "$staged" "$HY2_BIN"', fn)
 
     def test_reuse_existing_cert_and_setup_certificates_guards(self):

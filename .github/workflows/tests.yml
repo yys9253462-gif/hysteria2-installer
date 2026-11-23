@@ -22,7 +22,7 @@ jobs:
     name: 语法 / AWG 逻辑 / 门户
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: 确保 shell 可执行位
         run: chmod +x install.sh awgctl.sh tests/test_awgctl.sh
@@ -130,6 +130,9 @@ jobs:
         #   1. 三源都不可达时必须明确报错并中止（且不留半成品文件）
         #   2. 语法不合法的内容必须被拒绝
         #   3. 正常路径能取到并通过 Python 语法校验
+        # 注入工作流只读令牌，避免多租户共享执行机出口触发匿名接口每小时 60 次限流。
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash tests/portal-py-fetch-smoke.sh
 
       - name: ACME 端口占用检测（已有反代时也能签证书）
