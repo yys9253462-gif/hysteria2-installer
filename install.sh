@@ -57,7 +57,9 @@ curl() {
     for _a in "$@"; do
         case "$_a" in
             https://api.github.com/*)
-                [[ -n "${HY2_GITHUB_TOKEN_FILE:-}" && ! -L "$HY2_GITHUB_TOKEN_FILE" && -f "$HY2_GITHUB_TOKEN_FILE" && -r "$HY2_GITHUB_TOKEN_FILE" ]] && _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
+                if [[ -v HY2_GITHUB_TOKEN_FILE && -n "$HY2_GITHUB_TOKEN_FILE" && ! -L "$HY2_GITHUB_TOKEN_FILE" ]] && [[ -f "$HY2_GITHUB_TOKEN_FILE" && -r "$HY2_GITHUB_TOKEN_FILE" ]]; then
+                    _tok="$(tr -d '[:space:]' < "$HY2_GITHUB_TOKEN_FILE")"
+                fi
                 break ;;
         esac
     done
