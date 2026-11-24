@@ -2489,8 +2489,12 @@ setup_ports_and_obfs() {
         NODE_API_KEY=${NODE_API_KEY:-$RANDOM_API_KEY}
         log_info "已生成新的节点通信 API Key。"
     fi
-    if [[ ! "$NODE_API_KEY" =~ ^[!-~]+$ ]] || (( ${#NODE_API_KEY} > 256 )); then
-        log_err "NODE_API_KEY 必须是不含空白和控制字符且不超过 256 字符的纯 ASCII 字符串，已中止安装。"
+    if [[ ! "$NODE_API_KEY" =~ ^[!-~]+$ ]]; then
+        log_err "NODE_API_KEY 必须是不含空白和控制字符的纯 ASCII 字符串，已中止安装。"
+        return 1
+    fi
+    if (( ${#NODE_API_KEY} > 256 )); then
+        log_err "NODE_API_KEY 长度不能超过 256 个字符，已中止安装。"
         return 1
     fi
 
@@ -2793,7 +2797,7 @@ select_subscription_port() {
             return 0
         fi
     fi
-    HY2_SUB_PORT=$(python3 -I - "$HY2_DIR/portal.json" <<'PYPORT'
+    HY2_SUB_PORT=$(python3 - "$HY2_DIR/portal.json" <<'PYPORT'
 import json, os, socket, secrets, stat, sys
 RESERVED = {8443, 19898, 19996, 19997, 22, 80, 443, 40000, 56195}
 # 门户托管协议记下的端口也要避开（2026-11-04 修）：协议此刻停着时 bind 能成功，
@@ -6388,7 +6392,7 @@ install_amneziawg() {
             read -rp "请为首个客户端命名 [默认: client1]: " client || true
             client="${client// /}"
             client="${client:-client1}"
-            if ! [[ "$client" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]; then
+            if [[ "$client" == "." || "$client" == ".." || "$client" == -* || "$client" == .* || "$client" == _* || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
                 log_err "客户端名称不合法（须以字母/数字开头，仅允许 1-32 位字母/数字/._-）。"
                 return 1
             fi
@@ -7241,7 +7245,7 @@ flow_update_core() {
         return 0
     fi
     if ! restart_service; then
-        if [[ -L "$HY2_BIN" ]] || ! mv -f -- "$rollback_file" "$HY2_BIN"; then
+        if [[ -L "$HY2_BIN" ]] || ! mv -f "$rollback_file" "$HY2_BIN"; then
             local keep_rollback="$rollback_file"
             rollback_file=""
             log_err "新版本启动失败，回滚失败；本次旧核心保留在 ${keep_rollback}。"

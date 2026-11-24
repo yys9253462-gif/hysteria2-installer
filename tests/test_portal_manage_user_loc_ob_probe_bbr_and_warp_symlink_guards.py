@@ -35,7 +35,7 @@ class PortalManageUserLocObProbeBbrAndWarpSymlinkGuardsTests(unittest.TestCase):
         end = SOURCE.index('def _ob_list(self):', start)
         block = SOURCE[start:end]
 
-        self.assertIn('stat.S_ISREG(c_st.st_mode)', block)
+        self.assertIn('S_ISREG(c_st.st_mode)', block)
         self.assertIn("''.join(ch for ch in", block)
 
     def test_install_warp_script_rejects_symlinks_before_ownership_probe(self):

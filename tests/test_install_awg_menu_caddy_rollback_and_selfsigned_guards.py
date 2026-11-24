@@ -41,7 +41,7 @@ class InstallAwgMenuCaddyRollbackAndSelfsignedGuardsTests(unittest.TestCase):
         self.assertIn('[[ ! -L "$AWG_META_FILE" && -f "$AWG_META_FILE" ]]', fn_line)
 
         fn_inst = _extract_fn('install_amneziawg', '\nawg_menu_add_peer() {')
-        self.assertIn('[[ "$client" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]', fn_inst)
+        self.assertIn('"$client" == -* || "$client" == .* || "$client" == _*', fn_inst)
         self.assertIn('[[ "$endpoint" == -* || "$endpoint" =~ [[:space:][:cntrl:]] ]]', fn_inst)
         self.assertIn('[[ ! -L "$AWG_PEERS_FILE" && -f "$AWG_PEERS_FILE" ]]', fn_inst)
 

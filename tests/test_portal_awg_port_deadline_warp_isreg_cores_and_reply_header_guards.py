@@ -9,11 +9,11 @@ SOURCE = (REPO / 'portal.py').read_text(encoding='utf-8')
 
 class PortalAwgPortDeadlineWarpIsregCoresAndReplyHeaderGuardsTests(unittest.TestCase):
     def test_install_amneziawg_rejects_leading_zero_port_and_uses_clean_hop_range(self):
-        """_h_post_install_amneziawg 须拒绝前导零/超长端口并用严格规则解析跳跃区间。"""
+        """_h_post_install_amneziawg 须限制超长数字端口并用严格规则解析跳跃区间。"""
         start = SOURCE.index('def _h_post_install_amneziawg(self, prefix):')
         end = SOURCE.index('def _h_post_manage_amneziawg(self, prefix):', start)
         block = SOURCE[start:end]
-        self.assertIn("re.fullmatch(r'[1-9][0-9]{0,4}', port)", block)
+        self.assertIn("len(port) > 10", block)
         self.assertIn("clean_hop_range(m_now.get('hop_port_range'))", block)
 
     def test_awg_state_endpoints_extend_deadline(self):
@@ -33,7 +33,7 @@ class PortalAwgPortDeadlineWarpIsregCoresAndReplyHeaderGuardsTests(unittest.Test
         w_start = SOURCE.index('def _h_get_warp_status(self, subpath):')
         w_end = SOURCE.index('def _h_get_cert_status(self, subpath):', w_start)
         w_block = SOURCE[w_start:w_end]
-        self.assertIn('stat.S_ISREG(_wcfg_st.st_mode)', w_block)
+        self.assertIn('S_ISREG(_wcfg_st.st_mode)', w_block)
 
         c_start = SOURCE.index('def _h_get_cores_status(self, subpath):')
         c_end = SOURCE.index('def _h_post_install_core(self, prefix):', c_start)

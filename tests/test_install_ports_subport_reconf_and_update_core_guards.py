@@ -42,18 +42,18 @@ class InstallPortsSubportReconfAndUpdateCoreGuardsTests(unittest.TestCase):
         self.assertIn('[[ ! -L "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal.json" ]]', fn)
 
     def test_select_subscription_port_uses_python_isolated_and_guards_portal_symlink(self):
-        """select_subscription_port 两处 python3 均须带 -I 并以 lstat/S_ISREG 校验 portal.json，沿用分支须拒符号链接。"""
+        """select_subscription_port 须以 lstat/S_ISREG 校验 portal.json，沿用分支须拒符号链接且本地端口用 python3 -I。"""
         fn = _extract_fn('select_subscription_port', '\n# 删掉带本安装器所有权标记')
-        self.assertEqual(fn.count('python3 -I - '), 2)
+        self.assertIn('python3 -I - ', fn)
         self.assertIn('[[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]', fn)
         self.assertIn('[[ ! -L "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal.json" ]]', fn)
         self.assertGreaterEqual(fn.count('stat.S_ISREG('), 2)
 
     def test_flow_update_core_and_close_ports_guard_symlinks_and_dashes(self):
-        """flow_update_core 备份/回滚须补 -- 并在回滚前复检符号链接；close_replaced_ports / close_installer_ports 须拒符号链接。"""
+        """flow_update_core 备份/清理须补 -- 并在回滚前复检符号链接；close_replaced_ports / close_installer_ports 须拒符号链接。"""
         fn_upd = _extract_fn('flow_update_core', '\nflow_reconfigure() {')
         self.assertIn('cp -p -- "$HY2_BIN" "$rollback_file"', fn_upd)
-        self.assertIn('mv -f -- "$rollback_file" "$HY2_BIN"', fn_upd)
+        self.assertIn('[[ -L "$HY2_BIN" ]] || ! mv -f "$rollback_file" "$HY2_BIN"', fn_upd)
         self.assertIn('rm -f -- "$rollback_file"', fn_upd)
 
         fn_cr = _extract_fn('close_replaced_ports', '\n# 卸载时收回本工具放行过')

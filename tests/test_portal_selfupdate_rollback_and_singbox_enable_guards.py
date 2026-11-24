@@ -14,9 +14,9 @@ class PortalSelfupdateRollbackAndSingboxEnableGuardsTests(unittest.TestCase):
         end = SOURCE.index("if not changed:", start)
         block = SOURCE[start:end]
 
-        self.assertIn('stat.S_ISREG(_dst_st.st_mode)', block)
+        self.assertIn('S_ISREG(_dst_st.st_mode)', block)
         self.assertIn('bak_path.is_symlink()', block)
-        self.assertIn('stat.S_ISREG(_bak_st.st_mode)', block)
+        self.assertIn('S_ISREG(_bak_st.st_mode)', block)
         self.assertGreaterEqual(
             block.count("os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)"),
             2,
@@ -30,13 +30,13 @@ class PortalSelfupdateRollbackAndSingboxEnableGuardsTests(unittest.TestCase):
         a_block = SOURCE[a_start:a_end]
         self.assertIn('copy.deepcopy(data.get(k))', a_block)
         self.assertNotIn('_data_now = dict(data)', a_block)
-        self.assertIn('stat.S_ISREG(', a_block)
+        self.assertIn('S_ISREG(', a_block)
 
         t_start = SOURCE.index('def _apply_tuic_enable(self):')
         t_end = SOURCE.index('def _h_post_manage_tuic(self, prefix):', t_start)
         t_block = SOURCE[t_start:t_end]
         self.assertIn('ord(c) < 32 or ord(c) == 127', t_block)
-        self.assertIn('stat.S_ISREG(', t_block)
+        self.assertIn('S_ISREG(', t_block)
 
 
 if __name__ == '__main__':

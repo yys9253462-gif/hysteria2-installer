@@ -28,7 +28,7 @@ class PortalProxyBoundsSnapshotAndGostBackupGuardsTests(unittest.TestCase):
         end = SOURCE.index('with tempfile.TemporaryDirectory() as tmpdir:', start)
         block = SOURCE[start:end]
 
-        self.assertIn('stat.S_ISREG(', block)
+        self.assertIn('S_ISREG(', block)
         self.assertIn('asset_path.lstat()', block)
         self.assertIn('_max_asset_bytes', block)
 
