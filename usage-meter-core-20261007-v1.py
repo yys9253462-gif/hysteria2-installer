@@ -82,8 +82,18 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
     if 'totals' in new and not isinstance(new.get('totals'), dict):
         raise ValueError('invalid totals')
     totals = new.setdefault('totals', {})
+    retired_was_corrupt = 'retired_users' in new and not isinstance(new.get('retired_users'), list)
     retired_value = new.get('retired_users', [])
-    retired = {uid for uid in retired_value if isinstance(uid, str)} if isinstance(retired_value, list) else set()
+    retired = (
+        {uid for uid in retired_value
+         if isinstance(uid, str) and uid and not any(ord(c) < 32 or ord(c) == 127 for c in uid)}
+        if isinstance(retired_value, list) else set()
+    )
+    if retired_was_corrupt:
+        gaps.append({'source': source, 'at': sampled_at, 'reason': 'corrupt_retired_reset'})
+        new['retired_users'] = []
+    elif 'retired_users' in new:
+        new['retired_users'] = sorted(retired)
     if active_users is not None:
         retired.difference_update(active_users)
         new['retired_users'] = sorted(retired)
@@ -222,7 +232,7 @@ def apply_sample(state, source, epoch, counters, sampled_at, active_users=None):
 def total_bytes(state, uid):
     if not isinstance(state, dict):
         raise ValueError('invalid usage meter state')
-    if not isinstance(uid, str) or not uid:
+    if not isinstance(uid, str) or not uid or any(ord(c) < 32 or ord(c) == 127 for c in uid):
         raise ValueError('invalid user id')
     totals = state.get('totals', {})
     if not isinstance(totals, dict):
@@ -238,7 +248,7 @@ def adjusted_bytes(state, uid):
     """返回实测累计加账户有符号偏移；损坏状态和负结果均失败。"""
     if not isinstance(state, dict):
         raise ValueError('invalid usage meter state')
-    if not isinstance(uid, str) or not uid:
+    if not isinstance(uid, str) or not uid or any(ord(c) < 32 or ord(c) == 127 for c in uid):
         raise ValueError('invalid user id')
     total = total_bytes(state, uid)
     adjustments = state.get('adjustments', {})

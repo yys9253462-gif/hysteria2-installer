@@ -299,7 +299,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.74'
+PORTAL_VERSION = '2.75'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -10462,6 +10462,7 @@ def serve(path):
     gost_written_ports = []
     speedtest_lock = threading.Lock()
     unlock_check_lock = threading.Lock()
+    _ob_probe_sem = threading.BoundedSemaphore(4)
 
     def write_gost_config():
         """根据 proxy_services 动态生成 gost.yml 配置并触发热重载。"""
@@ -13470,9 +13471,14 @@ if __name__ == '__main__':
                                 #   「回滚成功」却仍然打不开。
                                 # 回滚脚本 portal_update_restart_script 拿的是
                                 # backups 列表里的具体路径，改名字不影响它。
+                                _stat = globals().get('stat')
+                                _dst_st = dest.lstat()
+                                _dst_is_reg = _stat.S_ISREG(_dst_st.st_mode) if _stat is not None else ((_dst_st.st_mode & 0o170000) == 0o100000)
+                                if not _dst_is_reg or _dst_st.st_size > 16 * 1024 * 1024:
+                                    raise OSError('目标门户文件非常规文件或体积异常: %s' % fname)
                                 bak = dest.with_name('%s.bak-%s' % (dest.name, stamp))
                                 old_bytes = dest.read_bytes()
-                                old_mode = dest.stat().st_mode & 0o777
+                                old_mode = _dst_st.st_mode & 0o777
                                 bak_tmp = dest.with_name('%s.bak-tmp-%s' % (dest.name, os.urandom(4).hex()))
                                 _bfd = None
                                 try:
@@ -13554,9 +13560,16 @@ if __name__ == '__main__':
                             rb_tmp = None
                             _rfd = None
                             try:
+                                _stat = globals().get('stat')
                                 bak_path = Path(bak)
+                                if bak_path.is_symlink():
+                                    raise OSError('回滚备份不允许为符号链接: %s' % bak_path.name)
+                                _bak_st = bak_path.lstat()
+                                _bak_is_reg = _stat.S_ISREG(_bak_st.st_mode) if _stat is not None else ((_bak_st.st_mode & 0o170000) == 0o100000)
+                                if not _bak_is_reg or _bak_st.st_size > 16 * 1024 * 1024:
+                                    raise OSError('回滚备份非常规文件或体积异常: %s' % bak_path.name)
                                 bak_bytes = bak_path.read_bytes()
-                                bak_mode = bak_path.stat().st_mode & 0o777
+                                bak_mode = _bak_st.st_mode & 0o777
                                 rb_tmp = Path(dest).with_name(
                                     '%s.rb-%s' % (Path(dest).name, os.urandom(4).hex()))
                                 _rfd = os.open(str(rb_tmp), _rb_flags, bak_mode or 0o600)
@@ -13585,6 +13598,17 @@ if __name__ == '__main__':
                                 Path(dest).unlink(missing_ok=True)
                             except OSError as exc:
                                 _log_ignored('portal_update.rollback_unlink', exc)
+                        try:
+                            _rb_dfd = os.open(str(base_dir), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+                            try:
+                                os.fsync(_rb_dfd)
+                            finally:
+                                try:
+                                    os.close(_rb_dfd)
+                                except OSError:
+                                    pass
+                        except OSError:
+                            pass
                         return self.reply_json(500, {'ok': False, 'error':
                             '更新过程中出错，已回滚到原版本：%s' % e})
 
@@ -13710,15 +13734,17 @@ if __name__ == '__main__':
                     previous = copy.deepcopy(data.get('proxy_services', []))
                     working = proxy_services(data)
                 if action == 'create':
+                    if len(working) >= 128:
+                        return 400, {'ok': False, 'error': '代理服务数量已达上限（最多 128 个），请先删除不用的代理'}
                     ptype = str(params.get('protocol') or params.get('type') or 'socks5').lower()
                     if ptype not in ('socks5', 'http', 'https'):
                         return 400, {'ok': False, 'error': '代理类型只能是 SOCKS5、HTTP 或 HTTPS'}
                     raw_port_in = params.get('port')
-                    if isinstance(raw_port_in, bool):
+                    if raw_port_in is not None and (isinstance(raw_port_in, bool) or not isinstance(raw_port_in, (int, str))):
                         return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
                     raw_port = str(raw_port_in if raw_port_in is not None else '').strip()
                     if raw_port:
-                        if not re.fullmatch(r'[0-9]{1,5}', raw_port):
+                        if not re.fullmatch(r'[1-9][0-9]{0,4}', raw_port):
                             return 400, {'ok': False, 'error': '端口必须是 1-65535 之间的整数；留空则自动选择'}
                         port = int(raw_port)
                         if not 1 <= port <= 65535:
@@ -13761,8 +13787,10 @@ if __name__ == '__main__':
                             _cfg_now = None
                         if not isinstance(_cfg_now, dict):
                             _cfg_now = None
+                    _port_snap_keys = ('proxy_services', 'reality_config', 'vmess_config', 'vlessenc_config',
+                                       'anytls_config', 'tuic_config', 'warp_config', 'port')
                     with data_lock:
-                        _data_now = dict(data)
+                        _data_now = {k: copy.deepcopy(data.get(k)) for k in _port_snap_keys if k in data}
                     _avoid = managed_reserved_ports(_meta_now, _data_now, _cfg_now, keep_disabled=True)
                     _avoid |= _listening_ports()
                     if port and port in _avoid:
@@ -13798,6 +13826,8 @@ if __name__ == '__main__':
                     password = raw_pass.strip() or secrets.token_hex(12)
                     if ptype in ('http', 'https') and ':' in username:
                         return 400, {'ok': False, 'error': 'HTTP Basic 认证用户名不能包含冒号'}
+                    if len(password) > 256:
+                        return 400, {'ok': False, 'error': '代理密码长度不能超过 256 个字符'}
                     if ptype == 'socks5' and (len(username.encode('utf-8')) > 255 or len(password.encode('utf-8')) > 255):
                         return 400, {'ok': False, 'error': 'SOCKS5 账号或密码不能超过 255 字节'}
                     _clean_note = ''.join(ch for ch in (raw_note_in or '') if ord(ch) >= 0x20 and ord(ch) != 0x7f).strip()[:200]
@@ -13847,8 +13877,10 @@ if __name__ == '__main__':
                     return 500, {'ok': False, 'applied': False,
                         'error': 'GOST 配置未成功应用或端口未监听，代理记录已恢复；请检查服务日志'}
                 if action == 'delete':
+                    _port_snap_keys = ('proxy_services', 'reality_config', 'vmess_config', 'vlessenc_config',
+                                       'anytls_config', 'tuic_config', 'warp_config', 'port')
                     with data_lock:
-                        data_snapshot = dict(data)
+                        data_snapshot = {k: copy.deepcopy(data.get(k)) for k in _port_snap_keys if k in data}
                     for item in working:
                         # data_snapshot 已剔除被删除的代理；不传 exclude_key 以免跳过其余仍在运行的同端口代理。
                         if item.get('id') == proxy_id and not protocol_port_in_use(
@@ -14029,14 +14061,24 @@ if __name__ == '__main__':
                 with data_lock:
                     had_proxy_services = 'proxy_services' in data
                     previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
+                _stat = globals().get('stat')
                 old_assets = {}
                 for asset_path in (gost_binary, gost_unit_path, gost_check_path,
                                    owner_marker_path, gost_config_path, *cert_files):
                     if asset_path.is_symlink():
                         return self.reply_json(409, {'ok': False, 'error':
                             '检测到 GOST 资产路径为符号链接，已拒绝安装：%s' % asset_path})
-                    old_assets[asset_path] = (asset_path.read_bytes(),
-                        asset_path.stat().st_mode & 0o777) if asset_path.exists() else None
+                    try:
+                        _ast = asset_path.lstat()
+                    except FileNotFoundError:
+                        old_assets[asset_path] = None
+                        continue
+                    _max_asset_bytes = 128 * 1024 * 1024 if asset_path == gost_binary else 4 * 1024 * 1024
+                    _ast_is_reg = _stat.S_ISREG(_ast.st_mode) if _stat is not None else ((_ast.st_mode & 0o170000) == 0o100000)
+                    if not _ast_is_reg or _ast.st_size > _max_asset_bytes:
+                        return self.reply_json(409, {'ok': False, 'error':
+                            '检测到 GOST 资产路径不是常规文件或体积异常，已拒绝安装：%s' % asset_path})
+                    old_assets[asset_path] = (asset_path.read_bytes(), _ast.st_mode & 0o777)
                 with tempfile.TemporaryDirectory() as tmpdir:
                     archive_path = Path(tmpdir) / 'gost.tar.gz'
                     for u in download_urls:
@@ -14305,7 +14347,7 @@ if __name__ == '__main__':
                 # 端口若由用户指定，提前拦掉非 ASCII 数字及会与 Hysteria2/TUIC 冲突的取值
                 port_num = None
                 if port:
-                    if not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535):
+                    if len(port) > 10 or not (port.isascii() and port.isdigit()) or not (1 <= int(port) <= 65535):
                         return self.reply_json(400, {'ok': False, 'error': '端口必须是 1-65535 的数字'})
                     port_num = int(port)
                     if 20000 <= port_num <= 40000:
@@ -14318,10 +14360,14 @@ if __name__ == '__main__':
                         hy2_listen = _valid_port(m_now.get('listen_port'))
                         if hy2_listen and port_num == hy2_listen:
                             return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 已被 Hysteria2 主监听端口占用，请更换其它 UDP 端口'})
-                        hop_range = str(m_now.get('hop_port_range') or '').strip()
-                        hop_match = re.fullmatch(r'([0-9]{1,5})-([0-9]{1,5})', hop_range)
-                        if hop_match:
-                            hs, he = int(hop_match.group(1)), int(hop_match.group(2))
+                        try:
+                            _hop_pair = clean_hop_range(m_now.get('hop_port_range'))
+                        except NameError:
+                            hop_range = str(m_now.get('hop_port_range') or '').strip()
+                            hop_match = re.fullmatch(r'([1-9][0-9]{0,4})-([1-9][0-9]{0,4})', hop_range)
+                            _hop_pair = (int(hop_match.group(1)), int(hop_match.group(2))) if hop_match else None
+                        if _hop_pair:
+                            hs, he = _hop_pair
                             if 1 <= hs <= he <= 65535 and hs <= port_num <= he:
                                 return self.reply_json(400, {'ok': False, 'error': f'端口 {port_num} 落在当前 Hysteria2 端口跳跃区间 {hs}-{he} 内，请更换其它 UDP 端口'})
                     try:
@@ -14382,6 +14428,8 @@ if __name__ == '__main__':
                 action = (form.get('action', [''])[0] or '').strip()
 
                 if action == 'state':
+                    if hasattr(self, '_extend_deadline'):
+                        self._extend_deadline(30)
                     return self.reply_json(200, awg_state())
 
                 # 先校验动作名再检查安装状态 —— 否则未知动作会拿到
@@ -15393,7 +15441,10 @@ if __name__ == '__main__':
                 try:
                     out = subprocess.run([binary] + args, capture_output=True, text=True, errors='replace', timeout=5)
                     m = re.search(pattern, (out.stdout or '') + (out.stderr or ''))
-                    return m.group(1) if m else '已安装'
+                    if not m:
+                        return '已安装'
+                    clean_v = ''.join(ch for ch in m.group(1) if ord(ch) >= 32 and ord(ch) != 127).strip()[:64]
+                    return clean_v or '已安装'
                 except Exception:
                     return '已安装'
 
@@ -15679,9 +15730,11 @@ if __name__ == '__main__':
             version = _singbox_version()
             if not version or version < ANYTLS_MIN_SINGBOX:
                 raise RuntimeError('sing-box 核心未安装或版本低于 1.12，请先在「核心管理」中安装')
+            _port_snap_keys = ('proxy_services', 'reality_config', 'vmess_config', 'vlessenc_config',
+                               'anytls_config', 'tuic_config', 'warp_config', 'port')
             with data_lock:
                 old = dict(config_section(data, 'anytls_config'))
-                _data_now = dict(data)
+                _data_now = {k: copy.deepcopy(data.get(k)) for k in _port_snap_keys if k in data}
             try:
                 _xp_cfg = Path('/etc/hysteria/xray.json')
                 if _xp_cfg.exists() and not _xp_cfg.is_symlink() and _xp_cfg.is_file() and _xp_cfg.lstat().st_size <= 4 * 1024 * 1024:
@@ -15712,17 +15765,29 @@ if __name__ == '__main__':
                     preview = dict(data)
                     preview['anytls_config'] = new_cfg
                     users = anytls_users(preview)
+                _stat = globals().get('stat')
                 if unit_path.is_symlink():
                     raise RuntimeError('AnyTLS 服务单元不允许为符号链接')
-                previous_unit = unit_path.read_bytes() if (unit_path.exists() and unit_path.lstat().st_size <= 1024 * 1024) else None
-                unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
+                previous_unit = None
+                unit_mode = 0o644
+                if unit_path.exists():
+                    _au_st = unit_path.lstat()
+                    _au_is_reg = _stat.S_ISREG(_au_st.st_mode) if _stat is not None else ((_au_st.st_mode & 0o170000) == 0o100000)
+                    if not _au_is_reg or _au_st.st_size > 1024 * 1024:
+                        raise RuntimeError('AnyTLS 服务单元不是常规文件或超过 1 MiB 上限')
+                    previous_unit = unit_path.read_bytes()
+                    unit_mode = _au_st.st_mode & 0o777
                 unit_changed = previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8')
                 cfg_path = portal_path.parent / ANYTLS_CONFIG_NAME
                 if cfg_path.is_symlink():
                     raise RuntimeError('anytls.json 不允许为符号链接')
-                if cfg_path.exists() and cfg_path.lstat().st_size > 4 * 1024 * 1024:
-                    raise RuntimeError('anytls.json 超过 4 MiB 上限')
-                previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
+                previous_file = None
+                if cfg_path.exists():
+                    _ac_st = cfg_path.lstat()
+                    _ac_is_reg = _stat.S_ISREG(_ac_st.st_mode) if _stat is not None else ((_ac_st.st_mode & 0o170000) == 0o100000)
+                    if not _ac_is_reg or _ac_st.st_size > 4 * 1024 * 1024:
+                        raise RuntimeError('anytls.json 不是常规文件或超过 4 MiB 上限')
+                    previous_file = cfg_path.read_bytes()
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
                 try:
                     if previous_unit != ANYTLS_UNIT_CONTENT.encode('utf-8'):
@@ -15990,22 +16055,32 @@ if __name__ == '__main__':
                     own_port_active=_systemd_state(TUIC_SERVICE) == 'active')
                 if not listen_port:
                     raise RuntimeError('在 %d-%d 内找不到空闲的 UDP 端口' % TUIC_PORT_RANGE)
+                _old_tuic_secret = old.get('secret') if (
+                    isinstance(old.get('secret'), str) and old.get('secret').strip()
+                    and not any(ord(c) < 32 or ord(c) == 127 for c in old.get('secret'))
+                ) else ''
                 new_cfg = {'enabled': True, 'port': listen_port, 'domain': domain, 'sni': sni,
-                           'secret': old.get('secret') if isinstance(old.get('secret'), str) and old.get('secret')
-                           else secrets.token_hex(32)}
+                           'secret': _old_tuic_secret or secrets.token_hex(32)}
                 with data_lock:
                     # 先发布启用状态，再写配置/启动服务。撤销线程若此时拍快照，
                     # 会看到 enabled 并等待 tuic_apply_lock，而不会把这次同步误判成无事可做。
                     data['tuic_config'] = new_cfg
                     users = tuic_users(data)
                 try:
+                    _stat = globals().get('stat')
                     unit_path = Path('/etc/systemd/system/%s.service' % TUIC_SERVICE)
                     _u_sym = getattr(unit_path, 'is_symlink', None)
                     if callable(_u_sym) and _u_sym():
                         raise RuntimeError('TUIC 服务单元不允许为符号链接')
                     _u_lstat = getattr(unit_path, 'lstat', None)
-                    if unit_path.exists() and callable(_u_lstat) and _u_lstat().st_size > 1024 * 1024:
-                        raise RuntimeError('TUIC 服务单元超过 1 MiB 上限')
+                    if unit_path.exists() and callable(_u_lstat):
+                        _tu_st = _u_lstat()
+                        _tu_is_reg = (
+                            (_stat.S_ISREG(_tu_st.st_mode) if _stat is not None else ((_tu_st.st_mode & 0o170000) == 0o100000))
+                            if hasattr(_tu_st, 'st_mode') else True
+                        )
+                        if not _tu_is_reg or _tu_st.st_size > 1024 * 1024:
+                            raise RuntimeError('TUIC 服务单元不是常规文件或超过 1 MiB 上限')
                     previous_unit = unit_path.read_bytes() if unit_path.exists() else None
                     unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
                     unit_changed = previous_unit != TUIC_UNIT_CONTENT.encode('utf-8')
@@ -16014,8 +16089,14 @@ if __name__ == '__main__':
                     if callable(_c_sym) and _c_sym():
                         raise RuntimeError('tuic.json 不允许为符号链接')
                     _c_lstat = getattr(cfg_path, 'lstat', None)
-                    if cfg_path.exists() and callable(_c_lstat) and _c_lstat().st_size > 4 * 1024 * 1024:
-                        raise RuntimeError('tuic.json 超过 4 MiB 上限')
+                    if cfg_path.exists() and callable(_c_lstat):
+                        _tc_st = _c_lstat()
+                        _tc_is_reg = (
+                            (_stat.S_ISREG(_tc_st.st_mode) if _stat is not None else ((_tc_st.st_mode & 0o170000) == 0o100000))
+                            if hasattr(_tc_st, 'st_mode') else True
+                        )
+                        if not _tc_is_reg or _tc_st.st_size > 4 * 1024 * 1024:
+                            raise RuntimeError('tuic.json 不是常规文件或超过 4 MiB 上限')
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
                     if unit_changed:
@@ -16874,7 +16955,7 @@ if __name__ == '__main__':
                             revoked_pending = True
                         else:
                             revoked_pending = False
-                            if previous_user is None:
+                            if not previous_had_user:
                                 if isinstance(data.get('users'), dict):
                                     data['users'].pop(user_id, None)
                             else:
@@ -16896,7 +16977,8 @@ if __name__ == '__main__':
                 regenerate_page()
                 self.send_response(302)
                 self._responded = True
-                self.send_header('Location', prefix + '#users')
+                safe_loc = ''.join(ch for ch in str(prefix) if ord(ch) >= 32 and ord(ch) != 127)
+                self.send_header('Location', (safe_loc or '/') + '#users')
                 self.send_header('Cache-Control', 'no-store')
                 self.send_header('X-Content-Type-Options', 'nosniff')
                 self.send_header('X-Frame-Options', 'DENY')
@@ -17045,6 +17127,10 @@ command -v curl >/dev/null 2>&1 || { echo "缺少 curl，无法继续" >&2; exit
 # unit 与 wp.conf；而 install.sh 卸载只认 .hy2-warp-owned，网页装的 WARP 卸载后
 # 还在跑、开机自启、watchdog 每 3 分钟拉起一次，wp.conf 里的私钥也留在盘上。
 WARP_OWNED_MARKER="/etc/hysteria/.hy2-warp-owned"
+if [ -L "$WARP_OWNED_MARKER" ] || [ -L "$WP_BIN" ] || [ -L /etc/systemd/system/wireproxy.service ] || [ -L "$WP_CFG" ]; then
+    echo "检测到 WARP 相关路径为符号链接，已拒绝安装以防覆盖宿主文件。" >&2
+    exit 1
+fi
 if [ ! -f "$WARP_OWNED_MARKER" ]; then
     if [ -f /etc/systemd/system/wireproxy.service ] && [ -f "$WP_CFG" ] \
             && grep -qF '# wireproxy config (managed by hysteria2-installer, do not edit)' "$WP_CFG" \
@@ -18755,10 +18841,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 kernel_ver = platform.release()
                 def _sysctl_read(param):
                     try:
-                        return subprocess.run(['sysctl', '-n', param],
-                                              capture_output=True, text=True,
-                                              encoding='utf-8', errors='replace',
-                                              timeout=2).stdout.strip()
+                        raw = subprocess.run(['sysctl', '-n', param],
+                                             capture_output=True, text=True,
+                                             encoding='utf-8', errors='replace',
+                                             timeout=2).stdout.strip()
+                        return ''.join(ch for ch in raw if ord(ch) >= 32 and ord(ch) != 127)
                     except (OSError, subprocess.SubprocessError):
                         return ''
                 cc_out = _sysctl_read('net.ipv4.tcp_congestion_control')
@@ -18768,8 +18855,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 configured_bbr = ''
                 if conf_path.exists():
                     try:
+                        _stat = globals().get('stat')
                         c_st = conf_path.lstat()
-                        if not conf_path.is_symlink() and conf_path.is_file() and c_st.st_size <= 1024 * 1024:
+                        _c_is_reg = _stat.S_ISREG(c_st.st_mode) if _stat is not None else ((c_st.st_mode & 0o170000) == 0o100000)
+                        if _c_is_reg and c_st.st_size <= 1024 * 1024:
                             c_text = conf_path.read_bytes().decode('utf-8', errors='replace')
                         else:
                             c_text = ''
@@ -18783,7 +18872,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                             continue
                         k_part, v_part = stripped.split('=', 1)
                         if k_part.strip() == 'net.ipv4.tcp_congestion_control':
-                            configured_bbr = v_part.split('#', 1)[0].split(';', 1)[0].strip()
+                            raw_cfg_bbr = v_part.split('#', 1)[0].split(';', 1)[0].strip()
+                            configured_bbr = ''.join(ch for ch in raw_cfg_bbr if ord(ch) >= 32 and ord(ch) != 127)
 
                 need_reboot = False
                 if configured_bbr and configured_bbr != cc_out:
@@ -18903,13 +18993,25 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 return self.reply_json(400, {'ok': False, 'error': '未知的出站类型，请刷新页面后重试'})
             if kind in ('socks5', 'http') and not addr:
                 return self.reply_json(400, {'ok': False, 'error': '探测 SOCKS5 / HTTP 代理需要先填写代理地址'})
+            if len(addr) > 512 or any(ord(ch) < 32 or ord(ch) == 127 for ch in addr):
+                return self.reply_json(400, {'ok': False, 'error': '代理地址格式不合法或长度超限'})
             insecure = (form.get('insecure', [''])[0] or '').strip().lower() in ('1', 'true', 'yes')
-            if hasattr(self, '_extend_deadline'):
-                self._extend_deadline(45)
-            ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
-            if kind == 'warp' and not ip:
-                # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
-                ip = detect_outbound_ip('socks5', '127.0.0.1:40000', proxy_insecure=insecure)
+            try:
+                _probe_sem = _ob_probe_sem
+            except NameError:
+                _probe_sem = None
+            if _probe_sem is not None and not _probe_sem.acquire(blocking=False):
+                return self.reply_json(429, {'ok': False, 'error': '出站探测并发过多，请稍后再试'})
+            try:
+                if hasattr(self, '_extend_deadline'):
+                    self._extend_deadline(45)
+                ip = detect_outbound_ip(kind, addr, proxy_insecure=insecure)
+                if kind == 'warp' and not ip:
+                    # 兼容尚未升级的旧官方 cloudflare-warp（127.0.0.1:40000），与 /warp-status 一致。
+                    ip = detect_outbound_ip('socks5', '127.0.0.1:40000', proxy_insecure=insecure)
+            finally:
+                if _probe_sem is not None:
+                    _probe_sem.release()
             return self.reply_json(200, {'ok': True, 'ip': ip, 'kind': kind})
 
         def _ob_manage(self):
@@ -19134,9 +19236,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         _warp_probe_cache['value'] = (outbound_ip, connected)
                         _warp_probe_cache['at'] = time.monotonic()
             try:
+                _stat = globals().get('stat')
                 _wcfg_p = Path('/etc/hysteria/config.yaml')
                 _wcfg_st = _wcfg_p.lstat()
-                if _wcfg_p.is_symlink() or not _wcfg_p.is_file() or _wcfg_st.st_size > 4 * 1024 * 1024:
+                _wcfg_is_reg = _stat.S_ISREG(_wcfg_st.st_mode) if _stat is not None else ((_wcfg_st.st_mode & 0o170000) == 0o100000)
+                if not _wcfg_is_reg or _wcfg_st.st_size > 4 * 1024 * 1024:
                     raise ValueError('config.yaml 非法或过大')
                 cfg_text = _wcfg_p.read_bytes().decode('utf-8', errors='replace')
                 applied = cfg_text == render_egress_config(cfg_text, state)
@@ -19216,6 +19320,8 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             """GET /awg-state 的处理逻辑（从 do_GET 机械搬移而来）。"""
             if not self.is_authenticated():
                 return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(30)
             return self.reply_json(200, awg_state())
 
         # 默认带 charset（2026-11-04 修）：网页表单的错误回复是中文 UTF-8，旧默认值没写
@@ -19223,12 +19329,13 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         def reply(self, code, body, mime='text/plain; charset=utf-8', www_auth=False, extra_headers=()):
             self.send_response(code)
             self._responded = True
-            self.send_header('Content-Type', mime)
+            safe_mime = ''.join(ch for ch in str(mime) if ord(ch) >= 32 and ord(ch) != 127) or 'text/plain; charset=utf-8'
+            self.send_header('Content-Type', safe_mime)
             self.send_header('Content-Length', str(len(body)))
             for _name, _value in extra_headers:
-                if not isinstance(_name, str) or not _name or any(ch in _name for ch in ('\r', '\n', '\x00', ':')):
+                if not isinstance(_name, str) or not _name or any(ord(ch) <= 32 or ord(ch) == 127 or ch == ':' for ch in _name):
                     continue
-                _safe_val = str(_value).replace('\r', '').replace('\n', '').replace('\x00', '')
+                _safe_val = ''.join(ch for ch in str(_value) if ord(ch) >= 32 and ord(ch) != 127)
                 self.send_header(_name, _safe_val)
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')

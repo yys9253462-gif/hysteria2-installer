@@ -627,15 +627,23 @@ async function submitUserForm(form) {
 // 必须在这里用 addEventListener 绑定。
 function bindUserForms() {
   document.querySelectorAll('form.js-confirm-delete').forEach(form => {
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      showConfirm({
-        title: '注销用户',
-        text: form.dataset.confirm || '确定注销此用户？此操作不可撤销。',
-        icon: '⚠️',
-        isDanger: true,
-        confirmText: '确定注销'
-      }).then(ok => { if (ok) submitUserForm(form); });
+      if (form._submitting || form._confirming) return;
+      form._confirming = true;
+      let ok = false;
+      try {
+        ok = await showConfirm({
+          title: '注销用户',
+          text: form.dataset.confirm || '确定注销此用户？此操作不可撤销。',
+          icon: '⚠️',
+          isDanger: true,
+          confirmText: '确定注销'
+        });
+      } finally {
+        form._confirming = false;
+      }
+      if (ok && !form._submitting) submitUserForm(form);
     });
   });
   document.querySelectorAll('form.js-user-form').forEach(form => {
@@ -648,6 +656,8 @@ function bindUserForms() {
 bindUserForms();
 
 function switchSubtab(paneId, subId) {
+  if (typeof paneId !== 'string' || !/^[a-z0-9_-]+$/i.test(paneId)) return;
+  if (typeof subId !== 'string' || !/^[a-z0-9_-]+$/i.test(subId)) return;
   const pane = document.getElementById('pane-' + paneId);
   if (!pane) return;
   pane.querySelectorAll('.subtab-btn').forEach(b => b.classList.remove('active'));
@@ -3514,12 +3524,16 @@ let curProxyServerHost = location.hostname;
 let modalReturnFocus = null;
 function focusModal(closeBtn) {
   if (modalReturnFocus === null) modalReturnFocus = document.activeElement || null;
-  if (closeBtn && typeof closeBtn.focus === 'function') closeBtn.focus();
+  if (closeBtn && typeof closeBtn.focus === 'function') {
+    try { closeBtn.focus(); } catch (_) {}
+  }
 }
 function restoreModalFocus() {
   const target = modalReturnFocus;
   modalReturnFocus = null;
-  if (target && typeof target.focus === 'function') target.focus();
+  if (target && typeof target.focus === 'function') {
+    try { target.focus(); } catch (_) {}
+  }
 }
 
 function closeProxyModal() {
@@ -3735,10 +3749,11 @@ async function loadProxyServices() {
     const typeLabel = { socks5: 'SOCKS5', http: 'HTTP', https: 'HTTPS' };
     proxyTbody.innerHTML = services.map(s => {
       const safeTypeClass = Object.prototype.hasOwnProperty.call(typeLabel, s.type) ? s.type : '';
+      const safeScheme = safeTypeClass || 'socks5';
       const displayType = safeTypeClass ? typeLabel[safeTypeClass] : String(s.type || '');
       const safeUser = typeof s.username === 'string' ? s.username : '';
       const safePass = typeof s.password === 'string' ? s.password : '';
-      const fullUrl = `${s.type || ''}://${encodeURIComponent(safeUser)}:${encodeURIComponent(safePass)}@${proxyHostPart}:${s.port}`;
+      const fullUrl = `${safeScheme}://${encodeURIComponent(safeUser)}:${encodeURIComponent(safePass)}@${proxyHostPart}:${s.port}`;
       return `
       <tr>
         <td><span class="proxy-type ${safeTypeClass}">${obEsc(displayType)}</span></td>
@@ -3747,7 +3762,7 @@ async function loadProxyServices() {
         <td><code style="font-size:12px">${obEsc(safePass)}</code></td>
         <td>
           <div style="display:flex;align-items:center;gap:6px">
-            <code style="font-size:11px;background:#f5f8f7;padding:2px 6px;border-radius:4px;word-break:break-all">${obEsc(s.type)}://${obEsc(safeUser)}:****@${obEsc(proxyHostPart)}:${obEsc(s.port)}</code>
+            <code style="font-size:11px;background:#f5f8f7;padding:2px 6px;border-radius:4px;word-break:break-all">${obEsc(safeScheme)}://${obEsc(safeUser)}:****@${obEsc(proxyHostPart)}:${obEsc(s.port)}</code>
             <button class="button" style="padding:2px 8px;font-size:11px;white-space:nowrap" type="button" data-copy-link="${obEsc(fullUrl)}">复制链接</button>
           </div>
         </td>
@@ -4108,6 +4123,7 @@ function renderAwgPeers(peers) {
   }
   awgPeerTbody.innerHTML = safePeers.map(p => {
     const enc = encodeURIComponent(p.name);
+    const safeEnc = obEsc(enc);
     const bs = 'padding:3px 10px;font-size:11px';
     return '<tr data-awg-endpoint="' + obEsc(p.endpoint || '') + '">'
       // 名称/地址虽受后端正则限制，仍统一走 obEsc —— 与其他表格保持同一套转义习惯。
@@ -4116,9 +4132,9 @@ function renderAwgPeers(peers) {
       + '<td style="color:var(--muted);font-size:11.5px" title="' + obEsc(p.created_at || '') + '">'
       + obEsc(fmtAwgCreated(p.created_at)) + '</td>'
       + '<td style="white-space:nowrap">'
-      + '<button class="button" type="button" data-awg-conf="' + enc + '" style="' + bs + '">下载配置</button> '
-      + '<button class="button" type="button" data-awg-qr="' + enc + '" style="' + bs + '">二维码</button> '
-      + '<button class="button" type="button" data-awg-del="' + enc + '" style="' + bs + ';color:#cf3c3c">删除</button>'
+      + '<button class="button" type="button" data-awg-conf="' + safeEnc + '" style="' + bs + '">下载配置</button> '
+      + '<button class="button" type="button" data-awg-qr="' + safeEnc + '" style="' + bs + '">二维码</button> '
+      + '<button class="button" type="button" data-awg-del="' + safeEnc + '" style="' + bs + ';color:#cf3c3c">删除</button>'
       + '</td></tr>';
   }).join('');
 
@@ -4139,17 +4155,24 @@ function renderAwgPeers(peers) {
   awgPeerTbody.querySelectorAll('[data-awg-del]').forEach(b => {
     b.addEventListener('click', async () => {
       if (b.disabled) return;
+      if (b.dataset.confirming === '1') return;
       const rawName = b.getAttribute('data-awg-del') || '';
       let n = rawName;
       try { n = decodeURIComponent(rawName); } catch (_) { n = rawName; }
       if (!n) return;
-      const confirmed = await showConfirm({
-        title: '删除 AWG 客户端',
-        text: '确认删除客户端「' + n + '」？该客户端会立即断开连接。',
-        icon: '🗑️',
-        confirmText: '删除',
-        isDanger: true
-      });
+      b.dataset.confirming = '1';
+      let confirmed = false;
+      try {
+        confirmed = await showConfirm({
+          title: '删除 AWG 客户端',
+          text: '确认删除客户端「' + n + '」？该客户端会立即断开连接。',
+          icon: '🗑️',
+          confirmText: '删除',
+          isDanger: true
+        });
+      } finally {
+        delete b.dataset.confirming;
+      }
       if (!confirmed || b.disabled) return;
       // 请求期间禁用按钮（2026-11-04 修）：连点两次第二次必然报「不存在」。
       b.disabled = true;

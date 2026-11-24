@@ -1699,12 +1699,15 @@ CEOF
         sleep 5
     done
     if [[ "$appended" == 1 ]]; then
-        rb_tmp="$(umask 077 && mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
-        if [[ -n "$rb_tmp" ]] && cp -p "$bak" "$rb_tmp" 2>/dev/null && mv -f "$rb_tmp" "$cf" 2>/dev/null; then
-            :
-        else
-            rm -f "$rb_tmp" 2>/dev/null || true
-            cp -a "$bak" "$cf" 2>/dev/null || true
+        if [[ ! -L "$cf" && ! -L "$bak" ]]; then
+            rb_tmp="$(umask 077 && mktemp "${cf}.hy2-rb.XXXXXX")" 2>/dev/null || rb_tmp=""
+            if [[ -n "$rb_tmp" ]] && cp -p -- "$bak" "$rb_tmp" 2>/dev/null && mv -f -- "$rb_tmp" "$cf" 2>/dev/null; then
+                rb_tmp=""
+            else
+                rm -f -- "${rb_tmp:-}" 2>/dev/null || true
+                rb_tmp=""
+                cp -a -- "$bak" "$cf" 2>/dev/null || true
+            fi
         fi
         systemctl reload caddy 2>/dev/null || true
         log_warn "签发超时，已从备份回滚本次自动追加到 Caddyfile 的占位站点块。"
@@ -1843,8 +1846,12 @@ setup_cert_via_nginx() {
             --accountemail "$email" --keylength ec-256 || rc=$?
     else
         conf="/etc/nginx/conf.d/hy2-acme-${domain}.conf"
-        if [[ -e "$conf" ]]; then
-            log_warn "目标 Nginx 配置文件已存在，无法确认归属；保留原文件并跳过自动建站。"
+        if [[ -e "$conf" || -L "$conf" ]]; then
+            log_warn "目标 Nginx 配置文件已存在或为符号链接，无法确认归属；保留原文件并跳过自动建站。"
+            return 1
+        fi
+        if [[ -L "$HY2_ACME_WEBROOT" ]]; then
+            log_warn "HY2_ACME_WEBROOT 不允许为符号链接，跳过自动建站。"
             return 1
         fi
         if [[ ! -d /etc/nginx/conf.d ]]; then
@@ -1933,6 +1940,14 @@ EOF
     # 复制到 /etc/hysteria/cert 并登记续期后的重启命令：Hysteria / Xray / sing-box
     # 都只在启动时读证书，续期后不重启就一直用旧证书，到期即全部握手失败。
     local out_cert="${HY2_CERT_DIR}/acme-${domain}.crt" out_key="${HY2_CERT_DIR}/acme-${domain}.key"
+    if [[ -L "$HY2_CERT_DIR" || -L "$out_cert" || -L "$out_key" ]]; then
+        if [[ "$created_owned_conf" == 1 && -n "$conf" ]]; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+        fi
+        log_err "证书目标目录或文件不允许为符号链接，拒绝写入。"
+        return 1
+    fi
     mkdir -p "$HY2_CERT_DIR"
     if ! (umask 077; "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
@@ -1948,7 +1963,14 @@ EOF
         log_err "证书已签发，但复制到 ${HY2_CERT_DIR} 失败或目标文件为空。"
         return 1
     fi
-    chmod 600 "$out_key"
+    chmod 600 "$out_key" || {
+        if [[ "$created_owned_conf" == 1 && -n "$conf" ]]; then
+            rm -f "$conf"
+            nginx_reload_checked || true
+        fi
+        log_err "无法收紧私钥权限: ${out_key}"
+        return 1
+    }
     if [[ "$created_owned_conf" == 1 ]]; then
         mkdir -p "$HY2_DIR"
         (umask 077; : > "$HY2_DIR/.hy2-nginx-acme-${domain}.owned" && chmod 600 "$HY2_DIR/.hy2-nginx-acme-${domain}.owned")
@@ -2081,6 +2103,10 @@ setup_cert_via_dns_api() {
     # 并给 acme.sh 注册 deploy/reload hook；否则 --cron 只换磁盘文件，
     # Hysteria 仍会在内存里继续提供旧证书直到重启。
     local out_cert="${HY2_CERT_DIR}/acme-${domain}.crt" out_key="${HY2_CERT_DIR}/acme-${domain}.key"
+    if [[ -L "$HY2_CERT_DIR" || -L "$out_cert" || -L "$out_key" ]]; then
+        log_err "证书目标目录或文件不允许为符号链接，拒绝写入。"
+        return 1
+    fi
     mkdir -p "$HY2_CERT_DIR"
     if ! (umask 077; "$acct" --install-cert -d "$domain" --ecc \
             --fullchain-file "$out_cert" --key-file "$out_key" \
@@ -2345,8 +2371,8 @@ generate_self_signed_cert() {
         log_err "自签名证书生成失败，未改动现有证书。"
         return 1
     fi
-    chmod 600 "$tmp_key" && chmod 644 "$tmp_cert" \
-        && mv -f "$tmp_key" "$KEY_FILE" && { tmp_key=""; mv -f "$tmp_cert" "$CERT_FILE"; } || {
+    chmod 600 -- "$tmp_key" && chmod 644 -- "$tmp_cert" \
+        && mv -f -- "$tmp_key" "$KEY_FILE" && { tmp_key=""; mv -f -- "$tmp_cert" "$CERT_FILE"; } || {
         rm -f -- "${tmp_key:-}" "${tmp_cert:-}"
         tmp_key=""; tmp_cert=""
         log_err "落盘自签名证书失败。"
@@ -2371,7 +2397,7 @@ setup_ports_and_obfs() {
     # 已装机的节点沿用现有端口作为默认值（2026-10-29 修）：
     # 旧实现给的是随机新端口，用户只想改证书、在端口提示处直接回车，
     # 端口就被换掉，所有已发放的客户端配置当场失效。
-    if [[ -z "${HY2_PORT:-}" && -f "$HY2_META_FILE" ]]; then
+    if [[ -z "${HY2_PORT:-}" && ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]; then
         local _cur_port
         _cur_port="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
         if is_valid_port "${_cur_port:-}"; then
@@ -2408,7 +2434,7 @@ setup_ports_and_obfs() {
     # 改个端口、结果 auth 密码和 obfs 密码一起被换掉 —— 所有已发放的客户端配置
     # 立刻失效，且 portal.json 里的机主/子账号也被 prepare() 重建（见菜单 4 的告警）。
     # 正确做法：**已装机时沿用旧密码**，只有「明确要换」时才生成新的。
-    if [[ -f "$HY2_META_FILE" ]] && [[ -z "${HY2_PASSWORD:-}" ]]; then
+    if [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]] && [[ -z "${HY2_PASSWORD:-}" ]]; then
         _old_pass="$(jq -r '.auth_password // empty' "$HY2_META_FILE" 2>/dev/null || true)"
         if [[ -n "$_old_pass" ]]; then
             RANDOM_PASS="$_old_pass"
@@ -2432,12 +2458,23 @@ setup_ports_and_obfs() {
         log_err "认证密码不能包含换行或控制字符，已中止安装。"
         return 1
     fi
+    if [[ "$AUTH_PASSWORD" =~ ^[[:space:]] || "$AUTH_PASSWORD" =~ [[:space:]]$ ]]; then
+        log_err "认证密码首尾不能包含空白字符，已中止安装。"
+        return 1
+    fi
+    if (( ${#AUTH_PASSWORD} > 256 )); then
+        log_err "认证密码长度不能超过 256 个字符，已中止安装。"
+        return 1
+    fi
 
     # 运行模式：本项目只提供商城版（Agent）节点。
     # 这里不再询问模式，只沿用/生成节点通信 API Key。已装机时**必须**沿用旧 Key，
     # 否则 Teyir 控制台保存的凭据立刻失效，控制台开的用户全部连不上。
     NODE_MODE="agent"
-    _cur_api_key="$(jq -r '.api_key // empty' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    _cur_api_key=""
+    if [[ ! -L "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal.json" ]]; then
+        _cur_api_key="$(jq -r '.api_key // empty' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    fi
     echo -e "\n${CYAN}商城版节点（Agent 模式）${PLAIN}：开启 REST API，支持动态开户 / 续费 / 对接商城。"
     if [[ -n "${HY2_NODE_MODE:-}" ]]; then
         log_info "已确认商城版节点（HY2_NODE_MODE=2）。"
@@ -2456,6 +2493,10 @@ setup_ports_and_obfs() {
         log_err "NODE_API_KEY 必须是不含空白和控制字符的纯 ASCII 字符串，已中止安装。"
         return 1
     fi
+    if (( ${#NODE_API_KEY} > 256 )); then
+        log_err "NODE_API_KEY 长度不能超过 256 个字符，已中止安装。"
+        return 1
+    fi
 
     # ⚠️ 主监听端口占用检测（2026-10-09 修）：
     # 脚本本来就有现成的 port_owner()（80/443 检测在用），但主监听端口从没查过。
@@ -2466,7 +2507,7 @@ setup_ports_and_obfs() {
     # 「服务没在跑」，重新配置 / 重装时服务总在跑，换成被 TUIC / AWG 占着的新端口
     # 也不提示，Hysteria 绑不上、节点直接掉线。
     _running_port=""
-    if systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f "$HY2_META_FILE" ]]; then
+    if systemctl is-active --quiet hysteria-server 2>/dev/null && [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]; then
         _running_port="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
     fi
     # 答 y 就地重选（2026-11-04 修）：旧实现问「换一个端口？」，答 y 也照样中止安装。
@@ -2503,15 +2544,18 @@ setup_ports_and_obfs() {
     # Salamander 混淆 (默认全自动开启并生成高熵密钥，免询问)
     # 与 auth 密码同理：菜单 4 保留旧 obfs 密钥，否则所有客户端的 obfs-password
     # 一起变错、握手直接失败（同一个混淆密码必须与服务端一致）。
-    if [[ -f "$HY2_META_FILE" ]]; then
+    if [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]; then
         _old_obfs="$(jq -r '.obfs_password // empty' "$HY2_META_FILE" 2>/dev/null || true)"
     else
         _old_obfs=""
     fi
-    if [[ -n "$_old_obfs" ]]; then
+    if [[ -n "$_old_obfs" && ! "$_old_obfs" =~ [[:cntrl:]] ]]; then
         OBFS_PASSWORD="$_old_obfs"
         log_info "已保留现有 Salamander 混淆密钥（菜单 4 默认不换，避免客户端失效）。"
     else
+        if [[ -n "$_old_obfs" ]] && [[ "$_old_obfs" =~ [[:cntrl:]] ]]; then
+            log_warn "旧 Salamander 混淆密钥含控制字符，已重新生成安全密钥。"
+        fi
         OBFS_PASSWORD=$(openssl rand -hex 16)
     fi
     unset _old_obfs
@@ -2739,9 +2783,13 @@ select_subscription_port() {
     # 每个客户订阅链接的一部分；门户本地端口写在 config.yaml 的 auth.url 里。
     # （旧端口此刻正被运行中的服务占着，bind 检测必然失败，所以直接沿用。）
     if [[ "${PRESERVE_PORTAL:-0}" == "1" ]]; then
-        local _old_sub _old_local
-        _old_sub="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
-        _old_local="$(jq -r '.port // empty' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+        local _old_sub="" _old_local=""
+        if [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]; then
+            _old_sub="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+        fi
+        if [[ ! -L "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal.json" ]]; then
+            _old_local="$(jq -r '.port // empty' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+        fi
         if is_valid_port "$_old_sub" && is_valid_port "$_old_local"; then
             HY2_SUB_PORT="$_old_sub"
             PORTAL_LOCAL_PORT="$_old_local"
@@ -2750,13 +2798,16 @@ select_subscription_port() {
         fi
     fi
     HY2_SUB_PORT=$(python3 - "$HY2_DIR/portal.json" <<'PYPORT'
-import json, socket, secrets, sys
+import json, os, socket, secrets, stat, sys
 RESERVED = {8443, 19898, 19996, 19997, 22, 80, 443, 40000, 56195}
 # 门户托管协议记下的端口也要避开（2026-11-04 修）：协议此刻停着时 bind 能成功，
 # 订阅端口占了它的位置，之后再启用该协议就撞车。
+_data = {}
 try:
-    with open(sys.argv[1], encoding='utf-8') as _fh:
-        _data = json.load(_fh)
+    _st = os.lstat(sys.argv[1])
+    if stat.S_ISREG(_st.st_mode) and _st.st_size <= 16 * 1024 * 1024:
+        with open(sys.argv[1], encoding='utf-8', errors='replace') as _fh:
+            _data = json.load(_fh)
 except (OSError, ValueError):
     _data = {}
 if isinstance(_data, dict):
@@ -2812,14 +2863,17 @@ PYPORT
     # 本地端口必须避开刚选中的订阅端口、计量/WARP 回环端口、跳跃区间与已登记托管协议端口：
     # 内核 bind(0) 可能分到这些端口，导致门户与 masquerade/计量/托管协议互抢端口起不来。
     PORTAL_LOCAL_PORT=$(python3 -I - "${HY2_SUB_PORT}" "$HY2_DIR/portal.json" <<'PYPORT'
-import json, socket, sys
+import json, os, socket, stat, sys
 avoid = {8443, 19898, 19996, 19997, 22, 80, 443, 40000, 56195}
 if len(sys.argv) > 1 and sys.argv[1].isascii() and sys.argv[1].isdigit():
     avoid.add(int(sys.argv[1]))
 if len(sys.argv) > 2:
+    _data = {}
     try:
-        with open(sys.argv[2], encoding='utf-8') as _fh:
-            _data = json.load(_fh)
+        _st = os.lstat(sys.argv[2])
+        if stat.S_ISREG(_st.st_mode) and _st.st_size <= 16 * 1024 * 1024:
+            with open(sys.argv[2], encoding='utf-8', errors='replace') as _fh:
+                _data = json.load(_fh)
     except (OSError, ValueError):
         _data = {}
     if isinstance(_data, dict):
@@ -5187,6 +5241,13 @@ install_warp_local_proxy() {
     WGCF_ACCT="${WGCF_DIR}/wgcf-account.toml"
     WP_BIN="/usr/local/bin/wireproxy"
     HY2_WARP_OWNED_MARKER="${HY2_DIR}/.hy2-warp-owned"
+    local _wpath
+    for _wpath in "$WGCF_BIN" "$WP_BIN" "$HY2_WARP_OWNED_MARKER" "$WGCF_DIR" "$WGCF_ACCT" "$WGCF_CONF" /etc/wireguard/wp.conf /etc/systemd/system/wireproxy.service /usr/local/bin/hy2-warp-watchdog.sh /etc/systemd/system/hy2-warp-watchdog.service /etc/systemd/system/hy2-warp-watchdog.timer; do
+        if [[ -L "$_wpath" ]]; then
+            log_err "检测到 WARP 相关路径为符号链接，已拒绝安装以防覆写宿主文件: ${_wpath}"
+            return 1
+        fi
+    done
     if [[ ! -f "$HY2_WARP_OWNED_MARKER" ]]; then
         if [[ -f /etc/systemd/system/wireproxy.service && -f /etc/wireguard/wp.conf ]] \
                 && grep -qF '# wireproxy config (managed by hysteria2-installer, do not edit)' \
@@ -5319,8 +5380,13 @@ install_warp_local_proxy() {
             log_err "wireproxy 解压失败"
             return 1
         fi
+        if [[ ! -f "${TMP_EXTRACT}/${WP_MEMBER}" || -L "${TMP_EXTRACT}/${WP_MEMBER}" ]]; then
+            rm -rf "$TMP_DIR" "$TMP_EXTRACT"
+            log_err "wireproxy 解压成员不是常规文件或为符号链接，已放弃安装。"
+            return 1
+        fi
         local _wp_stage=""
-        _wp_stage="$(umask 022; mktemp "${WP_BIN}.new.XXXXXX")" || {
+        _wp_stage="$(umask 077; mktemp "${WP_BIN}.new.XXXXXX")" || {
             rm -rf "$TMP_DIR" "$TMP_EXTRACT"
             log_err "创建 wireproxy 暂存文件失败，现有文件未改动。"
             return 1
@@ -5427,7 +5493,7 @@ EOF
 
     # 5. wireproxy systemd 守护（同目录临时文件原子替换）
     local _wp_unit_tmp=""
-    _wp_unit_tmp="$(mktemp "/etc/systemd/system/wireproxy.service.XXXXXX")" || {
+    _wp_unit_tmp="$(umask 077; mktemp "/etc/systemd/system/wireproxy.service.XXXXXX")" || {
         log_err "无法创建 wireproxy.service 临时文件。"
         return 1
     }
@@ -5463,7 +5529,7 @@ EOF
     sleep 3
 
     # 6. 探活 wireproxy socks5
-    if curl --proxy socks5h://"$WARP_SOCKS_ADDR" --silent --fail --max-time 8 https://api4.ipify.org >/dev/null 2>&1; then
+    if curl --proxy socks5h://"$WARP_SOCKS_ADDR" --silent --fail --max-time 8 --max-filesize 65536 https://api4.ipify.org >/dev/null 2>&1; then
         log_info "WARP socks5 探活成功 (上游出口 IP 已切换)"
     else
         log_warn "WARP socks5 探活失败 (可能上游封禁或 NAT 类型受限), 服务已启动但需手动验证"
@@ -5501,7 +5567,7 @@ EOWD
     fi
 
     local _wd_svc_tmp="" _wd_tmr_tmp=""
-    _wd_svc_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.service.XXXXXX")" || {
+    _wd_svc_tmp="$(umask 077; mktemp "/etc/systemd/system/hy2-warp-watchdog.service.XXXXXX")" || {
         log_err "无法创建 hy2-warp-watchdog.service 临时文件。"
         return 1
     }
@@ -5525,7 +5591,7 @@ EOF
         return 1
     fi
 
-    _wd_tmr_tmp="$(mktemp "/etc/systemd/system/hy2-warp-watchdog.timer.XXXXXX")" || {
+    _wd_tmr_tmp="$(umask 077; mktemp "/etc/systemd/system/hy2-warp-watchdog.timer.XXXXXX")" || {
         log_err "无法创建 hy2-warp-watchdog.timer 临时文件。"
         return 1
     }
@@ -6181,7 +6247,7 @@ awg_ensure_ctl() {
 # 绝不能拿来当连接地址，必须回退到公网 IP。
 awg_suggest_endpoint() {
     local sn="" ip="" insecure=""
-    if [[ -f "$HY2_META_FILE" ]]; then
+    if [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]; then
         sn="$(jq -r '.server_name // empty'  "$HY2_META_FILE" 2>/dev/null || true)"
         ip="$(jq -r '.public_ip // empty'    "$HY2_META_FILE" 2>/dev/null || true)"
         insecure="$(jq -r '.is_insecure // empty' "$HY2_META_FILE" 2>/dev/null || true)"
@@ -6203,7 +6269,7 @@ awg_suggest_endpoint() {
 # 读取当前已安装的协议线
 awg_current_line() {
     local v="3"
-    if [[ -f "$AWG_META_FILE" ]]; then
+    if [[ ! -L "$AWG_META_FILE" && -f "$AWG_META_FILE" ]]; then
         v="$(jq -r '.line // "3"' "$AWG_META_FILE" 2>/dev/null || echo 3)"
     fi
     if [[ "$v" != "2" && "$v" != "3" ]]; then
@@ -6309,22 +6375,25 @@ install_amneziawg() {
     fi
     if [[ -z "$endpoint" ]]; then
         log_warn "未提供连接地址，将跳过首个客户端创建，之后可手动补。"
+    elif [[ "$endpoint" == -* || "$endpoint" =~ [[:space:][:cntrl:]] ]]; then
+        log_err "连接地址不合法（不能以 - 开头或含空白/控制字符）。"
+        return 1
     fi
 
     # --- 首个客户端 ---
     local client="client1"
     if [[ -n "$endpoint" ]]; then
         local has_peers="0"
-        if [[ -f "$AWG_PEERS_FILE" ]]; then
-            has_peers="$(jq -r '[.peers[]?]|length' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
+        if [[ ! -L "$AWG_PEERS_FILE" && -f "$AWG_PEERS_FILE" ]]; then
+            has_peers="$(jq -r 'if (.peers | type) == "array" then (.peers | map(select(type=="object")) | length) else 0 end' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
         fi
         if [[ "$has_peers" == "0" ]]; then
             echo ""
             read -rp "请为首个客户端命名 [默认: client1]: " client || true
             client="${client// /}"
             client="${client:-client1}"
-            if [[ "$client" == "." || "$client" == ".." || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
-                log_err "客户端名称不合法（仅允许 1-32 位字母/数字/._-，且不能为 . 或 ..）。"
+            if [[ "$client" == "." || "$client" == ".." || "$client" == -* || "$client" == .* || "$client" == _* || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
+                log_err "客户端名称不合法（须以字母/数字开头，仅允许 1-32 位字母/数字/._-）。"
                 return 1
             fi
         fi
@@ -6342,8 +6411,8 @@ install_amneziawg() {
 
     # 已有客户端或未提供连接地址时不创建首个客户端，避免报"客户端已存在"或与上方提示矛盾
     local peer_count="0"
-    if [[ -f "$AWG_PEERS_FILE" ]]; then
-        peer_count="$(jq -r '[.peers[]?]|length' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
+    if [[ ! -L "$AWG_PEERS_FILE" && -f "$AWG_PEERS_FILE" ]]; then
+        peer_count="$(jq -r 'if (.peers | type) == "array" then (.peers | map(select(type=="object")) | length) else 0 end' "$AWG_PEERS_FILE" 2>/dev/null || echo 0)"
     fi
     if [[ -n "$endpoint" && "$peer_count" == "0" ]]; then
         args+=(--client "$client")
@@ -6371,8 +6440,12 @@ awg_menu_add_peer() {
         log_err "名称不能为空。"
         return 1
     fi
-    if ! [[ "$name" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
-        log_err "名称只允许字母、数字、点、下划线、连字符，且不超过 32 字符。"
+    if [[ "$name" == -* || "$name" =~ [[:cntrl:]] ]]; then
+        log_err "客户端名称不合法（不能以 - 开头或含控制字符）。"
+        return 1
+    fi
+    if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]; then
+        log_err "名称须以字母或数字开头，仅允许字母、数字、点、下划线、连字符，且不超过 32 字符。"
         return 1
     fi
 
@@ -6381,6 +6454,10 @@ awg_menu_add_peer() {
     endpoint="${endpoint:-$suggestion}"
     if [[ -z "$endpoint" ]]; then
         log_err "必须提供连接地址才能生成客户端配置。"
+        return 1
+    fi
+    if [[ "$endpoint" == -* || "$endpoint" =~ [[:space:][:cntrl:]] ]]; then
+        log_err "连接地址不合法（不能以 - 开头或含空白/控制字符）。"
         return 1
     fi
 
@@ -6411,6 +6488,10 @@ awg_menu_del_peer() {
     read -rp "请输入要删除的客户端名称: " name || true
     if [[ -z "$name" ]]; then
         log_err "名称不能为空。"
+        return 1
+    fi
+    if [[ "$name" == -* || "$name" =~ [[:cntrl:]] ]]; then
+        log_err "客户端名称不合法（不能以 - 开头或含控制字符）。"
         return 1
     fi
 
@@ -7148,7 +7229,7 @@ flow_update_core() {
     rollback_file="$(umask 077; mktemp "${HY2_BIN}.rollback.XXXXXX")" || {
         rollback_file=""
         log_err "创建核心备份失败，现有二进制未改动。"; return 1; }
-    if ! cp -p "$HY2_BIN" "$rollback_file"; then
+    if ! cp -p -- "$HY2_BIN" "$rollback_file"; then
         log_err "备份核心失败，已放弃更新，现有二进制未改动。"
         return 1
     fi
@@ -7164,7 +7245,7 @@ flow_update_core() {
         return 0
     fi
     if ! restart_service; then
-        if ! mv -f "$rollback_file" "$HY2_BIN"; then
+        if [[ -L "$HY2_BIN" ]] || ! mv -f "$rollback_file" "$HY2_BIN"; then
             local keep_rollback="$rollback_file"
             rollback_file=""
             log_err "新版本启动失败，回滚失败；本次旧核心保留在 ${keep_rollback}。"
@@ -7181,7 +7262,7 @@ flow_update_core() {
         fi
         return 1
     fi
-    rm -f "$rollback_file"
+    rm -f -- "$rollback_file"
     rollback_file=""
 }
 
@@ -7208,9 +7289,11 @@ flow_reconfigure() {
     trap "$_lock_trap" RETURN
     backup_state_before_reconfigure || return 1
     # 先记下旧端口：setup_ports_and_obfs 会重写 meta，之后就拿不到了。
-    local _old_listen _old_sub
-    _old_listen="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
-    _old_sub="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    local _old_listen="" _old_sub=""
+    if [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]; then
+        _old_listen="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+        _old_sub="$(jq -r '.subscription_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
     require_systemd_247 || return 1
     install_dependencies
     get_public_ip
@@ -7243,11 +7326,14 @@ close_replaced_ports() {
     local old_udp="$1" old_tcp="$2" in_use
     # gost 代理服务的端口也算在用（2026-11-06 补）：它们同样由门户放行，被换掉的订阅端口
     # 恰好与某条代理同号时不能把那条代理的放行一起收回。
-    in_use="$(jq -r 'def pnum: if type=="number" and floor == . and . >= 1 and . <= 65535 then . elif type=="string" and test("^[1-9][0-9]{0,4}$") then (tonumber | select(. >= 1 and . <= 65535)) else empty end;
-        ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
-        | map(select(type == "object") | .port | pnum))
-        + ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | pnum) else [] end)
-        | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    in_use=""
+    if [[ ! -L "$HY2_DIR/portal.json" && -f "$HY2_DIR/portal.json" ]]; then
+        in_use="$(jq -r 'def pnum: if type=="number" and floor == . and . >= 1 and . <= 65535 then . elif type=="string" and test("^[1-9][0-9]{0,4}$") then (tonumber | select(. >= 1 and . <= 65535)) else empty end;
+            ([.reality_config, .vmess_config, .vlessenc_config, .anytls_config, .tuic_config]
+            | map(select(type == "object") | .port | pnum))
+            + ((.proxy_services // []) | if type == "array" then map(select(type == "object") | .port | pnum) else [] end)
+            | .[]' "$HY2_DIR/portal.json" 2>/dev/null || true)"
+    fi
     _close_one() {   # $1=port $2=proto
         is_valid_port "$1" || return 0
         grep -qxF "$1" <<<"$in_use" && return 0
@@ -7296,8 +7382,12 @@ close_installer_ports() {
         if [[ "$ufw_on" == 1 ]]; then ufw delete allow "${1/-/:}/$2" >/dev/null 2>&1 || true; fi
         if [[ "$fwd_on" == 1 ]]; then firewall-cmd --remove-port="$1/$2" --permanent >/dev/null 2>&1 || true; fi
     }
-    listen="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
-    range="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    listen=""
+    range=""
+    if [[ ! -L "$HY2_META_FILE" && -f "$HY2_META_FILE" ]]; then
+        listen="$(jq -r '.listen_port // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+        range="$(jq -r '.hop_port_range // empty' "$HY2_META_FILE" 2>/dev/null || true)"
+    fi
     if is_valid_port "$listen"; then _fw_close "$listen" udp; fi
     # 先存下捕获组：is_valid_port 自己也用 =~，会覆盖 BASH_REMATCH。
     if [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then

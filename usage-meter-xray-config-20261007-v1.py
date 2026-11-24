@@ -1,5 +1,6 @@
 """幂等添加仅回环 StatsService；不修改任何 clients 或 Reality 参数。"""
 import copy
+import errno
 import pathlib
 import json
 import os
@@ -13,13 +14,44 @@ _MAX_XRAY_CONFIG_BYTES = 4 * 1024 * 1024
 
 
 def _read_regular_config_bytes(path):
-    """安全读取常规 Xray 配置文件：拒绝符号链接、非常规文件与超过 4 MiB 的大文件。"""
-    st = path.lstat()
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    """安全读取常规 Xray 配置文件：先 lstat 校验再 POSIX 下 O_NOFOLLOW+fstat 有界读盘，拒绝符号链接与超 4 MiB 文件。"""
+    st0 = path.lstat()
+    if stat.S_ISLNK(st0.st_mode) or not stat.S_ISREG(st0.st_mode):
         raise ValueError('xray config must be a regular file')
-    if st.st_size > _MAX_XRAY_CONFIG_BYTES:
+    if st0.st_size > _MAX_XRAY_CONFIG_BYTES:
         raise ValueError('xray config too large')
-    return path.read_bytes(), (st.st_mode & 0o777) or 0o600
+    nofollow = getattr(os, 'O_NOFOLLOW', 0)
+    if nofollow:
+        fd = None
+        try:
+            try:
+                fd = os.open(str(path), os.O_RDONLY | nofollow)
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise ValueError('xray config must be a regular file') from None
+                raise
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError('xray config must be a regular file')
+            if st.st_size > _MAX_XRAY_CONFIG_BYTES:
+                raise ValueError('xray config too large')
+            with os.fdopen(fd, 'rb') as fh:
+                fd = None
+                raw = fh.read(_MAX_XRAY_CONFIG_BYTES + 1)
+            if len(raw) > _MAX_XRAY_CONFIG_BYTES:
+                raise ValueError('xray config too large')
+            return raw, (st.st_mode & 0o777) or 0o600
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+    with open(path, 'rb') as fh:
+        raw = fh.read(_MAX_XRAY_CONFIG_BYTES + 1)
+    if len(raw) > _MAX_XRAY_CONFIG_BYTES:
+        raise ValueError('xray config too large')
+    return raw, (st0.st_mode & 0o777) or 0o600
 
 
 def _validate_loopback_address(address):
@@ -79,7 +111,7 @@ def _fsync_parent_dir(target):
     """在支持目录 fsync 的系统上刷盘父目录项，确保 os.replace 落盘持久。"""
     parent = pathlib.Path(target).parent
     try:
-        dir_fd = os.open(str(parent), os.O_RDONLY)
+        dir_fd = os.open(str(parent), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
     except OSError:
         return
     try:
@@ -346,6 +378,7 @@ def enable_iplimit_routing(config_path, binary, address):
         _write_private_bytes(candidate, json.dumps(config,indent=2,allow_nan=False).encode('utf-8'), orig_mode)
         subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
         if _read_regular_config_bytes(path)[0] != original:raise RuntimeError('xray config changed concurrently')
+        if backup.is_symlink():raise ValueError('xray backup path must not be symlink')
         _write_private_bytes(backup_tmp, original, orig_mode)
         os.replace(backup_tmp, backup)
         os.replace(candidate,path);replaced=True
@@ -423,6 +456,7 @@ def enable_reality_online(config_path, binary, address):
             _write_private_bytes(candidate, json.dumps(config,indent=2,allow_nan=False).encode('utf-8'), orig_mode)
             subprocess.run([binary,'run','-test','-c',str(candidate)],capture_output=True,timeout=10,check=True)
             if _read_regular_config_bytes(path)[0] != original:raise RuntimeError('xray config changed concurrently')
+            if backup.is_symlink():raise ValueError('xray backup path must not be symlink')
             _write_private_bytes(backup_tmp, original, orig_mode)
             os.replace(backup_tmp, backup)
             os.replace(candidate,path);replaced=True
