@@ -13471,9 +13471,10 @@ if __name__ == '__main__':
                                 #   「回滚成功」却仍然打不开。
                                 # 回滚脚本 portal_update_restart_script 拿的是
                                 # backups 列表里的具体路径，改名字不影响它。
-                                import stat as _stat
+                                _stat = globals().get('stat')
                                 _dst_st = dest.lstat()
-                                if not _stat.S_ISREG(_dst_st.st_mode) or _dst_st.st_size > 16 * 1024 * 1024:
+                                _dst_is_reg = _stat.S_ISREG(_dst_st.st_mode) if _stat is not None else ((_dst_st.st_mode & 0o170000) == 0o100000)
+                                if not _dst_is_reg or _dst_st.st_size > 16 * 1024 * 1024:
                                     raise OSError('目标门户文件非常规文件或体积异常: %s' % fname)
                                 bak = dest.with_name('%s.bak-%s' % (dest.name, stamp))
                                 old_bytes = dest.read_bytes()
@@ -13559,12 +13560,13 @@ if __name__ == '__main__':
                             rb_tmp = None
                             _rfd = None
                             try:
-                                import stat as _stat
+                                _stat = globals().get('stat')
                                 bak_path = Path(bak)
                                 if bak_path.is_symlink():
                                     raise OSError('回滚备份不允许为符号链接: %s' % bak_path.name)
                                 _bak_st = bak_path.lstat()
-                                if not _stat.S_ISREG(_bak_st.st_mode) or _bak_st.st_size > 16 * 1024 * 1024:
+                                _bak_is_reg = _stat.S_ISREG(_bak_st.st_mode) if _stat is not None else ((_bak_st.st_mode & 0o170000) == 0o100000)
+                                if not _bak_is_reg or _bak_st.st_size > 16 * 1024 * 1024:
                                     raise OSError('回滚备份非常规文件或体积异常: %s' % bak_path.name)
                                 bak_bytes = bak_path.read_bytes()
                                 bak_mode = _bak_st.st_mode & 0o777
@@ -14059,7 +14061,7 @@ if __name__ == '__main__':
                 with data_lock:
                     had_proxy_services = 'proxy_services' in data
                     previous_proxy_services = copy.deepcopy(data.get('proxy_services'))
-                import stat as _stat
+                _stat = globals().get('stat')
                 old_assets = {}
                 for asset_path in (gost_binary, gost_unit_path, gost_check_path,
                                    owner_marker_path, gost_config_path, *cert_files):
@@ -14072,7 +14074,8 @@ if __name__ == '__main__':
                         old_assets[asset_path] = None
                         continue
                     _max_asset_bytes = 128 * 1024 * 1024 if asset_path == gost_binary else 4 * 1024 * 1024
-                    if not _stat.S_ISREG(_ast.st_mode) or _ast.st_size > _max_asset_bytes:
+                    _ast_is_reg = _stat.S_ISREG(_ast.st_mode) if _stat is not None else ((_ast.st_mode & 0o170000) == 0o100000)
+                    if not _ast_is_reg or _ast.st_size > _max_asset_bytes:
                         return self.reply_json(409, {'ok': False, 'error':
                             '检测到 GOST 资产路径不是常规文件或体积异常，已拒绝安装：%s' % asset_path})
                     old_assets[asset_path] = (asset_path.read_bytes(), _ast.st_mode & 0o777)
@@ -15762,14 +15765,15 @@ if __name__ == '__main__':
                     preview = dict(data)
                     preview['anytls_config'] = new_cfg
                     users = anytls_users(preview)
-                import stat as _stat
+                _stat = globals().get('stat')
                 if unit_path.is_symlink():
                     raise RuntimeError('AnyTLS 服务单元不允许为符号链接')
                 previous_unit = None
                 unit_mode = 0o644
                 if unit_path.exists():
                     _au_st = unit_path.lstat()
-                    if not _stat.S_ISREG(_au_st.st_mode) or _au_st.st_size > 1024 * 1024:
+                    _au_is_reg = _stat.S_ISREG(_au_st.st_mode) if _stat is not None else ((_au_st.st_mode & 0o170000) == 0o100000)
+                    if not _au_is_reg or _au_st.st_size > 1024 * 1024:
                         raise RuntimeError('AnyTLS 服务单元不是常规文件或超过 1 MiB 上限')
                     previous_unit = unit_path.read_bytes()
                     unit_mode = _au_st.st_mode & 0o777
@@ -15780,7 +15784,8 @@ if __name__ == '__main__':
                 previous_file = None
                 if cfg_path.exists():
                     _ac_st = cfg_path.lstat()
-                    if not _stat.S_ISREG(_ac_st.st_mode) or _ac_st.st_size > 4 * 1024 * 1024:
+                    _ac_is_reg = _stat.S_ISREG(_ac_st.st_mode) if _stat is not None else ((_ac_st.st_mode & 0o170000) == 0o100000)
+                    if not _ac_is_reg or _ac_st.st_size > 4 * 1024 * 1024:
                         raise RuntimeError('anytls.json 不是常规文件或超过 4 MiB 上限')
                     previous_file = cfg_path.read_bytes()
                 service_state = _systemd_service_snapshot(ANYTLS_SERVICE)
@@ -16062,7 +16067,7 @@ if __name__ == '__main__':
                     data['tuic_config'] = new_cfg
                     users = tuic_users(data)
                 try:
-                    import stat as _stat
+                    _stat = globals().get('stat')
                     unit_path = Path('/etc/systemd/system/%s.service' % TUIC_SERVICE)
                     _u_sym = getattr(unit_path, 'is_symlink', None)
                     if callable(_u_sym) and _u_sym():
@@ -16070,7 +16075,11 @@ if __name__ == '__main__':
                     _u_lstat = getattr(unit_path, 'lstat', None)
                     if unit_path.exists() and callable(_u_lstat):
                         _tu_st = _u_lstat()
-                        if (hasattr(_tu_st, 'st_mode') and not _stat.S_ISREG(_tu_st.st_mode)) or _tu_st.st_size > 1024 * 1024:
+                        _tu_is_reg = (
+                            (_stat.S_ISREG(_tu_st.st_mode) if _stat is not None else ((_tu_st.st_mode & 0o170000) == 0o100000))
+                            if hasattr(_tu_st, 'st_mode') else True
+                        )
+                        if not _tu_is_reg or _tu_st.st_size > 1024 * 1024:
                             raise RuntimeError('TUIC 服务单元不是常规文件或超过 1 MiB 上限')
                     previous_unit = unit_path.read_bytes() if unit_path.exists() else None
                     unit_mode = unit_path.stat().st_mode & 0o777 if previous_unit is not None else 0o644
@@ -16082,7 +16091,11 @@ if __name__ == '__main__':
                     _c_lstat = getattr(cfg_path, 'lstat', None)
                     if cfg_path.exists() and callable(_c_lstat):
                         _tc_st = _c_lstat()
-                        if (hasattr(_tc_st, 'st_mode') and not _stat.S_ISREG(_tc_st.st_mode)) or _tc_st.st_size > 4 * 1024 * 1024:
+                        _tc_is_reg = (
+                            (_stat.S_ISREG(_tc_st.st_mode) if _stat is not None else ((_tc_st.st_mode & 0o170000) == 0o100000))
+                            if hasattr(_tc_st, 'st_mode') else True
+                        )
+                        if not _tc_is_reg or _tc_st.st_size > 4 * 1024 * 1024:
                             raise RuntimeError('tuic.json 不是常规文件或超过 4 MiB 上限')
                     previous_file = cfg_path.read_bytes() if cfg_path.exists() else None
                     service_state = _systemd_service_snapshot(TUIC_SERVICE)
@@ -18842,9 +18855,10 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 configured_bbr = ''
                 if conf_path.exists():
                     try:
-                        import stat as _stat
+                        _stat = globals().get('stat')
                         c_st = conf_path.lstat()
-                        if _stat.S_ISREG(c_st.st_mode) and c_st.st_size <= 1024 * 1024:
+                        _c_is_reg = _stat.S_ISREG(c_st.st_mode) if _stat is not None else ((c_st.st_mode & 0o170000) == 0o100000)
+                        if _c_is_reg and c_st.st_size <= 1024 * 1024:
                             c_text = conf_path.read_bytes().decode('utf-8', errors='replace')
                         else:
                             c_text = ''
@@ -19222,10 +19236,11 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                         _warp_probe_cache['value'] = (outbound_ip, connected)
                         _warp_probe_cache['at'] = time.monotonic()
             try:
-                import stat as _stat
+                _stat = globals().get('stat')
                 _wcfg_p = Path('/etc/hysteria/config.yaml')
                 _wcfg_st = _wcfg_p.lstat()
-                if not _stat.S_ISREG(_wcfg_st.st_mode) or _wcfg_st.st_size > 4 * 1024 * 1024:
+                _wcfg_is_reg = _stat.S_ISREG(_wcfg_st.st_mode) if _stat is not None else ((_wcfg_st.st_mode & 0o170000) == 0o100000)
+                if not _wcfg_is_reg or _wcfg_st.st_size > 4 * 1024 * 1024:
                     raise ValueError('config.yaml 非法或过大')
                 cfg_text = _wcfg_p.read_bytes().decode('utf-8', errors='replace')
                 applied = cfg_text == render_egress_config(cfg_text, state)
