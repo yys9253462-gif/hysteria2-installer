@@ -997,8 +997,9 @@ install_binary() {
     # `set -eo pipefail` 让整个赋值语句失败退出，于是下面那个 fallback 分支
     # 永远执行不到 —— 实测 api.github.com 不可达时 exit=6 直接死掉。
     # 而「api.github.com 被墙/限流」恰恰是本工具用户最常见的处境，
-    # 为此专门写的 download.hysteria.network 直链回退形同虚设。
-    LATEST_TAG=$(curl -s --max-time 10 --max-filesize 2097152 https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || LATEST_TAG=""
+    # 为此专门写的官方下载站与发布页回退不能失效；同时必须带 `-fsSL --max-redirs 5`
+    # 跟随仓库迁移 301 重定向（上游已由 apernet/hysteria 迁至 HyNetworks/hysteria）。
+    LATEST_TAG=$(curl -fsSL --max-time 10 --max-redirs 5 --max-filesize 2097152 https://api.github.com/repos/HyNetworks/hysteria/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || LATEST_TAG=""
 
     local asset_arch asset tmpdir="" staged="" expected got
     trap 'trap - RETURN; rm -rf -- "${tmpdir:-}" "${staged:-}"' RETURN
@@ -1012,14 +1013,31 @@ install_binary() {
         log_warn "从 GitHub API 获取版本失败，尝试从官方下载站解析最新版本..."
         # 用固定版本目录而不是 `latest/`：`latest` 是浮动指针，下载与取摘要之间
         # 可能已经切换版本，导致摘要与资产对不上（或更糟：对上了另一个版本）。
+        # ⚠️ 必须仅做单跳 HEAD 探测（-fsSI，不带 -L）：若跟随重定向到 25 MB 最终
+        # 二进制文件，即使发 HEAD，curl 仍会拿响应头 Content-Length 与 --max-filesize
+        # 比对并触发退出码 63（第 76 号议题根因），导致回退恒失败。
         local resolved
-        resolved="$(curl -fsSIL --max-time 20 --max-redirs 5 --max-filesize 2097152 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
+        resolved="$(curl -fsSI --max-time 20 --max-filesize 2097152 "https://download.hysteria.network/app/latest/${asset}" 2>/dev/null |
             awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)" || resolved=""
         if [[ "$resolved" =~ /app/(v[0-9][^/]*)/${asset}$ ]]; then
             # 下载站只给出裸版本号（v2.13.0），而 GitHub 的 release tag 是
             # `app/v2.13.0`。用裸版本号拼 GitHub URL 实测 404（hashes.txt 与资产
             # 都是），回退路径会因此永远失败，必须补回 app/ 前缀。
             LATEST_TAG="app/${BASH_REMATCH[1]}"
+        fi
+        if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
+            log_warn "从官方下载站解析版本失败，尝试从 GitHub 发布页重定向获取最新版本..."
+            # 第三级免接口配额兜底：探测官方发布页重定向头（目标为网页而非大体积二进制），
+            # 随后仍走下方严格版本号白名单与 hashes.txt 闭环校验，绝不做无校验下载。
+            local web_resolved web_tag
+            web_resolved="$(curl -fsSIL --max-time 15 --max-redirs 5 --max-filesize 2097152 "https://github.com/HyNetworks/hysteria/releases/latest" 2>/dev/null |
+                awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)" || web_resolved=""
+            web_resolved="${web_resolved//%2F//}"
+            web_resolved="${web_resolved//%2f//}"
+            if [[ "$web_resolved" =~ /releases/tag/((app/)?v[0-9][^/?#]*)([?#].*)?$ ]]; then
+                web_tag="${BASH_REMATCH[1]}"
+                LATEST_TAG="$web_tag"
+            fi
         fi
         if [[ -z "$LATEST_TAG" || "$LATEST_TAG" == "null" ]]; then
             log_err "无法确定 Hysteria 2 版本，已放弃安装（不做无校验下载）。"
@@ -1037,7 +1055,7 @@ install_binary() {
     tmpdir="$(umask 077; mktemp -d)" || return 1
     # 官方同版本的 hashes.txt；hysteria 的 tag 形如 app/v2.13.0，路径要原样保留。
     if ! expected="$(hy2_expected_sha256 \
-            "https://github.com/apernet/hysteria/releases/download/${LATEST_TAG}/hashes.txt" \
+            "https://github.com/HyNetworks/hysteria/releases/download/${LATEST_TAG}/hashes.txt" \
             "$asset" "$tmpdir")"; then
         rm -rf "$tmpdir"
         log_err "取不到 Hysteria ${LATEST_TAG} 的官方校验清单（hashes.txt）或其中没有 ${asset}。"
@@ -1046,7 +1064,7 @@ install_binary() {
     fi
 
     if ! curl -fL --progress-bar --max-time 300 --max-filesize 209715200 \
-            "https://github.com/apernet/hysteria/releases/download/${LATEST_TAG}/${asset}" \
+            "https://github.com/HyNetworks/hysteria/releases/download/${LATEST_TAG}/${asset}" \
             -o "${tmpdir}/${asset}"; then
         rm -rf "$tmpdir"
         log_err "下载失败，请检查网络连接。现有二进制未改动。"
@@ -3398,14 +3416,27 @@ if [[ "$TARGET" == "core" ]]; then
     ASSET="hysteria-linux-${HY_ARCH}"
 
     # 先定版本，再取该版本的官方 hashes.txt —— 绝不拿浮动 latest 的字节当依据。
-    TAG=$(curl -s --max-time 10 --max-filesize 2097152 https://api.github.com/repos/apernet/hysteria/releases/latest \
+    # 主渠道开启重定向跟随（上限 5 跳），应对上游仓库迁移 301。
+    TAG=$(curl -fsSL --max-time 10 --max-redirs 5 --max-filesize 2097152 https://api.github.com/repos/HyNetworks/hysteria/releases/latest 2>/dev/null \
           | jq -r '.tag_name // empty' 2>/dev/null) || TAG=""
     if [[ -z "$TAG" || "$TAG" == "null" ]]; then
-        _loc=$(curl -fsSIL --max-time 20 "https://download.hysteria.network/app/latest/${ASSET}" 2>/dev/null \
-               | awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1)
+        # 官方下载站仅做单跳 HEAD 探测（不带 -L），避免跟到 25 MB 最终二进制触发 --max-filesize 退出码 63。
+        _loc=$(curl -fsSI --max-time 20 --max-filesize 2097152 "https://download.hysteria.network/app/latest/${ASSET}" 2>/dev/null \
+               | awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1) || _loc=""
         if [[ "$_loc" =~ /app/(v[0-9][^/]*)/${ASSET}$ ]]; then
             # 下载站给的是裸版本号，GitHub 的 tag 是 `app/vX.Y.Z`；不补前缀会 404。
             TAG="app/${BASH_REMATCH[1]}"
+        fi
+    fi
+    if [[ -z "$TAG" || "$TAG" == "null" ]]; then
+        # 第三级免接口配额兜底：经官方发布页重定向头提取固定版本标签，随后仍走严格校验。
+        _web_loc=$(curl -fsSIL --max-time 15 --max-redirs 5 --max-filesize 2097152 "https://github.com/HyNetworks/hysteria/releases/latest" 2>/dev/null \
+                   | awk 'tolower($1)=="location:"{print $2}' | tr -d '\r' | tail -n1) || _web_loc=""
+        _web_loc="${_web_loc//%2F//}"
+        _web_loc="${_web_loc//%2f//}"
+        if [[ "$_web_loc" =~ /releases/tag/((app/)?v[0-9][^/?#]*)([?#].*)?$ ]]; then
+            _web_tag="${BASH_REMATCH[1]}"
+            TAG="$_web_tag"
         fi
     fi
     if [[ -z "$TAG" || "$TAG" == "null" || ! "$TAG" =~ ^(app/)?v[0-9A-Za-z._-]+$ || "$TAG" == *".."* ]]; then
@@ -3417,7 +3448,7 @@ if [[ "$TARGET" == "core" ]]; then
     TMP_FILE=""
     trap 'rm -rf "${SUMDIR:-}"; rm -f "${TMP_FILE:-}"' EXIT
     if ! curl -fsSL --max-time 30 --max-filesize 2097152 --retry 2 \
-            "https://github.com/apernet/hysteria/releases/download/${TAG}/hashes.txt" \
+            "https://github.com/HyNetworks/hysteria/releases/download/${TAG}/hashes.txt" \
             -o "${SUMDIR}/hashes.txt" 2>/dev/null; then
         echo "取不到 ${TAG} 的官方 hashes.txt，已放弃更新，现有核心未改动" >&2
         exit 1
@@ -3437,7 +3468,7 @@ if [[ "$TARGET" == "core" ]]; then
 
     # mktemp 而不是固定的 /tmp/hy2_update_*：root 写可预测路径会被符号链接劫持。
     TMP_FILE="$(mktemp "${HY2_BIN}.update.XXXXXX")"
-    curl -fsSL --max-time 300 --max-filesize 104857600 "https://github.com/apernet/hysteria/releases/download/${TAG}/${ASSET}" -o "$TMP_FILE" || {
+    curl -fsSL --max-time 300 --max-filesize 104857600 "https://github.com/HyNetworks/hysteria/releases/download/${TAG}/${ASSET}" -o "$TMP_FILE" || {
         echo "下载失败，现有核心未改动" >&2; exit 1; }
     GOT="$(sha256sum "$TMP_FILE" | awk '{print $1}')"
     if [[ "$GOT" != "$WANT" ]]; then
@@ -5653,7 +5684,8 @@ install_gost() {
     # 获取最新版本
     # ⚠️ 同样要 `|| GOST_LATEST=""`：api.github.com 不可达时 curl 失败会让
     # set -e 直接终止，下面的兜底版本号永远用不上（与 install_binary 同一个坑）。
-    GOST_LATEST=$(curl -s --max-time 15 --max-filesize 2097152 https://api.github.com/repos/go-gost/gost/releases/latest | jq -r '.tag_name // empty') || GOST_LATEST=""
+    # 带 `-fsSL --max-redirs 5` 防止上游仓库迁移 301 时静默回落旧版。
+    GOST_LATEST=$(curl -fsSL --max-time 15 --max-redirs 5 --max-filesize 2097152 https://api.github.com/repos/go-gost/gost/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null) || GOST_LATEST=""
     if [[ -z "$GOST_LATEST" || "$GOST_LATEST" == "null" || "$GOST_LATEST" == *..* || ! "$GOST_LATEST" =~ ^v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
         GOST_LATEST="v3.3.0"
     fi

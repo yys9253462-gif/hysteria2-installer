@@ -148,7 +148,20 @@ class GitHubTokenHandler(urllib.request.BaseHandler):
         return req
 
 
-urllib.request.install_opener(urllib.request.build_opener(GitHubTokenHandler()))
+class _PreserveHeadRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """在 Python 3.9–3.11 跟随重定向时保留 HEAD 方法，避免被静默降级为 GET 下载大文件正文。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None and req.get_method() == 'HEAD':
+            new_req.method = 'HEAD'
+        return new_req
+
+
+urllib.request.install_opener(urllib.request.build_opener(
+    GitHubTokenHandler(),
+    _PreserveHeadRedirectHandler(),
+))
 
 # 机主账号。它的 password 就是 Hysteria 的 auth_password —— /auth 是遍历
 # data['users'] 按密码匹配的，这条记录一旦被删，主密码立刻变成 "User not found"，
@@ -2233,19 +2246,21 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
         tag = ''
         try:
             rel_obj = json.loads(fetch_text(
-                'https://api.github.com/repos/apernet/hysteria/releases/latest',
+                'https://api.github.com/repos/HyNetworks/hysteria/releases/latest',
                 timeout=10))
             tag = _clean_hy2_tag(rel_obj.get('tag_name') if isinstance(rel_obj, dict) else '')
         except Exception:
             tag = ''
         if not tag:
             # 官方下载站的 latest 会 302 到 /app/<version>/<asset>，据此解析版本。
+            # 显式使用 HEAD 仅取响应头，避免触发 25 MB 二进制正文下载流。
             # 任何解析失败（网络、HTML 错误页、重定向缺失）都只意味着"版本无法确定"，
-            # 必须继续走下面的 fail-closed 分支，而不是把底层异常类型抛给调用方。
+            # 必须继续走下面的回退或 fail-closed 分支，而不是把底层异常类型抛给调用方。
             try:
                 req = urllib.request.Request(
                     'https://download.hysteria.network/app/latest/' + asset,
-                    headers={'User-Agent': 'hysteria2-installer'})
+                    headers={'User-Agent': 'hysteria2-installer'},
+                    method='HEAD')
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     final = resp.geturl() or ''
                 if urlsplit(final).scheme not in ('https', 'http'):
@@ -2258,14 +2273,30 @@ def _upgrade_core_binary_locked(binary='/usr/local/bin/hysteria', backup_dir='/e
             except Exception:
                 tag = ''
         if not tag:
+            # 第三级免接口配额兜底：仅 HEAD 探测官方发布页重定向路径提取版本标签。
+            try:
+                req = urllib.request.Request(
+                    'https://github.com/HyNetworks/hysteria/releases/latest',
+                    headers={'User-Agent': 'hysteria2-installer'},
+                    method='HEAD')
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    final = resp.geturl() or ''
+                if urlsplit(final).scheme not in ('https', 'http'):
+                    final = ''
+                final_path = urlsplit(final).path.replace('%2F', '/').replace('%2f', '/')
+                m_web = re.search(r'/releases/tag/((?:app/)?v[0-9][^/]*)$', final_path)
+                tag = _clean_hy2_tag(m_web.group(1) if m_web else '')
+            except Exception:
+                tag = ''
+        if not tag:
             raise RuntimeError('无法确定 Hysteria 版本，已放弃更新（不做无校验下载）')
         expected = fetch_expected_sha256(
-            'https://github.com/apernet/hysteria/releases/download/' + tag + '/hashes.txt',
+            'https://github.com/HyNetworks/hysteria/releases/download/' + tag + '/hashes.txt',
             asset)
         if not expected:
             raise RuntimeError(
                 '取不到 Hysteria %s 的官方 hashes.txt（或其中没有 %s），已放弃更新' % (tag, asset))
-        url = ('https://github.com/apernet/hysteria/releases/download/'
+        url = ('https://github.com/HyNetworks/hysteria/releases/download/'
                + tag + '/' + asset)
         req = urllib.request.Request(url, headers={'User-Agent': 'hysteria2-installer'})
         with urllib.request.urlopen(req, timeout=90) as source, open(candidate, 'wb') as dest:
@@ -18539,9 +18570,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 core_cached_tag = _core_ver_cache['tag']
             if now - core_cached_t >= (300 if core_cached_tag else 30):
                 try:
-                    req = urllib.request.Request('https://api.github.com/repos/apernet/hysteria/releases/latest',
+                    req = urllib.request.Request('https://api.github.com/repos/HyNetworks/hysteria/releases/latest',
                                                  headers={'User-Agent': 'hysteria2-installer'})
-                    with urllib.request.urlopen(req, timeout=3) as response:
+                    with urllib.request.urlopen(req, timeout=5) as response:
                         release = json.loads(_read_bounded_bytes(response).decode('utf-8', errors='replace'))
                     raw_tag = release.get('tag_name') if isinstance(release, dict) else None
                     new_tag = (
@@ -18550,6 +18581,27 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     )
                 except Exception:
                     new_tag = ''
+                if not new_tag:
+                    # 接口匿名限流或临时异常时，回退至官方发布页重定向仅头探测（不下载正文）。
+                    try:
+                        req_web = urllib.request.Request(
+                            'https://github.com/HyNetworks/hysteria/releases/latest',
+                            headers={'User-Agent': 'hysteria2-installer'},
+                            method='HEAD')
+                        with urllib.request.urlopen(req_web, timeout=5) as response:
+                            final_url = response.geturl() if hasattr(response, 'geturl') else ''
+                        if isinstance(final_url, str) and (
+                                final_url.startswith('https://') or final_url.startswith('http://')):
+                            marker = '/releases/tag/'
+                            idx = final_url.find(marker)
+                            if idx != -1:
+                                tail = final_url[idx + len(marker):].split('?', 1)[0].split('#', 1)[0]
+                                tail = tail.replace('%2F', '/').replace('%2f', '/').strip('/')
+                                tail = tail.removeprefix('app/').removeprefix('v')
+                                if tail and '/' not in tail and '..' not in tail and len(tail) <= 64:
+                                    new_tag = tail
+                    except Exception:
+                        new_tag = ''
                 try:
                     with _ver_cache_lock:
                         _core_ver_cache['tag'] = new_tag
