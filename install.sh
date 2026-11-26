@@ -63,7 +63,7 @@ curl() {
                 break ;;
         esac
     done
-    if [[ "$_tok" =~ ^[A-Za-z0-9_]{20,255}$ ]]; then
+    if ( export LC_ALL=C; [[ "$_tok" =~ ^[A-Za-z0-9_]{20,255}$ ]] ); then
         command curl -H @<(printf 'Authorization: Bearer %s\n' "$_tok") "$@"
     else
         command curl "$@"
@@ -104,7 +104,7 @@ hy2_sha256_file() {
 # 校验文件 SHA256 是否等于预期值；预期值格式非法即失败。
 hy2_verify_sha256() {
     local got
-    [[ "${2:-}" =~ ^[0-9a-f]{64}$ ]] || return 1
+    ( export LC_ALL=C; [[ "${2:-}" =~ ^[0-9a-f]{64}$ ]] ) || return 1
     got="$(hy2_sha256_file "$1")" || return 1
     [[ -n "$got" && "$got" == "$2" ]]
 }
@@ -133,7 +133,7 @@ hy2_manifest_sha256() {
         base="${name##*/}"
         [[ "$name" == "$asset" || "$base" == "$asset" ]] || continue
         digest="$(printf '%s' "$digest" | tr 'A-F' 'a-f')"
-        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1        # 匹配到但摘要畸形
+        ( export LC_ALL=C; [[ "$digest" =~ ^[0-9a-f]{64}$ ]] ) || return 1        # 匹配到但摘要畸形
         count=$((count + 1))
         found="$digest"
     done < "$manifest"
@@ -154,7 +154,7 @@ hy2_dgst_sha256() {
         key="$(printf '%s' "$key" | tr -d '[:space:]' | tr 'a-z' 'A-Z')"
         [[ "$key" == "SHA2-256" || "$key" == "SHA2_256" ]] || continue
         digest="$(printf '%s' "$value" | tr -d '[:space:]' | tr 'A-F' 'a-f')"
-        [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+        ( export LC_ALL=C; [[ "$digest" =~ ^[0-9a-f]{64}$ ]] ) || return 1
         count=$((count + 1))
         found="$digest"
     done < "$dgst"
@@ -648,7 +648,7 @@ hy2_acme_check_existing() {
 is_valid_port() {
     # 不收前导零（2026-11-06 修）：bash 算术把 020000 当八进制（8192），跳跃区间检查漏判；
     # 08 / 09 直接报 value too great for base；port_owner 拿 0443 去 grep 找不到占用者。
-    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 ))
+    ( export LC_ALL=C; [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] ) && (( 10#$1 <= 65535 ))
 }
 
 # 主机名：标签 1-63 位字母数字与连字符、不以连字符开头结尾，至少两段，总长 ≤ 253。
@@ -657,8 +657,9 @@ is_valid_domain() {
     local d="$1"
     (( ${#d} >= 1 && ${#d} <= 253 )) || return 1
     # 末段全是数字就是 IP（1.2.3.4），ACME 不给 IP 签发，提前拒绝。
-    [[ "${d##*.}" =~ ^[0-9]+$ ]] && return 1
-    [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
+    ( export LC_ALL=C; [[ "${d##*.}" =~ ^[0-9]+$ ]] ) && return 1
+    # 在 C 区域执行纯 ASCII 域名正则，防止 en_US.UTF-8 / zh_CN.UTF-8 下将重音字母误纳入 [a-z]
+    ( export LC_ALL=C; [[ "$d" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] )
 }
 
 # ACME 通知邮箱：本地部分只放行常见安全字符且禁止以 - 开头（防选项注入），域名部分同 is_valid_domain。
@@ -666,7 +667,8 @@ is_valid_email() {
     local e="$1" local_part domain
     [[ "$e" == *@* && "$e" != *@*@* ]] || return 1
     local_part="${e%@*}"; domain="$(printf '%s' "${e#*@}" | tr 'A-Z' 'a-z')"
-    [[ "$local_part" =~ ^[A-Za-z0-9._%+][A-Za-z0-9._%+-]{0,63}$ ]] && is_valid_domain "$domain"
+    # 在 C 区域校验本地部分，避免受当前区域排序规则影响放行非 ASCII 字符
+    ( export LC_ALL=C; [[ "$local_part" =~ ^[A-Za-z0-9._%+][A-Za-z0-9._%+-]{0,63}$ ]] ) && is_valid_domain "$domain"
 }
 
 # ==============================================================================
@@ -852,15 +854,15 @@ resolve_domain_ips() {
         return 1
     fi
     # 1) getent (glibc NSS, 走 /etc/resolv.conf)
-    ips=$(getent ahostsv4 -- "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+    ips=$(getent ahostsv4 -- "$domain" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)
     if [[ -z "$ips" ]] && command -v dig >/dev/null 2>&1; then
-        ips=$(dig +short +time=3 +tries=2 A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ')
+        ips=$(dig +short +time=3 +tries=2 A "$domain" 2>/dev/null | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ' || true)
     fi
     if [[ -z "$ips" ]] && command -v nslookup >/dev/null 2>&1; then
-        ips=$(nslookup -timeout=3 "$domain" 2>/dev/null | awk '/^Address: /{print $2}' | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ')
+        ips=$(nslookup -timeout=3 "$domain" 2>/dev/null | awk '/^Address: /{print $2}' | grep -E '^[0-9.]+$' | sort -u | tr '\n' ' ' || true)
     fi
     if [[ -z "$ips" ]] && command -v host >/dev/null 2>&1; then
-        ips=$(host -W 3 -- "$domain" 2>/dev/null | awk '/has address/{print $NF}' | sort -u | tr '\n' ' ')
+        ips=$(host -W 3 -- "$domain" 2>/dev/null | awk '/has address/{print $NF}' | sort -u | tr '\n' ' ' || true)
     fi
     # 4) 最后兜底: 用 python3 走系统解析器(总有一个能用)
     if [[ -z "$ips" ]] && command -v python3 >/dev/null 2>&1; then
@@ -869,7 +871,7 @@ try:
     addrs=sorted(set(a[4][0] for a in socket.getaddrinfo(sys.argv[1], None, socket.AF_INET)))
     print(' '.join(addrs))
 except Exception:
-    pass" "$domain" 2>/dev/null)
+    pass" "$domain" 2>/dev/null || true)
     fi
     [[ -n "$ips" ]] || return 1
     echo "$ips"
@@ -1044,7 +1046,7 @@ install_binary() {
             return 1
         fi
     fi
-    if [[ "$LATEST_TAG" == *".."* || ! "$LATEST_TAG" =~ ^(app/)?v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+    if [[ "$LATEST_TAG" == *".."* ]] || ! ( export LC_ALL=C; [[ "$LATEST_TAG" =~ ^(app/)?v?[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]] ); then
         log_err "获取到异常的 Hysteria 2 版本号 (${LATEST_TAG})，已放弃安装。"
         return 1
     fi
@@ -1358,8 +1360,8 @@ select_local_certificate() {
     if [[ -z "${SERVER_NAME:-}" ]]; then
         # 跳过通配符名字（2026-11-04 修）：*.example.com 不能当 SNI，写进订阅后客户端
         # 发出非法主机名、TLS 校验失败。只有通配符时走下面的提问。
-        SERVER_NAME="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[A-Za-z0-9*._-]+' | sed 's/^DNS://' | grep -v '^\*' | head -1)"
-        [[ -z "$SERVER_NAME" ]] && SERVER_NAME="$(openssl x509 -in "$cert" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | grep -v '^\*' | head -1)"
+        SERVER_NAME="$(openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -oE 'DNS:[A-Za-z0-9*._-]+' | sed 's/^DNS://' | grep -v '^\*' | head -1 || true)"
+        [[ -z "$SERVER_NAME" ]] && SERVER_NAME="$(openssl x509 -in "$cert" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | grep -v '^\*' | head -1 || true)"
     fi
     if [[ -z "${SERVER_NAME:-}" ]]; then
         read -rp "请输入证书绑定的域名 (SNI): " SERVER_NAME || true
@@ -1387,15 +1389,19 @@ port_owner() {
         *)   return 0 ;;
     esac
     # 内联端口合法性校验：禁止正则元字符与越界端口，避免把任意行误判为占用。
-    [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$port <= 65535 )) || return 0
-    # 仅精确比对第 4 列（Local Address:Port）末尾端口号，不误命中远端地址或进程参数。
-    line="$(ss -H $flag 2>/dev/null | awk -v p="$port" '
-        {
-            addr = $4
-            sub(/^.*[:.]/, "", addr)
-            if (addr == p) { print; exit }
-        }
-    ')"
+    ( export LC_ALL=C; [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] ) && (( 10#$port <= 65535 )) || return 0
+    # 仅精确比对第 4 列（Local Address:Port）末尾端口号，不误命中远端地址或进程参数；
+    # 精简镜像可能未装 iproute2（缺 ss），先判存并兜底管道失败，随后交由 python3 绑定探测。
+    line=""
+    if command -v ss >/dev/null 2>&1; then
+        line="$(ss -H $flag 2>/dev/null | awk -v p="$port" '
+            {
+                addr = $4
+                sub(/^.*[:.]/, "", addr)
+                if (addr == p) { print; exit }
+            }
+        ' || true)"
+    fi
     # 再用 python3 bind 兜底：ss 解析不出来时以实际能否绑定为准
     if [[ -z "$line" ]] && command -v python3 >/dev/null 2>&1; then
         if python3 -c '
@@ -1451,7 +1457,7 @@ detect_webserver_squatting() {
 # 输出 "cert|key"（找到）或空串（没找到）。
 find_cert_in_webserver() {
     local domain="$1" c k
-    [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || return 1
+    ( export LC_ALL=C; [[ "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] ) || return 1
     # 优先搜 Caddy 2.x：/var/lib/caddy/.local/share/caddy/certificates/<ca>/<domain>/
     # 🔴 CADDY_CERT_ROOT 可覆盖根路径：不同发行版/运行用户路径不同，
     #    同时留出测试注入点 —— 否则本函数无法被测试覆盖。
@@ -1635,9 +1641,9 @@ setup_cert_via_existing_caddy() {
     local domain_lc
     domain_lc="$(printf '%s' "$domain" | tr 'A-Z' 'a-z')"
     # 零外部函数依赖的内联域名校验（独立摘出本函数测试时无需依赖 is_valid_domain）
-    if [[ -z "$domain_lc" || ${#domain_lc} -gt 253 || "$domain_lc" == *..* \
-        || "${domain_lc##*.}" =~ ^[0-9]+$ \
-        || ! "$domain_lc" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+    if [[ -z "$domain_lc" || ${#domain_lc} -gt 253 || "$domain_lc" == *..* ]] \
+        || ( export LC_ALL=C; [[ "${domain_lc##*.}" =~ ^[0-9]+$ ]] ) \
+        || ! ( export LC_ALL=C; [[ "$domain_lc" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] ); then
         log_err "域名格式不合法，已拒绝写入 Caddyfile: ${domain}"
         return 1
     fi
@@ -1835,9 +1841,9 @@ setup_cert_via_nginx() {
     # 调用方用 $(...) 取 "cert|key"：日志与 acme.sh 输出全部改走 stderr，
     # 只有最后那一行结果写到 fd 3（原 stdout）。
     exec 3>&1 1>&2
-    if [[ -z "$domain" || ${#domain} -gt 253 \
-            || "${domain##*.}" =~ ^[0-9]+$ \
-            || ! "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+    if [[ -z "$domain" || ${#domain} -gt 253 ]] \
+            || ( export LC_ALL=C; [[ "${domain##*.}" =~ ^[0-9]+$ ]] ) \
+            || ! ( export LC_ALL=C; [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] ); then
         log_err "借 Nginx 签发拒绝非法域名: ${domain}"
         return 1
     fi
@@ -2017,9 +2023,9 @@ setup_cert_via_dns_api() {
     # 只有最后那一行结果写到 fd 3（原 stdout）。此前日志混进结果，CERT_FILE
     # 会变成「一大段日志 + 路径」，Hysteria 读不到证书（2026-10-29 修）。
     exec 3>&1 1>&2
-    if [[ -z "$domain" || ${#domain} -gt 253 \
-            || "${domain##*.}" =~ ^[0-9]+$ \
-            || ! "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+    if [[ -z "$domain" || ${#domain} -gt 253 ]] \
+            || ( export LC_ALL=C; [[ "${domain##*.}" =~ ^[0-9]+$ ]] ) \
+            || ! ( export LC_ALL=C; [[ "$domain" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] ); then
         log_err "DNS API 签发拒绝非法域名: ${domain}"
         return 1
     fi
@@ -2497,24 +2503,34 @@ setup_ports_and_obfs() {
     if [[ -n "${HY2_NODE_MODE:-}" ]]; then
         log_info "已确认商城版节点（HY2_NODE_MODE=2）。"
     fi
+    _api_key_source="" NODE_API_KEY=""
     if [[ -n "$_cur_api_key" ]]; then
-        read -rsp "请设置节点通信 API Key [回车沿用现有 Key，控制台无需改动]: " NODE_API_KEY || true; echo
+        IFS= read -rsp "请设置节点通信 API Key [回车沿用现有 Key，控制台无需改动]: " NODE_API_KEY || true; echo
+        [[ -n "$NODE_API_KEY" ]] && _api_key_source="custom" || _api_key_source="reused"
         NODE_API_KEY=${NODE_API_KEY:-$_cur_api_key}
-        log_info "已沿用现有 API Key。"
     else
         RANDOM_API_KEY="hy2_sec_$(openssl rand -hex 16)"
-        read -rsp "请设置节点通信 API Key [回车自动生成]: " NODE_API_KEY || true; echo
+        IFS= read -rsp "请设置节点通信 API Key [回车自动生成]: " NODE_API_KEY || true; echo
+        [[ -n "$NODE_API_KEY" ]] && _api_key_source="custom" || _api_key_source="generated"
         NODE_API_KEY=${NODE_API_KEY:-$RANDOM_API_KEY}
-        log_info "已生成新的节点通信 API Key。"
     fi
-    if [[ ! "$NODE_API_KEY" =~ ^[!-~]+$ ]]; then
+    # 强制 C 区域校验，避免 UTF-8 排序表使 [!-~] 拒收字母数字
+    if ! ( export LC_ALL=C; [[ "$NODE_API_KEY" =~ ^[!-~]+$ ]] ); then
+        unset _api_key_source
         log_err "NODE_API_KEY 必须是不含空白和控制字符的纯 ASCII 字符串，已中止安装。"
         return 1
     fi
     if (( ${#NODE_API_KEY} > 256 )); then
+        unset _api_key_source
         log_err "NODE_API_KEY 长度不能超过 256 个字符，已中止安装。"
         return 1
     fi
+    case "$_api_key_source" in
+        reused)    log_info "已沿用现有 API Key。" ;;
+        generated) log_info "已生成新的节点通信 API Key。" ;;
+        custom)    log_info "已使用自定义节点通信 API Key。" ;;
+    esac
+    unset _api_key_source
 
     # ⚠️ 主监听端口占用检测（2026-10-09 修）：
     # 脚本本来就有现成的 port_owner()（80/443 检测在用），但主监听端口从没查过。
@@ -2640,22 +2656,28 @@ setup_system_firewall() {
         # 收集**所有**会拦截的 input 链（2026-11-06 修）：旧实现只取第一条 policy drop 链就 exit，
         # 双栈主机上 ip6 的 INPUT 链没放行，IPv6 客户端连不上；以「policy accept + 末尾 drop」
         # 方式写的链（nftables.conf 常见写法）则完全被跳过，一个端口都没放。
-        local nft_inputs nft_input
-        nft_inputs=$(nft list ruleset 2>/dev/null | awk '
-            function flush() { if (cur != "" && (pdrop || tdrop)) print cur; cur=""; pdrop=0; tdrop=0 }
-            /^table /                 { flush(); tbl=$2" "$3 }
-            /^[[:space:]]*chain /     { flush(); chain=$2; sub(/\{.*/,"",chain); sub(/:$/,"",chain); inchain=1; hooked=0 }
-            inchain && /hook input/   { hooked=1; cur=tbl " " chain; if (/policy drop/) pdrop=1 }
-            inchain && hooked && /^[[:space:]]*(drop|reject)([[:space:]]|$)/ { tdrop=1 }
-            END { flush() }
-        ')
+        local nft_inputs="" nft_input _nft_ruleset=""
+        # 受限容器或未加载 nf_tables 模块的内核下 nft list ruleset 返回非零；
+        # 先捕获再解析，避免 set -eo pipefail 无声打断安装流程。
+        if _nft_ruleset="$(nft list ruleset 2>/dev/null)"; then
+            nft_inputs="$(awk '
+                function flush() { if (cur != "" && (pdrop || tdrop)) print cur; cur=""; pdrop=0; tdrop=0 }
+                /^table /                 { flush(); tbl=$2" "$3 }
+                /^[[:space:]]*chain /     { flush(); chain=$2; sub(/\{.*/,"",chain); sub(/:$/,"",chain); inchain=1; hooked=0 }
+                inchain && /hook input/   { hooked=1; cur=tbl " " chain; if (/policy drop/) pdrop=1 }
+                inchain && hooked && /^[[:space:]]*(drop|reject)([[:space:]]|$)/ { tdrop=1 }
+                END { flush() }
+            ' <<<"$_nft_ruleset" || true)"
+        else
+            log_warn "无法读取 nftables 规则集（权限受限或内核未启用 nf_tables），已跳过 nftables 自动放行。"
+        fi
         while IFS= read -r nft_input; do
             [[ -n "$nft_input" ]] || continue
             # nft_input = "<family> <table> <chain>"，正好是 nft 命令需要的三个参数。
             # 用 read 拆分而不是 set --，避免覆盖函数自身的位置参数（$1/$2/$3）。
             local nft_fam nft_tbl nft_chain
             read -r nft_fam nft_tbl nft_chain <<<"$nft_input"
-            if [[ ! "$nft_fam" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ || ! "$nft_tbl" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ || ! "$nft_chain" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ ]]; then
+            if ! ( export LC_ALL=C; [[ "$nft_fam" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ && "$nft_tbl" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ && "$nft_chain" =~ ^[A-Za-z0-9_.][A-Za-z0-9_.-]*$ ]] ); then
                 continue
             fi
             # 幂等判据必须**逐条规则**判断。旧实现只在「主 UDP 端口已放行」时
@@ -2663,8 +2685,11 @@ setup_system_firewall() {
             # 重装后订阅端口重新随机时面板公网打不开，日志却写着「已跳过」
             # （2026-10-29 修）。用「数字边界」正则避免 14617 命中 146170，
             # 且必须匹配含 accept 的放行规则，防止把已有的 drop/reject 误判为已放行。
-            local _nft_rules _changed=0
-            _nft_rules="$(nft list chain "$nft_fam" "$nft_tbl" "$nft_chain" 2>/dev/null)"
+            local _nft_rules="" _changed=0
+            if ! _nft_rules="$(nft list chain "$nft_fam" "$nft_tbl" "$nft_chain" 2>/dev/null)"; then
+                log_warn "无法读取 nftables 链 ${nft_fam} ${nft_tbl}/${nft_chain}，已跳过该链。"
+                continue
+            fi
             _nft_has() { grep -qE "(^|[[:space:]])$1[[:space:]]+dport[[:space:]]+$2[[:space:]].*accept([[:space:]]|;|$)" <<<"$3"; }
             _nft_ensure() {   # $1=proto $2=dport 表达式 $3=规则列表
                 _nft_has "$1" "$2" "$3" && return 0
@@ -3922,7 +3947,7 @@ EOUG
     PIN_SHA256=""
     if [[ -f "$CERT_FILE" ]]; then
         PIN_SHA256=$(openssl x509 -in "$CERT_FILE" -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print $NF}' | tr 'A-F' 'a-f' || true)
-        [[ "$PIN_SHA256" =~ ^[0-9a-f]{64}$ ]] || PIN_SHA256=""
+        ( export LC_ALL=C; [[ "$PIN_SHA256" =~ ^[0-9a-f]{64}$ ]] ) || PIN_SHA256=""
     fi
 
     local _meta_tmp=""
@@ -4111,7 +4136,7 @@ enabled_protocol_ports() {
             | (.port | numbers | select(floor == . and . >= 1 and . <= 65535)) as $p | "TCP \($p) 入站代理（\(.type // "proxy")）"' "$portal" 2>/dev/null || true
     fi
     if [[ -f "$AWG_CONFIG" ]]; then
-        awg_port="$(sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\)[[:space:]]*$/\1/p' "$AWG_CONFIG" | head -n 1)"
+        awg_port="$(sed -n 's/^[[:space:]]*ListenPort[[:space:]]*=[[:space:]]*\([0-9]\{1,5\}\)[[:space:]]*$/\1/p' "$AWG_CONFIG" | head -n 1 || true)"
         if [[ "$awg_port" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$awg_port <= 65535 )); then echo "UDP ${awg_port} AmneziaWG"; fi
     fi
 }
@@ -4873,12 +4898,12 @@ sync_cert_meta() {
     [[ -f "$cert_file" ]] || return 0
 
     local cn sans subject issuer self_signed="false" acme_block="false"
-    cn="$(openssl x509 -in "$cert_file" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -1 | sed 's/[[:space:]]*$//')"
+    cn="$(openssl x509 -in "$cert_file" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/^[[:space:]]*commonName[[:space:]]*=[[:space:]]*//p' | head -1 | sed 's/[[:space:]]*$//' || true)"
     # 收集**全部** SAN：一张证书常覆盖多个域名，只取第一个会把 server_name
     # 写成错的（客户端 SNI 对不上 → 握手失败）。具体选哪个在下面决定。
-    sans="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | tr '\n' ' ')"
-    subject="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/^subject=//' | sed 's/ *$//')"
-    issuer="$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/^issuer=//' | sed 's/ *$//')"
+    sans="$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | tr ',' '\n' | sed -n 's/^ *DNS://p' | tr '\n' ' ' || true)"
+    subject="$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/^subject=//' | sed 's/ *$//' || true)"
+    issuer="$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/^issuer=//' | sed 's/ *$//' || true)"
     [[ -n "$subject" && "$subject" == "$issuer" ]] && self_signed="true"
     grep -q '^acme:' "$HY2_CONFIG" 2>/dev/null && acme_block="true"
 
@@ -4901,7 +4926,7 @@ sync_cert_meta() {
     if [[ "$self_signed" == "true" ]]; then
         new_type="self_signed"; new_insecure="true"
         new_pin="$(openssl x509 -in "$cert_file" -outform DER 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print $NF}' | tr 'A-F' 'a-f' || true)"
-        if [[ ! "$new_pin" =~ ^[0-9a-f]{64}$ || "$new_pin" == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]]; then
+        if ! ( export LC_ALL=C; [[ "$new_pin" =~ ^[0-9a-f]{64}$ ]] ) || [[ "$new_pin" == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]]; then
             new_pin=""
         fi
     else
@@ -6424,7 +6449,7 @@ install_amneziawg() {
             read -rp "请为首个客户端命名 [默认: client1]: " client || true
             client="${client// /}"
             client="${client:-client1}"
-            if [[ "$client" == "." || "$client" == ".." || "$client" == -* || "$client" == .* || "$client" == _* || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
+            if [[ "$client" == "." || "$client" == ".." || "$client" == -* || "$client" == .* || "$client" == _* ]] || ! ( export LC_ALL=C; [[ "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] ); then
                 log_err "客户端名称不合法（须以字母/数字开头，仅允许 1-32 位字母/数字/._-）。"
                 return 1
             fi
@@ -6476,7 +6501,7 @@ awg_menu_add_peer() {
         log_err "客户端名称不合法（不能以 - 开头或含控制字符）。"
         return 1
     fi
-    if ! [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]]; then
+    if ! ( export LC_ALL=C; [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] ); then
         log_err "名称须以字母或数字开头，仅允许字母、数字、点、下划线、连字符，且不超过 32 字符。"
         return 1
     fi
@@ -6946,7 +6971,7 @@ uninstall_all() {
             [[ -f "$nginx_conf" && ! -L "$nginx_conf" ]] || continue
             nginx_domain="${nginx_conf##*/hy2-acme-}"
             nginx_domain="${nginx_domain%.conf}"
-            [[ "$nginx_domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || continue
+            ( export LC_ALL=C; [[ "$nginx_domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] ) || continue
             if grep -qF "由 hysteria2-installer 生成：只用于 Let's Encrypt 签发与续期 ${nginx_domain}" "$nginx_conf" \
                     && grep -qF "server_name ${nginx_domain};" "$nginx_conf" \
                     && grep -qF 'root /var/lib/hy2-acme-webroot;' "$nginx_conf" \
@@ -7477,7 +7502,7 @@ unit_state_text() {
 show_menu_status() {
     local ver
     if [[ -f "$HY2_BIN" ]]; then
-        ver="$($HY2_BIN version 2>/dev/null | awk '/^Version:/{print $2; exit}')"
+        ver="$($HY2_BIN version 2>/dev/null | awk '/^Version:/{print $2; exit}' || true)"
         echo -e "核心状态: $(unit_state_text hysteria-server) | 版本: ${ver:-未知}"
     else
         echo -e "核心状态: ${YELLOW}未安装${PLAIN}"
