@@ -323,7 +323,7 @@ detect_wan_iface() {
     wan="$(ip -4 route show default 2>/dev/null \
         | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
     if [[ -n "$wan" ]]; then
-        if [[ "$wan" == "." || "$wan" == ".." || "$wan" == -* || ! "$wan" =~ ^[A-Za-z0-9._:@-]{1,32}$ ]]; then
+        if [[ "$wan" == "." || "$wan" == ".." || "$wan" == -* ]] || ! ( export LC_ALL=C; [[ "$wan" =~ ^[A-Za-z0-9._:@-]{1,32}$ ]] ); then
             log_err "默认出口网卡名非法: ${wan}"
             return 1
         fi
@@ -417,7 +417,7 @@ validate_endpoint() {
         if [[ "$host" == \[*\] ]]; then
             host="${host#[}"; host="${host%]}"
             python3 -I -c 'import ipaddress,sys; sys.exit(0 if ipaddress.ip_address(sys.argv[1]).version == 6 else 1)'                 "$host" 2>/dev/null || { log_err "方括号里必须是 IPv6 地址: ${ep}"; return 1; }
-        elif (( ${#host} > 253 )) || [[ ! "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+        elif (( ${#host} > 253 )) || ! ( export LC_ALL=C; [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] ); then
             log_err "连接地址不是有效的域名或 IPv4: ${ep}"
             return 1
         elif [[ "${host##*.}" =~ ^[0-9]+$ ]] \
@@ -498,7 +498,7 @@ download_binaries() {
     want="$(awk -v f="amneziawg-linux-${arch}-awg${line}.tar.gz" \
             '$1 ~ /^#/ || NF != 2 { next } { n=$2; sub(/^\*/, "", n); while (sub(/^\.\//, "", n)) {} if (n==f) print $1 }' \
             "${tmpd}/SHA256SUMS" | tr 'A-F' 'a-f' | sort -u)"
-    if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+    if ! ( export LC_ALL=C; [[ "$want" =~ ^[0-9a-f]{64}$ ]] ); then
         rm -rf "$tmpd"
         log_err "SHA256SUMS 中安装包的摘要缺失或不唯一（实际: [${want}]），已放弃安装"
         return 1
@@ -1139,7 +1139,7 @@ cmd_peer_add() {
     is_installed || die "AmneziaWG 尚未安装，请先执行: hy2-awgctl install"
 
     [[ -n "$name" ]] || die "用法: hy2-awgctl peer-add <名称> [--endpoint HOST]"
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] || die "客户端名称须以字母/数字开头，仅允许字母/数字/._- 且不超过 32 字符"
+    ( export LC_ALL=C; [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] ) || die "客户端名称须以字母/数字开头，仅允许字母/数字/._- 且不超过 32 字符"
     if [[ -n "$endpoint" ]]; then
         validate_endpoint "$endpoint" || die "连接地址非法"
     fi
@@ -1318,7 +1318,7 @@ cmd_client_conf() {
     is_installed || die "AmneziaWG 尚未安装。"
     [[ -L "$AWG_PEERS_FILE" ]] && die "客户端列表不允许为符号链接：${AWG_PEERS_FILE}"
     [[ -n "$name" ]] || die "用法: hy2-awgctl client-conf <名称> [--endpoint HOST]"
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] || die "客户端名称不合法（仅允许字母/数字/点/下划线/短横，1-32 字符）: ${name}"
+    ( export LC_ALL=C; [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] ) || die "客户端名称不合法（仅允许字母/数字/点/下划线/短横，1-32 字符）: ${name}"
     peer_exists "$name" || die "客户端不存在: ${name}"
 
     if [[ -z "$endpoint" ]]; then
@@ -1375,7 +1375,7 @@ cmd_install() {
         validate_endpoint "$endpoint" || die "连接地址非法"
     fi
     if [[ -n "$client" ]]; then
-        if [[ "$client" == "." || "$client" == ".." || ! "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]]; then
+        if [[ "$client" == "." || "$client" == ".." ]] || ! ( export LC_ALL=C; [[ "$client" =~ ^[A-Za-z0-9_.-]{1,32}$ ]] ); then
             die "客户端名称非法（仅允许 1-32 位字母/数字/._-，且不能为 . 或 ..）: ${client}"
         fi
     fi
@@ -1856,7 +1856,7 @@ cmd_qr() {
     local name="${1:-}" endpoint="${2:-}"
     is_installed || die "AmneziaWG 尚未安装。"
     [[ -n "$name" ]] || die "用法: hy2-awgctl qr <名称> [--endpoint HOST]"
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] || die "客户端名称不合法（仅允许字母/数字/点/下划线/短横，1-32 字符）: ${name}"
+    ( export LC_ALL=C; [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$ ]] ) || die "客户端名称不合法（仅允许字母/数字/点/下划线/短横，1-32 字符）: ${name}"
     if ! command -v qrencode >/dev/null 2>&1; then
         die "缺少 qrencode，请先安装：apt-get install -y qrencode"
     fi
