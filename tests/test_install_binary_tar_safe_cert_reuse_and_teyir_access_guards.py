@@ -38,11 +38,19 @@ class InstallBinaryTarSafeCertReuseAndTeyirAccessGuardsTests(unittest.TestCase):
         self.assertIn('*:*', fn)
 
     def test_install_binary_rejects_symlink_and_bounds_fallback_curl(self):
-        """install_binary 须拒绝符号链接 HY2_BIN 并为下载站回落探测限制最大重定向与体积。"""
+        """install_binary 须拒绝符号链接 HY2_BIN、为接口与发布页探测限制重定向与体积，且下载站直链不得混用 -L 与小体积上限。"""
         fn = _extract_fn('install_binary')
         self.assertIn('[[ -L "$HY2_BIN" ]]', fn)
         self.assertIn('--max-redirs 5 --max-filesize 2097152', fn)
         self.assertIn('mv -f -- "$staged" "$HY2_BIN"', fn)
+        # 下载站指向 25 MB 二进制文件，仅允许单跳 HEAD 探测（-fsSI），严禁与 -L 混用触发退出码 63
+        dl_lines = [ln for ln in fn.splitlines() if 'download.hysteria.network/app/latest/' in ln]
+        self.assertTrue(dl_lines, 'install_binary 缺少官方下载站回退探测语句')
+        for ln in dl_lines:
+            self.assertIn('-fsSI ', ln, f'官方下载站探测必须采用单跳仅头模式 -fsSI: {ln}')
+            self.assertIn('--max-filesize 2097152', ln, f'官方下载站单跳探测须限制体积上限: {ln}')
+            self.assertNotIn('-fsSIL', ln, f'官方下载站直链禁止使用 -fsSIL（跟随 25 MB 响应头会触发退出码 63）: {ln}')
+            self.assertNotIn(' -L ', ln, f'官方下载站直链禁止混用 -L 重定向跟随: {ln}')
 
     def test_reuse_existing_cert_and_setup_certificates_guards(self):
         """reuse_existing_cert_config 须拒符号链接并用 has(\"is_insecure\") 保真 false；setup_certificates 须拦截前导 - 迁移证书路径。"""
