@@ -1,3 +1,9 @@
+## 2026-11-28 — 新增节点总流量限额与自动硬熔断防超量功能，门户 2.76
+
+- 新增节点总流量限额与自动硬熔断引擎（`portal.py`）：支持三种统计口径自由切换（`iface_tx` 默认物理出口网卡仅出站，排除隧道与虚拟网卡、`users_total` 所有用户累计总流量、`iface_both` 物理出口网卡双向总计），支持 `monthly`（UTC+00:00 账单日 1–31 日、2 月等短月自动钳制至月末自动归零恢复）与 `cumulative`（累计上限不自动重置）两种周期模式，并支持可选手动校准当前周期已用流量（GB）。
+- 硬熔断防复活与主控和平共存（`portal.py`）：新增独立 5 秒后台守护线程 `node_traffic_quota_worker`（`except BaseException` 永生兜底且不吞退出信号），触达限额瞬间立即调用整机停用引擎关停全部 6 个对外代理服务（`hysteria-server`、`xray`、`gost`、`amneziawg-server`、`hy2-anytls`、`hy2-tuic`）并绕过节流强制落盘，始终保留控制中心与远程登录；熔断期间每 5 秒持续防复活，重启后门户自动保持停用；在 `data['traffic_suspend']` 中维护 `reasons` 原因隔离列表（`controller` / `local_quota`，兼容旧版无 `reasons` 视为 `['controller']`），确保外部主控制台与本机限额互不误解封、互不越权启动；通过 `last_boot_id` + 网卡增量与 `users_accum` + `last_user_bytes` 正增量保障重启、回绕、首次启用与删除用户均不丢流量、不倒退、不自锁。
+- 新增网页会话路由与实时面板界面（`portal.py`、`portal_assets.py`）：新增 `GET / POST <prefix>node-traffic-quota` 网页会话鉴权路由（带严格 `Content-Length` 位数守卫、零锁内写盘、CLI 状态合并保护），并将实时限额摘要并入 `GET <prefix>traffic-speed`；在多用户管理页紧邻「总已用流量」新增实时限额徽章与「节点总流量限额与自动熔断（防 VPS 超量）」卡片，触发熔断时在页面顶部展示醒目红色熔断横幅并提供一键跳转按钮。
+
 ## 2026-11-24 — 第六十五批十项修复，门户 2.75
 
 - 门户代理服务数量上限、端口与密码严格边界、深拷贝端口快照及 GOST 备份常规文件校验（`portal.py`）：`_manage_proxy_operation()` 新增代理服务总数上限（`<= 128`）防配置与端口表无限膨胀，端口入参拒绝非字符串/非整数与前导零（收紧为 `^[1-9][0-9]{0,4}$`），统一限制 HTTP/HTTPS 代理密码 `<= 256` 字符，并将新建与删除分支锁内端口快照由浅拷贝 `dict(data)` 升级为深拷贝消除并发迭代崩溃隐患；`_h_post_install_gost()` 备份现有 GOST 资产前校验 `stat.S_ISREG` 与体积上限（二进制 `128 MiB`、其余资产 `4 MiB`），防范 FIFO 阻塞与超大文件耗尽内存。

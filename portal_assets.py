@@ -435,6 +435,51 @@ footer{display:flex;justify-content:space-between;margin-top:32px;color:#879996;
 .awg-hint { font-size: 11.5px; color: var(--muted); margin: 10px 0 0; line-height: 1.6; }
 @media(max-width: 600px) { .awg-add-form { flex-direction: column; } .awg-add-form .awg-input { width: 100%; } }
 
+/* ===== 节点总流量限额与自动硬熔断卡片（门户 2.76） ===== */
+.quota-alert-banner { display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap; margin: 0 0 18px; padding: 14px 18px; border-radius: 14px; background: #fff1f0; border: 1.5px solid #f5b8b4; color: #8c1d18; box-shadow: 0 6px 18px rgba(207, 60, 60, 0.12); }
+.quota-alert-body { flex: 1; min-width: 220px; }
+.quota-alert-title { font-size: 14px; font-weight: 800; color: #b42318; margin-bottom: 4px; }
+.quota-alert-desc { font-size: 12.5px; color: #7a271a; line-height: 1.5; }
+.quota-pill { background: #f3f7f6; color: var(--muted); border-color: var(--line); }
+.quota-pill.ok { background: #eafaf3; color: #0b8650; border-color: #b7e6d0; }
+.quota-pill.warn { background: #fff7e6; color: #b25e09; border-color: #f6d598; }
+.quota-pill.tripped { background: #fff1f0; color: #cf3c3c; border-color: #f5b8b4; }
+.nq-card { background: #f9fcfb; border: 1px solid #d4e5e1; border-left: 4px solid var(--accent); border-radius: 14px; padding: 18px 20px; margin-bottom: 18px; }
+.nq-card.tripped { background: #fffafa; border-color: #f5c2be; border-left-color: var(--danger); }
+.nq-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.nq-title { font-size: 15px; font-weight: 800; color: var(--ink); margin: 0 0 4px; }
+.nq-sub { font-size: 12px; color: var(--muted); margin: 0; line-height: 1.5; }
+.nq-pill { background: #f1efe8; color: #5f5e5a; }
+.nq-pill.ok { background: #eafaf3; color: #0b8650; }
+.nq-pill.warn { background: #fff7e6; color: #b25e09; }
+.nq-pill.tripped { background: #fff1f0; color: #cf3c3c; }
+.nq-meter { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; margin-bottom: 14px; }
+.nq-meter-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 8px; }
+.nq-usage-main { font-size: 16px; font-weight: 800; color: var(--ink); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.nq-percent { font-size: 13px; font-weight: 800; color: var(--accent); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.nq-percent.warn { color: #b25e09; }
+.nq-percent.tripped { color: var(--danger); }
+.nq-progress-track { height: 10px; width: 100%; background: #e6edec; border-radius: 999px; overflow: hidden; margin-bottom: 12px; }
+.nq-progress-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width .25s ease, background-color .2s ease; }
+.nq-progress-fill.warn { background: #d97706; }
+.nq-progress-fill.tripped { background: var(--danger); }
+.nq-meta-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.nq-meta-item { background: #f7faf9; border: 1px solid #e3eeec; border-radius: 9px; padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
+.nq-meta-item span { font-size: 11px; color: var(--muted); font-weight: 600; }
+.nq-meta-item strong { font-size: 12px; color: var(--ink); word-break: break-word; }
+.nq-trip-notice { margin-bottom: 14px; padding: 11px 14px; border-radius: 10px; background: #fff1f0; border: 1px solid #f5b8b4; color: #8c1d18; font-size: 12.5px; line-height: 1.6; }
+.nq-form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 18px; }
+.nq-form-grid select { height: 42px; padding: 0 12px; border: 1px solid var(--line); border-radius: 9px; font-size: 13px; background: #fff; color: var(--ink); outline: none; }
+.nq-form-grid select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(8, 127, 116, 0.12); }
+.nq-toggle-row { padding: 8px 12px; background: #fff; border: 1px solid var(--line); border-radius: 10px; }
+.nq-check-label { display: flex !important; justify-content: flex-start !important; align-items: center; gap: 9px; cursor: pointer; font-size: 13px !important; font-weight: 700 !important; color: var(--ink) !important; }
+.nq-check-label input[type="checkbox"] { width: 17px; height: 17px; padding: 0; accent-color: var(--accent); cursor: pointer; }
+.nq-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.nq-msg { font-size: 12px; color: var(--muted); }
+.nq-msg.ok { color: #0b8650; font-weight: 600; }
+.nq-msg.err { color: var(--danger); font-weight: 600; }
+@media(max-width: 760px) { .nq-meta-grid, .nq-form-grid { grid-template-columns: 1fr; } }
+
 
 
 """
@@ -3496,6 +3541,11 @@ async function pollTrafficSpeed() {
         }
       });
     }
+
+    // 同步刷新节点总流量限额进度条、顶部徽章与红色熔断横幅（不覆写用户正在填写的表单）
+    if (json.node_traffic_quota && typeof renderNodeQuotaSummary === 'function') {
+      renderNodeQuotaSummary(json.node_traffic_quota);
+    }
   } catch (_) {} finally { trafficPollPending = false; }
 }
 
@@ -4327,6 +4377,399 @@ if (btnUpdateAwg) {
 }
 
 loadAwgState();
+
+// ============================================================================
+// 节点总流量限额与自动硬熔断（防 VPS 超量）交互与实时渲染
+// ============================================================================
+const nqEls = {
+  banner: document.getElementById('node-quota-alert-banner'),
+  bannerTitle: document.getElementById('nq-banner-title'),
+  bannerDesc: document.getElementById('nq-banner-desc'),
+  bannerGoto: document.getElementById('btn-quota-banner-goto'),
+  headerBadge: document.getElementById('node-quota-header-badge'),
+  card: document.getElementById('node-quota-card'),
+  pill: document.getElementById('nq-status-pill'),
+  usageText: document.getElementById('nq-usage-text'),
+  percentText: document.getElementById('nq-percent-text'),
+  progressBar: document.getElementById('nq-progress-bar'),
+  metaMode: document.getElementById('nq-meta-mode'),
+  metaIfaces: document.getElementById('nq-meta-ifaces'),
+  metaReset: document.getElementById('nq-meta-reset'),
+  tripNotice: document.getElementById('nq-trip-notice'),
+  enabled: document.getElementById('nq-enabled'),
+  limitGb: document.getElementById('nq-limit-gb'),
+  mode: document.getElementById('nq-mode'),
+  resetMode: document.getElementById('nq-reset-mode'),
+  resetDayWrap: document.getElementById('nq-reset-day-wrap'),
+  resetDay: document.getElementById('nq-reset-day'),
+  calibrateGb: document.getElementById('nq-calibrate-gb'),
+  btnSave: document.getElementById('btn-nq-save'),
+  btnReset: document.getElementById('btn-nq-reset'),
+  btnRefresh: document.getElementById('btn-nq-refresh'),
+  msg: document.getElementById('nq-msg'),
+};
+
+let nqFormSynced = false;
+
+function nqFmtBytes(val) {
+  if (typeof fmtUnits === 'function') {
+    return fmtUnits(val, ['B', 'KB', 'MB', 'GB', 'TB'], [0, 1, 2, 2, 2]);
+  }
+  const n = Number(val || 0);
+  return (Number.isFinite(n) && n >= 0 ? Math.round(n) : 0) + ' B';
+}
+
+function nqFmtUtcTime(ts) {
+  const sec = Number(ts || 0);
+  if (!Number.isFinite(sec) || sec <= 0) return '';
+  try {
+    return new Date(sec * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  } catch (_) {
+    return '';
+  }
+}
+
+function nqSetMsg(text, kind) {
+  if (!nqEls.msg) return;
+  nqEls.msg.textContent = text || '';
+  nqEls.msg.className = 'nq-msg' + (kind ? (' ' + kind) : '');
+}
+
+function nqSyncResetDayVisibility() {
+  if (!nqEls.resetMode) return;
+  const isMonthly = nqEls.resetMode.value !== 'cumulative';
+  if (nqEls.resetDayWrap) nqEls.resetDayWrap.style.display = isMonthly ? '' : 'none';
+  if (nqEls.resetDay) nqEls.resetDay.disabled = !isMonthly;
+}
+
+function fillNodeQuotaForm(q) {
+  if (!q || typeof q !== 'object') return;
+  if (nqEls.enabled) nqEls.enabled.checked = q.enabled === true;
+  if (nqEls.limitGb) {
+    const gb = Number(q.limit_gb || 0);
+    nqEls.limitGb.value = (Number.isFinite(gb) && gb > 0) ? String(gb) : '0';
+  }
+  if (nqEls.mode && typeof q.mode === 'string') nqEls.mode.value = q.mode;
+  if (nqEls.resetMode && typeof q.reset_mode === 'string') nqEls.resetMode.value = q.reset_mode;
+  if (nqEls.resetDay) {
+    const day = Number(q.reset_day || 1);
+    nqEls.resetDay.value = (Number.isFinite(day) && day >= 1 && day <= 31) ? String(Math.floor(day)) : '1';
+  }
+  nqSyncResetDayVisibility();
+  nqFormSynced = true;
+}
+
+function renderNodeQuotaSummary(q, syncForm) {
+  if (!q || typeof q !== 'object') return;
+  const enabled = q.enabled === true;
+  const tripped = q.tripped === true;
+  const controllerSuspended = q.controller_suspended === true;
+  const usedBytes = Number(q.used_bytes || 0);
+  const limitBytes = Number(q.limit_bytes || 0);
+  const rawPct = Number(q.percent || 0);
+  const pct = Number.isFinite(rawPct) ? Math.max(0, Math.min(100, rawPct)) : 0;
+  const pctText = pct.toFixed(1) + '%';
+  const usedStr = nqFmtBytes(usedBytes);
+  const limitStr = limitBytes > 0 ? nqFmtBytes(limitBytes) : '未设置上限';
+
+  let level = '';
+  if (tripped) level = 'tripped';
+  else if (enabled && limitBytes > 0 && pct >= 80) level = 'warn';
+  else if (enabled && limitBytes > 0) level = 'ok';
+
+  // 1. 页面顶部红色熔断横幅（任意页签均可见）
+  if (nqEls.banner) {
+    if (tripped) {
+      nqEls.banner.style.display = 'flex';
+      if (nqEls.bannerTitle) {
+        nqEls.bannerTitle.textContent = '⛔ 节点总流量已达上限，对外代理服务已自动熔断关停';
+      }
+      if (nqEls.bannerDesc) {
+        let desc = '当前周期已用 ' + usedStr + ' / 上限 ' + limitStr + '（' + pctText + '），已停用全部对外代理服务；控制中心与远程登录仍保持可用。';
+        if (controllerSuspended) desc += ' 同时检测到外部主控制台也处于停用状态。';
+        nqEls.bannerDesc.textContent = desc;
+      }
+    } else {
+      nqEls.banner.style.display = 'none';
+    }
+  }
+
+  // 2. 多用户头部徽章（紧邻总已用流量）
+  if (nqEls.headerBadge) {
+    if (tripped) {
+      nqEls.headerBadge.textContent = '节点限额: 已熔断停服 (' + pctText + ')';
+      nqEls.headerBadge.className = 'badge-count quota-pill tripped';
+    } else if (enabled && limitBytes > 0) {
+      nqEls.headerBadge.textContent = '节点限额: ' + usedStr + ' / ' + limitStr + ' (' + pctText + ')';
+      nqEls.headerBadge.className = 'badge-count quota-pill ' + (level || 'ok');
+    } else {
+      nqEls.headerBadge.textContent = '节点限额: 未启用';
+      nqEls.headerBadge.className = 'badge-count quota-pill';
+    }
+  }
+
+  // 3. 节点限额卡片状态与进度条
+  if (nqEls.card) nqEls.card.className = tripped ? 'nq-card tripped' : 'nq-card';
+  if (nqEls.pill) {
+    if (tripped && controllerSuspended) {
+      nqEls.pill.textContent = '本机熔断 + 主控停用';
+      nqEls.pill.className = 'status-pill nq-pill tripped';
+    } else if (tripped) {
+      nqEls.pill.textContent = '已自动熔断停服';
+      nqEls.pill.className = 'status-pill nq-pill tripped';
+    } else if (controllerSuspended) {
+      nqEls.pill.textContent = enabled ? '监控中（主控停用中）' : '未启用（主控停用中）';
+      nqEls.pill.className = 'status-pill nq-pill warn';
+    } else if (enabled && limitBytes > 0 && pct >= 80) {
+      nqEls.pill.textContent = '即将达限（预警）';
+      nqEls.pill.className = 'status-pill nq-pill warn';
+    } else if (enabled && limitBytes > 0) {
+      nqEls.pill.textContent = '实时监控中';
+      nqEls.pill.className = 'status-pill nq-pill ok';
+    } else {
+      nqEls.pill.textContent = '未启用';
+      nqEls.pill.className = 'status-pill nq-pill';
+    }
+  }
+
+  if (nqEls.usageText) nqEls.usageText.textContent = usedStr + ' / ' + limitStr;
+  if (nqEls.percentText) {
+    nqEls.percentText.textContent = (enabled && limitBytes > 0) ? pctText : '未设限';
+    nqEls.percentText.className = 'nq-percent' + (level === 'tripped' ? ' tripped' : (level === 'warn' ? ' warn' : ''));
+  }
+  if (nqEls.progressBar) {
+    nqEls.progressBar.style.width = ((enabled && limitBytes > 0) ? pct : 0) + '%';
+    nqEls.progressBar.className = 'nq-progress-fill' + (level === 'tripped' ? ' tripped' : (level === 'warn' ? ' warn' : ''));
+  }
+
+  if (nqEls.metaMode) nqEls.metaMode.textContent = typeof q.mode_label === 'string' ? q.mode_label : '物理出口网卡（仅出站）';
+  if (nqEls.metaIfaces) {
+    const ifaces = Array.isArray(q.interfaces) ? q.interfaces.filter(x => typeof x === 'string' && x) : [];
+    nqEls.metaIfaces.textContent = ifaces.length ? ifaces.join(', ') : (q.mode === 'users_total' ? '按全用户统计' : '未探测到物理网卡');
+  }
+  if (nqEls.metaReset) {
+    if (q.reset_mode === 'monthly') {
+      const nextTxt = typeof q.next_reset_text === 'string' && q.next_reset_text ? q.next_reset_text : '自动计算';
+      nqEls.metaReset.textContent = '每月 ' + (q.reset_day || 1) + ' 日重置 · 下次: ' + nextTxt;
+    } else {
+      nqEls.metaReset.textContent = '累计上限（不自动重置，需手动清零）';
+    }
+  }
+
+  if (nqEls.tripNotice) {
+    if (tripped) {
+      const tripTime = nqFmtUtcTime(q.tripped_at);
+      let tip = '⛔ 节点已触发本机超量硬熔断' + (tripTime ? ('（触发时间：' + tripTime + '）') : '')
+        + '：全部对外代理服务已被关停并持续防复活。你可通过下方「清零本周期已用」、调高限额保存或等待月度账单日自动重置来恢复服务。';
+      if (controllerSuspended) {
+        tip += ' 注意：外部主控制台当前也处于停用状态，解除本机熔断后仍需主控制台恢复才会启动服务。';
+      }
+      nqEls.tripNotice.textContent = tip;
+      nqEls.tripNotice.style.display = 'block';
+    } else if (controllerSuspended) {
+      nqEls.tripNotice.textContent = 'ℹ️ 当前节点处于外部主控制台停用状态（非本机总流量限额触发），本机总流量限额运行正常。';
+      nqEls.tripNotice.style.display = 'block';
+    } else {
+      nqEls.tripNotice.style.display = 'none';
+    }
+  }
+
+  if (syncForm || !nqFormSynced) fillNodeQuotaForm(q);
+}
+
+async function loadNodeQuota(syncForm) {
+  if (portalSessionExpired) {
+    return { ok: false, expired: true, error: '登录已过期，请刷新页面重新登录' };
+  }
+  try {
+    const res = await fetch(location.pathname + 'node-traffic-quota', { credentials: 'same-origin' });
+    if (res.status === 401) {
+      portalSessionExpired = true;
+      return { ok: false, expired: true, error: '登录已过期，请刷新页面重新登录' };
+    }
+    let json = null;
+    try { json = await res.json(); } catch (_) { json = null; }
+    if (res.ok !== false && json && json.ok && json.quota) {
+      renderNodeQuotaSummary(json.quota, !!syncForm);
+      return { ok: true, quota: json.quota };
+    }
+    return { ok: false, error: (json && json.error) || ('获取状态失败（HTTP ' + res.status + '）') };
+  } catch (e) {
+    return { ok: false, error: '刷新请求异常：' + (e && e.message ? e.message : e) };
+  }
+}
+
+if (nqEls.resetMode) {
+  nqEls.resetMode.addEventListener('change', nqSyncResetDayVisibility);
+}
+
+if (nqEls.bannerGoto) {
+  nqEls.bannerGoto.addEventListener('click', () => {
+    if (typeof gotoTarget === 'function') gotoTarget('users');
+    else if (typeof switchTab === 'function') switchTab('users');
+    if (nqEls.card && typeof nqEls.card.scrollIntoView === 'function') {
+      try { nqEls.card.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (_) {}
+    }
+  });
+}
+
+if (nqEls.btnRefresh) {
+  nqEls.btnRefresh.addEventListener('click', async () => {
+    if (nqEls.btnRefresh.disabled) return;
+    nqEls.btnRefresh.disabled = true;
+    nqSetMsg('正在刷新节点限额状态…', '');
+    try {
+      const outcome = await loadNodeQuota(true);
+      if (outcome && outcome.ok) {
+        nqSetMsg('已刷新最新统计数据', 'ok');
+      } else {
+        nqSetMsg((outcome && outcome.error) || '刷新失败，请稍后重试', 'err');
+      }
+    } finally {
+      nqEls.btnRefresh.disabled = false;
+    }
+  });
+}
+
+if (nqEls.btnSave) {
+  nqEls.btnSave.addEventListener('click', async () => {
+    if (nqEls.btnSave.disabled) return;
+    const enabled = !!(nqEls.enabled && nqEls.enabled.checked);
+    const limitVal = nqEls.limitGb ? String(nqEls.limitGb.value || '').trim() : '0';
+    const modeVal = nqEls.mode ? String(nqEls.mode.value || 'iface_tx') : 'iface_tx';
+    const resetModeVal = nqEls.resetMode ? String(nqEls.resetMode.value || 'monthly') : 'monthly';
+    const resetDayVal = nqEls.resetDay ? String(nqEls.resetDay.value || '1').trim() : '1';
+    const calVal = nqEls.calibrateGb ? String(nqEls.calibrateGb.value || '').trim() : '';
+
+    if (enabled) {
+      const limNum = Number(limitVal);
+      if (!limitVal || !Number.isFinite(limNum) || limNum <= 0 || Math.round(limNum * 1073741824) <= 0) {
+        nqSetMsg('启用节点总流量限额时，限额折合字节数必须大于 0', 'err');
+        return;
+      }
+    }
+    if (resetModeVal === 'monthly') {
+      const dNum = Number(resetDayVal);
+      if (!/^[1-9][0-9]?$/.test(resetDayVal) || dNum < 1 || dNum > 31) {
+        nqSetMsg('每月账单日必须为 1 至 31 的整数', 'err');
+        return;
+      }
+    }
+    if (calVal !== '') {
+      const cNum = Number(calVal);
+      if (!Number.isFinite(cNum) || cNum < 0) {
+        nqSetMsg('校准已用流量必须为非负数字，留空表示不校准', 'err');
+        return;
+      }
+    }
+
+    nqEls.btnSave.disabled = true;
+    nqSetMsg('正在保存配置…', '');
+    try {
+      const payloadMap = {
+        action: 'save',
+        enabled: enabled ? 'true' : 'false',
+        mode: modeVal,
+        limit_gb: limitVal || '0',
+        reset_mode: resetModeVal,
+        calibrate_used_gb: calVal,
+      };
+      // 仅按月重置模式才携带账单日，避免累计模式隐藏禁用该控件后残留脏值触发 400
+      if (resetModeVal === 'monthly') {
+        payloadMap.reset_day = resetDayVal || '1';
+      }
+      const body = new URLSearchParams(payloadMap);
+      const res = await fetch(location.pathname + 'node-traffic-quota', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+      });
+      if (res.status === 401) {
+        portalSessionExpired = true;
+        nqSetMsg('登录已过期，请刷新页面重新登录', 'err');
+        return;
+      }
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (res.ok !== false && json && json.ok) {
+        if (nqEls.calibrateGb) nqEls.calibrateGb.value = '';
+        if (json.quota) renderNodeQuotaSummary(json.quota, true);
+        const msg = json.message || '配置已保存';
+        nqSetMsg(msg, 'ok');
+        if (typeof showToast === 'function') showToast(msg, 'success');
+      } else {
+        const err = (json && json.error) || ('保存失败（HTTP ' + res.status + '）');
+        nqSetMsg(err, 'err');
+        if (typeof showToast === 'function') showToast(err, 'error');
+      }
+    } catch (e) {
+      const err = '保存请求异常：' + (e && e.message ? e.message : e);
+      nqSetMsg(err, 'err');
+    } finally {
+      nqEls.btnSave.disabled = false;
+    }
+  });
+}
+
+if (nqEls.btnReset) {
+  nqEls.btnReset.addEventListener('click', async () => {
+    if (nqEls.btnReset.disabled || nqEls.btnReset._confirming) return;
+    nqEls.btnReset._confirming = true;
+    let confirmed = false;
+    try {
+      if (typeof showConfirm === 'function') {
+        confirmed = await showConfirm({
+          title: '清零本周期节点已用流量',
+          text: '确认将本周期已用流量归零并重建网卡/用户统计基线？\n若当前处于本机超量熔断状态，清零后将立即自动恢复代理服务（外部主控停用不受影响）。',
+          icon: '🧹',
+          confirmText: '确认清零并恢复',
+          isDanger: true,
+        });
+      } else {
+        confirmed = true;
+      }
+    } finally {
+      nqEls.btnReset._confirming = false;
+    }
+    if (!confirmed || nqEls.btnReset.disabled) return;
+    nqEls.btnReset.disabled = true;
+    nqSetMsg('正在清零本周期计数…', '');
+    try {
+      const body = new URLSearchParams({ action: 'reset' });
+      const res = await fetch(location.pathname + 'node-traffic-quota', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+      });
+      if (res.status === 401) {
+        portalSessionExpired = true;
+        nqSetMsg('登录已过期，请刷新页面重新登录', 'err');
+        return;
+      }
+      let json = null;
+      try { json = await res.json(); } catch (_) { json = null; }
+      if (res.ok !== false && json && json.ok) {
+        if (nqEls.calibrateGb) nqEls.calibrateGb.value = '';
+        if (json.quota) renderNodeQuotaSummary(json.quota, true);
+        const msg = json.message || '已清零本周期已用流量';
+        nqSetMsg(msg, 'ok');
+        if (typeof showToast === 'function') showToast(msg, 'success');
+      } else {
+        const err = (json && json.error) || ('清零失败（HTTP ' + res.status + '）');
+        nqSetMsg(err, 'err');
+        if (typeof showToast === 'function') showToast(err, 'error');
+      }
+    } catch (e) {
+      nqSetMsg('清零请求异常：' + (e && e.message ? e.message : e), 'err');
+    } finally {
+      nqEls.btnReset.disabled = false;
+    }
+  });
+}
+
+loadNodeQuota(true);
 """
 
 # ============================================================================

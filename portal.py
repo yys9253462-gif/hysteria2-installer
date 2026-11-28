@@ -4,6 +4,7 @@
 import ast
 import collections
 import signal
+import calendar
 import copy
 import contextlib
 import datetime
@@ -312,7 +313,7 @@ AWG_REPO = 'yys9253462-gif/hysteria2-installer'
 #
 # ⚠️ 改动 portal.py 的**能力**时记得同步 +1，否则主面板会按旧能力显示。
 # 格式固定 `PORTAL_VERSION = 'x.y'`（capabilities 端点按行首匹配解析它）。
-PORTAL_VERSION = '2.75'
+PORTAL_VERSION = '2.76'
 
 # ---------------------------------------------------------------------------
 # 流媒体 / AI 解锁检测（2.8，GET /api/v1/unlock-check）
@@ -3377,6 +3378,15 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
 <header class="hero"><div class="eyebrow">HYSTERIA 2 NODE DASHBOARD</div><h1>{html.escape(host)}</h1><p>官方核心驱动 · 极速 QUIC 代理 · 多用户开户与流量/IP限制{fake_sni_hint}</p>
 <form method="POST" action="/{token_attr}/logout" style="margin-top:10px"><button class="button" type="submit" style="padding:6px 14px;font-size:12px">退出登录</button></form></header>
 
+<!-- 节点总流量超额熔断顶部醒目横幅（实时状态由脚本自动同步） -->
+<div class="quota-alert-banner" id="node-quota-alert-banner" role="alert" style="display:none">
+  <div class="quota-alert-body">
+    <div class="quota-alert-title" id="nq-banner-title">⛔ 节点总流量已达上限，对外代理服务已自动熔断关停</div>
+    <div class="quota-alert-desc" id="nq-banner-desc">已停用全部对外代理服务，控制中心与远程登录保持可用。</div>
+  </div>
+  <button class="button danger" type="button" id="btn-quota-banner-goto">前往管理与恢复 →</button>
+</div>
+
 <!-- 顶部 Tab 导航栏 -->
 <div class="tab-bar">
   <button class="tab-btn active" data-tab="connect" type="button">🚀 节点导入 (Connect)</button>
@@ -3424,6 +3434,7 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
       <div class="user-stats">
         <span class="badge-count">有效用户: {active_count} / {len(users)}</span>
         <span class="badge-count" style="background:#f0f7f6">总已用流量: <span id="total-used-bytes">{format_bytes(total_used_bytes)}</span></span>
+        <span class="badge-count quota-pill" id="node-quota-header-badge">节点限额: 未启用</span>
       </div>
     </div>
 
@@ -3442,6 +3453,87 @@ def page_html(m, uri, subscription, clash, sing, users=None, api_key=None, token
           <div class="val" id="node-speed-tx" style="color:#284d56">0.0 KB/s</div>
         </div>
         <span class="speed-badge" id="tx-active-tag">● 实时监听</span>
+      </div>
+    </div>
+
+    <!-- 节点总流量限额与自动硬熔断卡片（防云服务器超量计费） -->
+    <div class="nq-card" id="node-quota-card">
+      <div class="nq-head">
+        <div>
+          <h3 class="nq-title">🛡️ 节点总流量限额与自动熔断（防 VPS 超量）</h3>
+          <p class="nq-sub">独立守护线程每 5 秒检测，触达上限立即关停全部对外代理服务并持续防复活，始终保留控制中心与远程登录</p>
+        </div>
+        <span class="status-pill nq-pill" id="nq-status-pill">未启用</span>
+      </div>
+
+      <div class="nq-meter">
+        <div class="nq-meter-top">
+          <div class="nq-usage-main" id="nq-usage-text">0 B / 未设置上限</div>
+          <div class="nq-percent" id="nq-percent-text">0.0%</div>
+        </div>
+        <div class="nq-progress-track">
+          <div class="nq-progress-fill" id="nq-progress-bar" style="width:0%"></div>
+        </div>
+        <div class="nq-meta-grid">
+          <div class="nq-meta-item"><span>统计口径</span><strong id="nq-meta-mode">物理出口网卡（仅出站）</strong></div>
+          <div class="nq-meta-item"><span>监控网卡</span><strong id="nq-meta-ifaces">自动探测中</strong></div>
+          <div class="nq-meta-item"><span>周期与下次重置</span><strong id="nq-meta-reset">每月 1 日自动重置（UTC）</strong></div>
+        </div>
+      </div>
+
+      <div class="nq-trip-notice" id="nq-trip-notice" style="display:none"></div>
+
+      <div class="nq-form-grid">
+        <div class="form-field form-field-full nq-toggle-row">
+          <label class="nq-check-label" for="nq-enabled">
+            <input id="nq-enabled" type="checkbox">
+            <span>启用节点总流量限额与自动硬熔断（到达上限立即停服）</span>
+          </label>
+        </div>
+
+        <div class="form-field">
+          <label for="nq-limit-gb">节点总流量上限 (GB) <span>启用时须大于 0</span></label>
+          <input id="nq-limit-gb" type="number" step="any" min="0" max="1000000" value="0" placeholder="例如 180">
+          <small>建议设为云商免费额度或月包额度的 85%–95%，预留缓冲余量</small>
+        </div>
+
+        <div class="form-field">
+          <label for="nq-mode">流量统计口径 <span>默认物理网卡出站</span></label>
+          <select id="nq-mode">
+            <option value="iface_tx">物理出口网卡 · 仅出站（推荐，贴合云商出站计费）</option>
+            <option value="users_total">所有用户累计总流量（与右上角总已用流量同源）</option>
+            <option value="iface_both">物理出口网卡 · 双向总计（入站 + 出站）</option>
+          </select>
+          <small>物理网卡自动排除隧道与虚拟网卡，重启与删用户均不丢累计</small>
+        </div>
+
+        <div class="form-field">
+          <label for="nq-reset-mode">周期重置模式 <span>默认按月自动清零</span></label>
+          <select id="nq-reset-mode">
+            <option value="monthly">每月账单日自动重置（UTC+00:00，到期自动恢复）</option>
+            <option value="cumulative">累计上限（不自动重置，超额后需手动清零）</option>
+          </select>
+          <small>若同时被外部主控制台停用，本机重置不会越权拉起服务</small>
+        </div>
+
+        <div class="form-field" id="nq-reset-day-wrap">
+          <label for="nq-reset-day">每月账单日 (1–31) <span>UTC+00:00</span></label>
+          <input id="nq-reset-day" type="number" min="1" max="31" value="1" placeholder="1">
+          <small>2 月等短月自动钳制到当月最后一天（如 31 日对齐 2 月 28/29 日）</small>
+        </div>
+
+        <div class="form-field form-field-full">
+          <label for="nq-calibrate-gb">可选：校准当前周期已用流量 (GB) <span>留空保持当前累计不变</span></label>
+          <input id="nq-calibrate-gb" type="number" step="any" min="0" max="1000000" value="" placeholder="留空不变；如需对齐云商本月已用可填例如 80">
+          <small>填写后会立即把当前口径的本周期累计值校准为该值，并马上重新判定是否触发或解除熔断</small>
+        </div>
+      </div>
+
+      <div class="nq-actions">
+        <button class="button primary" type="button" id="btn-nq-save">💾 保存限额设置</button>
+        <button class="button danger" type="button" id="btn-nq-reset">🧹 清零本周期已用</button>
+        <button class="button" type="button" id="btn-nq-refresh">🔄 刷新状态</button>
+        <span class="nq-msg" id="nq-msg"></span>
       </div>
     </div>
 
@@ -5734,6 +5826,23 @@ def legacy_used_bytes(data, uid):
 
 
 TRAFFIC_SUSPEND_UNIT_RE = re.compile(r'^[a-z0-9][a-z0-9@._-]{0,127}$')
+TRAFFIC_SUSPEND_REASONS = ('controller', 'local_quota')
+
+# 节点总流量限额与自动硬熔断（防云服务器超量计费）常量与纯函数引擎。
+NODE_TRAFFIC_QUOTA_MODES = ('iface_tx', 'users_total', 'iface_both')
+NODE_TRAFFIC_QUOTA_MODE_LABELS = {
+    'iface_tx': '物理出口网卡（仅出站）',
+    'users_total': '所有用户累计总流量',
+    'iface_both': '物理出口网卡（入站 + 出站）',
+}
+NODE_TRAFFIC_QUOTA_RESETS = ('monthly', 'cumulative')
+NODE_TRAFFIC_QUOTA_RESET_LABELS = {
+    'monthly': '每月账单日自动重置',
+    'cumulative': '累计上限（不自动重置）',
+}
+NODE_TRAFFIC_QUOTA_MAX_GB = 1000000.0
+GIB_BYTES = 1024 ** 3
+NODE_QUOTA_SAVE_INTERVAL = 60
 
 
 def suspend_state(data):
@@ -5765,7 +5874,439 @@ def suspend_state(data):
         clean.pop('since', None)
     else:
         clean['since'] = int(raw_since)
+    # 兼容旧版无 reasons 字段的数据：仅在显式存在 reasons 键时做清洗，不破坏既有往返契约。
+    if 'reasons' in clean:
+        raw_reasons = clean.get('reasons')
+        deduped_reasons = []
+        if isinstance(raw_reasons, list):
+            for r in raw_reasons:
+                if r in ('controller', 'local_quota') and r not in deduped_reasons:
+                    deduped_reasons.append(r)
+        if deduped_reasons:
+            clean['reasons'] = deduped_reasons
+        else:
+            clean.pop('reasons', None)
     return clean
+
+
+def suspend_reasons(state):
+    """提取当前生效的整机停用原因列表；兼容旧版无 reasons 字段且已停用时视为主控制台停用。"""
+    if not isinstance(state, dict) or state.get('suspended') is not True:
+        return []
+    raw_reasons = state.get('reasons')
+    cleaned = []
+    if isinstance(raw_reasons, list):
+        for r in raw_reasons:
+            if r in TRAFFIC_SUSPEND_REASONS and r not in cleaned:
+                cleaned.append(r)
+    return cleaned or ['controller']
+
+
+def default_node_traffic_quota():
+    """返回节点总流量限额的默认配置与状态结构（默认关闭、物理网卡出站、每月 1 日重置）。"""
+    return {
+        'enabled': False,
+        'mode': 'iface_tx',
+        'limit_bytes': 0,
+        'reset_mode': 'monthly',
+        'reset_day': 1,
+        'cycle_key': '',
+        'cycle_start_ts': 0,
+        'used_bytes': 0,
+        'iface_tx_accum': 0,
+        'iface_rx_accum': 0,
+        'iface_baseline_ready': False,
+        'last_boot_id': '',
+        'last_raw_tx': 0,
+        'last_raw_rx': 0,
+        'last_interfaces': [],
+        'users_accum': 0,
+        'users_baseline_ready': False,
+        'last_user_bytes': {},
+        'tripped': False,
+        'tripped_at': 0,
+        'last_reset_at': 0,
+        'last_sample_at': 0,
+        'updated_at': 0,
+    }
+
+
+def node_quota_cycle_window(now_ts, reset_day):
+    """按 UTC+00:00 计算账单日对应的当前周期窗口，返回 (周期标识, 起始时间戳, 下次重置时间戳)。
+
+    对 2 月、4 月等短月自动将账单日钳制到当月最后一天（例如 31 日在非闰年 2 月对齐 28 日、闰年对齐 29 日）。
+    """
+    ts = int(now_ts) if (isinstance(now_ts, (int, float)) and not isinstance(now_ts, bool)
+                         and math.isfinite(now_ts) and now_ts >= 0) else int(time.time())
+    day = int(reset_day) if (isinstance(reset_day, int) and not isinstance(reset_day, bool)
+                             and 1 <= reset_day <= 31) else 1
+    now_dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    y, m = now_dt.year, now_dt.month
+    cur_bill_day = min(day, calendar.monthrange(y, m)[1])
+    cur_bill_dt = datetime.datetime(y, m, cur_bill_day, 0, 0, 0, tzinfo=datetime.timezone.utc)
+    if now_dt >= cur_bill_dt:
+        start_dt = cur_bill_dt
+        ny, nm = (y + 1, 1) if m == 12 else (y, m + 1)
+        next_day = min(day, calendar.monthrange(ny, nm)[1])
+        next_dt = datetime.datetime(ny, nm, next_day, 0, 0, 0, tzinfo=datetime.timezone.utc)
+    else:
+        py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
+        prev_day = min(day, calendar.monthrange(py, pm)[1])
+        start_dt = datetime.datetime(py, pm, prev_day, 0, 0, 0, tzinfo=datetime.timezone.utc)
+        next_dt = cur_bill_dt
+    return start_dt.strftime('%Y-%m-%d'), int(start_dt.timestamp()), int(next_dt.timestamp())
+
+
+def _quota_nonneg_int(value):
+    """安全转为非负整数，拦截负数、布尔、非有限浮点与损坏字符串。"""
+    v = _safe_int(value)
+    return v if v > 0 else 0
+
+
+def quota_current_used_bytes(q):
+    """按统计口径计算当前周期累计已用字节数。"""
+    if not isinstance(q, dict):
+        return 0
+    mode = q.get('mode')
+    if mode == 'users_total':
+        return _quota_nonneg_int(q.get('users_accum'))
+    if mode == 'iface_both':
+        return _quota_nonneg_int(q.get('iface_tx_accum')) + _quota_nonneg_int(q.get('iface_rx_accum'))
+    return _quota_nonneg_int(q.get('iface_tx_accum'))
+
+
+def normalize_node_traffic_quota(raw):
+    """清洗并规范化节点总流量限额配置，任何损坏值均安全降级为合法默认项。"""
+    q = default_node_traffic_quota()
+    if not isinstance(raw, dict):
+        return q
+    q['enabled'] = raw.get('enabled') is True
+    mode = raw.get('mode')
+    if mode in NODE_TRAFFIC_QUOTA_MODES:
+        q['mode'] = mode
+    reset_mode = raw.get('reset_mode')
+    if reset_mode in NODE_TRAFFIC_QUOTA_RESETS:
+        q['reset_mode'] = reset_mode
+    raw_day = raw.get('reset_day')
+    if isinstance(raw_day, int) and not isinstance(raw_day, bool) and 1 <= raw_day <= 31:
+        q['reset_day'] = raw_day
+    for k in ('limit_bytes', 'cycle_start_ts', 'iface_tx_accum', 'iface_rx_accum',
+              'last_raw_tx', 'last_raw_rx', 'users_accum', 'tripped_at',
+              'last_reset_at', 'last_sample_at', 'updated_at'):
+        q[k] = _quota_nonneg_int(raw.get(k))
+    ck = raw.get('cycle_key')
+    if isinstance(ck, str) and len(ck) <= 32 and not any(ord(c) < 32 or ord(c) == 127 for c in ck):
+        q['cycle_key'] = ck
+    q['iface_baseline_ready'] = raw.get('iface_baseline_ready') is True
+    q['users_baseline_ready'] = raw.get('users_baseline_ready') is True
+    q['tripped'] = raw.get('tripped') is True
+    bid = raw.get('last_boot_id')
+    if isinstance(bid, str) and len(bid) <= 128 and not any(ord(c) < 32 or ord(c) == 127 for c in bid):
+        q['last_boot_id'] = bid
+    raw_ifaces = raw.get('last_interfaces')
+    if isinstance(raw_ifaces, list):
+        cleaned_ifaces = []
+        for item in raw_ifaces:
+            if (isinstance(item, str) and item and len(item) <= 64
+                    and not any(ord(c) < 32 or ord(c) == 127 for c in item)
+                    and item not in cleaned_ifaces):
+                cleaned_ifaces.append(item)
+        q['last_interfaces'] = cleaned_ifaces[:16]
+    raw_lub = raw.get('last_user_bytes')
+    if isinstance(raw_lub, dict):
+        cleaned_lub = {}
+        for uid, val in raw_lub.items():
+            if isinstance(uid, str) and uid and len(uid) <= 128 and not any(ord(c) < 32 or ord(c) == 127 for c in uid):
+                cleaned_lub[uid] = _quota_nonneg_int(val)
+        q['last_user_bytes'] = cleaned_lub
+    q['used_bytes'] = quota_current_used_bytes(q)
+    return q
+
+
+def _quota_parse_bool(raw):
+    """严格解析布尔字段（支持表单字符串与 JSON 布尔值）。"""
+    if isinstance(raw, bool):
+        return True, raw, ''
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ('1', 'true', 'yes', 'on'):
+            return True, True, ''
+        if s in ('0', 'false', 'no', 'off', ''):
+            return True, False, ''
+    return False, False, '开关参数必须为布尔值'
+
+
+def _quota_parse_reset_day(raw):
+    """严格解析每月账单日（1-31 整数，拒绝布尔、小数、前导零与超长字符串）。"""
+    if isinstance(raw, bool):
+        return False, 1, '账单日必须为 1-31 的整数'
+    if isinstance(raw, int):
+        if 1 <= raw <= 31:
+            return True, raw, ''
+        return False, 1, '账单日必须在 1 到 31 之间'
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s or not s.isascii() or not s.isdigit() or len(s) > 4 or (len(s) > 1 and s.startswith('0')):
+            return False, 1, '账单日必须为 1-31 的整数'
+        day = int(s)
+        if 1 <= day <= 31:
+            return True, day, ''
+        return False, 1, '账单日必须在 1 到 31 之间'
+    return False, 1, '账单日必须为 1-31 的整数'
+
+
+def _quota_parse_gb_value(raw, *, allow_empty=False, allow_zero=True, label='流量数值'):
+    """严格解析 GB 数值为字节整数，拦截布尔、负数、非有限浮点与超长字符串。"""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        if allow_empty:
+            return True, None, ''
+        return False, 0, f'{label}不能为空'
+    if isinstance(raw, bool):
+        return False, 0, f'{label}必须为有效数字'
+    if isinstance(raw, (int, float)):
+        val = float(raw)
+    elif isinstance(raw, str):
+        s = raw.strip()
+        if len(s) > 24 or not s.isascii():
+            return False, 0, f'{label}格式不合法'
+        try:
+            val = float(s)
+        except ValueError:
+            return False, 0, f'{label}必须为有效数字'
+    else:
+        return False, 0, f'{label}必须为有效数字'
+    if not math.isfinite(val) or val < 0 or val > NODE_TRAFFIC_QUOTA_MAX_GB:
+        return False, 0, f'{label}须为 0 至 {int(NODE_TRAFFIC_QUOTA_MAX_GB)} GB 的有限数值'
+    byte_val = int(round(val * GIB_BYTES))
+    if not allow_zero and (val <= 0 or byte_val <= 0):
+        return False, 0, f'{label}折合字节数必须大于 0（启用时不可设为 0）'
+    return True, byte_val, ''
+
+
+def _quota_users_byte_map(users):
+    """提取全部用户的非负已用字节快照，供用户口径增量累计使用。"""
+    result = {}
+    for uid, info in users_list_rows(users):
+        if isinstance(uid, str) and isinstance(info, dict):
+            result[uid] = _quota_nonneg_int(info.get('used_bytes'))
+    return result
+
+
+def advance_node_traffic_quota(q, counters, users_map, now_ts, *, allow_auto_reset=True):
+    """纯函数推进一轮节点总流量采样、月度周期重置与超额判定，返回 (新状态, 事件字典)。
+
+    设计不变量：
+    1. 网卡口径首次建基线增量恒为 0，绝不把机器开机历史流量算成当前周期直接自锁；
+    2. 整机重启（boot_id 变化）或网卡计数器回绕时累加新计数值，绝不丢失历史累计；
+    3. 用户口径仅累加单用户正增量，删除用户绝不导致已用流量倒退；
+    4. 月度重置仅在时间向前跨入新账单周期时触发，免疫时钟回拨误清零；累计模式绝不自动重置。
+    """
+    st = normalize_node_traffic_quota(q)
+    ts = int(now_ts) if (isinstance(now_ts, (int, float)) and not isinstance(now_ts, bool)
+                         and math.isfinite(now_ts) and now_ts >= 0) else int(time.time())
+    c = counters if isinstance(counters, dict) else {}
+    rx_raw = _quota_nonneg_int(c.get('rx_bytes'))
+    tx_raw = _quota_nonneg_int(c.get('tx_bytes'))
+    raw_bid = c.get('boot_id')
+    boot_id = raw_bid.strip() if isinstance(raw_bid, str) else ''
+    raw_ifaces = c.get('interfaces')
+    ifaces = [x for x in (raw_ifaces if isinstance(raw_ifaces, list) else [])
+              if isinstance(x, str) and x and len(x) <= 64 and not any(ord(ch) < 32 or ord(ch) == 127 for ch in x)][:16]
+    umap = {k: _quota_nonneg_int(v) for k, v in (users_map.items() if isinstance(users_map, dict) else [])
+            if isinstance(k, str) and k}
+
+    did_reset = False
+    changed = False
+    baseline_initialized = False
+
+    if ifaces and ifaces != st['last_interfaces']:
+        st['last_interfaces'] = list(ifaces)
+        changed = True
+
+    # 1. 月度周期检查（仅 monthly 模式且允许自动重置时触发）
+    if st['reset_mode'] == 'monthly':
+        cur_key, cur_start, _ = node_quota_cycle_window(ts, st['reset_day'])
+        if st['cycle_start_ts'] <= 0 or not st['cycle_key']:
+            st['cycle_key'] = cur_key
+            st['cycle_start_ts'] = cur_start
+            changed = True
+        elif allow_auto_reset and cur_start > st['cycle_start_ts']:
+            # 跨入新的账单周期：归零全部累计并重建网卡/用户基线
+            st['cycle_key'] = cur_key
+            st['cycle_start_ts'] = cur_start
+            st['iface_tx_accum'] = 0
+            st['iface_rx_accum'] = 0
+            st['users_accum'] = 0
+            st['used_bytes'] = 0
+            st['last_boot_id'] = boot_id
+            st['last_raw_tx'] = tx_raw
+            st['last_raw_rx'] = rx_raw
+            st['iface_baseline_ready'] = bool(ifaces or boot_id or tx_raw > 0 or rx_raw > 0)
+            st['last_user_bytes'] = dict(umap)
+            st['users_baseline_ready'] = True
+            st['last_reset_at'] = ts
+            st['tripped'] = False
+            st['tripped_at'] = 0
+            did_reset = True
+            changed = True
+
+    # 2. 若本轮未重置，则按增量公式推进网卡与用户两套累计计数
+    if not did_reset:
+        has_iface_sample = bool(ifaces or boot_id or tx_raw > 0 or rx_raw > 0)
+        if has_iface_sample:
+            if not st['iface_baseline_ready']:
+                # 首次建立基线：仅记录当前计数器，delta = 0 防止误锁
+                st['last_boot_id'] = boot_id
+                st['last_raw_tx'] = tx_raw
+                st['last_raw_rx'] = rx_raw
+                st['iface_baseline_ready'] = True
+                baseline_initialized = True
+                changed = True
+            else:
+                rebooted = bool(boot_id and st['last_boot_id'] and boot_id != st['last_boot_id'])
+                if rebooted:
+                    delta_tx = tx_raw
+                    delta_rx = rx_raw
+                else:
+                    delta_tx = (tx_raw - st['last_raw_tx']) if tx_raw >= st['last_raw_tx'] else tx_raw
+                    delta_rx = (rx_raw - st['last_raw_rx']) if rx_raw >= st['last_raw_rx'] else rx_raw
+                if delta_tx > 0:
+                    st['iface_tx_accum'] += delta_tx
+                    changed = True
+                if delta_rx > 0:
+                    st['iface_rx_accum'] += delta_rx
+                    changed = True
+                if boot_id and boot_id != st['last_boot_id']:
+                    st['last_boot_id'] = boot_id
+                    changed = True
+                if tx_raw != st['last_raw_tx'] or rx_raw != st['last_raw_rx']:
+                    st['last_raw_tx'] = tx_raw
+                    st['last_raw_rx'] = rx_raw
+                    changed = True
+
+        # 用户累计总流量口径（删用户不倒退，首次启用且无清零/校准记录时对齐当前总已用流量）
+        if not st['users_baseline_ready']:
+            if st['users_accum'] == 0 and st['last_reset_at'] == 0:
+                st['users_accum'] = sum(umap.values())
+            st['last_user_bytes'] = dict(umap)
+            st['users_baseline_ready'] = True
+            baseline_initialized = True
+            changed = True
+        else:
+            prev_map = st['last_user_bytes']
+            user_delta = 0
+            for uid, cur_val in umap.items():
+                prev_val = _safe_int(prev_map.get(uid)) if uid in prev_map else 0
+                if cur_val > prev_val:
+                    user_delta += (cur_val - prev_val)
+            if user_delta > 0:
+                st['users_accum'] += user_delta
+                changed = True
+            if prev_map != umap:
+                st['last_user_bytes'] = dict(umap)
+                changed = True
+
+    st['used_bytes'] = quota_current_used_bytes(st)
+    st['last_sample_at'] = ts
+    over_limit = bool(st['enabled'] and st['limit_bytes'] > 0 and st['used_bytes'] >= st['limit_bytes'])
+    return st, {
+        'did_reset': did_reset,
+        'changed': changed,
+        'baseline_initialized': baseline_initialized,
+        'over_limit': over_limit,
+    }
+
+
+def node_traffic_quota_summary(raw_quota, raw_suspend, now_ts=None, live_counters=None, users_map=None):
+    """构造节点总流量限额的只读摘要，供网页接口与实时轮询共用（不改动原对象）。"""
+    ts = int(now_ts) if (isinstance(now_ts, (int, float)) and not isinstance(now_ts, bool)
+                         and math.isfinite(now_ts) and now_ts >= 0) else int(time.time())
+    q = normalize_node_traffic_quota(raw_quota)
+    susp = suspend_state({'traffic_suspend': raw_suspend}) if isinstance(raw_suspend, dict) else {}
+    reasons = suspend_reasons(susp)
+
+    # 启用态下利用实时读数做无副作用预览，保证页面展示与后台 5 秒判定同源
+    if q['enabled'] and (live_counters is not None or users_map is not None):
+        preview_q, _ = advance_node_traffic_quota(
+            q,
+            live_counters if isinstance(live_counters, dict) else {},
+            users_map if isinstance(users_map, dict) else q['last_user_bytes'],
+            ts,
+            allow_auto_reset=False,
+        )
+        view_q = preview_q
+    else:
+        view_q = q
+        if not view_q['enabled'] and view_q['mode'] == 'users_total' and not view_q['users_baseline_ready'] and isinstance(users_map, dict):
+            view_q = dict(view_q)
+            view_q['users_accum'] = sum(_safe_int(v) for v in users_map.values())
+            view_q['used_bytes'] = view_q['users_accum']
+
+    used_bytes = _safe_int(view_q.get('used_bytes'))
+    limit_bytes = _safe_int(view_q.get('limit_bytes'))
+    if limit_bytes > 0:
+        percent = 100.0 if used_bytes >= limit_bytes else round(min(99.9, used_bytes * 100.0 / limit_bytes), 1)
+        remaining_bytes = max(0, limit_bytes - used_bytes)
+    else:
+        percent = 0.0
+        remaining_bytes = 0
+
+    if view_q['reset_mode'] == 'monthly':
+        cycle_key, cycle_start_ts, next_reset_ts = node_quota_cycle_window(ts, view_q['reset_day'])
+        next_dt = datetime.datetime.fromtimestamp(next_reset_ts, tz=datetime.timezone.utc)
+        next_reset_text = next_dt.strftime('%Y-%m-%d 00:00 UTC')
+    else:
+        cycle_key = view_q['cycle_key'] or 'cumulative'
+        cycle_start_ts = view_q['cycle_start_ts']
+        next_reset_ts = 0
+        next_reset_text = '不自动重置（需手动清零）'
+
+    live_ifaces = []
+    if isinstance(live_counters, dict) and isinstance(live_counters.get('interfaces'), list):
+        live_ifaces = [x for x in live_counters['interfaces']
+                       if isinstance(x, str) and x and len(x) <= 64 and not any(ord(c) < 32 or ord(c) == 127 for c in x)][:16]
+    interfaces = live_ifaces or list(view_q.get('last_interfaces') or [])
+    boot_id = ''
+    if isinstance(live_counters, dict) and isinstance(live_counters.get('boot_id'), str) and live_counters['boot_id'].strip():
+        boot_id = live_counters['boot_id'].strip()[:128]
+    else:
+        boot_id = view_q.get('last_boot_id') or ''
+
+    tripped = bool(view_q.get('tripped') or ('local_quota' in reasons))
+    suspended = bool(susp.get('suspended') is True)
+    controller_suspended = bool('controller' in reasons)
+    users_total_bytes = sum(_safe_int(v) for v in users_map.values()) if isinstance(users_map, dict) else _safe_int(view_q.get('users_accum'))
+
+    return {
+        'enabled': bool(view_q['enabled']),
+        'mode': view_q['mode'],
+        'mode_label': NODE_TRAFFIC_QUOTA_MODE_LABELS.get(view_q['mode'], view_q['mode']),
+        'limit_bytes': limit_bytes,
+        'limit_gb': round(limit_bytes / GIB_BYTES, 4) if limit_bytes > 0 else 0,
+        'used_bytes': used_bytes,
+        'percent': percent,
+        'remaining_bytes': remaining_bytes,
+        'reset_mode': view_q['reset_mode'],
+        'reset_mode_label': NODE_TRAFFIC_QUOTA_RESET_LABELS.get(view_q['reset_mode'], view_q['reset_mode']),
+        'reset_day': view_q['reset_day'],
+        'cycle_key': cycle_key,
+        'cycle_start_ts': cycle_start_ts,
+        'next_reset_ts': next_reset_ts,
+        'next_reset_text': next_reset_text,
+        'interfaces': interfaces,
+        'boot_id': boot_id,
+        'tripped': tripped,
+        'tripped_at': _safe_int(view_q.get('tripped_at')) if tripped else 0,
+        'suspended': suspended,
+        'suspend_reasons': reasons,
+        'controller_suspended': controller_suspended,
+        'users_total_bytes': users_total_bytes,
+        'iface_tx_bytes': _safe_int(view_q.get('iface_tx_accum')),
+        'iface_rx_bytes': _safe_int(view_q.get('iface_rx_accum')),
+        'last_reset_at': _safe_int(view_q.get('last_reset_at')),
+        'last_sample_at': _safe_int(view_q.get('last_sample_at')),
+        'updated_at': _safe_int(view_q.get('updated_at')),
+    }
 
 
 def pending_revocations(data):
@@ -10121,19 +10662,47 @@ def serve(path):
     global _unit_suspended
     _unit_suspended = unit_suspended
 
-    def set_traffic_suspension(suspend):
+    _suspend_call_ctx = {'reason': 'controller'}
+
+    def set_traffic_suspension(suspend, reason='controller'):
+        use_reason = reason if reason in ('controller', 'local_quota') else 'controller'
         with traffic_suspend_lock:
-            return _set_traffic_suspension(suspend)
+            prev_reason = _suspend_call_ctx['reason']
+            _suspend_call_ctx['reason'] = use_reason
+            try:
+                return _set_traffic_suspension(suspend)
+            finally:
+                _suspend_call_ctx['reason'] = prev_reason
 
     def _set_traffic_suspension(suspend):
+        try:
+            _reason = _suspend_call_ctx['reason']
+        except NameError:
+            _reason = 'controller'
+        if _reason not in ('controller', 'local_quota'):
+            _reason = 'controller'
         with data_lock:
             # 状态被写成 7 / 字符串时 `dict(...)` 抛异常，超额停用直接 500，
             # 一台服务都没停。这里统一走 suspend_state 的清洗规则。
             state = suspend_state(data)
+        if state.get('suspended') is True:
+            _raw_reasons = state.get('reasons')
+            _cur_reasons = []
+            if isinstance(_raw_reasons, list):
+                for _r in _raw_reasons:
+                    if _r in ('controller', 'local_quota') and _r not in _cur_reasons:
+                        _cur_reasons.append(_r)
+            if not _cur_reasons:
+                _cur_reasons = ['controller']
+        else:
+            _cur_reasons = []
         results = {}
         _retired = set()
         _active_before_stop = set()
         if suspend:
+            _next_reasons = list(_cur_reasons)
+            if _reason not in _next_reasons:
+                _next_reasons.append(_reason)
             units = state.get('units') if state.get('suspended') else None
             if units is None:
                 units = [u for u in TRAFFIC_SUSPEND_UNITS if _unit_active(u)]
@@ -10154,40 +10723,50 @@ def serve(path):
                     results[u] = r.returncode == 0
                 except Exception:
                     results[u] = False
-            # Keep every service selected for suspension so a later resume can
-            # start the ones that stopped successfully; failed stops are still
-            # reported separately in results for the controller to retry.
+            # 保留所有被选中停用的服务名，便于后续恢复时按原状拉起；
+            # 停服失败的服务会在 results 中单独反馈并由外层或守护线程重试。
             new_state = {'suspended': True, 'units': list(units),
-                         'since': state.get('since') or int(time.time())}
+                         'since': state.get('since') or int(time.time()),
+                         'reasons': _next_reasons}
         else:
-            # 停用期间被管理员关掉的协议不再拉起（2026-11-04 修）：AnyTLS / TUIC 停用会删掉
-            # 配置文件，start 必然失败、留在 remaining 里，suspended 永远是 True，控制台
-            # 每轮恢复都 500，而停用状态下又不许重新启用 —— Web 端无路可退。
-            with data_lock:
-                _retired = {name for name, key in ((ANYTLS_SERVICE, 'anytls_config'),
-                                                   (TUIC_SERVICE, 'tuic_config'))
-                            if not (isinstance(data.get(key), dict) and data[key].get('enabled') is True)}
-            for u in state.get('units') or []:
-                if u in _retired:
-                    results[u] = True
-                    continue
-                try:
-                    subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
-                except (OSError, subprocess.SubprocessError) as rf_exc:
-                    _log_ignored('traffic_resume_reset_failed', rf_exc)
-                try:
-                    r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
-                    results[u] = r.returncode == 0
-                except Exception:
-                    results[u] = False
-            # 没启动成功的服务必须留在停用记录里：原来一律清空，控制台下一轮重试
-            # 时已无服务可启、直接回成功，该服务就一直停着而控制台以为已恢复。
-            remaining = [u for u, ok in results.items() if not ok]
-            if remaining:
-                new_state = {'suspended': True, 'units': remaining,
-                             'since': state.get('since') or int(time.time())}
+            _next_reasons = [_r for _r in _cur_reasons if _r != _reason]
+            if _next_reasons:
+                # 仍有其它原因要求保持整机停用（例如外部主控解除但本机总限额仍在熔断，
+                # 或本机解除但外部主控仍未恢复）：绝不越权启动任何代理服务。
+                new_state = {'suspended': True, 'units': list(state.get('units') or []),
+                             'since': state.get('since') or int(time.time()),
+                             'reasons': _next_reasons}
             else:
-                new_state = {'suspended': False}
+                # 停用期间被管理员关掉的协议不再拉起（2026-11-04 修）：AnyTLS / TUIC 停用会删掉
+                # 配置文件，start 必然失败、留在 remaining 里，suspended 永远是 True，控制台
+                # 每轮恢复都 500，而停用状态下又不许重新启用 —— Web 端无路可退。
+                with data_lock:
+                    _retired = {name for name, key in ((ANYTLS_SERVICE, 'anytls_config'),
+                                                       (TUIC_SERVICE, 'tuic_config'))
+                                if not (isinstance(data.get(key), dict) and data[key].get('enabled') is True)}
+                for u in state.get('units') or []:
+                    if u in _retired:
+                        results[u] = True
+                        continue
+                    try:
+                        subprocess.run(['systemctl', 'reset-failed', u], capture_output=True, timeout=5)
+                    except (OSError, subprocess.SubprocessError) as rf_exc:
+                        _log_ignored('traffic_resume_reset_failed', rf_exc)
+                    try:
+                        r = subprocess.run(['systemctl', 'start', u], capture_output=True, timeout=20)
+                        results[u] = r.returncode == 0
+                    except Exception:
+                        results[u] = False
+                # 没启动成功的服务必须留在停用记录里：原来一律清空，控制台下一轮重试
+                # 时已无服务可启、直接回成功，该服务就一直停着而控制台以为已恢复。
+                remaining = [u for u, ok in results.items() if not ok]
+                if remaining:
+                    new_state = {'suspended': True, 'units': remaining,
+                                 'since': state.get('since') or int(time.time())}
+                    if 'reasons' in state or _reason != 'controller':
+                        new_state['reasons'] = [_reason]
+                else:
+                    new_state = {'suspended': False}
         with data_lock:
             previous_suspend_exists = 'traffic_suspend' in data
             previous_suspend = copy.deepcopy(data.get('traffic_suspend'))
@@ -10239,6 +10818,136 @@ def serve(path):
             return
         save_data()
         _meter_last_save[0] = now
+
+    # ---- 节点总流量限额独立 5 秒守护线程（硬熔断 + 防复活 + 月度自动重置）----
+    node_quota_lock = threading.Lock()
+    _node_quota_last_save = [None]
+
+    def step_node_traffic_quota(now_ts=None):
+        """执行单轮节点总流量限额采样、周期重置、超额硬熔断与熔断期防复活复核。
+
+        所有落盘（save_data）与启停服务（set_traffic_suspension / _unit_active）均严格放在 data_lock 外，
+        确保慢盘与子进程绝不阻塞高并发 /auth 鉴权。
+        """
+        ts = int(now_ts) if now_ts is not None else int(time.time())
+        try:
+            counters = node_traffic_counters()
+        except Exception:
+            counters = {'rx_bytes': 0, 'tx_bytes': 0, 'interfaces': [], 'boot_id': ''}
+
+        with node_quota_lock:
+            with data_lock:
+                raw_q = data.get('node_traffic_quota')
+                cur_q = normalize_node_traffic_quota(raw_q)
+                cur_susp = suspend_state(data)
+                cur_reasons = suspend_reasons(cur_susp)
+                users_map = _quota_users_byte_map(user_table(data))
+                was_suspended = cur_susp.get('suspended') is True
+                was_local_reason = 'local_quota' in cur_reasons
+
+                if not cur_q['enabled']:
+                    need_release_orphan = was_local_reason or cur_q['tripped']
+                    if cur_q['tripped']:
+                        cur_q['tripped'] = False
+                        cur_q['tripped_at'] = 0
+                        data['node_traffic_quota'] = cur_q
+                    new_q = cur_q
+                    need_suspend = False
+                    need_recheck_units = False
+                    need_resume = need_release_orphan
+                    force_save = False
+                    changed = False
+                else:
+                    new_q, ev = advance_node_traffic_quota(cur_q, counters, users_map, ts, allow_auto_reset=True)
+                    over_limit = ev['over_limit']
+                    did_reset = ev['did_reset']
+                    changed = ev['changed']
+                    need_suspend = False
+                    need_recheck_units = False
+                    need_resume = False
+                    force_save = bool(did_reset or ev['baseline_initialized'])
+
+                    if over_limit:
+                        if not new_q['tripped'] or not was_local_reason or not was_suspended:
+                            new_q['tripped'] = True
+                            new_q['tripped_at'] = new_q['tripped_at'] or ts
+                            need_suspend = True
+                            force_save = True
+                        else:
+                            need_recheck_units = True
+                    else:
+                        if new_q['tripped'] or was_local_reason or did_reset:
+                            new_q['tripped'] = False
+                            new_q['tripped_at'] = 0
+                            if was_local_reason:
+                                need_resume = True
+                                force_save = True
+                            elif did_reset:
+                                force_save = True
+                    data['node_traffic_quota'] = new_q
+
+            # 以下全部位于 data_lock 锁外执行
+            if need_suspend:
+                print('[quota] 节点总流量已达限额（%d / %d 字节，口径 %s），立即触发硬熔断关停全部对外代理服务'
+                      % (new_q['used_bytes'], new_q['limit_bytes'], new_q['mode']), file=sys.stderr)
+                try:
+                    set_traffic_suspension(True, reason='local_quota')
+                    _node_quota_last_save[0] = time.monotonic()
+                except Exception as exc:
+                    print('[quota] 触发超额停服失败，下轮重试: %s' % type(exc).__name__, file=sys.stderr)
+                    try:
+                        save_data()
+                        _node_quota_last_save[0] = time.monotonic()
+                    except Exception:
+                        pass
+            elif need_recheck_units:
+                revived = [u for u in TRAFFIC_SUSPEND_UNITS if _unit_active(u)]
+                if revived or not was_suspended:
+                    print('[quota] 本机超量熔断防复活检测发现仍在运行的服务: %s，立即再次强行关停'
+                          % (','.join(revived) or '停用状态修复'), file=sys.stderr)
+                    try:
+                        set_traffic_suspension(True, reason='local_quota')
+                        _node_quota_last_save[0] = time.monotonic()
+                    except Exception as exc:
+                        print('[quota] 熔断防复活强停失败: %s' % type(exc).__name__, file=sys.stderr)
+            elif need_resume:
+                print('[quota] 节点总流量恢复到限额以内或已跨周期归零，解除本机熔断标记', file=sys.stderr)
+                try:
+                    set_traffic_suspension(False, reason='local_quota')
+                    _node_quota_last_save[0] = time.monotonic()
+                except Exception as exc:
+                    print('[quota] 解除本机熔断失败，下轮重试: %s' % type(exc).__name__, file=sys.stderr)
+                    try:
+                        save_data()
+                        _node_quota_last_save[0] = time.monotonic()
+                    except Exception:
+                        pass
+            elif force_save:
+                try:
+                    save_data()
+                    _node_quota_last_save[0] = time.monotonic()
+                except Exception as exc:
+                    print('[quota] 强制保存限额状态失败: %s' % type(exc).__name__, file=sys.stderr)
+            elif changed:
+                mono_now = time.monotonic()
+                if (_node_quota_last_save[0] is None
+                        or not (0 <= mono_now - _node_quota_last_save[0] < NODE_QUOTA_SAVE_INTERVAL)):
+                    try:
+                        save_data()
+                        _node_quota_last_save[0] = mono_now
+                    except Exception as exc:
+                        print('[quota] 周期保存限额状态失败: %s' % type(exc).__name__, file=sys.stderr)
+
+    def node_traffic_quota_worker():
+        """独立 5 秒后台守护线程：持续监测节点总流量、执行硬熔断、防复活与月度自动重置。"""
+        while True:
+            try:
+                step_node_traffic_quota()
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException as exc:
+                print('[quota] 节点总流量限额守护线程捕获异常继续下一轮: ' + type(exc).__name__, file=sys.stderr)
+            time.sleep(5)
 
         # 每个来源使用实际采样间隔计算速率，不能把 5 秒增量除以固定 3 秒。
     SPEED_WINDOW_SECONDS = 15
@@ -13203,7 +13912,7 @@ if __name__ == '__main__':
                     # 停用或恢复涉及多个 systemd 单元启停，续期死线避免撞上默认 30 秒超时。
                     self._extend_deadline(120)
                     try:
-                        state, results = set_traffic_suspension(params['suspended'])
+                        state, results = set_traffic_suspension(params['suspended'], reason='controller')
                     except AtomicWriteDurabilityError:
                         return self.reply_json(503, {'ok': False,
                             'error': 'Traffic suspension state written but durability uncertain; verify and retry'})
@@ -13216,6 +13925,7 @@ if __name__ == '__main__':
                     failed = [u for u, ok in results.items() if not ok]
                     return self.reply_json(200 if not failed else 500, {
                         'ok': not failed, 'suspended': state.get('suspended', False),
+                        'reasons': suspend_reasons(state),
                         'units': results, 'failed': failed})
 
                 return self.reply_json(404, {'ok': False, 'error': 'API endpoint not found'})
@@ -13330,6 +14040,9 @@ if __name__ == '__main__':
 
             if self.path == prefix + 'outbounds/probe':
                 return self._ob_probe()
+
+            if self.path == prefix + 'node-traffic-quota':
+                return self._h_post_node_traffic_quota(prefix)
 
             return self.reply(404, b'Not found')
 
@@ -18065,6 +18778,9 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
             if subpath == 'traffic-speed':
                 return self._h_get_traffic_speed(subpath)
 
+            if subpath.split('?', 1)[0] == 'node-traffic-quota':
+                return self._h_get_node_traffic_quota(subpath)
+
             if subpath == 'proxy-services':
                 return self._h_get_proxy_services(subpath)
 
@@ -18508,15 +19224,347 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                     # 整个 /traffic-speed 变 500 —— 而它是每 2 秒一次的前端
                     # 主轮询，后果是「面板流量整块空白、所有用户都看不到」。
                     entry['used_bytes'] = _safe_int(user.get('used_bytes'))
+                _norm_quota = globals().get('normalize_node_traffic_quota')
+                _q_raw = data.get('node_traffic_quota') if isinstance(data, dict) else None
+                _q_norm = _norm_quota(_q_raw) if callable(_norm_quota) else None
+                _susp_raw = data.get('traffic_suspend') if isinstance(data, dict) else None
+                _susp_snap = dict(_susp_raw) if isinstance(_susp_raw, dict) else None
+                if isinstance(_susp_snap, dict):
+                    if isinstance(_susp_snap.get('units'), list):
+                        _susp_snap['units'] = list(_susp_snap['units'])
+                    if isinstance(_susp_snap.get('reasons'), list):
+                        _susp_snap['reasons'] = list(_susp_snap['reasons'])
 
-            return self.reply_json(200, {
+            _users_map = {uid: max(0, _safe_int(u.get('used_bytes'))) for uid, u in user_speeds.items()}
+            _resp_payload = {
                 'ok': True,
                 'node_tx': total_tx_speed,
                 'node_rx': total_rx_speed,
                 'users': user_speeds,
                 'total_used_bytes': sum(_safe_int(u.get('used_bytes'))
-                                        for u in user_speeds.values())
-            })
+                                        for u in user_speeds.values()),
+            }
+            _quota_sum_fn = globals().get('node_traffic_quota_summary')
+            if _q_norm is not None and callable(_quota_sum_fn):
+                _live_counters = None
+                if _q_norm['enabled'] and _q_norm['mode'] in ('iface_tx', 'iface_both'):
+                    try:
+                        _live_counters = node_traffic_counters()
+                    except Exception:
+                        _live_counters = None
+                _resp_payload['node_traffic_quota'] = _quota_sum_fn(
+                    _q_norm, _susp_snap, now_ts=int(time.time()),
+                    live_counters=_live_counters, users_map=_users_map)
+
+            return self.reply_json(200, _resp_payload)
+
+        def _h_get_node_traffic_quota(self, subpath):
+            """GET <prefix>node-traffic-quota：返回节点总流量限额实时配置、用量与熔断状态（仅网页会话可访问）。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            try:
+                counters = node_traffic_counters()
+            except Exception:
+                counters = {'rx_bytes': 0, 'tx_bytes': 0, 'interfaces': [], 'boot_id': ''}
+            with data_lock:
+                raw_q = copy.deepcopy(data.get('node_traffic_quota')) if isinstance(data.get('node_traffic_quota'), dict) else None
+                raw_susp = copy.deepcopy(data.get('traffic_suspend')) if isinstance(data.get('traffic_suspend'), dict) else None
+                users_map = _quota_users_byte_map(user_table(data))
+            summary = node_traffic_quota_summary(
+                raw_q, raw_susp, now_ts=int(time.time()),
+                live_counters=counters, users_map=users_map)
+            return self.reply_json(200, {'ok': True, 'quota': summary})
+
+        def _h_post_node_traffic_quota(self, prefix):
+            """POST <prefix>node-traffic-quota：保存节点总流量限额配置或手动清零本周期已用（仅网页会话可访问）。"""
+            if not self.is_authenticated():
+                return self.reply_json(401, {'ok': False, 'error': 'Unauthorized'})
+            # 严格 Content-Length 守卫：拒绝重复头、非纯 ASCII 数字、负号/正号与超大位数防 DoS
+            try:
+                _cl_vals = self.headers.get_all('Content-Length') if hasattr(self.headers, 'get_all') else None
+                if _cl_vals is not None:
+                    if len(_cl_vals) > 1:
+                        return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                    _raw_cl = _cl_vals[0] if _cl_vals else '0'
+                else:
+                    _raw_cl = self.headers.get('Content-Length', '0')
+                if isinstance(_raw_cl, int) and not isinstance(_raw_cl, bool):
+                    _raw_cl = str(_raw_cl)
+                if not isinstance(_raw_cl, str):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                _raw_cl_s = _raw_cl.strip()
+                if not _raw_cl_s or not _raw_cl_s.isascii() or not _raw_cl_s.isdigit():
+                    return self.reply_json(400, {'ok': False, 'error': '请求体长度不合法'})
+                if len(_raw_cl_s) > 10:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
+                length = int(_raw_cl_s)
+                if length > 65536:
+                    return self.reply_json(413, {'ok': False, 'error': '请求体过大'})
+                raw_body = self.rfile.read(length).decode('utf-8', errors='replace') if length > 0 else ''
+            except Exception:
+                return self.reply_json(400, {'ok': False, 'error': '读取请求内容失败'})
+
+            ctype = (self.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
+            if ctype == 'application/json':
+                try:
+                    parsed = json.loads(raw_body) if raw_body.strip() else {}
+                except ValueError:
+                    return self.reply_json(400, {'ok': False, 'error': 'JSON 格式无效'})
+                if not isinstance(parsed, dict):
+                    return self.reply_json(400, {'ok': False, 'error': '请求体必须是 JSON 对象'})
+                params = parsed
+            else:
+                form = parse_qs(raw_body, keep_blank_values=True)
+                params = {k: (v[0] if v else '') for k, v in form.items()}
+
+            raw_action = params.get('action', '')
+            if not isinstance(raw_action, str):
+                return self.reply_json(400, {'ok': False, 'error': '操作类型参数不合法'})
+            action = raw_action.strip().lower()
+            if action not in ('save', 'reset'):
+                return self.reply_json(400, {'ok': False, 'error': '未知的操作类型，仅支持 save 或 reset'})
+
+            if hasattr(self, '_extend_deadline'):
+                self._extend_deadline(120)
+
+            now_ts = int(time.time())
+            try:
+                counters = node_traffic_counters()
+            except Exception:
+                counters = {'rx_bytes': 0, 'tx_bytes': 0, 'interfaces': [], 'boot_id': ''}
+            rx_raw = _safe_int(counters.get('rx_bytes'))
+            tx_raw = _safe_int(counters.get('tx_bytes'))
+            boot_id = counters.get('boot_id').strip() if isinstance(counters.get('boot_id'), str) else ''
+            ifaces = [x for x in (counters.get('interfaces') if isinstance(counters.get('interfaces'), list) else [])
+                      if isinstance(x, str) and x and len(x) <= 64 and not any(ord(c) < 32 or ord(c) == 127 for c in x)][:16]
+            has_iface_sample = bool(ifaces or boot_id or tx_raw > 0 or rx_raw > 0)
+
+            with node_quota_lock:
+                with data_lock:
+                    prev_exists = 'node_traffic_quota' in data
+                    prev_quota = copy.deepcopy(data.get('node_traffic_quota'))
+                    old_q = normalize_node_traffic_quota(prev_quota)
+                    old_susp = suspend_state(data)
+                    old_reasons = suspend_reasons(old_susp)
+                    users_map = _quota_users_byte_map(user_table(data))
+
+                if action == 'save':
+                    ok_en, enabled, err_en = _quota_parse_bool(params.get('enabled', False))
+                    if not ok_en:
+                        return self.reply_json(400, {'ok': False, 'error': err_en})
+                    raw_mode = params.get('mode', old_q['mode'])
+                    mode = raw_mode.strip().lower() if isinstance(raw_mode, str) else ''
+                    if mode not in NODE_TRAFFIC_QUOTA_MODES:
+                        return self.reply_json(400, {'ok': False, 'error': '统计口径仅支持 iface_tx / users_total / iface_both'})
+                    raw_reset_mode = params.get('reset_mode', old_q['reset_mode'])
+                    reset_mode = raw_reset_mode.strip().lower() if isinstance(raw_reset_mode, str) else ''
+                    if reset_mode not in NODE_TRAFFIC_QUOTA_RESETS:
+                        return self.reply_json(400, {'ok': False, 'error': '重置模式仅支持 monthly 或 cumulative'})
+                    raw_reset_day = params.get('reset_day', None)
+                    if reset_mode == 'cumulative' and (raw_reset_day is None or (isinstance(raw_reset_day, str) and not raw_reset_day.strip())):
+                        reset_day = old_q['reset_day']
+                    else:
+                        ok_day, reset_day, err_day = _quota_parse_reset_day(
+                            old_q['reset_day'] if raw_reset_day is None else raw_reset_day)
+                        if not ok_day:
+                            return self.reply_json(400, {'ok': False, 'error': err_day})
+
+                    raw_limit_gb = params.get('limit_gb', None)
+                    if enabled:
+                        ok_lim, limit_bytes, err_lim = _quota_parse_gb_value(
+                            raw_limit_gb, allow_empty=False, allow_zero=False, label='节点总流量限额')
+                    else:
+                        ok_lim, limit_bytes, err_lim = _quota_parse_gb_value(
+                            raw_limit_gb, allow_empty=True, allow_zero=True, label='节点总流量限额')
+                    if not ok_lim:
+                        return self.reply_json(400, {'ok': False, 'error': err_lim})
+                    if limit_bytes is None:
+                        limit_bytes = old_q['limit_bytes']
+
+                    ok_cal, cal_bytes, err_cal = _quota_parse_gb_value(
+                        params.get('calibrate_used_gb', ''), allow_empty=True, allow_zero=True, label='校准当前周期已用流量')
+                    if not ok_cal:
+                        return self.reply_json(400, {'ok': False, 'error': err_cal})
+
+                    new_q = copy.deepcopy(old_q)
+                    # 若原已启用且本次未手动校准，先将截至当前的真实增量吸收进累计值
+                    if old_q['enabled'] and cal_bytes is None:
+                        new_q, _ = advance_node_traffic_quota(new_q, counters, users_map, now_ts, allow_auto_reset=False)
+
+                    new_q['enabled'] = enabled
+                    new_q['mode'] = mode
+                    new_q['limit_bytes'] = limit_bytes
+                    new_q['reset_mode'] = reset_mode
+                    new_q['reset_day'] = reset_day
+                    if ifaces:
+                        new_q['last_interfaces'] = list(ifaces)
+
+                    if reset_mode == 'monthly':
+                        ck, cstart, _ = node_quota_cycle_window(now_ts, reset_day)
+                        # 初次设置或修改账单日/重置模式时对齐当前账单周期，避免保存瞬间误触发跨月清零
+                        if not new_q['cycle_key'] or new_q['cycle_start_ts'] <= 0 or reset_day != old_q['reset_day'] or reset_mode != old_q['reset_mode']:
+                            new_q['cycle_key'] = ck
+                            new_q['cycle_start_ts'] = cstart
+                    else:
+                        new_q['cycle_key'] = 'cumulative'
+                        if new_q['cycle_start_ts'] <= 0:
+                            new_q['cycle_start_ts'] = now_ts
+
+                    # 从关闭转为开启时刷新网卡基线（增量=0），防止把停用期间或开机历史流量直接算进本周期自锁
+                    if enabled and not old_q['enabled']:
+                        if has_iface_sample:
+                            new_q['last_boot_id'] = boot_id
+                            new_q['last_raw_tx'] = tx_raw
+                            new_q['last_raw_rx'] = rx_raw
+                            new_q['iface_baseline_ready'] = True
+                        if not new_q['users_baseline_ready']:
+                            if new_q['users_accum'] == 0 and new_q['last_reset_at'] == 0:
+                                new_q['users_accum'] = sum(users_map.values())
+                            new_q['last_user_bytes'] = dict(users_map)
+                            new_q['users_baseline_ready'] = True
+                        else:
+                            new_q['last_user_bytes'] = dict(users_map)
+                    elif enabled:
+                        # 已启用状态下切换口径时，补齐尚未初始化的基线
+                        if not new_q['iface_baseline_ready'] and has_iface_sample:
+                            new_q['last_boot_id'] = boot_id
+                            new_q['last_raw_tx'] = tx_raw
+                            new_q['last_raw_rx'] = rx_raw
+                            new_q['iface_baseline_ready'] = True
+                        if not new_q['users_baseline_ready']:
+                            if new_q['users_accum'] == 0 and new_q['last_reset_at'] == 0:
+                                new_q['users_accum'] = sum(users_map.values())
+                            new_q['last_user_bytes'] = dict(users_map)
+                            new_q['users_baseline_ready'] = True
+
+                    # 可选手动校准当前周期已用流量（GB）
+                    if cal_bytes is not None:
+                        if mode == 'users_total':
+                            new_q['users_accum'] = cal_bytes
+                            new_q['last_user_bytes'] = dict(users_map)
+                            new_q['users_baseline_ready'] = True
+                        elif mode == 'iface_both':
+                            new_q['iface_tx_accum'] = cal_bytes
+                            new_q['iface_rx_accum'] = 0
+                            if has_iface_sample:
+                                new_q['last_boot_id'] = boot_id
+                                new_q['last_raw_tx'] = tx_raw
+                                new_q['last_raw_rx'] = rx_raw
+                                new_q['iface_baseline_ready'] = True
+                        else:
+                            new_q['iface_tx_accum'] = cal_bytes
+                            if has_iface_sample:
+                                new_q['last_boot_id'] = boot_id
+                                new_q['last_raw_tx'] = tx_raw
+                                new_q['last_raw_rx'] = rx_raw
+                                new_q['iface_baseline_ready'] = True
+
+                    new_q['used_bytes'] = quota_current_used_bytes(new_q)
+                    new_q['last_sample_at'] = now_ts
+                    new_q['updated_at'] = now_ts
+                    over_limit = bool(new_q['enabled'] and new_q['limit_bytes'] > 0 and new_q['used_bytes'] >= new_q['limit_bytes'])
+                    was_local = bool(old_q['tripped'] or ('local_quota' in old_reasons))
+                    if over_limit:
+                        new_q['tripped'] = True
+                        new_q['tripped_at'] = old_q['tripped_at'] or now_ts
+                    else:
+                        new_q['tripped'] = False
+                        new_q['tripped_at'] = 0
+                else:
+                    # action == 'reset'：手动清零本周期已用计数并重建基线，若因本机超量熔断则立刻恢复
+                    new_q = copy.deepcopy(old_q)
+                    new_q['iface_tx_accum'] = 0
+                    new_q['iface_rx_accum'] = 0
+                    new_q['users_accum'] = 0
+                    new_q['used_bytes'] = 0
+                    new_q['last_boot_id'] = boot_id
+                    new_q['last_raw_tx'] = tx_raw
+                    new_q['last_raw_rx'] = rx_raw
+                    new_q['iface_baseline_ready'] = has_iface_sample
+                    if ifaces:
+                        new_q['last_interfaces'] = list(ifaces)
+                    new_q['last_user_bytes'] = dict(users_map)
+                    new_q['users_baseline_ready'] = True
+                    if new_q['reset_mode'] == 'monthly':
+                        ck, cstart, _ = node_quota_cycle_window(now_ts, new_q['reset_day'])
+                        new_q['cycle_key'] = ck
+                        new_q['cycle_start_ts'] = cstart
+                    new_q['tripped'] = False
+                    new_q['tripped_at'] = 0
+                    new_q['last_reset_at'] = now_ts
+                    new_q['last_sample_at'] = now_ts
+                    new_q['updated_at'] = now_ts
+                    over_limit = False
+                    was_local = bool(old_q['tripped'] or ('local_quota' in old_reasons))
+
+                with data_lock:
+                    data['node_traffic_quota'] = new_q
+
+                # 严格在 data_lock 锁外执行停服 / 恢复与原子落盘
+                suspend_results = {}
+                try:
+                    if over_limit:
+                        susp_state_out, suspend_results = set_traffic_suspension(True, reason='local_quota')
+                    elif was_local:
+                        susp_state_out, suspend_results = set_traffic_suspension(False, reason='local_quota')
+                    else:
+                        save_data()
+                        with data_lock:
+                            susp_state_out = suspend_state(data)
+                    _node_quota_last_save[0] = time.monotonic()
+                except AtomicWriteDurabilityError:
+                    return self.reply_json(503, {'ok': False, 'error': '配置已写入但落盘持久性未确认，请刷新核对'})
+                except OSError as exc:
+                    with data_lock:
+                        if prev_exists:
+                            data['node_traffic_quota'] = prev_quota
+                        else:
+                            data.pop('node_traffic_quota', None)
+                    return self.reply_json(503, {'ok': False, 'error': '保存失败已回滚：' + api_error_text(exc)})
+                except Exception as exc:
+                    with data_lock:
+                        if prev_exists:
+                            data['node_traffic_quota'] = prev_quota
+                        else:
+                            data.pop('node_traffic_quota', None)
+                    return self.reply_json(500, {'ok': False, 'error': '执行节点总流量限额操作失败：' + api_error_text(exc)})
+
+                summary = node_traffic_quota_summary(
+                    new_q, susp_state_out, now_ts=now_ts, live_counters=counters, users_map=users_map)
+                failed_units = [u for u, ok in suspend_results.items() if not ok]
+                if action == 'reset':
+                    if summary['controller_suspended']:
+                        msg = '已清零本周期已用流量并解除本机熔断；但外部主控制台仍处于停用状态，代理服务将在主控制台恢复后启动'
+                    elif was_local and failed_units:
+                        msg = '已清零本周期已用流量，但部分代理服务恢复失败（%s），请稍后检查' % '、'.join(failed_units)
+                    elif was_local:
+                        msg = '已清零本周期已用流量，本机熔断已解除并恢复代理服务'
+                    else:
+                        msg = '已清零本周期已用流量并重新建立统计基线'
+                else:
+                    if over_limit:
+                        if failed_units:
+                            msg = '配置已保存；已用流量已达上限并触发熔断，部分服务停服异常（%s），守护线程将持续重试' % '、'.join(failed_units)
+                        else:
+                            msg = '配置已保存；当前已用流量已达上限，已立即关停全部对外代理服务'
+                    elif was_local:
+                        if summary['controller_suspended']:
+                            msg = '配置已保存并解除本机熔断；但外部主控制台仍处于停用状态，代理服务暂未启动'
+                        elif failed_units:
+                            msg = '配置已保存并解除本机熔断，但部分服务恢复失败（%s）' % '、'.join(failed_units)
+                        else:
+                            msg = '配置已保存，本机熔断已解除并恢复代理服务'
+                    else:
+                        msg = '节点总流量限额配置已保存并生效'
+
+                return self.reply_json(200, {
+                    'ok': True,
+                    'message': msg,
+                    'quota': summary,
+                    'suspended': summary['suspended'],
+                    'units': suspend_results,
+                    'failed': failed_units,
+                })
 
         def _h_get_proxy_services(self, subpath):
             """GET /proxy-services 的处理逻辑（从 do_GET 机械搬移而来）。"""
@@ -19627,6 +20675,14 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
                 and not _u.strip().startswith('-')
                 and not any(_c.isspace() or ord(_c) < 32 for _c in _u.strip())
             ]
+            _raw_reasons = _susp.get('reasons') if isinstance(_susp, dict) else None
+            if isinstance(_raw_reasons, list) and 'local_quota' in _raw_reasons:
+                try:
+                    for _tu in TRAFFIC_SUSPEND_UNITS:
+                        if _tu not in _units and _unit_active(_tu):
+                            _units.append(_tu)
+                except NameError:
+                    pass
             _stopped_units = []
             _failed_units = []
             for _u in _units:
@@ -19648,6 +20704,7 @@ log "Cloudflare WARP Local Proxy (wgcf + wireproxy) 部署完成"
         usage_meter.start()
     threading.Thread(target=expiry_access_worker,name="portal-expiry-enforcer",daemon=True).start()
     threading.Thread(target=reality_iplimit_worker,name="portal-reality-iplimit",daemon=True).start()
+    threading.Thread(target=node_traffic_quota_worker,name="portal-node-quota-enforcer",daemon=True).start()
 
     # systemd 停止 / 重启 / 关机时先把内存里的计量落盘（2026-11-04 修）：计量每 60 秒
     # 才写一次，旧实现收到 SIGTERM 直接退出，最多丢一分钟流量；关机时 Hy2 / Xray
