@@ -37,7 +37,7 @@ POST_ENDPOINTS = {
     'do-upgrade', 'install-amneziawg', 'install-gost', 'install-warp',
     'install-xray', 'login', 'logout', 'manage-amneziawg', 'manage-proxy', 'outbounds/probe',
     'manage-outbounds', 'manage-reality', 'manage-user', 'manage-vlessenc', 'manage-anytls', 'manage-tuic', 'install-core', 'uninstall-core',
-    'manage-vmess', 'manage-warp', 'reboot-server', 'set-bbr',
+    'manage-vmess', 'manage-warp', 'node-traffic-quota', 'reboot-server', 'set-bbr',
 }
 
 # 集群 API：不带 token 前缀，走 Bearer api_key
